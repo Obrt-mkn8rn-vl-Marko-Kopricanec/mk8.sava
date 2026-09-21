@@ -495,10 +495,65 @@ public sealed partial class AzureResponseWriter
         response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
     }
 
+    public static void AddBlobWriteHeaders(HttpResponse response, BlobRecord blob)
+    {
+        AddBlobEntityHeaders(response, blob);
+        AddBlobVersionHeader(response, blob);
+    }
+
+    public static void AddBlobCopyHeaders(HttpResponse response, BlobRecord blob, bool includeVersion)
+    {
+        AddBlobEntityHeaders(response, blob);
+        if (blob.Copy is not null)
+        {
+            response.Headers["x-ms-copy-id"] = blob.Copy.Id;
+            response.Headers["x-ms-copy-status"] = blob.Copy.Status;
+        }
+        if (includeVersion)
+            AddBlobVersionHeader(response, blob);
+    }
+
+    public static void AddPageBlobWriteHeaders(HttpResponse response, BlobRecord blob)
+    {
+        AddBlobEntityHeaders(response, blob);
+        response.Headers["x-ms-blob-sequence-number"] = blob.SequenceNumber.ToString(CultureInfo.InvariantCulture);
+    }
+
+    public static void AddAppendBlobSealHeaders(HttpResponse response, BlobRecord blob)
+    {
+        AddBlobEntityHeaders(response, blob);
+        response.Headers["x-ms-blob-sealed"] = blob.IsSealed ? "true" : "false";
+    }
+
+    public static void AddBlobQueryHeaders(HttpResponse response, BlobRecord blob)
+    {
+        var request = StorageRequestContext.Get(response.HttpContext);
+        AddBlobEntityHeaders(response, blob);
+        SetOptional(response.Headers, "Content-Encoding", blob.Http.ContentEncoding);
+        SetOptional(response.Headers, "Content-Language", blob.Http.ContentLanguage);
+        SetOptional(response.Headers, "Cache-Control", blob.Http.CacheControl);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+            SetOptional(response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
+        response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
+        if (blob.Kind == Storage.BlobKind.AppendBlob)
+            response.Headers["x-ms-blob-committed-block-count"] = blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+            response.Headers["x-ms-server-encrypted"] = "true";
+    }
+
     private static void AddContainerPublicAccessHeader(HttpResponse response, ContainerRecord container)
     {
         if (container.PublicAccess is not null)
             response.Headers["x-ms-blob-public-access"] = container.PublicAccess;
+    }
+
+    private static void AddBlobVersionHeader(HttpResponse response, BlobRecord blob)
+    {
+        if (blob.VersionId is not null &&
+            IsServiceVersionAtLeast(StorageRequestContext.Get(response.HttpContext), new DateOnly(2019, 12, 12)))
+        {
+            response.Headers["x-ms-version-id"] = blob.VersionId;
+        }
     }
 
     public static void AddBlobHeaders(HttpResponse response, BlobRecord blob)

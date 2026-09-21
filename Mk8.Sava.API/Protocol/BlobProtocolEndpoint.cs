@@ -968,8 +968,9 @@ public static class BlobProtocolEndpoint
                 current?.GenerationId,
                 current?.Revision,
                 cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, committed);
+            AzureResponseWriter.AddBlobWriteHeaders(http.Response, committed);
             AddRequestServerEncryptedHeader(http.Response);
+            AddEncryptionResponseHeaders(http.Response, EncryptionOf(committed));
             EchoTransactionalChecksum(http);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -1013,9 +1014,11 @@ public static class BlobProtocolEndpoint
                         cancellationToken),
                     cancellationToken);
             }
-            AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            AzureResponseWriter.AddBlobEntityHeaders(http.Response, updated);
             http.Response.Headers["x-ms-blob-append-offset"] = current.Content.Length.ToString(CultureInfo.InvariantCulture);
             http.Response.Headers["x-ms-blob-committed-block-count"] = updated.AppendBlockCount.ToString(CultureInfo.InvariantCulture);
+            AddRequestServerEncryptedHeader(http.Response);
+            AddEncryptionResponseHeaders(http.Response, EncryptionOf(updated));
             EchoTransactionalChecksum(http, copySource is not null);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -1092,7 +1095,9 @@ public static class BlobProtocolEndpoint
             {
                 throw AzureStorageException.InvalidHeader("x-ms-page-write", operation);
             }
-            AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            AzureResponseWriter.AddPageBlobWriteHeaders(http.Response, updated);
+            AddRequestServerEncryptedHeader(http.Response);
+            AddEncryptionResponseHeaders(http.Response, EncryptionOf(updated));
             EchoTransactionalChecksum(http, ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source") is not null);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -1146,7 +1151,7 @@ public static class BlobProtocolEndpoint
                 SanitizeCopySource(copySource),
                 current,
                 cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, copied);
+            AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: false);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -1372,7 +1377,10 @@ public static class BlobProtocolEndpoint
                 ProtocolParsing.First(http.Request.Headers, "x-ms-sequence-number-action"),
                 contentEncryption,
                 cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            if (updated.Kind == BlobKind.PageBlob)
+                AzureResponseWriter.AddPageBlobWriteHeaders(http.Response, updated);
+            else
+                AzureResponseWriter.AddBlobEntityHeaders(http.Response, updated);
             return;
         }
 
@@ -1405,7 +1413,7 @@ public static class BlobProtocolEndpoint
             EnsureMutableVersion(blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var updated = await service.SealAppendBlobAsync(blob, cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            AzureResponseWriter.AddAppendBlobSealHeaders(http.Response, updated);
             return;
         }
 
@@ -1513,7 +1521,7 @@ public static class BlobProtocolEndpoint
             var nextMarker = nextOffset < ordered.Length
                 ? nextOffset.ToString(CultureInfo.InvariantCulture)
                 : http.Request.Query.ContainsKey("maxresults") || http.Request.Query.ContainsKey("marker") ? string.Empty : null;
-            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            AzureResponseWriter.AddBlobEntityHeaders(http.Response, blob);
             http.Response.Headers["x-ms-blob-content-length"] = blob.Content.Length.ToString(CultureInfo.InvariantCulture);
             await writer.WritePageRangesAsync(
                 http,
@@ -1606,9 +1614,9 @@ public static class BlobProtocolEndpoint
                         current?.Revision,
                         cancellationToken),
                     cancellationToken);
-                AzureResponseWriter.AddBlobHeaders(http.Response, uploaded);
-                http.Response.Headers["x-ms-copy-status"] = "success";
+                AzureResponseWriter.AddBlobWriteHeaders(http.Response, uploaded);
                 AddRequestServerEncryptedHeader(http.Response);
+                AddEncryptionResponseHeaders(http.Response, EncryptionOf(uploaded));
                 EchoTransactionalChecksum(http, sourceChecksum: true);
                 http.Response.StatusCode = StatusCodes.Status201Created;
                 return;
@@ -1662,7 +1670,7 @@ public static class BlobProtocolEndpoint
                         cancellationToken),
                     cancellationToken);
             }
-            AzureResponseWriter.AddBlobHeaders(http.Response, copied);
+            AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: true);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -1723,9 +1731,10 @@ public static class BlobProtocolEndpoint
                 throw AzureStorageException.InvalidHeader("x-ms-blob-type", type);
         }
 
-        AzureResponseWriter.AddBlobHeaders(http.Response, created);
+        AzureResponseWriter.AddBlobWriteHeaders(http.Response, created);
         EchoTransactionalChecksum(http);
         AddRequestServerEncryptedHeader(http.Response);
+        AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));
         http.Response.StatusCode = StatusCodes.Status201Created;
     }
 
@@ -1892,7 +1901,7 @@ public static class BlobProtocolEndpoint
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
         var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken);
-        AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+        AzureResponseWriter.AddBlobQueryHeaders(http.Response, blob);
         http.Response.ContentType = "avro/binary";
         http.Response.StatusCode = StatusCodes.Status200OK;
 
