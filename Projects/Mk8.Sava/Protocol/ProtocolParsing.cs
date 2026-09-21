@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Xml;
+using System.Xml.Linq;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -65,24 +66,12 @@ internal static class ProtocolParsing
     public static async Task<Dictionary<string, string>> ReadTagsBodyAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
         var tags = new Dictionary<string, string>(StringComparer.Ordinal);
-        while (await reader.ReadAsync())
+        foreach (var tag in document.Descendants().Where(element => element.Name.LocalName == "Tag"))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (reader.NodeType != XmlNodeType.Element || reader.LocalName != "Tag")
-                continue;
-            using var subtree = reader.ReadSubtree();
-            string? key = null;
-            string? value = null;
-            while (await subtree.ReadAsync())
-            {
-                if (subtree.NodeType != XmlNodeType.Element)
-                    continue;
-                if (subtree.LocalName == "Key")
-                    key = await subtree.ReadElementContentAsStringAsync();
-                else if (subtree.LocalName == "Value")
-                    value = await subtree.ReadElementContentAsStringAsync();
-            }
+            var key = ChildValue(tag, "Key");
+            var value = ChildValue(tag, "Value");
             if (key is null || value is null)
                 throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
             ValidateTag(key, value);
@@ -97,20 +86,20 @@ internal static class ProtocolParsing
     public static async Task<IReadOnlyList<BlockListEntry>> ReadBlockListAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
         var blocks = new List<BlockListEntry>();
-        while (await reader.ReadAsync())
+        if (document.Root?.Name.LocalName != "BlockList")
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
+        foreach (var element in document.Root.Elements())
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (reader.NodeType == XmlNodeType.Element && reader.LocalName is "Latest" or "Committed" or "Uncommitted")
+            var mode = element.Name.LocalName switch
             {
-                var mode = reader.LocalName switch
-                {
-                    "Latest" => BlockListMode.Latest,
-                    "Committed" => BlockListMode.Committed,
-                    _ => BlockListMode.Uncommitted
-                };
-                blocks.Add(new BlockListEntry(await reader.ReadElementContentAsStringAsync(), mode));
-            }
+                "Latest" => BlockListMode.Latest,
+                "Committed" => BlockListMode.Committed,
+                "Uncommitted" => BlockListMode.Uncommitted,
+                _ => throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The block list contains an invalid element.")
+            };
+            blocks.Add(new BlockListEntry(element.Value, mode));
         }
         return blocks;
     }
@@ -118,29 +107,17 @@ internal static class ProtocolParsing
     public static async Task<Dictionary<string, StoredAccessPolicy>> ReadAclAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
         var policies = new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal);
-        while (await reader.ReadAsync())
+        if (document.Root?.Name.LocalName != "SignedIdentifiers")
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified access policy XML is invalid.");
+        foreach (var identifier in document.Root.Elements().Where(element => element.Name.LocalName == "SignedIdentifier"))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (reader.NodeType != XmlNodeType.Element || reader.LocalName != "SignedIdentifier")
-                continue;
-            using var subtree = reader.ReadSubtree();
-            string? id = null;
-            string permission = string.Empty;
-            DateTimeOffset? start = null;
-            DateTimeOffset? expiry = null;
-            while (await subtree.ReadAsync())
-            {
-                if (subtree.NodeType != XmlNodeType.Element)
-                    continue;
-                switch (subtree.LocalName)
-                {
-                    case "Id": id = await subtree.ReadElementContentAsStringAsync(); break;
-                    case "Permission": permission = await subtree.ReadElementContentAsStringAsync(); break;
-                    case "Start": start = ParseDate(await subtree.ReadElementContentAsStringAsync(), "Start"); break;
-                    case "Expiry": expiry = ParseDate(await subtree.ReadElementContentAsStringAsync(), "Expiry"); break;
-                }
-            }
+            var id = ChildValue(identifier, "Id");
+            var accessPolicy = identifier.Elements().FirstOrDefault(element => element.Name.LocalName == "AccessPolicy");
+            var permission = accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Permission") ?? string.Empty;
+            var start = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Start") ?? string.Empty, "Start");
+            var expiry = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Expiry") ?? string.Empty, "Expiry");
             if (string.IsNullOrEmpty(id) || id.Length > 64 || !policies.TryAdd(id, new StoredAccessPolicy
                 {
                     StartsAt = start,
@@ -304,6 +281,9 @@ internal static class ProtocolParsing
 
     private static string? OptionalText(XmlElement parent, string name) =>
         (parent.SelectSingleNode($"*[local-name()='{name}']") as XmlElement)?.InnerText;
+
+    private static string? ChildValue(XElement parent, string name) =>
+        parent.Elements().FirstOrDefault(element => element.Name.LocalName == name)?.Value;
 
     private static AzureStorageException InvalidRange() => new(
         StatusCodes.Status416RangeNotSatisfiable,

@@ -45,6 +45,8 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (request.Authorization.Kind == StorageAuthorizationKind.Sas && !request.Authorization.IsAccountSas)
+            throw AzureStorageException.AuthorizationFailure();
         if (HttpMethods.IsGet(http.Request.Method) && comp == "list")
         {
             Require(request, 'l');
@@ -128,6 +130,12 @@ public static class BlobProtocolEndpoint
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
+            !request.Authorization.IsAccountSas &&
+            !(HttpMethods.IsGet(http.Request.Method) && comp == "list"))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
@@ -273,6 +281,8 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "block")
         {
             RequireAny(request, 'w', 'c');
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
             await WithIntegrityValidationAsync(http.Request, async body =>
                 await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, cancellationToken));

@@ -8,6 +8,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 {
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
+    public const string SecondAccountName = "devstoreaccount2";
+    public const string SecondAccountKey = "mQ9zP2jx0fSgXK7cZ4aNH3kv1VYw+eR8sL6dB5uC0iFqW7oT2rA9gE4hJ1nM8pUxZcK5bQ3sD6vF0yL7wN2tGA==";
 
     public string DataPath { get; } = Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}");
 
@@ -20,6 +22,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:DataPath"] = DataPath,
                 ["Sava:DefaultAccount"] = AccountName,
                 [$"Sava:Accounts:{AccountName}"] = AccountKey,
+                [$"Sava:Accounts:{SecondAccountName}"] = SecondAccountKey,
                 ["Sava:MinimumChunkBytes"] = "4096",
                 ["Sava:TargetChunkBytes"] = "8192",
                 ["Sava:MaximumChunkBytes"] = "16384",

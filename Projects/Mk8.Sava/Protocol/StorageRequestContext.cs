@@ -20,6 +20,8 @@ public sealed record StorageRequestContext
     public required string Account { get; init; }
     public string? Container { get; init; }
     public string? Blob { get; init; }
+    public string? Snapshot { get; init; }
+    public string? VersionId { get; init; }
     public required StorageResourceKind ResourceKind { get; init; }
     public required string CanonicalResourcePath { get; init; }
     public required string ServiceVersion { get; init; }
@@ -104,6 +106,8 @@ public sealed class RequestContextMiddleware(
             Account = account,
             Container = container,
             Blob = blob,
+            Snapshot = NullIfEmpty(context.Request.Query["snapshot"].ToString()),
+            VersionId = NullIfEmpty(context.Request.Query["versionid"].ToString()),
             ResourceKind = resourceKind,
             CanonicalResourcePath = canonicalPath,
             ServiceVersion = serviceVersion,
@@ -127,4 +131,6 @@ public sealed class RequestContextMiddleware(
             throw AzureStorageException.InvalidHeader("x-ms-version", version);
         return version;
     }
+
+    private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;
 }

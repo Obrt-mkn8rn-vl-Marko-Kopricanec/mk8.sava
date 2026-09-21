@@ -175,10 +175,12 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         try
         {
             await using var connection = await OpenAsync(cancellationToken);
-            var current = await GetContainerAsync(connection, transaction: null, container.Account, container.Name, includeDeleted: true, cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var current = await GetContainerAsync(connection, transaction, container.Account, container.Name, includeDeleted: true, cancellationToken);
             if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = """
                 UPDATE containers SET deleted = $deleted, modified_ticks = $modified, data = $data
                 WHERE account = $account AND name = $name;
@@ -186,6 +188,7 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             AddContainerParameters(command, container);
             if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
                 throw new StorageConcurrencyException();
+            await transaction.CommitAsync(cancellationToken);
         }
         finally
         {
@@ -299,6 +302,32 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
+        CancellationToken cancellationToken) =>
+        await PublishBlobCoreAsync(
+            proposed,
+            expectedCurrentGeneration,
+            expectedCurrentRevision,
+            stagedBlockSnapshot: null,
+            cancellationToken);
+
+    public async Task<BlobRecord> PublishBlockListAsync(
+        BlobRecord proposed,
+        string? expectedCurrentGeneration,
+        string? expectedCurrentRevision,
+        IReadOnlyList<StagedBlockRecord> stagedBlockSnapshot,
+        CancellationToken cancellationToken) =>
+        await PublishBlobCoreAsync(
+            proposed,
+            expectedCurrentGeneration,
+            expectedCurrentRevision,
+            stagedBlockSnapshot,
+            cancellationToken);
+
+    private async Task<BlobRecord> PublishBlobCoreAsync(
+        BlobRecord proposed,
+        string? expectedCurrentGeneration,
+        string? expectedCurrentRevision,
+        IReadOnlyList<StagedBlockRecord>? stagedBlockSnapshot,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken);
@@ -310,6 +339,19 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             if (!string.Equals(current?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
                 !string.Equals(current?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
+
+            if (stagedBlockSnapshot is not null)
+            {
+                var actualBlocks = await ListStagedBlocksAsync(
+                    connection,
+                    transaction,
+                    proposed.Account,
+                    proposed.Container,
+                    proposed.Name,
+                    cancellationToken);
+                if (!EquivalentStagedBlocks(actualBlocks, stagedBlockSnapshot))
+                    throw new StorageConcurrencyException();
+            }
 
             var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken);
             if (current is not null)
@@ -338,6 +380,19 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 Snapshot = null
             };
             await InsertBlobRowAsync(connection, transaction, published, cancellationToken);
+            if (stagedBlockSnapshot is not null)
+            {
+                await using var clearBlocks = connection.CreateCommand();
+                clearBlocks.Transaction = transaction;
+                clearBlocks.CommandText = """
+                    DELETE FROM staged_blocks
+                    WHERE account = $account AND container = $container AND blob_name = $blob;
+                    """;
+                clearBlocks.Parameters.AddWithValue("$account", proposed.Account);
+                clearBlocks.Parameters.AddWithValue("$container", proposed.Container);
+                clearBlocks.Parameters.AddWithValue("$blob", proposed.Name);
+                await clearBlocks.ExecuteNonQueryAsync(cancellationToken);
+            }
             await transaction.CommitAsync(cancellationToken);
             return published;
         }
@@ -408,15 +463,19 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         try
         {
             await using var connection = await OpenAsync(cancellationToken);
-            var current = await GetBlobByGenerationAsync(connection, transaction: null, generationId, cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var current = await GetBlobByGenerationAsync(connection, transaction, generationId, cancellationToken);
             if (current is null)
                 return false;
             if (!string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = "DELETE FROM blobs WHERE generation_id = $generation;";
             command.Parameters.AddWithValue("$generation", generationId);
-            return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            var deleted = await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            await transaction.CommitAsync(cancellationToken);
+            return deleted;
         }
         finally
         {
@@ -459,7 +518,19 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
+        return await ListStagedBlocksAsync(connection, transaction: null, account, container, blobName, cancellationToken);
+    }
+
+    private static async Task<IReadOnlyList<StagedBlockRecord>> ListStagedBlocksAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string account,
+        string container,
+        string blobName,
+        CancellationToken cancellationToken)
+    {
         await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = """
             SELECT data FROM staged_blocks
             WHERE account = $account AND container = $container AND blob_name = $blob
@@ -727,6 +798,21 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         while (await reader.ReadAsync(cancellationToken))
             values.Add(Deserialize<T>(reader.GetString(0)));
         return values;
+    }
+
+    private static bool EquivalentStagedBlocks(
+        IReadOnlyList<StagedBlockRecord> left,
+        IReadOnlyList<StagedBlockRecord> right)
+    {
+        if (left.Count != right.Count)
+            return false;
+        var expected = right.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
+        return left.All(item =>
+            expected.TryGetValue(item.BlockId, out var candidate) &&
+            item.CreatedAt == candidate.CreatedAt &&
+            item.Content.Length == candidate.Content.Length &&
+            string.Equals(item.Content.Domain, candidate.Content.Domain, StringComparison.Ordinal) &&
+            string.Equals(item.Content.Sha256, candidate.Content.Sha256, StringComparison.Ordinal));
     }
 
     private static string Serialize<T>(T value) => JsonSerializer.Serialize(value, JsonOptions);

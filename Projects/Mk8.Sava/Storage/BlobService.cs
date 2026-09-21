@@ -275,8 +275,18 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        ValidateBlockId(blockId);
+        var blockIdLength = ValidateBlockId(blockId);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        if (current is not null && current.Kind != BlobKind.BlockBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
+        if (staged.Count >= 100_000 && staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The uncommitted block count exceeds the maximum permitted value.");
+        var existingId = staged.Select(item => item.BlockId).FirstOrDefault()
+                         ?? current?.CommittedBlocks.FirstOrDefault()?.Id;
+        if (existingId is not null && ValidateBlockId(existingId) != blockIdLength)
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlobOrBlock", "All block IDs for a blob must have the same length.");
         using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
         await metadata.PutStagedBlockAsync(new StagedBlockRecord
         {
@@ -311,10 +321,14 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
             ?? new Dictionary<string, CommittedBlockRecord>(StringComparer.Ordinal);
 
         var selected = new List<CommittedBlockRecord>(blockList.Count);
+        int? blockIdLength = null;
         foreach (var entry in blockList)
         {
             var blockId = entry.Id;
-            ValidateBlockId(blockId);
+            var currentIdLength = ValidateBlockId(blockId);
+            if (blockIdLength.HasValue && currentIdLength != blockIdLength.Value)
+                throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlobOrBlock", "All block IDs for a blob must have the same length.");
+            blockIdLength = currentIdLength;
             StagedBlockRecord? stagedBlock;
             CommittedBlockRecord? committedBlock;
             var resolved = entry.Mode switch
@@ -337,15 +351,12 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
         {
             CommittedBlocks = selected
         };
-        var published = await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
-        await metadata.CommitStagedBlocksAsync(
-            account,
-            container,
-            name,
-            selected.Select(item => item.Id).Where(stagedById.ContainsKey).ToArray(),
-            staged.Select(item => item.BlockId).Except(selected.Select(item => item.Id), StringComparer.Ordinal).ToArray(),
+        return await metadata.PublishBlockListAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            staged,
             cancellationToken);
-        return published;
     }
 
     public async Task<BlobRecord> AppendBlockAsync(
@@ -358,10 +369,14 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.IsSealed)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobIsSealed", "The specified append blob is sealed.");
+        if (current.AppendBlockCount >= 50_000)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The append block count exceeds the maximum permitted value.");
         if (expectedPosition.HasValue && expectedPosition.Value != current.Content.Length)
             throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, "AppendPositionConditionNotMet", "The append position condition specified was not met.");
 
         using var appended = await chunks.StorePinnedAsync(current.Account, source, cancellationToken);
+        if (appended.Manifest.Length > 100L * 1024 * 1024)
+            throw new AzureStorageException(StatusCodes.Status413PayloadTooLarge, "RequestBodyTooLarge", "An append block cannot exceed 100 MiB.");
         var content = await chunks.ComposeAsync(current.Account, [current.Content, appended.Manifest], cancellationToken);
         using var contentPin = chunks.Pin(content);
         var updated = current with
@@ -797,12 +812,14 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidResourceName", "The specified resource name contains invalid characters.");
     }
 
-    private static void ValidateBlockId(string blockId)
+    private static int ValidateBlockId(string blockId)
     {
         try
         {
-            if (Convert.FromBase64String(blockId).Length > 64)
+            var length = Convert.FromBase64String(blockId).Length;
+            if (length is 0 or > 64)
                 throw new FormatException();
+            return length;
         }
         catch (FormatException)
         {
