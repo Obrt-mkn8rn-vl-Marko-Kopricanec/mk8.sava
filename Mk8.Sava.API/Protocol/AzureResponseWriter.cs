@@ -387,6 +387,7 @@ public sealed partial class AzureResponseWriter
             writer.WriteStartElement("StaticWebsite");
             writer.WriteElementString("Enabled", properties.StaticWebsite.Enabled ? "true" : "false");
             WriteOptional(writer, "IndexDocument", properties.StaticWebsite.IndexDocument);
+            WriteOptional(writer, "DefaultIndexDocumentPath", properties.StaticWebsite.DefaultIndexDocumentPath);
             WriteOptional(writer, "ErrorDocument404Path", properties.StaticWebsite.ErrorDocument404Path);
             writer.WriteEndElement();
             writer.WriteEndElement();

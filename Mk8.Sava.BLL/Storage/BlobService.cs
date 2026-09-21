@@ -1451,8 +1451,37 @@ public sealed class BlobService(
     public Task<ServiceProperties> GetServicePropertiesAsync(string account, CancellationToken cancellationToken) =>
         metadata.GetServicePropertiesAsync(account, cancellationToken);
 
-    public Task PutServicePropertiesAsync(string account, ServiceProperties properties, CancellationToken cancellationToken) =>
-        metadata.PutServicePropertiesAsync(account, properties, cancellationToken);
+    public async Task PutServicePropertiesAsync(
+        string account,
+        ServiceProperties properties,
+        CancellationToken cancellationToken)
+    {
+        if (properties.StaticWebsite.Enabled)
+        {
+            var websiteContainer = await metadata.GetContainerAsync(
+                account,
+                "$web",
+                includeDeleted: true,
+                cancellationToken);
+            if (websiteContainer?.DeletedAt is not null)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "ContainerBeingDeleted",
+                    "The static website container is being deleted.");
+            }
+            if (websiteContainer is null)
+            {
+                _ = await CreateContainerAsync(
+                    account,
+                    "$web",
+                    new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                    publicAccess: null,
+                    cancellationToken);
+            }
+        }
+        await metadata.PutServicePropertiesAsync(account, properties, cancellationToken);
+    }
 
     public async Task<StorageMaintenanceResult> RunMaintenanceAsync(CancellationToken cancellationToken)
     {
@@ -2138,7 +2167,7 @@ public sealed class BlobService(
 
     private static void ValidateContainerName(string name)
     {
-        if (name == "$root")
+        if (name is "$root" or "$web")
             return;
         if (name.Length is < 3 or > 63 ||
             name[0] == '-' || name[^1] == '-' ||

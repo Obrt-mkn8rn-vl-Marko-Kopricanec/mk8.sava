@@ -9,7 +9,8 @@ public enum StorageResourceKind
 {
     Service,
     Container,
-    Blob
+    Blob,
+    StaticWebsite
 }
 
 public sealed record StorageRequestContext
@@ -54,7 +55,9 @@ public sealed class RequestContextMiddleware(
 
         var parsed = Parse(context);
         StorageRequestContext.Set(context, parsed);
-        parsed.Authorization = await authenticator.AuthenticateAsync(context, parsed, context.RequestAborted);
+        parsed.Authorization = parsed.ResourceKind == StorageResourceKind.StaticWebsite
+            ? StorageAuthorization.Anonymous
+            : await authenticator.AuthenticateAsync(context, parsed, context.RequestAborted);
         AzureExceptionMiddleware.AddCommonHeaders(context);
         await next(context);
     }
@@ -64,6 +67,7 @@ public sealed class RequestContextMiddleware(
         var rawPath = context.Request.Path.Value ?? "/";
         var segments = rawPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
         var account = ResolveHostAccount(context.Request.Host.Host);
+        var staticWebsite = account is not null && IsStaticWebsiteHost(context.Request.Host.Host);
         var pathOffset = 0;
 
         if (account is null)
@@ -81,12 +85,18 @@ public sealed class RequestContextMiddleware(
             throw AzureStorageException.AuthenticationFailed("The specified account does not exist.");
 
         var remaining = segments.Skip(pathOffset).ToArray();
-        var container = remaining.Length > 0 ? Uri.UnescapeDataString(remaining[0]) : null;
-        var blob = remaining.Length > 1
-            ? string.Join('/', remaining.Skip(1).Select(Uri.UnescapeDataString))
-            : null;
+        var container = staticWebsite
+            ? "$web"
+            : remaining.Length > 0 ? Uri.UnescapeDataString(remaining[0]) : null;
+        var blob = staticWebsite
+            ? string.Join('/', remaining.Select(Uri.UnescapeDataString))
+            : remaining.Length > 1
+                ? string.Join('/', remaining.Skip(1).Select(Uri.UnescapeDataString))
+                : null;
         var restype = context.Request.Query["restype"].ToString();
-        var resourceKind = container is null
+        var resourceKind = staticWebsite
+            ? StorageResourceKind.StaticWebsite
+            : container is null
             ? StorageResourceKind.Service
             : blob is not null
                 ? StorageResourceKind.Blob
@@ -121,6 +131,11 @@ public sealed class RequestContextMiddleware(
         var firstLabel = host.Split('.', 2)[0];
         return _options.Accounts.ContainsKey(firstLabel) ? firstLabel : null;
     }
+
+    private static bool IsStaticWebsiteHost(string host) =>
+        host.Split('.', StringSplitOptions.RemoveEmptyEntries)
+            .Skip(1)
+            .Any(label => string.Equals(label, "web", StringComparison.OrdinalIgnoreCase));
 
     private static string ResolveServiceVersion(HttpRequest request)
     {
