@@ -13,6 +13,9 @@ namespace Mk8.Sava.Protocol;
 
 public static class BlobProtocolEndpoint
 {
+    private static readonly IReadOnlyDictionary<string, string> EmptyBlobTags =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
     public static async Task HandleAsync(HttpContext http)
     {
         var request = StorageRequestContext.Get(http);
@@ -820,6 +823,10 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'r');
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            if (current is null)
+                EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
+            else
+                EvaluateReadConditions(http.Request, current);
             var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken);
             var listType = http.Request.Query["blocklisttype"].ToString().ToLowerInvariant();
             if (listType is not ("all" or "committed" or "uncommitted"))
@@ -1063,6 +1070,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            EvaluateWriteConditions(http.Request, blob);
             await HandleBlobLeaseAsync(http, service, blob, cancellationToken);
             return;
         }
@@ -1380,9 +1388,6 @@ public static class BlobProtocolEndpoint
         }
 
         EvaluateReadConditions(http.Request, blob);
-        var tagCondition = ProtocolParsing.First(http.Request.Headers, "x-ms-if-tags");
-        if (tagCondition is not null && !MatchesTagCondition(tagCondition, blob.Tags, "x-ms-if-tags"))
-            throw AzureStorageException.ConditionNotMet();
         if (ProtocolParsing.First(http.Request.Headers, "x-ms-lease-id") is not null)
             EnsureLease(http.Request, blob.Lease, "blob");
 
@@ -1862,6 +1867,7 @@ public static class BlobProtocolEndpoint
         var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
         if (ifUnmodified.HasValue && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
             throw AzureStorageException.ConditionNotMet();
+        EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
     }
 
     private static void EvaluateWriteConditions(HttpRequest request, BlobRecord? blob)
@@ -1878,6 +1884,7 @@ public static class BlobProtocolEndpoint
         var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
         if (ifUnmodified.HasValue && blob is not null && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
             throw AzureStorageException.ConditionNotMet();
+        EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
     }
 
     private static void EvaluatePageSequenceConditions(HttpRequest request, BlobRecord blob)
@@ -2208,23 +2215,45 @@ public static class BlobProtocolEndpoint
         if (ifUnmodified.HasValue && source.LastModified > ifUnmodified.Value.AddSeconds(1))
             throw SourceConditionNotMet();
         var tagCondition = ProtocolParsing.First(request.Headers, "x-ms-source-if-tags");
-        if (tagCondition is not null && !MatchesTagCondition(tagCondition, source.Tags, "x-ms-source-if-tags"))
-            throw SourceConditionNotMet();
+        if (tagCondition is not null)
+            EvaluateTagCondition(request, source, "x-ms-source-if-tags", source: true);
     }
 
-    private static bool MatchesTagCondition(
-        string expression,
-        IReadOnlyDictionary<string, string> tags,
-        string headerName)
+    private static void EvaluateTagCondition(
+        HttpRequest request,
+        BlobRecord? blob,
+        string headerName,
+        bool source)
     {
-        var match = System.Text.RegularExpressions.Regex.Match(
-            expression,
-            "^\\s*\"(?<key>[^\"]+)\"\\s*=\\s*'(?<value>[^']*)'\\s*$",
-            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-        if (!match.Success)
-            throw AzureStorageException.InvalidHeader(headerName, expression);
-        return tags.TryGetValue(match.Groups["key"].Value, out var value) &&
-               string.Equals(value, match.Groups["value"].Value, StringComparison.Ordinal);
+        var expression = ProtocolParsing.First(request.Headers, headerName);
+        if (expression is null)
+            return;
+
+        var context = StorageRequestContext.Get(request.HttpContext);
+        if (!DateOnly.TryParseExact(
+                context.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var serviceVersion) || serviceVersion < new DateOnly(2019, 12, 12))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                $"The {headerName} condition requires service version 2019-12-12 or later.",
+                headerName,
+                expression);
+        }
+
+        if (!context.Authorization.Allows('t'))
+        {
+            throw context.Authorization.Kind == StorageAuthorizationKind.Anonymous
+                ? AzureStorageException.AuthenticationFailed()
+                : AzureStorageException.AuthorizationPermissionMismatch();
+        }
+        if (BlobTagCondition.Evaluate(expression, blob?.Tags ?? EmptyBlobTags, headerName))
+            return;
+        throw source ? SourceConditionNotMet() : AzureStorageException.ConditionNotMet();
     }
 
     private static AzureStorageException SourceConditionNotMet() => new(
