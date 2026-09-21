@@ -1282,20 +1282,22 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        var encryption = EncryptionOf(options);
-        if (!chunks.IsInDomain(account, encryption, source.Content))
-            throw UnsupportedEncryptionTransition();
-        using var sourcePin = chunks.Pin(source.Content);
+        using var prepared = await PrepareCopyContentAsync(
+            account,
+            source,
+            EncryptionOf(options),
+            preserveCommittedBlocks: true,
+            cancellationToken);
         return await BeginCopyAsync(
             account,
             container,
             name,
             source.Kind,
-            source.Content,
+            prepared.Content,
             source.SequenceNumber,
             source.IsSealed,
             source.AppendBlockCount,
-            source.CommittedBlocks,
+            prepared.CommittedBlocks,
             source.PageRanges,
             options,
             sourceUri,
@@ -1324,16 +1326,18 @@ public sealed class BlobService(
                 "InvalidSourceBlobType",
                 "The source blob type is invalid for this operation.");
         }
-        var encryption = EncryptionOf(options);
-        if (!chunks.IsInDomain(account, encryption, source.Content))
-            throw UnsupportedEncryptionTransition();
-        using var sourcePin = chunks.Pin(source.Content);
+        using var prepared = await PrepareCopyContentAsync(
+            account,
+            source,
+            EncryptionOf(options),
+            preserveCommittedBlocks: true,
+            cancellationToken);
         return await PublishSynchronousBlockCopyAsync(
             account,
             container,
             name,
-            source.Content,
-            source.CommittedBlocks,
+            prepared.Content,
+            prepared.CommittedBlocks,
             options,
             sourceUri,
             destinationLease,
@@ -1453,10 +1457,12 @@ public sealed class BlobService(
         {
             encryption = EncryptionOf(options);
         }
-        if (!chunks.IsInDomain(account, encryption, source.Content))
-            throw UnsupportedEncryptionTransition();
-
-        using var sourcePin = chunks.Pin(source.Content);
+        using var prepared = await PrepareCopyContentAsync(
+            account,
+            source,
+            encryption,
+            preserveCommittedBlocks: false,
+            cancellationToken);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
         var pending = (current ?? NewBlob(
@@ -1475,7 +1481,7 @@ public sealed class BlobService(
             IsIncrementalCopy = true,
             IncrementalCopySource = sourceIdentity,
             IncrementalCopySourceCreatedAt = source.CreatedAt,
-            PendingCopyContent = source.Content,
+            PendingCopyContent = prepared.Content,
             PendingCopyPageRanges = [.. source.PageRanges],
             Copy = new CopyState
             {
@@ -1483,7 +1489,7 @@ public sealed class BlobService(
                 Source = sourceUri,
                 Status = "pending",
                 BytesCopied = 0,
-                TotalBytes = source.Content.Length,
+                TotalBytes = prepared.Content.Length,
                 ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
                 IsIncremental = true,
                 SourceSnapshot = source.Snapshot
@@ -1574,6 +1580,80 @@ public sealed class BlobService(
             }
         };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+    }
+
+    private async Task<PreparedCopyContent> PrepareCopyContentAsync(
+        string destinationAccount,
+        BlobRecord source,
+        BlobEncryption destinationEncryption,
+        bool preserveCommittedBlocks,
+        CancellationToken cancellationToken)
+    {
+        if (chunks.IsInDomain(destinationAccount, destinationEncryption, source.Content))
+        {
+            return new PreparedCopyContent(
+                source.Content,
+                preserveCommittedBlocks ? source.CommittedBlocks : [],
+                [chunks.Pin(source.Content)]);
+        }
+        if (source.CustomerProvidedKeySha256 is not null)
+            throw UnsupportedEncryptionTransition();
+
+        var leases = new List<IDisposable>();
+        try
+        {
+            if (preserveCommittedBlocks && source.CommittedBlocks.Count > 0)
+            {
+                var copiedBlocks = new List<CommittedBlockRecord>(source.CommittedBlocks.Count);
+                foreach (var block in source.CommittedBlocks)
+                {
+                    var copied = await chunks.CopyToDomainPinnedAsync(
+                        destinationAccount,
+                        EncryptionOf(source),
+                        destinationEncryption,
+                        block.Content,
+                        cancellationToken);
+                    leases.Add(copied);
+                    copiedBlocks.Add(new CommittedBlockRecord(block.Id, copied.Manifest));
+                }
+                var content = await chunks.ComposeAsync(
+                    destinationAccount,
+                    destinationEncryption,
+                    copiedBlocks.Select(block => block.Content).ToArray(),
+                    cancellationToken);
+                return new PreparedCopyContent(content, copiedBlocks, leases);
+            }
+
+            var copiedContent = await chunks.CopyToDomainPinnedAsync(
+                destinationAccount,
+                EncryptionOf(source),
+                destinationEncryption,
+                source.Content,
+                cancellationToken);
+            leases.Add(copiedContent);
+            return new PreparedCopyContent(copiedContent.Manifest, [], leases);
+        }
+        catch
+        {
+            foreach (var lease in leases)
+                lease.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class PreparedCopyContent(
+        ContentManifest content,
+        IReadOnlyList<CommittedBlockRecord> committedBlocks,
+        IReadOnlyList<IDisposable> leases) : IDisposable
+    {
+        public ContentManifest Content { get; } = content;
+        public IReadOnlyList<CommittedBlockRecord> CommittedBlocks { get; } = committedBlocks;
+
+        public void Dispose()
+        {
+            foreach (var lease in leases)
+                lease.Dispose();
+        }
     }
 
     public async Task<BlobRecord> AbortCopyAsync(

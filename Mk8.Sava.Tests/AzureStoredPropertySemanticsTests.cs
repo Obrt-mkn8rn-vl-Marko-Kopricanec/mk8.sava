@@ -306,6 +306,119 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.Equal("InvalidSourceBlobType", invalidType.ErrorCode);
     }
 
+    [Fact]
+    public async Task CopyPreservesDestinationTierAndRequiresAnOnlineTierForArchivedSources()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"copy-tier-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlockBlobClient("source.bin");
+        await source.UploadAsync(
+            BinaryData.FromString("tiered copy payload").ToStream(),
+            new BlobUploadOptions { AccessTier = AccessTier.Cool });
+
+        var existing = container.GetBlockBlobClient("existing.bin");
+        await existing.UploadAsync(
+            BinaryData.FromString("old destination").ToStream(),
+            new BlobUploadOptions { AccessTier = AccessTier.Cold });
+        var overwrite = await existing.StartCopyFromUriAsync(source.Uri);
+        await overwrite.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var overwritten = (await existing.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Cold, overwritten.AccessTier);
+        Assert.False(overwritten.AccessTierInferred);
+
+        var created = container.GetBlockBlobClient("created.bin");
+        var create = await created.StartCopyFromUriAsync(source.Uri);
+        await create.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var createdProperties = (await created.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Hot, createdProperties.AccessTier);
+        Assert.True(createdProperties.AccessTierInferred);
+
+        var synchronousExisting = container.GetBlockBlobClient("sync-existing.bin");
+        await synchronousExisting.UploadAsync(
+            BinaryData.FromString("old synchronous destination").ToStream(),
+            new BlobUploadOptions { AccessTier = AccessTier.Cold });
+        await synchronousExisting.SyncCopyFromUriAsync(source.Uri);
+        var synchronousProperties = (await synchronousExisting.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Cold, synchronousProperties.AccessTier);
+        Assert.False(synchronousProperties.AccessTierInferred);
+
+        await source.SetAccessTierAsync(AccessTier.Archive);
+        var missingTier = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            container.GetBlockBlobClient("archive-without-tier.bin").StartCopyFromUriAsync(source.Uri));
+        Assert.Equal(409, missingTier.Status);
+        Assert.Equal("BlobArchived", missingTier.ErrorCode);
+
+        var rehydratedCopy = container.GetBlockBlobClient("archive-to-hot.bin");
+        var rehydrate = await rehydratedCopy.StartCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions { AccessTier = AccessTier.Hot });
+        await rehydrate.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        Assert.Equal(AccessTier.Hot, (await rehydratedCopy.GetPropertiesAsync()).Value.AccessTier);
+
+        var synchronousArchive = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            container.GetBlockBlobClient("sync-archive.bin").SyncCopyFromUriAsync(
+                source.Uri,
+                new BlobCopyFromUriOptions { AccessTier = AccessTier.Hot }));
+        Assert.Equal(409, synchronousArchive.Status);
+        Assert.Equal("BlobArchived", synchronousArchive.ErrorCode);
+    }
+
+    [Fact]
+    public async Task SynchronousCopyUsesTheOperationSpecificEncryptionScopeContract()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"copy-encryption-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlockBlobClient("source.bin");
+        await source.UploadAsync(BinaryData.FromString("encryption-domain copy payload").ToStream());
+        var sourceUri = source.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        var oldVersionDestination = container.GetBlockBlobClient("old-version.bin");
+        using (var request = SyncCopyRequest(oldVersionDestination, sourceUri, "2020-04-08"))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "scope-old");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(
+                "FeatureVersionMismatch",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await oldVersionDestination.ExistsAsync()).Value);
+
+        var encrypted = container.GetBlockBlobClient("encrypted.bin");
+        using (var request = SyncCopyRequest(encrypted, sourceUri, "2020-12-06"))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "copy-scope");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.Equal("copy-scope", response.Headers.GetValues("x-ms-encryption-scope").Single());
+        }
+        var encryptedProperties = (await encrypted.GetPropertiesAsync()).Value;
+        Assert.Equal("copy-scope", encryptedProperties.EncryptionScope);
+        Assert.Equal(
+            "encryption-domain copy payload",
+            (await encrypted.DownloadContentAsync()).Value.Content.ToString());
+
+        var customerKeyDestination = container.GetBlockBlobClient("customer-key.bin");
+        using (var request = SyncCopyRequest(customerKeyDestination, sourceUri, "2023-11-03"))
+        {
+            var key = RandomNumberGenerator.GetBytes(32);
+            request.Headers.TryAddWithoutValidation("x-ms-encryption-key", Convert.ToBase64String(key));
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-encryption-key-sha256",
+                Convert.ToBase64String(SHA256.HashData(key)));
+            request.Headers.TryAddWithoutValidation("x-ms-encryption-algorithm", "AES256");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await customerKeyDestination.ExistsAsync()).Value);
+    }
+
     private static HttpRequestMessage PutBlobRequest(BlockBlobClient blob, byte[] payload)
     {
         var request = new HttpRequestMessage(HttpMethod.Put, WriteUri(blob))
@@ -314,6 +427,21 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         };
         request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
         request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        return request;
+    }
+
+    private static HttpRequestMessage SyncCopyRequest(
+        BlockBlobClient destination,
+        Uri source,
+        string serviceVersion)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, WriteUri(destination))
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", serviceVersion);
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.AbsoluteUri);
+        request.Headers.TryAddWithoutValidation("x-ms-requires-sync", "true");
         return request;
     }
 

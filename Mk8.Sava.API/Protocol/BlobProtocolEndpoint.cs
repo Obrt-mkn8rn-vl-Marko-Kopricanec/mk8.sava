@@ -1156,7 +1156,7 @@ public static class BlobProtocolEndpoint
                 containerName,
                 blobName,
                 source,
-                ReadCopyWriteOptions(http.Request, source),
+                ReadCopyWriteOptions(http.Request, source, current),
                 SanitizeCopySource(copySource),
                 current,
                 cancellationToken);
@@ -1601,6 +1601,7 @@ public static class BlobProtocolEndpoint
             var requiresSync = false;
             if (requiresSyncValue is not null && !bool.TryParse(requiresSyncValue, out requiresSync))
                 throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
+            EnsureDestinationCanBeOverwritten(current);
 
             if (requestedType is not null)
             {
@@ -1626,7 +1627,7 @@ public static class BlobProtocolEndpoint
                         containerName,
                         blobName,
                         source.Content,
-                        ReadUrlWriteOptions(http.Request, source, copySourceTags),
+                        ReadUrlWriteOptions(http.Request, source, copySourceTags, current),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
@@ -1646,6 +1647,7 @@ public static class BlobProtocolEndpoint
             if (requiresSync)
             {
                 RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
+                ValidateSynchronousCopyEncryption(http.Request);
                 RequireZeroContentLength(http.Request);
                 if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
                     throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
@@ -1668,12 +1670,18 @@ public static class BlobProtocolEndpoint
                         cancellationToken,
                         requireTagsPermission: copySourceTags);
                     EvaluateCopySourceConditions(http.Request, source);
+                    ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
                     synchronousCopy = await service.CopyBlockBlobFromBlobAsync(
                         request.Account,
                         containerName,
                         blobName,
                         source,
-                        ReadCopyWriteOptions(http.Request, source, copySourceTags),
+                        ReadCopyWriteOptions(
+                            http.Request,
+                            source,
+                            current,
+                            copySourceTags,
+                            synchronous: true),
                         publicSource,
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
@@ -1704,7 +1712,12 @@ public static class BlobProtocolEndpoint
                                 containerName,
                                 blobName,
                                 source.Content,
-                                ReadUrlCopyWriteOptions(http.Request, source, copySourceTags),
+                                ReadUrlCopyWriteOptions(
+                                    http.Request,
+                                    source,
+                                    copySourceTags,
+                                    current,
+                                    synchronous: true),
                                 publicSource,
                                 current?.Lease ?? LeaseRecord.Available,
                                 current?.GenerationId,
@@ -1734,6 +1747,7 @@ public static class BlobProtocolEndpoint
                     "x-ms-copy-source-blob-properties",
                     ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
             }
+            ValidateAsynchronousCopyEncryption(http.Request);
             BlobRecord copied;
             var internalSource = ResolveInternalCopySource(http.Request, request, copySource);
             if (internalSource is not null)
@@ -1745,12 +1759,13 @@ public static class BlobProtocolEndpoint
                     internalSource,
                     cancellationToken);
                 EvaluateCopySourceConditions(http.Request, source);
+                ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
                     containerName,
                     blobName,
                     source,
-                    ReadCopyWriteOptions(http.Request, source),
+                    ReadCopyWriteOptions(http.Request, source, current),
                     publicSource,
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
@@ -1773,7 +1788,12 @@ public static class BlobProtocolEndpoint
                         containerName,
                         blobName,
                         source.Content,
-                        ReadUrlCopyWriteOptions(http.Request, source, copySourceTags: false),
+                        ReadUrlCopyWriteOptions(
+                            http.Request,
+                            source,
+                            copySourceTags: false,
+                            current,
+                            synchronous: false),
                         publicSource,
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
@@ -1787,6 +1807,7 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        EnsureDestinationCanBeOverwritten(current);
         var type = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type")
                    ?? throw AzureStorageException.InvalidHeader("x-ms-blob-type");
         var explicitlyRequestedTier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier");
@@ -2940,7 +2961,8 @@ public static class BlobProtocolEndpoint
     private static BlobWriteOptions ReadUrlWriteOptions(
         HttpRequest request,
         UrlSource source,
-        bool copySourceTags)
+        bool copySourceTags,
+        BlobRecord? destination)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
@@ -2958,25 +2980,31 @@ public static class BlobProtocolEndpoint
             copySourceTags
                 ? new Dictionary<string, string>(source.Tags, StringComparer.Ordinal)
                 : ReadTagsHeader(request),
-            ReadAccessTier(request, fallback: null),
+            ReadAccessTier(request, destination?.AccessTier),
             until,
             locked,
             legalHold,
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
             encryption.CustomerProvidedKey,
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null ? null : false,
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
+                ? destination?.AccessTierInferred
+                : false,
             GenerateContentMd5: true);
     }
 
     private static BlobWriteOptions ReadUrlCopyWriteOptions(
         HttpRequest request,
         UrlSource source,
-        bool copySourceTags)
+        bool copySourceTags,
+        BlobRecord? destination,
+        bool synchronous)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
-        var encryption = ReadRequestEncryption(request, write: true);
+        var encryption = synchronous
+            ? ReadRequestEncryption(request, write: true)
+            : ReadSignedCopyEncryption(request);
         var hasReplacementMetadata = request.Headers.Keys.Any(name =>
             name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
         return new BlobWriteOptions(
@@ -2987,14 +3015,16 @@ public static class BlobProtocolEndpoint
             copySourceTags
                 ? new Dictionary<string, string>(source.Tags, StringComparer.Ordinal)
                 : ReadTagsHeader(request),
-            ReadAccessTier(request, fallback: null),
+            ReadAccessTier(request, destination?.AccessTier),
             until,
             locked,
             legalHold,
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
             encryption.CustomerProvidedKey,
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null ? null : false);
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
+                ? destination?.AccessTierInferred
+                : false);
     }
 
     private static bool ReadCopySourceBlobProperties(HttpRequest request)
@@ -3011,11 +3041,15 @@ public static class BlobProtocolEndpoint
     private static BlobWriteOptions ReadCopyWriteOptions(
         HttpRequest request,
         BlobRecord source,
-        bool copySourceTags = false)
+        BlobRecord? destination,
+        bool copySourceTags = false,
+        bool synchronous = false)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
-        var encryption = ReadRequestEncryption(request, write: true);
+        var encryption = synchronous
+            ? ReadRequestEncryption(request, write: true)
+            : ReadSignedCopyEncryption(request);
         var hasReplacementMetadata = request.Headers.Keys.Any(name =>
             name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
         return new BlobWriteOptions(
@@ -3026,7 +3060,7 @@ public static class BlobProtocolEndpoint
             copySourceTags
                 ? new Dictionary<string, string>(source.Tags, StringComparer.Ordinal)
                 : ReadTagsHeader(request),
-            ReadAccessTier(request, source.AccessTier),
+            ReadAccessTier(request, destination?.AccessTier),
             until,
             locked,
             legalHold,
@@ -3034,8 +3068,83 @@ public static class BlobProtocolEndpoint
             encryption.CustomerProvidedKeySha256,
             encryption.CustomerProvidedKey,
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
-                ? source.AccessTierInferred
+                ? destination?.AccessTierInferred
                 : false);
+    }
+
+    private static void ValidateSynchronousCopyEncryption(HttpRequest request)
+    {
+        foreach (var headerName in new[]
+                 {
+                     "x-ms-encryption-key",
+                     "x-ms-encryption-key-sha256",
+                     "x-ms-encryption-algorithm"
+                 })
+        {
+            if (request.Headers.ContainsKey(headerName))
+                throw AzureStorageException.InvalidHeader(headerName, ProtocolParsing.First(request.Headers, headerName));
+        }
+        if (ProtocolParsing.First(request.Headers, "x-ms-encryption-scope") is not null ||
+            request.Query.ContainsKey("sig") && !string.IsNullOrEmpty(request.Query["ses"]))
+        {
+            RequireFeatureVersion(
+                StorageRequestContext.Get(request.HttpContext),
+                new DateOnly(2020, 12, 6),
+                "Copy Blob From URL encryption scope");
+        }
+        if (request.Headers.ContainsKey("x-ms-rehydrate-priority"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-rehydrate-priority",
+                ProtocolParsing.First(request.Headers, "x-ms-rehydrate-priority"));
+        }
+    }
+
+    private static void ValidateAsynchronousCopyEncryption(HttpRequest request)
+    {
+        foreach (var headerName in new[]
+                 {
+                     "x-ms-encryption-scope",
+                     "x-ms-encryption-key",
+                     "x-ms-encryption-key-sha256",
+                     "x-ms-encryption-algorithm"
+                 })
+        {
+            if (request.Headers.ContainsKey(headerName))
+                throw AzureStorageException.InvalidHeader(headerName, ProtocolParsing.First(request.Headers, headerName));
+        }
+    }
+
+    private static BlobEncryption ReadSignedCopyEncryption(HttpRequest request) =>
+        request.Query.ContainsKey("sig") && !string.IsNullOrEmpty(request.Query["ses"])
+            ? ReadRequestEncryption(request, write: true)
+            : new BlobEncryption(null, null);
+
+    private static void EnsureDestinationCanBeOverwritten(BlobRecord? destination)
+    {
+        if (string.Equals(destination?.AccessTier, "Archive", StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobArchived",
+                "This operation is not permitted on an archived blob.");
+        }
+    }
+
+    private static void ValidateCopySourceTier(
+        HttpRequest request,
+        BlobRecord source,
+        bool allowArchivedSource)
+    {
+        if (!string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal))
+            return;
+        var destinationTier = ProtocolParsing.First(request.Headers, "x-ms-access-tier");
+        if (allowArchivedSource && destinationTier is "Hot" or "Cool" or "Cold" or "Smart")
+            return;
+        throw new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "BlobArchived",
+            "An archived copy source requires an explicit online destination access tier.");
     }
 
     private static bool ReadCopySourceTags(HttpRequest request)
