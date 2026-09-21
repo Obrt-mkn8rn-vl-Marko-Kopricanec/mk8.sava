@@ -27,18 +27,22 @@ public sealed partial class AzureResponseWriter
         AddStringColumn(fields, arrays, "Name", items, entry => entry.Name, nullable: false, required: true);
         AddTimestampColumn(fields, arrays, "Creation-Time", items, entry => entry.Blob?.CreatedAt);
         AddTimestampColumn(fields, arrays, "Last-Modified", items, entry => entry.Blob?.LastModified);
-        AddStringColumn(fields, arrays, "BlobType", items, entry => entry.Blob is { } blob ? BlobType(blob.Kind) : null);
+        AddStringColumn(fields, arrays, "BlobType", items, entry => entry.Blob is { } blob
+            ? BlobType(blob.Kind)
+            : entry.IsUncommitted ? "BlockBlob" : null);
         AddStringColumn(
             fields,
             arrays,
             "ResourceType",
             items,
-            entry => entry.Blob is null ? "blobprefix" : "blob",
+            entry => entry.Prefix is not null ? "blobprefix" : "blob",
             nullable: false,
             required: true);
         AddStringColumn(fields, arrays, "Etag", items, entry => entry.Blob?.ETag);
         AddUInt64Column(fields, arrays, "Content-Length", items, entry =>
-            entry.Blob is { } blob ? checked((ulong)blob.Content.Length) : null);
+            entry.Blob is { } blob
+                ? checked((ulong)blob.Content.Length)
+                : entry.IsUncommitted ? 0UL : null);
         AddStringColumn(fields, arrays, "Content-Type", items, entry => entry.Blob?.Http.ContentType);
         AddStringColumn(fields, arrays, "Content-Encoding", items, entry => entry.Blob?.Http.ContentEncoding);
         AddStringColumn(fields, arrays, "Content-Language", items, entry => entry.Blob?.Http.ContentLanguage);

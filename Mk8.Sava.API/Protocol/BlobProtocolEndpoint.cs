@@ -283,6 +283,7 @@ public static class BlobProtocolEndpoint
                 includes.Contains("versions"),
                 includes.Contains("snapshots"),
                 includes.Contains("deleted") || includes.Contains("deletedwithversions"),
+                includes.Contains("uncommittedblobs"),
                 prefix,
                 startFrom,
                 endBefore,
@@ -898,6 +899,8 @@ public static class BlobProtocolEndpoint
             else
                 EvaluateReadConditions(http.Request, current);
             var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken);
+            if (current is null && staged.Count == 0)
+                throw AzureStorageException.BlobNotFound();
             var listType = http.Request.Query["blocklisttype"].ToString().ToLowerInvariant();
             if (listType is not ("all" or "committed" or "uncommitted"))
                 throw AzureStorageException.InvalidQuery("blocklisttype");
@@ -910,6 +913,20 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Undelete Blob");
             Require(request, 'w');
             await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
+            return;
+        }
+
+        if (HttpMethods.IsDelete(http.Request.Method) &&
+            string.IsNullOrEmpty(comp) &&
+            versionId is null &&
+            snapshot is null &&
+            IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)) &&
+            await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken) is null)
+        {
+            Require(request, 'd');
+            EvaluateWriteConditions(http.Request, null);
+            await service.DeleteUncommittedBlobAsync(request.Account, containerName, blobName, cancellationToken);
+            http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
 

@@ -130,6 +130,18 @@ public sealed partial class AzureResponseWriter
                     continue;
                 }
 
+                if (entry.IsUncommitted)
+                {
+                    writer.WriteStartElement("Blob");
+                    writer.WriteElementString("Name", entry.Name);
+                    writer.WriteStartElement("Properties");
+                    writer.WriteElementString("Content-Length", "0");
+                    writer.WriteElementString("BlobType", "BlockBlob");
+                    writer.WriteEndElement();
+                    writer.WriteEndElement();
+                    continue;
+                }
+
                 var blob = entry.Blob!;
                 writer.WriteStartElement("Blob");
                 writer.WriteElementString("Name", blob.Name);
@@ -671,6 +683,8 @@ public sealed partial class AzureResponseWriter
                    cursor.OrderedId.Length == 0 &&
                    cursor.GenerationId.Length == 0;
         }
+        if (cursor.Rank == -1)
+            return cursor.GenerationId.Length == 0 && cursor.OrderedId.Length == 0;
         return cursor.Rank is >= 0 and <= 3 &&
                cursor.GenerationId.Length > 0 &&
                (cursor.Rank is not (1 or 3) || cursor.OrderedId.Length > 0);

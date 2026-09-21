@@ -780,6 +780,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         bool includeVersions,
         bool includeSnapshots,
         bool includeDeleted,
+        bool includeUncommitted,
         string prefix,
         string startFrom,
         string endBefore,
@@ -821,17 +822,51 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 ELSE 3
             END
             """;
-        var eligible = $"""
+        var eligibleBlobs = $"""
             SELECT data, name, version_id, snapshot, generation_id,
-                   {rankExpression} AS rank
+                   {rankExpression} AS rank,
+                   0 AS is_uncommitted
             FROM blobs
             WHERE {string.Join(" AND ", predicates)}
+            """;
+        var uncommittedPredicates = new List<string>
+        {
+            "staged.account = $account",
+            "staged.container = $container",
+            "staged.blob_name >= $prefix",
+            "staged.blob_name >= $start_from",
+            "substr(staged.blob_name, 1, length($prefix)) = $prefix"
+        };
+        if (!string.IsNullOrEmpty(endBefore))
+            uncommittedPredicates.Add("staged.blob_name < $end_before");
+        var eligibleUncommitted = $"""
+            SELECT NULL AS data, staged.blob_name AS name,
+                   NULL AS version_id, NULL AS snapshot, '' AS generation_id,
+                   -1 AS rank, 1 AS is_uncommitted
+            FROM staged_blocks AS staged
+            WHERE $include_uncommitted = 1
+              AND {string.Join(" AND ", uncommittedPredicates)}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM blobs AS current
+                  WHERE current.account = staged.account
+                    AND current.container = staged.container
+                    AND current.name = staged.blob_name
+                    AND current.is_current = 1
+                    AND current.is_deleted = 0
+              )
+            GROUP BY staged.blob_name
+            """;
+        var eligible = $"""
+            SELECT * FROM ({eligibleBlobs})
+            UNION ALL
+            SELECT * FROM ({eligibleUncommitted})
             """;
         var entries = string.IsNullOrEmpty(delimiter)
             ? $"""
                 WITH entries AS (
                     SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id
+                           version_id, snapshot, generation_id, is_uncommitted
                     FROM ({eligible})
                 )
                 """
@@ -852,12 +887,13 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                            -1 AS rank,
                            NULL AS version_id,
                            NULL AS snapshot,
-                           '' AS generation_id
+                           '' AS generation_id,
+                           0 AS is_uncommitted
                     FROM eligible
                     WHERE delimiter_offset > 0
                     UNION ALL
                     SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id
+                           version_id, snapshot, generation_id, is_uncommitted
                     FROM eligible
                     WHERE delimiter_offset = 0
                 )
@@ -867,7 +903,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             {entries}
-            SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id
+            SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
+                   is_uncommitted
             FROM entries
             WHERE $has_cursor = 0
                OR ($name_complete = 1 AND entry_name > $cursor_name)
@@ -905,6 +942,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$start_from", startFrom);
         command.Parameters.AddWithValue("$end_before", endBefore);
         command.Parameters.AddWithValue("$delimiter", delimiter);
+        command.Parameters.AddWithValue("$include_uncommitted", includeUncommitted ? 1 : 0);
         command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
         command.Parameters.AddWithValue("$name_complete", cursor?.NameComplete == true ? 1 : 0);
         command.Parameters.AddWithValue("$cursor_name", cursor?.Name ?? string.Empty);
@@ -921,7 +959,9 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         {
             items.Add(reader.GetInt32(2) == 0
                 ? new BlobListEntry(null, reader.GetString(1))
-                : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null));
+                : reader.GetInt32(7) == 1
+                    ? new BlobListEntry(null, null, reader.GetString(1))
+                    : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null));
         }
         var hasMore = items.Count > maximum;
         if (hasMore)
@@ -1209,19 +1249,13 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 Snapshot = null
             };
             await InsertBlobRowAsync(connection, transaction, published, cancellationToken);
-            if (stagedBlockSnapshot is not null)
-            {
-                await using var clearBlocks = connection.CreateCommand();
-                clearBlocks.Transaction = transaction;
-                clearBlocks.CommandText = """
-                    DELETE FROM staged_blocks
-                    WHERE account = $account AND container = $container AND blob_name = $blob;
-                    """;
-                clearBlocks.Parameters.AddWithValue("$account", proposed.Account);
-                clearBlocks.Parameters.AddWithValue("$container", proposed.Container);
-                clearBlocks.Parameters.AddWithValue("$blob", proposed.Name);
-                await clearBlocks.ExecuteNonQueryAsync(cancellationToken);
-            }
+            await DeleteStagedBlocksAsync(
+                connection,
+                transaction,
+                proposed.Account,
+                proposed.Container,
+                proposed.Name,
+                cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             return published;
         }
@@ -1255,7 +1289,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
 
     internal async Task ApplyBlobRecordMutationsAsync(
         IReadOnlyList<BlobRecordMutation> mutations,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool clearStagedBlocksForCurrentBlobs = false)
     {
         if (mutations.Count == 0)
             return;
@@ -1274,6 +1309,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         {
             await using var connection = await OpenAsync(cancellationToken);
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var currentRecords = new List<BlobRecord>(mutations.Count);
             foreach (var mutation in mutations)
             {
                 var current = await GetBlobByGenerationAsync(
@@ -1286,6 +1322,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 {
                     throw new StorageConcurrencyException();
                 }
+                currentRecords.Add(current);
             }
 
             foreach (var mutation in mutations)
@@ -1304,6 +1341,21 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                         connection,
                         transaction,
                         mutation.Replacement,
+                        cancellationToken);
+                }
+            }
+            if (clearStagedBlocksForCurrentBlobs)
+            {
+                foreach (var current in currentRecords
+                             .Where(record => record.IsCurrent && record.Snapshot is null)
+                             .DistinctBy(record => (record.Account, record.Container, record.Name)))
+                {
+                    await DeleteStagedBlocksAsync(
+                        connection,
+                        transaction,
+                        current.Account,
+                        current.Container,
+                        current.Name,
                         cancellationToken);
                 }
             }
@@ -1457,6 +1509,16 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             command.CommandText = "DELETE FROM blobs WHERE generation_id = $generation;";
             command.Parameters.AddWithValue("$generation", generationId);
             var deleted = await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            if (deleted && current.IsCurrent && current.Snapshot is null)
+            {
+                await DeleteStagedBlocksAsync(
+                    connection,
+                    transaction,
+                    current.Account,
+                    current.Container,
+                    current.Name,
+                    cancellationToken);
+            }
             await transaction.CommitAsync(cancellationToken);
             return deleted;
         }
@@ -1530,6 +1592,63 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$blob", blobName);
         return await ReadJsonRowsAsync<StagedBlockRecord>(command, cancellationToken);
+    }
+
+    private static async Task<int> DeleteStagedBlocksAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string account,
+        string container,
+        string blobName,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DELETE FROM staged_blocks
+            WHERE account = $account AND container = $container AND blob_name = $blob;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$blob", blobName);
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<bool> DeleteStagedBlocksAsync(
+        string account,
+        string container,
+        string blobName,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                DELETE FROM staged_blocks
+                WHERE account = $account
+                  AND container = $container
+                  AND blob_name = $blob
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM blobs
+                      WHERE blobs.account = staged_blocks.account
+                        AND blobs.container = staged_blocks.container
+                        AND blobs.name = staged_blocks.blob_name
+                        AND blobs.is_current = 1
+                        AND blobs.is_deleted = 0
+                  );
+                """;
+            command.Parameters.AddWithValue("$account", account);
+            command.Parameters.AddWithValue("$container", container);
+            command.Parameters.AddWithValue("$blob", blobName);
+            return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     public async Task CommitStagedBlocksAsync(

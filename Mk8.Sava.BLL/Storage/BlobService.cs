@@ -267,6 +267,7 @@ public sealed class BlobService(
         bool includeVersions,
         bool includeSnapshots,
         bool includeDeleted,
+        bool includeUncommitted,
         string prefix,
         string startFrom,
         string endBefore,
@@ -282,6 +283,7 @@ public sealed class BlobService(
             includeVersions,
             includeSnapshots,
             includeDeleted,
+            includeUncommitted,
             prefix,
             startFrom,
             endBefore,
@@ -1139,7 +1141,10 @@ public sealed class BlobService(
             }
             mutations.Add(new BlobRecordMutation(target.GenerationId, target.Revision, replacement));
         }
-        await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken);
+        await metadata.ApplyBlobRecordMutationsAsync(
+            mutations,
+            cancellationToken,
+            clearStagedBlocksForCurrentBlobs: true);
     }
 
     public async Task UndeleteBlobAsync(
@@ -1430,6 +1435,18 @@ public sealed class BlobService(
         string name,
         CancellationToken cancellationToken) =>
         metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
+
+    public async Task DeleteUncommittedBlobAsync(
+        string account,
+        string container,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        if (!await metadata.DeleteStagedBlocksAsync(account, container, name, cancellationToken))
+            throw AzureStorageException.BlobNotFound();
+    }
 
     public Task<ServiceProperties> GetServicePropertiesAsync(string account, CancellationToken cancellationToken) =>
         metadata.GetServicePropertiesAsync(account, cancellationToken);
