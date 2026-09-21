@@ -1,13 +1,16 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 using System.Xml;
+using Microsoft.AspNetCore.WebUtilities;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
 public sealed class AzureResponseWriter
 {
-    private const string BlobMarkerPrefix = "mk8s1.";
+    private const string LegacyBlobMarkerPrefix = "mk8s1.";
+    private const string BlobMarkerPrefix = "mk8s2.";
 
     public async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
     {
@@ -26,9 +29,9 @@ public sealed class AzureResponseWriter
         await context.Response.WriteAsync(builder.ToString(), cancellationToken);
     }
 
-    public Task WriteContainersAsync(
+    internal Task WriteContainersAsync(
         HttpContext context,
-        IReadOnlyList<ContainerRecord> containers,
+        ContainerListPage page,
         string prefix,
         string marker,
         int maxResults,
@@ -36,13 +39,7 @@ public sealed class AzureResponseWriter
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        var filtered = containers
-            .Where(container => container.Name.StartsWith(prefix, StringComparison.Ordinal))
-            .Where(container => string.IsNullOrEmpty(marker) || string.CompareOrdinal(container.Name, marker) > 0)
-            .Take(maxResults + 1)
-            .ToArray();
-        var page = filtered.Take(maxResults).ToArray();
-        var nextMarker = filtered.Length > maxResults ? page[^1].Name : string.Empty;
+        var nextMarker = page.HasMore && page.Items.Count > 0 ? page.Items[^1].Name : string.Empty;
         var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{StorageRequestContext.Get(context).Account}";
 
         return WriteXmlAsync(context, writer =>
@@ -56,7 +53,7 @@ public sealed class AzureResponseWriter
             if (context.Request.Query.ContainsKey("maxresults"))
                 writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
             writer.WriteStartElement("Containers");
-            foreach (var container in page)
+            foreach (var container in page.Items)
             {
                 writer.WriteStartElement("Container");
                 writer.WriteElementString("Name", container.Name);
@@ -87,9 +84,9 @@ public sealed class AzureResponseWriter
         }, cancellationToken);
     }
 
-    public Task WriteBlobsAsync(
+    internal Task WriteBlobsAsync(
         HttpContext context,
-        IReadOnlyList<BlobRecord> blobs,
+        BlobListPage listing,
         string prefix,
         string delimiter,
         string marker,
@@ -99,35 +96,8 @@ public sealed class AzureResponseWriter
     {
         var request = StorageRequestContext.Get(context);
         var listingScope = CreateBlobListingScope(request, prefix, delimiter, includes);
-        var offset = DecodeBlobMarker(marker, listingScope, out var rawMarker);
-        var entries = new List<BlobListEntry>();
-        var seenPrefixes = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var blob in blobs.Where(item => item.Name.StartsWith(prefix, StringComparison.Ordinal)))
-        {
-            if (!string.IsNullOrEmpty(rawMarker) && string.CompareOrdinal(blob.Name, rawMarker) <= 0)
-                continue;
-            if (!string.IsNullOrEmpty(delimiter))
-            {
-                var remainder = blob.Name[prefix.Length..];
-                var delimiterIndex = remainder.IndexOf(delimiter, StringComparison.Ordinal);
-                if (delimiterIndex >= 0)
-                {
-                    var commonPrefix = prefix + remainder[..(delimiterIndex + delimiter.Length)];
-                    if (seenPrefixes.Add(commonPrefix))
-                        entries.Add(new BlobListEntry(null, commonPrefix));
-                    continue;
-                }
-            }
-            entries.Add(new BlobListEntry(blob, null));
-        }
-
-        entries.Sort(CompareBlobListEntries);
-        if (offset > entries.Count)
-            throw AzureStorageException.InvalidQuery("marker");
-        var selected = entries.Skip(offset).Take(maxResults + 1).ToArray();
-        var page = selected.Take(maxResults).ToArray();
-        var nextMarker = selected.Length > maxResults
-            ? EncodeBlobMarker(checked(offset + page.Length), listingScope)
+        var nextMarker = listing.HasMore && listing.Items.Count > 0
+            ? EncodeBlobMarker(listing.Items[^1].Cursor, listingScope)
             : string.Empty;
         var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
 
@@ -145,7 +115,7 @@ public sealed class AzureResponseWriter
             if (context.Request.Query.ContainsKey("maxresults"))
                 writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
             writer.WriteStartElement("Blobs");
-            foreach (var entry in page)
+            foreach (var entry in listing.Items)
             {
                 if (entry.Prefix is not null)
                 {
@@ -549,66 +519,86 @@ public sealed class AzureResponseWriter
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)).AsSpan(0, 12));
     }
 
-    private static int DecodeBlobMarker(string marker, string expectedScope, out string rawMarker)
+    internal static BlobListingMarker DecodeBlobMarker(
+        HttpContext context,
+        string prefix,
+        string delimiter,
+        IReadOnlySet<string> includes,
+        string marker)
     {
-        rawMarker = marker;
-        if (!marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))
-            return 0;
+        if (string.IsNullOrEmpty(marker))
+            return new BlobListingMarker(null, 0);
 
-        rawMarker = string.Empty;
-        var separator = marker.IndexOf('.', BlobMarkerPrefix.Length);
-        if (separator < 0 ||
+        var expectedScope = CreateBlobListingScope(
+            StorageRequestContext.Get(context),
+            prefix,
+            delimiter,
+            includes);
+        if (marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))
+        {
+            var scopeSeparator = marker.LastIndexOf('.');
+            if (scopeSeparator <= BlobMarkerPrefix.Length ||
+                !string.Equals(marker[(scopeSeparator + 1)..], expectedScope, StringComparison.Ordinal))
+            {
+                throw AzureStorageException.InvalidQuery("marker");
+            }
+
+            try
+            {
+                var bytes = WebEncoders.Base64UrlDecode(
+                    marker[BlobMarkerPrefix.Length..scopeSeparator]);
+                var cursor = JsonSerializer.Deserialize<BlobListCursor>(bytes);
+                if (!IsValidBlobCursor(cursor))
+                    throw AzureStorageException.InvalidQuery("marker");
+                return new BlobListingMarker(cursor, 0);
+            }
+            catch (Exception exception) when (exception is FormatException or JsonException)
+            {
+                throw AzureStorageException.InvalidQuery("marker");
+            }
+        }
+
+        if (!marker.StartsWith(LegacyBlobMarkerPrefix, StringComparison.Ordinal))
+        {
+            return new BlobListingMarker(
+                new BlobListCursor(marker, true, false, 3, string.Empty, string.Empty),
+                0);
+        }
+
+        var legacySeparator = marker.IndexOf('.', LegacyBlobMarkerPrefix.Length);
+        if (legacySeparator < 0 ||
             !int.TryParse(
-                marker.AsSpan(BlobMarkerPrefix.Length, separator - BlobMarkerPrefix.Length),
+                marker.AsSpan(
+                    LegacyBlobMarkerPrefix.Length,
+                    legacySeparator - LegacyBlobMarkerPrefix.Length),
                 NumberStyles.None,
                 CultureInfo.InvariantCulture,
-                out var offset) ||
+            out var offset) ||
             offset < 0 ||
-            !string.Equals(marker[(separator + 1)..], expectedScope, StringComparison.Ordinal))
+            !string.Equals(marker[(legacySeparator + 1)..], expectedScope, StringComparison.Ordinal))
         {
             throw AzureStorageException.InvalidQuery("marker");
         }
-        return offset;
+        return new BlobListingMarker(null, offset);
     }
 
-    private static string EncodeBlobMarker(int offset, string scope) =>
-        $"{BlobMarkerPrefix}{offset.ToString(CultureInfo.InvariantCulture)}.{scope}";
-
-    private static int CompareBlobListEntries(BlobListEntry left, BlobListEntry right)
+    private static bool IsValidBlobCursor(BlobListCursor? cursor)
     {
-        var nameComparison = string.CompareOrdinal(left.Name, right.Name);
-        if (nameComparison != 0)
-            return nameComparison;
-        if (left.Prefix is not null || right.Prefix is not null)
-            return left.Prefix is not null ? right.Prefix is not null ? 0 : -1 : 1;
-
-        var leftBlob = left.Blob!;
-        var rightBlob = right.Blob!;
-        var rankComparison = BlobListRank(leftBlob).CompareTo(BlobListRank(rightBlob));
-        if (rankComparison != 0)
-            return rankComparison;
-        if (leftBlob.Snapshot is not null || rightBlob.Snapshot is not null)
+        if (cursor is null || cursor.NameComplete || string.IsNullOrEmpty(cursor.Name))
+            return false;
+        if (cursor.IsPrefix)
         {
-            var snapshotComparison = string.CompareOrdinal(leftBlob.Snapshot, rightBlob.Snapshot);
-            if (snapshotComparison != 0)
-                return snapshotComparison;
+            return cursor.Rank == -1 &&
+                   cursor.OrderedId.Length == 0 &&
+                   cursor.GenerationId.Length == 0;
         }
-        if (leftBlob.VersionId is not null || rightBlob.VersionId is not null)
-        {
-            var versionComparison = string.CompareOrdinal(rightBlob.VersionId, leftBlob.VersionId);
-            if (versionComparison != 0)
-                return versionComparison;
-        }
-        return string.CompareOrdinal(leftBlob.GenerationId, rightBlob.GenerationId);
+        return cursor.Rank is >= 0 and <= 3 &&
+               cursor.GenerationId.Length > 0 &&
+               (cursor.Rank is not (1 or 3) || cursor.OrderedId.Length > 0);
     }
 
-    private static int BlobListRank(BlobRecord blob) => blob switch
-    {
-        { IsCurrent: true } => 0,
-        { VersionId: not null } => 1,
-        { Snapshot: null } => 2,
-        _ => 3
-    };
+    private static string EncodeBlobMarker(BlobListCursor cursor, string scope) =>
+        $"{BlobMarkerPrefix}{WebEncoders.Base64UrlEncode(JsonSerializer.SerializeToUtf8Bytes(cursor))}.{scope}";
 
     private static string BlobType(Storage.BlobKind kind) => kind switch
     {
@@ -622,8 +612,4 @@ public sealed class AzureResponseWriter
 
     private static string LeaseStateValue(LeaseRecord lease) => lease.State.ToString().ToLowerInvariant();
 
-    private sealed record BlobListEntry(BlobRecord? Blob, string? Prefix)
-    {
-        public string Name => Blob?.Name ?? Prefix!;
-    }
 }

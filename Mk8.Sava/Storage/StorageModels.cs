@@ -193,6 +193,41 @@ internal sealed record KeysetPage<T>(IReadOnlyList<T> Items, bool HasMore);
 
 internal readonly record struct ContainerKey(string Account, string Name);
 
+internal sealed record BlobListCursor(
+    string Name,
+    bool NameComplete,
+    bool IsPrefix,
+    int Rank,
+    string OrderedId,
+    string GenerationId);
+
+internal sealed record BlobListingMarker(BlobListCursor? Cursor, int LegacyOffset);
+
+internal sealed record BlobListEntry(BlobRecord? Blob, string? Prefix)
+{
+    public string Name => Blob?.Name ?? Prefix!;
+
+    public BlobListCursor Cursor => Blob is null
+        ? new BlobListCursor(Name, false, true, -1, string.Empty, string.Empty)
+        : new BlobListCursor(
+            Blob.Name,
+            false,
+            false,
+            Blob switch
+            {
+                { IsCurrent: true } => 0,
+                { VersionId: not null } => 1,
+                { Snapshot: null } => 2,
+                _ => 3
+            },
+            Blob.VersionId ?? Blob.Snapshot ?? string.Empty,
+            Blob.GenerationId);
+}
+
+internal sealed record BlobListPage(IReadOnlyList<BlobListEntry> Items, bool HasMore);
+
+internal sealed record ContainerListPage(IReadOnlyList<ContainerRecord> Items, bool HasMore);
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable

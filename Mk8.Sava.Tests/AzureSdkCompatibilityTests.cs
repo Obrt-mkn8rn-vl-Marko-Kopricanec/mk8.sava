@@ -123,8 +123,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 Assert.Single(page.Values);
                 listed.Add(page.Values[0]);
-                if (page.ContinuationToken is not null)
+                if (!string.IsNullOrEmpty(page.ContinuationToken))
+                {
+                    Assert.StartsWith("mk8s2.", page.ContinuationToken, StringComparison.Ordinal);
                     Assert.True(flatTokens.Add(page.ContinuationToken));
+                }
             }
             Assert.Equal(expectedRecords.Length, listed.Count);
             Assert.Equal(
@@ -157,10 +160,58 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.Single(page.Values);
                 var item = page.Values[0];
                 hierarchy.Add(item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}");
-                if (page.ContinuationToken is not null)
+                if (!string.IsNullOrEmpty(page.ContinuationToken))
+                {
+                    Assert.StartsWith("mk8s2.", page.ContinuationToken, StringComparison.Ordinal);
                     Assert.True(hierarchyTokens.Add(page.ContinuationToken));
+                }
             }
             Assert.Equal(["P:folders/a/", "P:folders/b/", "B:folders/root"], hierarchy);
+
+            var livePrefix = $"live-{Guid.NewGuid():N}-";
+            await container.GetBlobClient(livePrefix + "b").UploadAsync(BinaryData.FromString("b"));
+            await container.GetBlobClient(livePrefix + "d").UploadAsync(BinaryData.FromString("d"));
+            Page<BlobItem>? firstLivePage = null;
+            await foreach (var page in container
+                               .GetBlobsAsync(prefix: livePrefix)
+                               .AsPages(pageSizeHint: 1))
+            {
+                firstLivePage = page;
+                break;
+            }
+            Assert.NotNull(firstLivePage);
+            Assert.Equal(livePrefix + "b", Assert.Single(firstLivePage!.Values).Name);
+            Assert.NotNull(firstLivePage.ContinuationToken);
+            await container.GetBlobClient(livePrefix + "a").UploadAsync(BinaryData.FromString("a"));
+            await container.GetBlobClient(livePrefix + "c").UploadAsync(BinaryData.FromString("c"));
+            var resumedLiveNames = new List<string>();
+            await foreach (var page in container
+                               .GetBlobsAsync(prefix: livePrefix)
+                               .AsPages(firstLivePage.ContinuationToken, pageSizeHint: 1))
+            {
+                resumedLiveNames.AddRange(page.Values.Select(item => item.Name));
+            }
+            Assert.Equal([livePrefix + "c", livePrefix + "d"], resumedLiveNames);
+
+            var containerPrefix = $"listed-{Guid.NewGuid():N}-";
+            var expectedContainers = Enumerable.Range(0, 3)
+                .Select(index => containerPrefix + index)
+                .ToArray();
+            foreach (var name in expectedContainers)
+                await service.GetBlobContainerClient(name).CreateAsync();
+            var listedContainers = new List<string>();
+            var containerTokens = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var page in service
+                               .GetBlobContainersAsync(prefix: containerPrefix)
+                               .AsPages(pageSizeHint: 1))
+            {
+                Assert.Single(page.Values);
+                listedContainers.Add(page.Values[0].Name);
+                if (!string.IsNullOrEmpty(page.ContinuationToken))
+                    Assert.True(containerTokens.Add(page.ContinuationToken));
+            }
+            Assert.Equal(expectedContainers, listedContainers);
+            Assert.Equal(2, containerTokens.Count);
         }
         finally
         {

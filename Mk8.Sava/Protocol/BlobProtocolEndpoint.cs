@@ -72,7 +72,13 @@ public static class BlobProtocolEndpoint
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
-            var containers = await service.ListContainersAsync(request.Account, includes.Contains("deleted"), cancellationToken);
+            var containers = await service.ListContainersPageAsync(
+                request.Account,
+                includes.Contains("deleted"),
+                prefix,
+                marker,
+                maxResults,
+                cancellationToken);
             await writer.WriteContainersAsync(
                 http,
                 containers,
@@ -200,20 +206,34 @@ public static class BlobProtocolEndpoint
         {
             await AuthorizeContainerListAsync(request, service, container);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
-            var blobs = await service.ListBlobsAsync(
+            var prefix = http.Request.Query["prefix"].ToString();
+            var delimiter = http.Request.Query["delimiter"].ToString();
+            var marker = http.Request.Query["marker"].ToString();
+            var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+            var decodedMarker = AzureResponseWriter.DecodeBlobMarker(
+                http,
+                prefix,
+                delimiter,
+                includes,
+                marker);
+            var blobs = await service.ListBlobsPageAsync(
                 request.Account,
                 containerName,
                 includes.Contains("versions"),
                 includes.Contains("snapshots"),
                 includes.Contains("deleted") || includes.Contains("deletedwithversions"),
+                prefix,
+                delimiter,
+                decodedMarker,
+                maxResults,
                 cancellationToken);
             await writer.WriteBlobsAsync(
                 http,
                 blobs,
-                http.Request.Query["prefix"].ToString(),
-                http.Request.Query["delimiter"].ToString(),
-                http.Request.Query["marker"].ToString(),
-                ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000),
+                prefix,
+                delimiter,
+                marker,
+                maxResults,
                 includes,
                 cancellationToken);
             return;

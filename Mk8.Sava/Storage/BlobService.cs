@@ -76,6 +76,42 @@ public sealed class BlobService(
             : container).ToArray();
     }
 
+    internal async Task<ContainerListPage> ListContainersPageAsync(
+        string account,
+        bool includeDeleted,
+        string prefix,
+        string marker,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        var page = await metadata.ListContainersPageAsync(
+            account,
+            includeDeleted,
+            prefix,
+            marker,
+            maximum,
+            cancellationToken);
+        if (!includeDeleted || !page.Items.Any(item =>
+                item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
+        {
+            return page;
+        }
+
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        return page with
+        {
+            Items = page.Items.Select(container =>
+                    container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
+                        ? container with
+                        {
+                            DeleteRetentionUntil = container.DeletedAt.Value.AddDays(
+                                properties.ContainerSoftDeleteRetentionDays)
+                        }
+                        : container)
+                .ToArray()
+        };
+    }
+
     public async Task<ContainerRecord> CreateContainerAsync(
         string account,
         string name,
@@ -254,6 +290,62 @@ public sealed class BlobService(
                 : rehydrated);
         }
         return effective;
+    }
+
+    internal async Task<BlobListPage> ListBlobsPageAsync(
+        string account,
+        string container,
+        bool includeVersions,
+        bool includeSnapshots,
+        bool includeDeleted,
+        string prefix,
+        string delimiter,
+        BlobListingMarker marker,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var page = await metadata.ListBlobsPageAsync(
+            account,
+            container,
+            includeVersions,
+            includeSnapshots,
+            includeDeleted,
+            prefix,
+            delimiter,
+            marker.Cursor,
+            marker.LegacyOffset,
+            maximum,
+            cancellationToken);
+        ServiceProperties? properties = null;
+        if (includeDeleted && page.Items.Any(item =>
+                item.Blob is { DeletedAt: not null, DeleteRetentionUntil: null }))
+        {
+            properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        }
+
+        var effective = new List<BlobListEntry>(page.Items.Count);
+        foreach (var item in page.Items)
+        {
+            if (item.Blob is null)
+            {
+                effective.Add(item);
+                continue;
+            }
+
+            var copy = await CompleteCopyIfDueAsync(item.Blob, cancellationToken);
+            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
+            var blob = properties is not null && rehydrated.DeletedAt.HasValue &&
+                       !rehydrated.DeleteRetentionUntil.HasValue
+                ? rehydrated with
+                {
+                    DeleteRetentionUntil = rehydrated.DeletedAt.Value.AddDays(
+                        properties.BlobSoftDeleteRetentionDays)
+                }
+                : rehydrated;
+            effective.Add(new BlobListEntry(blob, null));
+        }
+        return new BlobListPage(effective, page.HasMore);
     }
 
     public async Task<BlobRecord> GetBlobAsync(
