@@ -129,11 +129,11 @@ internal static class ProtocolParsing
             var start = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Start") ?? string.Empty, "Start");
             var expiry = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Expiry") ?? string.Empty, "Expiry");
             if (string.IsNullOrEmpty(id) || id.Length > 64 || !policies.TryAdd(id, new StoredAccessPolicy
-                {
-                    StartsAt = start,
-                    ExpiresAt = expiry,
-                    Permission = permission
-                }))
+            {
+                StartsAt = start,
+                ExpiresAt = expiry,
+                Permission = permission
+            }))
             {
                 throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified access policy XML is invalid.");
             }
@@ -269,8 +269,21 @@ internal static class ProtocolParsing
 
     private static void ValidateTag(string key, string value)
     {
-        if (key.Length is < 1 or > 128 || value.Length > 256 || key.Any(char.IsControl) || value.Any(char.IsControl))
+        if (!IsValidTagComponent(key, allowEmpty: false) ||
+            !IsValidTagComponent(value, allowEmpty: true))
+        {
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidTag", "The specified blob tag is invalid.");
+        }
+    }
+
+    internal static bool IsValidTagComponent(string value, bool allowEmpty)
+    {
+        var maximum = allowEmpty ? 256 : 128;
+        if (value.Length > maximum || !allowEmpty && value.Length == 0)
+            return false;
+        return value.All(character =>
+            char.IsAsciiLetterOrDigit(character) ||
+            character is ' ' or '+' or '-' or '.' or ':' or '=' or '_' or '/');
     }
 
     private static DateTimeOffset? ParseDate(string value, string field) =>
