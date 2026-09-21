@@ -2704,6 +2704,88 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task CopyBlobAuthenticatesSourceIndependentlyForSasDestinations()
+    {
+        var owner = CreateClient(factory);
+        var container = owner.GetBlobContainerClient($"copy-sas-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlobClient("source.bin");
+        var content = Enumerable.Range(0, 32 * 1024).Select(index => (byte)(index % 239)).ToArray();
+        await source.UploadAsync(BinaryData.FromBytes(content), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string> { ["origin"] = "source-sas" }
+        });
+
+        var sourceSas = source.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var destination = container.GetBlobClient("destination.bin");
+        var destinationSas = destination.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var delegatedDestination = CreateBlobClient(factory, destinationSas);
+        var copy = await delegatedDestination.StartCopyFromUriAsync(sourceSas);
+        await copy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+
+        Assert.Equal(content, (await destination.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal("source-sas", (await destination.GetPropertiesAsync()).Value.Metadata["origin"]);
+
+        var bearerTarget = container.GetBlobClient("bearer-source.bin");
+        var bearerTargetSas = bearerTarget.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var sourceToken = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
+        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        using (var request = new HttpRequestMessage(HttpMethod.Put, bearerTargetSas)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.Uri.AbsoluteUri);
+            request.Headers.TryAddWithoutValidation("x-ms-copy-source-authorization", $"Bearer {sourceToken}");
+            using var response = await transport.SendAsync(request);
+            Assert.True(
+                response.StatusCode == HttpStatusCode.Accepted,
+                $"Expected 202 but received {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+        }
+        for (var attempt = 0; attempt < 60; attempt++)
+        {
+            if ((await bearerTarget.GetPropertiesAsync()).Value.CopyStatus == CopyStatus.Success)
+                break;
+            await Task.Delay(50);
+        }
+        Assert.Equal(content, (await bearerTarget.DownloadContentAsync()).Value.Content.ToArray());
+
+        var unsignedTarget = container.GetBlobClient("unsigned-source.bin");
+        var unsignedTargetSas = unsignedTarget.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var unsignedSource = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            CreateBlobClient(factory, unsignedTargetSas).StartCopyFromUriAsync(source.Uri));
+        Assert.Equal(403, unsignedSource.Status);
+        Assert.False((await unsignedTarget.ExistsAsync()).Value);
+
+        var other = container.GetBlobClient("other.bin");
+        await other.UploadAsync(BinaryData.FromString("other"));
+        var otherSas = other.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var wrongResourceSource = new UriBuilder(source.Uri)
+        {
+            Query = otherSas.Query.TrimStart('?')
+        }.Uri;
+        var wrongResourceTarget = container.GetBlobClient("wrong-resource.bin");
+        var wrongResourceTargetSas = wrongResourceTarget.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var wrongResource = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            CreateBlobClient(factory, wrongResourceTargetSas).StartCopyFromUriAsync(wrongResourceSource));
+        Assert.Equal(403, wrongResource.Status);
+        Assert.False((await wrongResourceTarget.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task BlobBatchesExecuteIndependentDeleteAndTierSubrequests()
     {
         var service = CreateClient(factory);
