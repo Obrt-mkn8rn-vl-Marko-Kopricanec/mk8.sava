@@ -88,6 +88,7 @@ public sealed class AzureResponseWriter
         HttpContext context,
         BlobListPage listing,
         string prefix,
+        string startFrom,
         string delimiter,
         string marker,
         int maxResults,
@@ -95,7 +96,7 @@ public sealed class AzureResponseWriter
         CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
-        var listingScope = CreateBlobListingScope(request, prefix, delimiter, includes);
+        var listingScope = CreateBlobListingScope(request, prefix, startFrom, delimiter, includes);
         var nextMarker = listing.HasMore && listing.Items.Count > 0
             ? EncodeBlobMarker(listing.Items[^1].Cursor, listingScope)
             : string.Empty;
@@ -150,6 +151,11 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
                 writer.WriteElementString("AccessTier", blob.AccessTier);
+                if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
+                {
+                    WriteOptional(writer, "SmartAccessTier", blob.SmartAccessTier);
+                }
                 writer.WriteElementString("ServerEncrypted", "true");
                 WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
                 WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
@@ -392,6 +398,11 @@ public sealed class AzureResponseWriter
         SetOptional(response.Headers, "x-ms-encryption-key-sha256", blob.CustomerProvidedKeySha256);
         SetOptional(response.Headers, "x-ms-encryption-scope", blob.EncryptionScope);
         response.Headers["x-ms-access-tier"] = blob.AccessTier;
+        if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
+            IsServiceVersionAtLeast(StorageRequestContext.Get(response.HttpContext), new DateOnly(2026, 2, 6)))
+        {
+            SetOptional(response.Headers, "x-ms-smart-access-tier", blob.SmartAccessTier);
+        }
         SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
         SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
         SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
@@ -502,9 +513,18 @@ public sealed class AzureResponseWriter
     private static int RemainingRetentionDays(DateTimeOffset retentionUntil) =>
         Math.Max(0, (int)Math.Ceiling((retentionUntil - DateTimeOffset.UtcNow).TotalDays));
 
+    private static bool IsServiceVersionAtLeast(StorageRequestContext request, DateOnly minimum) =>
+        DateOnly.TryParseExact(
+            request.ServiceVersion,
+            "yyyy-MM-dd",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out var version) && version >= minimum;
+
     private static string CreateBlobListingScope(
         StorageRequestContext request,
         string prefix,
+        string startFrom,
         string delimiter,
         IReadOnlySet<string> includes)
     {
@@ -514,6 +534,7 @@ public sealed class AzureResponseWriter
             request.Container,
             request.ServiceVersion,
             prefix,
+            startFrom,
             delimiter,
             string.Join(',', includes.Order(StringComparer.OrdinalIgnoreCase)));
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)).AsSpan(0, 12));
@@ -522,6 +543,7 @@ public sealed class AzureResponseWriter
     internal static BlobListingMarker DecodeBlobMarker(
         HttpContext context,
         string prefix,
+        string startFrom,
         string delimiter,
         IReadOnlySet<string> includes,
         string marker)
@@ -532,6 +554,7 @@ public sealed class AzureResponseWriter
         var expectedScope = CreateBlobListingScope(
             StorageRequestContext.Get(context),
             prefix,
+            startFrom,
             delimiter,
             includes);
         if (marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))

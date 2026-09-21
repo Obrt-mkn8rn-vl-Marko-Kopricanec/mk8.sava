@@ -781,6 +781,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         bool includeSnapshots,
         bool includeDeleted,
         string prefix,
+        string startFrom,
         string delimiter,
         BlobListCursor? cursor,
         int legacyOffset,
@@ -797,6 +798,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             "account = $account",
             "container = $container",
             "name >= $prefix",
+            "name >= $start_from",
             "substr(name, 1, length($prefix)) = $prefix"
         };
         if (!includeVersions && !includeSnapshots)
@@ -897,6 +899,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$prefix", prefix);
+        command.Parameters.AddWithValue("$start_from", startFrom);
         command.Parameters.AddWithValue("$delimiter", delimiter);
         command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
         command.Parameters.AddWithValue("$name_complete", cursor?.NameComplete == true ? 1 : 0);

@@ -240,6 +240,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             });
         Assert.Equal(200, metadata.GetRawResponse().Status);
 
+        var currentEtag = (await source.GetPropertiesAsync()).Value.ETag;
+        var conditionedTags = await source.GetTagsAsync(new BlobRequestConditions { IfMatch = currentEtag });
+        Assert.Equal("Done", conditionedTags.Value.Tags["Status"]);
+        var rejectedTagRead = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.GetTagsAsync(new BlobRequestConditions { IfMatch = new ETag("\"not-the-current-etag\"") }));
+        Assert.Equal(412, rejectedTagRead.Status);
+        Assert.Equal("ConditionNotMet", rejectedTagRead.ErrorCode);
+        await source.SetTagsAsync(
+            new Dictionary<string, string>
+            {
+                ["Status"] = "Done",
+                ["Priority"] = "07",
+                ["special key"] = "yes"
+            },
+            new BlobRequestConditions { IfMatch = currentEtag });
+        var rejectedTagWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.SetTagsAsync(
+                new Dictionary<string, string> { ["Status"] = "rejected" },
+                new BlobRequestConditions { IfMatch = new ETag("\"not-the-current-etag\"") }));
+        Assert.Equal(412, rejectedTagWrite.Status);
+        Assert.Equal("ConditionNotMet", rejectedTagWrite.ErrorCode);
+
         var falseCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
             source.DownloadContentAsync(new BlobDownloadOptions
             {
@@ -320,6 +342,36 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         authorizedRequest.Headers.Add("x-ms-if-tags", "Status = 'Done'");
         using var authorizedResponse = await transport.SendAsync(authorizedRequest);
         Assert.Equal(HttpStatusCode.OK, authorizedResponse.StatusCode);
+
+        var oldVersionTagsUri = AppendQuery(
+            source.GenerateSasUri(
+                BlobSasPermissions.Read | BlobSasPermissions.Tag,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=tags");
+        using var oldVersionCondition = new HttpRequestMessage(HttpMethod.Get, oldVersionTagsUri);
+        oldVersionCondition.Headers.Add("x-ms-version", "2023-11-03");
+        oldVersionCondition.Headers.Add("x-ms-blob-if-match", currentEtag.ToString());
+        using var oldVersionConditionResponse = await transport.SendAsync(oldVersionCondition);
+        Assert.Equal(HttpStatusCode.BadRequest, oldVersionConditionResponse.StatusCode);
+        Assert.Equal(
+            "FeatureVersionMismatch",
+            oldVersionConditionResponse.Headers.GetValues("x-ms-error-code").Single());
+
+        var badChecksumTagsUri = AppendQuery(
+            source.GenerateSasUri(BlobSasPermissions.Tag, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=tags");
+        using var badChecksumTags = new HttpRequestMessage(HttpMethod.Put, badChecksumTagsUri)
+        {
+            Content = new ByteArrayContent(
+                "<Tags><TagSet><Tag><Key>Status</Key><Value>corrupt</Value></Tag></TagSet></Tags>"u8.ToArray())
+        };
+        badChecksumTags.Headers.Add("x-ms-version", "2026-06-06");
+        badChecksumTags.Headers.Add("x-ms-content-crc64", Convert.ToBase64String(new byte[8]));
+        badChecksumTags.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/xml; charset=utf-8");
+        using var badChecksumTagsResponse = await transport.SendAsync(badChecksumTags);
+        Assert.Equal(HttpStatusCode.BadRequest, badChecksumTagsResponse.StatusCode);
+        Assert.Equal("Crc64Mismatch", badChecksumTagsResponse.Headers.GetValues("x-ms-error-code").Single());
+        Assert.Equal("Done", (await source.GetTagsAsync()).Value.Tags["Status"]);
     }
 
     [Fact]
@@ -418,6 +470,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 }
             }
             Assert.Equal(["P:folders/a/", "P:folders/b/", "B:folders/root"], hierarchy);
+
+            var startedNames = new List<string>();
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+            {
+                Prefix = "folders/",
+                StartFrom = "folders/b/one"
+            }))
+            {
+                startedNames.Add(item.Name);
+            }
+            Assert.Equal(["folders/b/one", "folders/root"], startedNames);
+            var startedHierarchy = new List<string>();
+            await foreach (var item in container.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+            {
+                Delimiter = "/",
+                Prefix = "folders/",
+                StartFrom = "folders/b/"
+            }))
+            {
+                startedHierarchy.Add(item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}");
+            }
+            Assert.Equal(["P:folders/b/", "B:folders/root"], startedHierarchy);
 
             var livePrefix = $"live-{Guid.NewGuid():N}-";
             await container.GetBlobClient(livePrefix + "b").UploadAsync(BinaryData.FromString("b"));
@@ -1459,6 +1533,40 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(AccessTier.Hot, online.AccessTier);
         Assert.Null(online.ArchiveStatus);
         Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
+
+        var smart = await blob.SetAccessTierAsync(AccessTier.Smart);
+        Assert.Equal(200, smart.Status);
+        var smartProperties = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Smart, smartProperties.AccessTier);
+        Assert.Equal("Hot", smartProperties.SmartAccessTier);
+        var smartItems = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { Prefix = blob.Name }))
+            smartItems.Add(item);
+        var smartItem = Assert.Single(smartItems);
+        Assert.Equal(AccessTier.Smart, smartItem.Properties.AccessTier);
+        Assert.Equal("Hot", smartItem.Properties.SmartAccessTier);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        var tierUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=tier");
+        using var oldVersionTierRequest = new HttpRequestMessage(HttpMethod.Put, tierUri)
+        {
+            Content = new ByteArrayContent([])
+        };
+        oldVersionTierRequest.Headers.Add("x-ms-version", "2023-11-03");
+        oldVersionTierRequest.Headers.Add("x-ms-access-tier", "Smart");
+        using var oldVersionTierResponse = await transport.SendAsync(oldVersionTierRequest);
+        Assert.Equal(HttpStatusCode.BadRequest, oldVersionTierResponse.StatusCode);
+        Assert.Equal("FeatureVersionMismatch", oldVersionTierResponse.Headers.GetValues("x-ms-error-code").Single());
+
+        using var oldVersionPropertiesRequest = new HttpRequestMessage(
+            HttpMethod.Head,
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        oldVersionPropertiesRequest.Headers.Add("x-ms-version", "2023-11-03");
+        using var oldVersionPropertiesResponse = await transport.SendAsync(oldVersionPropertiesRequest);
+        Assert.Equal(HttpStatusCode.OK, oldVersionPropertiesResponse.StatusCode);
+        Assert.False(oldVersionPropertiesResponse.Headers.Contains("x-ms-smart-access-tier"));
     }
 
     [Fact]

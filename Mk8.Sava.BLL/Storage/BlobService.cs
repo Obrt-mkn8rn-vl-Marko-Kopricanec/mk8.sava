@@ -268,6 +268,7 @@ public sealed class BlobService(
         bool includeSnapshots,
         bool includeDeleted,
         string prefix,
+        string startFrom,
         string delimiter,
         BlobListingMarker marker,
         int maximum,
@@ -281,6 +282,7 @@ public sealed class BlobService(
             includeSnapshots,
             includeDeleted,
             prefix,
+            startFrom,
             delimiter,
             marker.Cursor,
             marker.LegacyOffset,
@@ -905,6 +907,7 @@ public sealed class BlobService(
             updated = current with
             {
                 AccessTier = tier,
+                SmartAccessTier = tier == "Smart" ? "Hot" : null,
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
@@ -1840,6 +1843,7 @@ public sealed class BlobService(
         var updated = blob with
         {
             AccessTier = targetTier,
+            SmartAccessTier = targetTier == "Smart" ? "Hot" : null,
             AccessTierChangedAt = metadata.GetUtcNow(),
             ArchiveStatus = null,
             RehydratePriority = null,
@@ -1880,6 +1884,11 @@ public sealed class BlobService(
                 "x-ms-immutability-policy-until-date",
                 options.ImmutabilityUntil?.ToString("R", CultureInfo.InvariantCulture));
         }
+        if (options.AccessTier is not null &&
+            options.AccessTier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-access-tier", options.AccessTier);
+        }
 
         return new BlobRecord
         {
@@ -1898,6 +1907,7 @@ public sealed class BlobService(
             Tags = options.Tags ?? new Dictionary<string, string>(StringComparer.Ordinal),
             Http = options.Http,
             AccessTier = options.AccessTier ?? "Hot",
+            SmartAccessTier = options.AccessTier == "Smart" ? "Hot" : null,
             ImmutabilityUntil = options.ImmutabilityUntil,
             ImmutabilityLocked = options.ImmutabilityLocked,
             HasLegalHold = options.HasLegalHold,
