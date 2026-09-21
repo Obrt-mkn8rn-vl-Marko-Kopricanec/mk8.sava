@@ -1,0 +1,12 @@
+/docs/internal
+**/bin/
+**/obj/
+.idea/
+.vs/
+.vscode/
+TestResults/
+artifacts/
+data/
+*.db
+*.db-shm
+*.db-wal

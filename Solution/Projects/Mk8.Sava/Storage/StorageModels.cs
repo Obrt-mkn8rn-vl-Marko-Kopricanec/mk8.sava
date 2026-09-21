@@ -1,0 +1,175 @@
+using System.Text.Json.Serialization;
+
+namespace Mk8.Sava.Storage;
+
+[JsonConverter(typeof(JsonStringEnumConverter<BlobKind>))]
+public enum BlobKind
+{
+    BlockBlob,
+    AppendBlob,
+    PageBlob
+}
+
+[JsonConverter(typeof(JsonStringEnumConverter<LeaseState>))]
+public enum LeaseState
+{
+    Available,
+    Leased,
+    Expired,
+    Breaking,
+    Broken
+}
+
+public sealed record ChunkReference(string Id, long Offset, int Length);
+
+public sealed record ContentManifest(
+    string Domain,
+    long Length,
+    string Sha256,
+    IReadOnlyList<ChunkReference> Chunks)
+{
+    public static ContentManifest Empty(string domain) =>
+        new(domain, 0, Convert.ToHexStringLower(SHA256.HashData([])), []);
+}
+
+public sealed record CommittedBlockRecord(string Id, ContentManifest Content);
+
+public enum BlockListMode
+{
+    Latest,
+    Committed,
+    Uncommitted
+}
+
+public sealed record BlockListEntry(string Id, BlockListMode Mode);
+
+public sealed record ContainerRecord
+{
+    public required string Account { get; init; }
+    public required string Name { get; init; }
+    public required string Revision { get; init; }
+    public required string ETag { get; init; }
+    public required DateTimeOffset CreatedAt { get; init; }
+    public required DateTimeOffset LastModified { get; init; }
+    public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, StoredAccessPolicy> AccessPolicies { get; init; } = new(StringComparer.Ordinal);
+    public string? PublicAccess { get; init; }
+    public LeaseRecord Lease { get; init; } = LeaseRecord.Available;
+    public DateTimeOffset? DeletedAt { get; init; }
+    public string? DeletedVersion { get; init; }
+    public bool HasLegalHold { get; init; }
+    public DateTimeOffset? ImmutabilityUntil { get; init; }
+    public bool ImmutabilityLocked { get; init; }
+}
+
+public sealed record StoredAccessPolicy
+{
+    public DateTimeOffset? StartsAt { get; init; }
+    public DateTimeOffset? ExpiresAt { get; init; }
+    public required string Permission { get; init; }
+}
+
+public sealed record BlobRecord
+{
+    public required string Account { get; init; }
+    public required string Container { get; init; }
+    public required string Name { get; init; }
+    public required string GenerationId { get; init; }
+    public required string Revision { get; init; }
+    public string? VersionId { get; init; }
+    public string? Snapshot { get; init; }
+    public bool IsCurrent { get; init; }
+    public bool IsDeleted { get; init; }
+    public DateTimeOffset? DeletedAt { get; init; }
+    public required BlobKind Kind { get; init; }
+    public required ContentManifest Content { get; init; }
+    public required string ETag { get; init; }
+    public required DateTimeOffset CreatedAt { get; init; }
+    public required DateTimeOffset LastModified { get; init; }
+    public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, string> Tags { get; init; } = new(StringComparer.Ordinal);
+    public BlobHttpProperties Http { get; init; } = new();
+    public LeaseRecord Lease { get; init; } = LeaseRecord.Available;
+    public long SequenceNumber { get; init; }
+    public bool IsSealed { get; init; }
+    public string AccessTier { get; init; } = "Hot";
+    public DateTimeOffset? AccessTierChangedAt { get; init; }
+    public DateTimeOffset? ExpiresAt { get; init; }
+    public DateTimeOffset? ImmutabilityUntil { get; init; }
+    public bool ImmutabilityLocked { get; init; }
+    public bool HasLegalHold { get; init; }
+    public CopyState? Copy { get; init; }
+    public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
+    public int AppendBlockCount { get; init; }
+}
+
+public sealed record BlobHttpProperties
+{
+    public string ContentType { get; init; } = "application/octet-stream";
+    public string? ContentEncoding { get; init; }
+    public string? ContentLanguage { get; init; }
+    public string? CacheControl { get; init; }
+    public string? ContentDisposition { get; init; }
+    public string? ContentMd5 { get; init; }
+}
+
+public sealed record LeaseRecord
+{
+    public static LeaseRecord Available { get; } = new();
+
+    public string? Id { get; init; }
+    public LeaseState State { get; init; } = LeaseState.Available;
+    public int? DurationSeconds { get; init; }
+    public DateTimeOffset? AcquiredAt { get; init; }
+    public DateTimeOffset? ExpiresAt { get; init; }
+    public DateTimeOffset? BreakEndsAt { get; init; }
+}
+
+public sealed record CopyState
+{
+    public required string Id { get; init; }
+    public required string Source { get; init; }
+    public required string Status { get; init; }
+    public required long BytesCopied { get; init; }
+    public required long TotalBytes { get; init; }
+    public DateTimeOffset? CompletedAt { get; init; }
+    public string? Description { get; init; }
+}
+
+public sealed record StagedBlockRecord
+{
+    public required string Account { get; init; }
+    public required string Container { get; init; }
+    public required string BlobName { get; init; }
+    public required string BlockId { get; init; }
+    public required ContentManifest Content { get; init; }
+    public required DateTimeOffset CreatedAt { get; init; }
+}
+
+public sealed record ServiceProperties
+{
+    public bool VersioningEnabled { get; init; }
+    public bool ContainerSoftDeleteEnabled { get; init; }
+    public int ContainerSoftDeleteRetentionDays { get; init; } = 7;
+    public bool BlobSoftDeleteEnabled { get; init; }
+    public int BlobSoftDeleteRetentionDays { get; init; } = 7;
+    public string? DefaultServiceVersion { get; init; }
+    public List<CorsRule> Cors { get; init; } = [];
+    public StaticWebsiteProperties StaticWebsite { get; init; } = new();
+}
+
+public sealed record CorsRule
+{
+    public required string AllowedOrigins { get; init; }
+    public required string AllowedMethods { get; init; }
+    public required string AllowedHeaders { get; init; }
+    public required string ExposedHeaders { get; init; }
+    public required int MaxAgeInSeconds { get; init; }
+}
+
+public sealed record StaticWebsiteProperties
+{
+    public bool Enabled { get; init; }
+    public string? IndexDocument { get; init; }
+    public string? ErrorDocument404Path { get; init; }
+}
