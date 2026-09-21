@@ -189,6 +189,10 @@ internal sealed record ChunkIdPage(IReadOnlyList<string> Items, bool HasMore);
 
 internal sealed record PhysicalChunkPage(IReadOnlyList<string> Items, bool HasMore);
 
+internal sealed record KeysetPage<T>(IReadOnlyList<T> Items, bool HasMore);
+
+internal readonly record struct ContainerKey(string Account, string Name);
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable

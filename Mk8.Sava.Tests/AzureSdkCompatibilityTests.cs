@@ -1437,6 +1437,152 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task LifecycleMaintenanceUsesBoundedMetadataPages()
+    {
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:BlobRecordsPerMaintenancePass"] = "1",
+            ["Sava:ContainerRecordsPerMaintenancePass"] = "1",
+            ["Sava:UncommittedBlocksPerMaintenancePass"] = "1"
+        });
+        try
+        {
+            await application.InitializeAsync();
+            var blobService = application.Services.GetRequiredService<BlobService>();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+
+            // Synchronize with the hosted service's initial empty pass before creating content.
+            await blobService.RunMaintenanceAsync(CancellationToken.None);
+
+            var service = CreateClient(application);
+            var containerName = $"bounded-lifecycle-{Guid.NewGuid():N}";
+            var container = service.GetBlobContainerClient(containerName);
+            await container.CreateAsync();
+            for (var index = 0; index < 3; index++)
+            {
+                var blob = container.GetBlobClient($"expiring-{index}.bin");
+                await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(2048)));
+                var record = await blobService.GetBlobAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    containerName,
+                    blob.Name,
+                    versionId: null,
+                    snapshot: null,
+                    includeDeleted: false,
+                    CancellationToken.None);
+                await blobService.SetExpiryAsync(
+                    record,
+                    DateTimeOffset.UtcNow.AddMilliseconds(100),
+                    CancellationToken.None);
+            }
+
+            var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
+            for (var index = 0; index < 3; index++)
+            {
+                var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes($"bounded-block-{index:D2}"));
+                await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(2048)));
+            }
+            foreach (var block in await blobService.ListStagedBlocksAsync(
+                         SavaWebApplicationFactory.AccountName,
+                         containerName,
+                         uncommitted.Name,
+                         CancellationToken.None))
+            {
+                await metadata.PutStagedBlockAsync(
+                    block with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) },
+                    CancellationToken.None);
+            }
+
+            await Task.Delay(150);
+            for (var expectedRemaining = 2; expectedRemaining >= 0; expectedRemaining--)
+            {
+                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
+                Assert.Equal(1, result.ExpiredBlobs);
+                Assert.Equal(1, result.ExpiredUncommittedBlocks);
+                Assert.Equal(
+                    expectedRemaining,
+                    (await metadata.ListBlobsAsync(
+                        SavaWebApplicationFactory.AccountName,
+                        containerName,
+                        includeVersions: false,
+                        includeSnapshots: false,
+                        includeDeleted: false,
+                        CancellationToken.None)).Count);
+                Assert.Equal(
+                    expectedRemaining,
+                    (await blobService.ListStagedBlocksAsync(
+                        SavaWebApplicationFactory.AccountName,
+                        containerName,
+                        uncommitted.Name,
+                        CancellationToken.None)).Count);
+            }
+
+            var properties = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                properties with
+                {
+                    ContainerSoftDeleteEnabled = true,
+                    ContainerSoftDeleteRetentionDays = 1
+                },
+                CancellationToken.None);
+            var deletedContainerNames = Enumerable.Range(0, 3)
+                .Select(index => $"bounded-purge-{Guid.NewGuid():N}-{index}")
+                .ToArray();
+            foreach (var name in deletedContainerNames)
+            {
+                var client = service.GetBlobContainerClient(name);
+                await client.CreateAsync();
+                var record = await metadata.GetContainerAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    name,
+                    includeDeleted: false,
+                    CancellationToken.None);
+                Assert.NotNull(record);
+                await blobService.DeleteContainerAsync(record!, CancellationToken.None);
+                var deleted = await metadata.GetContainerAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    name,
+                    includeDeleted: true,
+                    CancellationToken.None);
+                Assert.NotNull(deleted);
+                await metadata.PutContainerAsync(
+                    deleted! with
+                    {
+                        Revision = MetadataStore.NewRevision(),
+                        DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
+                    },
+                    deleted.Revision,
+                    CancellationToken.None);
+            }
+
+            var purgedContainers = 0;
+            for (var pass = 0; pass < 8 && purgedContainers < deletedContainerNames.Length; pass++)
+            {
+                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
+                Assert.InRange(result.PurgedSoftDeletedContainers, 0, 1);
+                purgedContainers += result.PurgedSoftDeletedContainers;
+            }
+            Assert.Equal(deletedContainerNames.Length, purgedContainers);
+            foreach (var name in deletedContainerNames)
+            {
+                Assert.Null(await metadata.GetContainerAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    name,
+                    includeDeleted: true,
+                    CancellationToken.None));
+            }
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task ConsistentBackupRestoresExactSharedSnapshotAndUncommittedContent()
     {
         var source = new SavaWebApplicationFactory();

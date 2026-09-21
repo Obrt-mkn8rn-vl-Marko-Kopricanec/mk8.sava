@@ -25,6 +25,14 @@ structurally checked and counted separately because mk8.sava deliberately does
 not retain those keys. An authorized read supplies the key and performs the
 full AES-GCM, decompression, digest, and length verification.
 
+Lifecycle work uses independent keyset cursors. Each pass examines at most
+`Sava:BlobRecordsPerMaintenancePass` blob/version/snapshot records and
+`Sava:ContainerRecordsPerMaintenancePass` container records for due copy,
+rehydration, expiry, and retention transitions. It also removes at most
+`Sava:UncommittedBlocksPerMaintenancePass` expired uncommitted blocks, oldest
+first. A full cursor cycle repeats, so records created or moved behind a cursor
+are deferred rather than lost.
+
 Crash-abandoned `.tmp` files are removed after
 `Sava:AbandonedStagingRetention`, up to
 `Sava:MaximumStagingFilesPerMaintenancePass` deletions per pass. A file still
