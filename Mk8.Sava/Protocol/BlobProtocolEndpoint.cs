@@ -727,6 +727,48 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        if (HttpMethods.IsPut(http.Request.Method) && comp == "incrementalcopy")
+        {
+            if (!DateOnly.TryParseExact(
+                    request.ServiceVersion,
+                    "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out var serviceVersion) || serviceVersion < new DateOnly(2016, 5, 31))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "FeatureVersionMismatch",
+                    "Incremental Copy Blob requires service version 2016-05-31 or later.");
+            }
+
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            RequireAny(request, current is null ? 'c' : 'w', 'w');
+            EvaluateWriteConditions(http.Request, current);
+            if (current is not null)
+            {
+                EvaluatePageSequenceConditions(http.Request, current);
+                EnsureLease(http.Request, current.Lease, "blob");
+                EnsureCustomerProvidedKey(http.Request, current, write: true);
+            }
+            var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
+                             ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+            var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
+            EvaluateCopySourceConditions(http.Request, source);
+            var copied = await service.BeginIncrementalCopyAsync(
+                request.Account,
+                containerName,
+                blobName,
+                source,
+                ReadCopyWriteOptions(http.Request, source),
+                SanitizeCopySource(copySource),
+                current,
+                cancellationToken);
+            AzureResponseWriter.AddBlobHeaders(http.Response, copied);
+            http.Response.StatusCode = StatusCodes.Status202Accepted;
+            return;
+        }
+
         if (HttpMethods.IsGet(http.Request.Method) && comp == "blocklist")
         {
             Require(request, 'r');
@@ -754,6 +796,17 @@ public static class BlobProtocolEndpoint
             snapshot,
             includeDeleted: false,
             cancellationToken);
+
+        if (blob.IsIncrementalCopy && blob.Snapshot is null &&
+            !(HttpMethods.IsHead(http.Request.Method) && string.IsNullOrEmpty(comp)) &&
+            !(HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp)) &&
+            !(HttpMethods.IsPut(http.Request.Method) && comp == "copy"))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "OperationNotAllowedOnIncrementalCopyBlob",
+                "The operation is not permitted on an incremental copy destination blob.");
+        }
 
         if (HttpMethods.IsPost(http.Request.Method) && comp == "query")
         {

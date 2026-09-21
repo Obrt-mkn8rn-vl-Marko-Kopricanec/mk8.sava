@@ -114,6 +114,12 @@ public sealed record BlobRecord
     public string? CustomerProvidedKeySha256 { get; init; }
     public CopyState? Copy { get; init; }
     public ContentManifest? PendingCopyContent { get; init; }
+    public List<PageRange>? PendingCopyPageRanges { get; init; }
+    public bool IsIncrementalCopy { get; init; }
+    public string? IncrementalCopySource { get; init; }
+    public string? IncrementalCopySourceSnapshot { get; init; }
+    public DateTimeOffset? IncrementalCopySourceCreatedAt { get; init; }
+    public string? CopyDestinationSnapshot { get; init; }
     public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
     public List<PageRange> PageRanges { get; init; } = [];
@@ -151,6 +157,8 @@ public sealed record CopyState
     public DateTimeOffset? CompletedAt { get; init; }
     public DateTimeOffset? ReadyAt { get; init; }
     public string? Description { get; init; }
+    public bool IsIncremental { get; init; }
+    public string? SourceSnapshot { get; init; }
 }
 
 public sealed record StagedBlockRecord

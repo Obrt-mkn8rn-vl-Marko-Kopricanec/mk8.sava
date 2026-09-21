@@ -195,7 +195,7 @@ public sealed class AzureResponseWriter
                 }
                 if (includes.Contains("legalhold"))
                     writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
-                if (includes.Contains("copy") && blob.Copy is not null)
+                if (blob.Copy is not null)
                 {
                     writer.WriteElementString("CopyId", blob.Copy.Id);
                     writer.WriteElementString("CopySource", blob.Copy.Source);
@@ -204,6 +204,10 @@ public sealed class AzureResponseWriter
                     WriteOptional(writer, "CopyCompletionTime", blob.Copy.CompletedAt?.ToString("R", CultureInfo.InvariantCulture));
                     WriteOptional(writer, "CopyStatusDescription", blob.Copy.Description);
                 }
+                if (blob.IsIncrementalCopy)
+                    writer.WriteElementString("IncrementalCopy", "true");
+                if (blob.Copy?.Status == "success")
+                    WriteOptional(writer, "DestinationSnapshot", blob.CopyDestinationSnapshot);
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
                     WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
@@ -428,6 +432,10 @@ public sealed class AzureResponseWriter
                 response.Headers["x-ms-copy-completion-time"] = blob.Copy.CompletedAt.Value.ToString("R", CultureInfo.InvariantCulture);
             SetOptional(response.Headers, "x-ms-copy-status-description", blob.Copy.Description);
         }
+        if (blob.IsIncrementalCopy)
+            response.Headers["x-ms-incremental-copy"] = "true";
+        if (blob.Copy?.Status == "success")
+            SetOptional(response.Headers, "x-ms-copy-destination-snapshot", blob.CopyDestinationSnapshot);
     }
 
     private static void WriteMetadata(

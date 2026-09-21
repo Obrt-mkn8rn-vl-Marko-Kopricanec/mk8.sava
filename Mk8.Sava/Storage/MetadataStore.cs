@@ -518,6 +518,54 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         }
     }
 
+    public async Task<BlobRecord> CompleteIncrementalCopyAsync(
+        BlobRecord record,
+        string expectedRevision,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var current = await GetBlobByGenerationAsync(connection, transaction, record.GenerationId, cancellationToken);
+            if (current is null ||
+                !current.IsCurrent ||
+                !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
+            {
+                throw new StorageConcurrencyException();
+            }
+
+            var snapshotId = await CreateUniqueSnapshotIdAsync(
+                connection,
+                transaction,
+                record.Account,
+                record.Container,
+                record.Name,
+                now,
+                cancellationToken);
+            var completed = record with { CopyDestinationSnapshot = snapshotId };
+            await UpdateBlobRowAsync(connection, transaction, completed, cancellationToken);
+            var snapshot = completed with
+            {
+                GenerationId = Guid.NewGuid().ToString("N"),
+                Revision = NewRevision(),
+                VersionId = null,
+                Snapshot = snapshotId,
+                IsCurrent = false,
+                Lease = LeaseRecord.Available
+            };
+            await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return completed;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
     public async Task<BlobRecord> CreateSnapshotAsync(
         BlobRecord source,
         Dictionary<string, string>? snapshotMetadata,

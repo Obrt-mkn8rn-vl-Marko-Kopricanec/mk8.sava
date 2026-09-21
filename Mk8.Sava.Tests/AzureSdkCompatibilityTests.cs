@@ -478,6 +478,91 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task IncrementalPageCopiesCreateReadableSnapshotsAndReuseExtents()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"incremental-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetPageBlobClient("source.vhd");
+        await source.CreateAsync(2048);
+        var firstPage = Enumerable.Repeat((byte)0x51, 512).ToArray();
+        var secondPage = Enumerable.Repeat((byte)0x62, 512).ToArray();
+        await source.UploadPagesAsync(new MemoryStream(firstPage), offset: 0);
+        await source.UploadPagesAsync(new MemoryStream(secondPage), offset: 512);
+        var firstSourceSnapshot = (await source.CreateSnapshotAsync()).Value.Snapshot;
+        var chunksBeforeFirstCopy = EnumerateChunkFiles(factory.DataPath).Count();
+
+        var destination = container.GetPageBlobClient("backup.vhd");
+        var firstCopy = await destination.StartCopyIncrementalAsync(source.Uri, firstSourceSnapshot);
+        Assert.Equal(202, firstCopy.GetRawResponse().Status);
+        await firstCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var firstProperties = (await destination.GetPropertiesAsync()).Value;
+        Assert.True(firstProperties.IsIncrementalCopy);
+        Assert.Equal(CopyStatus.Success, firstProperties.CopyStatus);
+        Assert.NotNull(firstProperties.DestinationSnapshot);
+        Assert.Equal(chunksBeforeFirstCopy, EnumerateChunkFiles(factory.DataPath).Count());
+
+        var baseRead = await Assert.ThrowsAsync<RequestFailedException>(() => destination.DownloadContentAsync());
+        Assert.Equal(409, baseRead.Status);
+        Assert.Equal("OperationNotAllowedOnIncrementalCopyBlob", baseRead.ErrorCode);
+        var firstExpected = new byte[2048];
+        firstPage.CopyTo(firstExpected, 0);
+        secondPage.CopyTo(firstExpected, 512);
+        var firstDestinationSnapshot = firstProperties.DestinationSnapshot!;
+        Assert.Equal(
+            firstExpected,
+            (await destination.WithSnapshot(firstDestinationSnapshot).DownloadContentAsync()).Value.Content.ToArray());
+
+        var changedPage = Enumerable.Repeat((byte)0x73, 512).ToArray();
+        await source.UploadPagesAsync(new MemoryStream(changedPage), offset: 0);
+        await source.ClearPagesAsync(new HttpRange(512, 512));
+        var secondSourceSnapshot = (await source.CreateSnapshotAsync()).Value.Snapshot;
+        var chunksBeforeSecondCopy = EnumerateChunkFiles(factory.DataPath).Count();
+        var secondCopy = await destination.StartCopyIncrementalAsync(source.Uri, secondSourceSnapshot);
+        await secondCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var secondProperties = (await destination.GetPropertiesAsync()).Value;
+        Assert.NotEqual(firstDestinationSnapshot, secondProperties.DestinationSnapshot);
+        Assert.Equal(chunksBeforeSecondCopy, EnumerateChunkFiles(factory.DataPath).Count());
+
+        var secondExpected = new byte[2048];
+        changedPage.CopyTo(secondExpected, 0);
+        Assert.Equal(
+            secondExpected,
+            (await destination.WithSnapshot(secondProperties.DestinationSnapshot!).DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(
+            firstExpected,
+            (await destination.WithSnapshot(firstDestinationSnapshot).DownloadContentAsync()).Value.Content.ToArray());
+
+        var earlier = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            destination.StartCopyIncrementalAsync(source.Uri, firstSourceSnapshot));
+        Assert.Equal(409, earlier.Status);
+        Assert.Equal("IncrementalCopyOfEarlierVersionSnapshotNotAllowed", earlier.ErrorCode);
+
+        await source.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
+        await source.CreateAsync(2048);
+        var replacementSnapshot = (await source.CreateSnapshotAsync()).Value.Snapshot;
+        var replacedSource = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            destination.StartCopyIncrementalAsync(source.Uri, replacementSnapshot));
+        Assert.Equal(409, replacedSource.Status);
+        Assert.Equal("IncrementalCopyBlobMismatch", replacedSource.ErrorCode);
+
+        var listed = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(BlobTraits.None, BlobStates.Snapshots, prefix: destination.Name))
+            listed.Add(item);
+        var listedBase = Assert.Single(listed, item => item.Snapshot is null);
+        Assert.Equal(secondProperties.DestinationSnapshot, listedBase.Properties.DestinationSnapshot);
+        Assert.Equal(2, listed.Count(item => item.Snapshot is not null));
+
+        var listUri = new UriBuilder(container.GenerateSasUri(
+            BlobContainerSasPermissions.List,
+            DateTimeOffset.UtcNow.AddMinutes(5)));
+        listUri.Query = $"{listUri.Query.TrimStart('?')}&restype=container&comp=list&include=snapshots&prefix={destination.Name}";
+        using var httpClient = new HttpClient(factory.Server.CreateHandler());
+        var listXml = await httpClient.GetStringAsync(listUri.Uri);
+        Assert.Equal(3, listXml.Split("<IncrementalCopy>true</IncrementalCopy>", StringSplitOptions.None).Length - 1);
+    }
+
+    [Fact]
     public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
     {
         var service = CreateClient(factory);

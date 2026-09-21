@@ -1053,6 +1053,99 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             cancellationToken);
     }
 
+    public async Task<BlobRecord> BeginIncrementalCopyAsync(
+        string account,
+        string container,
+        string name,
+        BlobRecord source,
+        BlobWriteOptions options,
+        string sourceUri,
+        BlobRecord? current,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        if (source.Kind != BlobKind.PageBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidSourceBlobType", "The source blob type is invalid for incremental copy.");
+        if (source.Snapshot is null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "IncrementalCopySourceMustBeSnapshot",
+                "The source for an incremental copy must be a page blob snapshot.");
+        }
+
+        var sourceIdentity = $"{source.Account}/{source.Container}/{source.Name}";
+        BlobEncryption encryption;
+        if (current is not null)
+        {
+            EnsureNoPendingCopy(current);
+            if (!current.IsIncrementalCopy || current.Kind != BlobKind.PageBlob ||
+                !string.Equals(current.IncrementalCopySource, sourceIdentity, StringComparison.Ordinal) ||
+                current.IncrementalCopySourceCreatedAt != source.CreatedAt)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "IncrementalCopyBlobMismatch",
+                    "The source blob does not match the source associated with this incremental copy blob.");
+            }
+            if (current.IncrementalCopySourceSnapshot is not null &&
+                string.CompareOrdinal(source.Snapshot, current.IncrementalCopySourceSnapshot) <= 0)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "IncrementalCopyOfEarlierVersionSnapshotNotAllowed",
+                    "The source snapshot must be newer than the last successfully copied snapshot.");
+            }
+            encryption = EncryptionOf(current);
+        }
+        else
+        {
+            encryption = EncryptionOf(options);
+        }
+        if (!chunks.IsInDomain(account, encryption, source.Content))
+            throw UnsupportedEncryptionTransition();
+
+        using var sourcePin = chunks.Pin(source.Content);
+        var now = metadata.GetUtcNow();
+        var copyId = Guid.NewGuid().ToString();
+        var pending = (current ?? NewBlob(
+            account,
+            container,
+            name,
+            BlobKind.PageBlob,
+            chunks.Empty(account, encryption),
+            options,
+            now)) with
+        {
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = now,
+            SequenceNumber = source.SequenceNumber,
+            IsIncrementalCopy = true,
+            IncrementalCopySource = sourceIdentity,
+            IncrementalCopySourceCreatedAt = source.CreatedAt,
+            PendingCopyContent = source.Content,
+            PendingCopyPageRanges = [.. source.PageRanges],
+            Copy = new CopyState
+            {
+                Id = copyId,
+                Source = sourceUri,
+                Status = "pending",
+                BytesCopied = 0,
+                TotalBytes = source.Content.Length,
+                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
+                IsIncremental = true,
+                SourceSnapshot = source.Snapshot
+            }
+        };
+
+        if (current is null)
+            return await metadata.PublishBlobAsync(pending, null, null, cancellationToken);
+        await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken);
+        return pending;
+    }
+
     public async Task<BlobRecord> BeginCopyFromStreamAsync(
         string account,
         string container,
@@ -1152,12 +1245,15 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var now = metadata.GetUtcNow();
         var updated = current with
         {
-            Content = chunks.Empty(current.Account, EncryptionOf(current)),
+            Content = current.Copy.IsIncremental
+                ? current.Content
+                : chunks.Empty(current.Account, EncryptionOf(current)),
             PendingCopyContent = null,
-            CommittedBlocks = [],
-            PageRanges = [],
-            AppendBlockCount = 0,
-            IsSealed = false,
+            PendingCopyPageRanges = null,
+            CommittedBlocks = current.Copy.IsIncremental ? current.CommittedBlocks : [],
+            PageRanges = current.Copy.IsIncremental ? current.PageRanges : [],
+            AppendBlockCount = current.Copy.IsIncremental ? current.AppendBlockCount : 0,
+            IsSealed = current.Copy.IsIncremental && current.IsSealed,
             Copy = current.Copy with
             {
                 Status = "aborted",
@@ -1357,6 +1453,11 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         {
             Content = blob.PendingCopyContent,
             PendingCopyContent = null,
+            PageRanges = blob.PendingCopyPageRanges ?? blob.PageRanges,
+            PendingCopyPageRanges = null,
+            IncrementalCopySourceSnapshot = blob.Copy.IsIncremental
+                ? blob.Copy.SourceSnapshot
+                : blob.IncrementalCopySourceSnapshot,
             Copy = blob.Copy with
             {
                 Status = "success",
@@ -1370,6 +1471,8 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         };
         try
         {
+            if (blob.Copy.IsIncremental)
+                return await metadata.CompleteIncrementalCopyAsync(updated, blob.Revision, now, cancellationToken);
             await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
             return updated;
         }
