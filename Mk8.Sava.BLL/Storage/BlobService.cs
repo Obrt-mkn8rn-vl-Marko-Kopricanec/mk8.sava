@@ -2220,8 +2220,13 @@ public sealed class BlobService(
 
     private static void ValidateBlobName(string name)
     {
-        if (string.IsNullOrEmpty(name) || Encoding.UTF8.GetByteCount(name) > 1024 || name.Any(char.IsControl))
+        if (string.IsNullOrEmpty(name) ||
+            name.Length > 1024 ||
+            name.Count(character => character == '/') + 1 > 254 ||
+            name.Any(char.IsControl))
+        {
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidResourceName", "The specified resource name contains invalid characters.");
+        }
     }
 
     private void EnsurePublicAccessAllowed(string? publicAccess)

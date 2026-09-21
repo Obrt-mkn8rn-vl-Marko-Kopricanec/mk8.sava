@@ -189,6 +189,116 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task EscapedSegmentedAndRootBlobNamesRemainExactAndHonorAzureLimits()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"names-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var expected = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["a/b"] = "ordinary separator",
+            ["a//b"] = "empty segment",
+            ["%41"] = "literal escape",
+            ["A"] = "decoded character",
+            ["reserved ?#% ü.bin"] = "reserved and unicode"
+        };
+
+        foreach (var pair in expected)
+            await container.GetBlobClient(pair.Key).UploadAsync(BinaryData.FromString(pair.Value));
+
+        foreach (var pair in expected)
+        {
+            var content = await container.GetBlobClient(pair.Key).DownloadContentAsync();
+            Assert.Equal(pair.Value, content.Value.Content.ToString());
+        }
+
+        async Task PutAndReadDirectAsync(string blobName, string escapedBlobPath, string value)
+        {
+            var sas = new BlobSasBuilder
+            {
+                BlobContainerName = container.Name,
+                BlobName = blobName,
+                Resource = "b",
+                ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
+            };
+            sas.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read);
+            var uri = new Uri(
+                $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{container.Name}/{escapedBlobPath}?" +
+                sas.ToSasQueryParameters(new StorageSharedKeyCredential(
+                    SavaWebApplicationFactory.AccountName,
+                    SavaWebApplicationFactory.AccountKey)));
+
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+            using var put = new HttpRequestMessage(HttpMethod.Put, uri)
+            {
+                Content = new ByteArrayContent(Encoding.UTF8.GetBytes(value))
+            };
+            put.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            put.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var putResponse = await transport.SendAsync(put);
+            Assert.Equal(HttpStatusCode.Created, putResponse.StatusCode);
+
+            using var getResponse = await transport.GetAsync(uri);
+            Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+            Assert.Equal(value, await getResponse.Content.ReadAsStringAsync());
+        }
+
+        await PutAndReadDirectAsync("/a", "/a", "leading separator");
+        await PutAndReadDirectAsync("tail/", "tail/", "trailing separator");
+        expected.Add("/a", "leading separator");
+        expected.Add("tail/", "trailing separator");
+
+        var listed = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var item in container.GetBlobsAsync())
+            listed.Add(item.Name);
+        Assert.Equal(expected.Keys.Order(StringComparer.Ordinal), listed.Order(StringComparer.Ordinal));
+
+        var root = service.GetBlobContainerClient("$root");
+        await root.CreateIfNotExistsAsync();
+        var rootName = $"implicit-root-{Guid.NewGuid():N}.bin";
+        var rootUri = new Uri(service.Uri, Uri.EscapeDataString(rootName));
+        using (var transport = new HttpClient(factory.Server.CreateHandler()) { BaseAddress = service.Uri })
+        {
+            var implicitRoot = new BlobClient(
+                rootUri,
+                new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+                new BlobClientOptions
+                {
+                    Transport = new HttpClientTransport(transport),
+                    Retry = { MaxRetries = 0 }
+                });
+            await implicitRoot.UploadAsync(BinaryData.FromString("root payload"));
+        }
+        Assert.Equal(
+            "root payload",
+            (await root.GetBlobClient(rootName).DownloadContentAsync()).Value.Content.ToString());
+
+        var maximumUnicodeName = new string('é', 1024);
+        await container.GetBlobClient(maximumUnicodeName).UploadAsync(BinaryData.FromString("maximum name"));
+        Assert.Equal(
+            "maximum name",
+            (await container.GetBlobClient(maximumUnicodeName).DownloadContentAsync()).Value.Content.ToString());
+
+        var oversizedName = new string('é', 1025);
+        var oversized = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient(oversizedName).UploadAsync(BinaryData.FromString("must not publish")));
+        Assert.Equal(400, oversized.Status);
+        Assert.Equal("InvalidResourceName", oversized.ErrorCode);
+
+        var maximumSegments = string.Join('/', Enumerable.Repeat("s", 254));
+        await container.GetBlobClient(maximumSegments).UploadAsync(BinaryData.FromString("maximum segments"));
+        Assert.Equal(
+            "maximum segments",
+            (await container.GetBlobClient(maximumSegments).DownloadContentAsync()).Value.Content.ToString());
+
+        var tooManySegments = string.Join('/', Enumerable.Repeat("s", 255));
+        var tooMany = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient(tooManySegments).UploadAsync(BinaryData.FromString("must not publish")));
+        Assert.Equal(400, tooMany.Status);
+        Assert.Equal("InvalidResourceName", tooMany.ErrorCode);
+    }
+
+    [Fact]
     public async Task IndexedTagQueriesAreBoundedScopedAndTransactionallyVerified()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
@@ -2311,7 +2421,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"pages-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        var page = container.GetPageBlobClient("disk.vhd");
+        var page = container.GetPageBlobClient("nested//disk.vhd");
         var chunksBeforeCreate = EnumerateChunkFiles(factory.DataPath).Count();
         const long initialLength = 1L * 1024 * 1024 * 1024 * 1024;
         const long allocationOffset = 4L * 1024 * 1024 * 1024;
@@ -2355,7 +2465,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"page-diff-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        var page = container.GetPageBlobClient("disk.vhd");
+        var page = container.GetPageBlobClient("nested//disk.vhd");
         await page.CreateAsync(2048, new PageBlobCreateOptions { SequenceNumber = 7 });
 
         var first = Enumerable.Repeat((byte)0x11, 512).ToArray();
@@ -2790,7 +2900,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(0, abortedProperties.ContentLength);
         Assert.Equal("abort", abortedProperties.Metadata["copy"]);
 
-        var source = container.GetBlobClient("source.bin");
+        var source = container.GetBlobClient("nested//source%.bin");
         await source.UploadAsync(BinaryData.FromBytes(remoteBytes), new BlobUploadOptions
         {
             Metadata = new Dictionary<string, string> { ["origin"] = "internal" },
@@ -2897,7 +3007,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"batch-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        var deleteTarget = container.GetBlobClient("delete.bin");
+        var deleteTarget = container.GetBlobClient("nested//delete.bin");
         await deleteTarget.UploadAsync(BinaryData.FromString("delete me"));
 
         var serviceBatchClient = service.GetBlobBatchClient();
@@ -2913,7 +3023,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
         Assert.False(await deleteTarget.ExistsAsync());
 
-        var tierTarget = container.GetBlobClient("tier.bin");
+        var tierTarget = container.GetBlobClient("nested//tier.bin");
         await tierTarget.UploadAsync(BinaryData.FromString("tier me"));
         var containerBatchClient = container.GetBlobBatchClient();
         using (var tierBatch = containerBatchClient.CreateBatch())

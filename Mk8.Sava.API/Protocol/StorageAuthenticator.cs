@@ -196,11 +196,15 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             throw AzureStorageException.AuthenticationFailed();
 
         ValidateRequestTime(httpRequest);
-        var stringToSign = lite
-            ? BuildSharedKeyLiteString(httpRequest, request)
-            : BuildSharedKeyString(httpRequest, request);
-        var expected = Sign(encodedKey, stringToSign);
-        if (!FixedTimeEquals(expected, suppliedSignature))
+        var authenticated = false;
+        foreach (var escapedPath in StorageResourcePath.GetSignaturePathCandidates(httpRequest))
+        {
+            var stringToSign = lite
+                ? BuildSharedKeyLiteString(httpRequest, request, escapedPath)
+                : BuildSharedKeyString(httpRequest, request, escapedPath);
+            authenticated |= FixedTimeEquals(Sign(encodedKey, stringToSign), suppliedSignature);
+        }
+        if (!authenticated)
             throw AzureStorageException.AuthenticationFailed("Server failed to authenticate the request. Make sure the value of the Authorization header is formed correctly including the signature.");
         return StorageAuthorization.Owner;
     }
@@ -445,7 +449,10 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null);
     }
 
-    private static string BuildSharedKeyString(HttpRequest request, StorageRequestContext context)
+    private static string BuildSharedKeyString(
+        HttpRequest request,
+        StorageRequestContext context,
+        string escapedPath)
     {
         var contentLength = request.ContentLength is > 0 ? request.ContentLength.Value.ToString(CultureInfo.InvariantCulture) : string.Empty;
         return string.Join('\n',
@@ -461,11 +468,15 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             Header(request, "If-None-Match"),
             Header(request, "If-Unmodified-Since"),
             Header(request, "Range"),
-            BuildCanonicalizedHeaders(request) + BuildCanonicalizedResource(request, context));
+            BuildCanonicalizedHeaders(request) + BuildCanonicalizedResource(request, context, escapedPath));
     }
 
-    private static string BuildSharedKeyLiteString(HttpRequest request, StorageRequestContext context) =>
-        Header(request, "Date") + "\n" + BuildCanonicalizedHeaders(request) + BuildCanonicalizedResource(request, context);
+    private static string BuildSharedKeyLiteString(
+        HttpRequest request,
+        StorageRequestContext context,
+        string escapedPath) =>
+        Header(request, "Date") + "\n" + BuildCanonicalizedHeaders(request) +
+        BuildCanonicalizedResource(request, context, escapedPath);
 
     private static string BuildCanonicalizedHeaders(HttpRequest request)
     {
@@ -481,12 +492,15 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         return builder.ToString();
     }
 
-    private static string BuildCanonicalizedResource(HttpRequest request, StorageRequestContext context)
+    private static string BuildCanonicalizedResource(
+        HttpRequest request,
+        StorageRequestContext context,
+        string escapedPath)
     {
         var builder = new StringBuilder()
             .Append('/')
             .Append(context.Account)
-            .Append(request.Path.Value ?? "/");
+            .Append(escapedPath);
         foreach (var parameter in request.Query
                      .OrderBy(parameter => parameter.Key, StringComparer.OrdinalIgnoreCase))
         {
