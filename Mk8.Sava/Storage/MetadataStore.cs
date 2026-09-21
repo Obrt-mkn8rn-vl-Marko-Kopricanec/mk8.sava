@@ -298,6 +298,15 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
     }
 
+    public async Task<IReadOnlyList<BlobRecord>> ListPendingCopiesAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT data FROM blobs WHERE is_deleted = 0;";
+        var blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+        return blobs.Where(blob => blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null).ToArray();
+    }
+
     public async Task<BlobRecord> PublishBlobAsync(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
@@ -356,6 +365,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken);
             if (current is not null)
             {
+                if (current.Copy?.Status == "pending")
+                    throw new StoragePendingCopyException();
                 var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > _timeProvider.GetUtcNow();
                 var createsProtectedHistoricalVersion = serviceProperties.VersioningEnabled &&
                                                         current.Kind == BlobKind.BlockBlob &&
@@ -625,6 +636,11 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 var blob = Deserialize<BlobRecord>(reader.GetString(0));
                 foreach (var chunk in blob.Content.Chunks)
                     reachable.Add(chunk.Id);
+                if (blob.PendingCopyContent is not null)
+                {
+                    foreach (var chunk in blob.PendingCopyContent.Chunks)
+                        reachable.Add(chunk.Id);
+                }
             }
         }
 
@@ -840,4 +856,9 @@ public sealed class StorageImmutabilityException(bool legalHold) : Exception(
         : "The blob is protected by a time-based retention policy.")
 {
     public bool LegalHold { get; } = legalHold;
+}
+
+public sealed class StoragePendingCopyException : Exception
+{
+    public StoragePendingCopyException() : base("There is currently a pending copy operation.") { }
 }

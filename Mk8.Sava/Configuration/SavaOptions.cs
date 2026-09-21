@@ -27,6 +27,8 @@ public sealed class SavaOptions : IValidatableObject
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
+    public TimeSpan AsyncCopyCompletionDelay { get; init; } = TimeSpan.FromSeconds(1);
+    public TimeSpan MaintenanceScanInterval { get; init; } = TimeSpan.FromSeconds(1);
     public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
@@ -74,8 +76,17 @@ public sealed class SavaOptions : IValidatableObject
         if (MaximumRequestBodyBytes <= 0)
             yield return new ValidationResult("MaximumRequestBodyBytes must be positive.", [nameof(MaximumRequestBodyBytes)]);
 
-        if (StandardRehydrationDelay < TimeSpan.Zero || HighPriorityRehydrationDelay < TimeSpan.Zero)
-            yield return new ValidationResult("Rehydration delays cannot be negative.", [nameof(StandardRehydrationDelay), nameof(HighPriorityRehydrationDelay)]);
+        if (StandardRehydrationDelay < TimeSpan.Zero ||
+            HighPriorityRehydrationDelay < TimeSpan.Zero ||
+            AsyncCopyCompletionDelay < TimeSpan.Zero)
+        {
+            yield return new ValidationResult(
+                "Rehydration and copy-completion delays cannot be negative.",
+                [nameof(StandardRehydrationDelay), nameof(HighPriorityRehydrationDelay), nameof(AsyncCopyCompletionDelay)]);
+        }
+
+        if (MaintenanceScanInterval <= TimeSpan.Zero)
+            yield return new ValidationResult("MaintenanceScanInterval must be positive.", [nameof(MaintenanceScanInterval)]);
 
         if (BearerAuthentication.Enabled)
         {

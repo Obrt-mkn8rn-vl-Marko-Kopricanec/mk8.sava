@@ -104,6 +104,7 @@ public sealed record BlobRecord
     public bool ImmutabilityLocked { get; init; }
     public bool HasLegalHold { get; init; }
     public CopyState? Copy { get; init; }
+    public ContentManifest? PendingCopyContent { get; init; }
     public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
     public List<PageRange> PageRanges { get; init; } = [];
@@ -139,6 +140,7 @@ public sealed record CopyState
     public required long BytesCopied { get; init; }
     public required long TotalBytes { get; init; }
     public DateTimeOffset? CompletedAt { get; init; }
+    public DateTimeOffset? ReadyAt { get; init; }
     public string? Description { get; init; }
 }
 

@@ -509,6 +509,23 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        if (HttpMethods.IsPut(http.Request.Method) && comp == "copy")
+        {
+            Require(request, 'w');
+            EnsureMutableVersion(blob);
+            EvaluateWriteConditions(http.Request, blob);
+            EnsureLease(http.Request, blob.Lease, "blob");
+            var action = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-action");
+            if (!string.Equals(action, "abort", StringComparison.OrdinalIgnoreCase))
+                throw AzureStorageException.InvalidHeader("x-ms-copy-action", action);
+            var copyId = http.Request.Query["copyid"].ToString();
+            if (string.IsNullOrEmpty(copyId))
+                throw AzureStorageException.InvalidQuery("copyid");
+            await service.AbortCopyAsync(blob, copyId, cancellationToken);
+            http.Response.StatusCode = StatusCodes.Status204NoContent;
+            return;
+        }
+
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
@@ -704,17 +721,43 @@ public static class BlobProtocolEndpoint
                 return;
             }
 
-            var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
-            var copied = await service.CopyFromAsync(
-                request.Account,
-                containerName,
-                blobName,
-                source,
-                ReadWriteOptions(http.Request, source),
-                copySource,
-                current?.GenerationId,
-                current?.Revision,
-                cancellationToken);
+            var publicSource = SanitizeCopySource(copySource);
+            BlobRecord copied;
+            if (Uri.TryCreate(copySource, UriKind.Absolute, out var copyUri) &&
+                string.Equals(copyUri.Host, http.Request.Host.Host, StringComparison.OrdinalIgnoreCase))
+            {
+                var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
+                EvaluateCopySourceConditions(http.Request, source);
+                copied = await service.BeginCopyFromBlobAsync(
+                    request.Account,
+                    containerName,
+                    blobName,
+                    source,
+                    ReadCopyWriteOptions(http.Request, source),
+                    publicSource,
+                    current?.GenerationId,
+                    current?.Revision,
+                    cancellationToken);
+            }
+            else
+            {
+                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+                copied = await transfers.ReadAsync(
+                    http.Request,
+                    copySource,
+                    sourceRange: null,
+                    async source => await service.BeginCopyFromStreamAsync(
+                        request.Account,
+                        containerName,
+                        blobName,
+                        source.Content,
+                        ReadUrlWriteOptions(http.Request, source),
+                        publicSource,
+                        current?.GenerationId,
+                        current?.Revision,
+                        cancellationToken),
+                    cancellationToken);
+            }
             AzureResponseWriter.AddBlobHeaders(http.Response, copied);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
@@ -1236,6 +1279,23 @@ public static class BlobProtocolEndpoint
             legalHold);
     }
 
+    private static BlobWriteOptions ReadCopyWriteOptions(HttpRequest request, BlobRecord source)
+    {
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var hasReplacementMetadata = request.Headers.Keys.Any(name =>
+            name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
+        return new BlobWriteOptions(
+            ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
+            hasReplacementMetadata
+                ? ProtocolParsing.ReadMetadata(request.Headers)
+                : new Dictionary<string, string>(source.Metadata, StringComparer.OrdinalIgnoreCase),
+            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? source.AccessTier,
+            until,
+            locked,
+            legalHold);
+    }
+
     private static (DateTimeOffset? Until, bool Locked, bool LegalHold) ReadImmutabilityHeaders(IHeaderDictionary headers)
     {
         var untilValue = ProtocolParsing.First(headers, "x-ms-immutability-policy-until-date");
@@ -1274,6 +1334,57 @@ public static class BlobProtocolEndpoint
             response.Headers["x-ms-immutability-policy-mode"] = blob.ImmutabilityLocked ? "locked" : "unlocked";
         }
         response.Headers["x-ms-legal-hold"] = blob.HasLegalHold ? "true" : "false";
+    }
+
+    private static void EvaluateCopySourceConditions(HttpRequest request, BlobRecord source)
+    {
+        var ifMatch = ProtocolParsing.First(request.Headers, "x-ms-source-if-match");
+        if (!string.IsNullOrEmpty(ifMatch) && !MatchesETag(ifMatch, source.ETag, requireMatch: true))
+            throw SourceConditionNotMet();
+        var ifNoneMatch = ProtocolParsing.First(request.Headers, "x-ms-source-if-none-match");
+        if (!string.IsNullOrEmpty(ifNoneMatch) && MatchesETag(ifNoneMatch, source.ETag, requireMatch: true))
+            throw SourceConditionNotMet();
+        var ifModified = ParseHttpDate(request.Headers, "x-ms-source-if-modified-since");
+        if (ifModified.HasValue && source.LastModified <= ifModified.Value.AddSeconds(1))
+            throw SourceConditionNotMet();
+        var ifUnmodified = ParseHttpDate(request.Headers, "x-ms-source-if-unmodified-since");
+        if (ifUnmodified.HasValue && source.LastModified > ifUnmodified.Value.AddSeconds(1))
+            throw SourceConditionNotMet();
+        var tagCondition = ProtocolParsing.First(request.Headers, "x-ms-source-if-tags");
+        if (tagCondition is not null && !MatchesTagCondition(tagCondition, source.Tags))
+            throw SourceConditionNotMet();
+    }
+
+    private static bool MatchesTagCondition(string expression, IReadOnlyDictionary<string, string> tags)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            expression,
+            "^\\s*\"(?<key>[^\"]+)\"\\s*=\\s*'(?<value>[^']*)'\\s*$",
+            System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+        if (!match.Success)
+            throw AzureStorageException.InvalidHeader("x-ms-source-if-tags", expression);
+        return tags.TryGetValue(match.Groups["key"].Value, out var value) &&
+               string.Equals(value, match.Groups["value"].Value, StringComparison.Ordinal);
+    }
+
+    private static AzureStorageException SourceConditionNotMet() => new(
+        StatusCodes.Status412PreconditionFailed,
+        "SourceConditionNotMet",
+        "The source condition specified using HTTP conditional header(s) is not met.");
+
+    private static string SanitizeCopySource(string sourceValue)
+    {
+        if (sourceValue.Length > 2048 || !Uri.TryCreate(sourceValue, UriKind.Absolute, out var source))
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(source.Query);
+        var values = query
+            .Where(pair => !string.Equals(pair.Key, "sig", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(pair => pair.Value.Select(value => new KeyValuePair<string, string?>(pair.Key, value)));
+        var builder = new UriBuilder(source)
+        {
+            Query = QueryString.Create(values).Value?.TrimStart('?') ?? string.Empty
+        };
+        return builder.Uri.AbsoluteUri;
     }
 
     private static async Task WithIntegrityValidationAsync(HttpRequest request, Func<Stream, Task> action)

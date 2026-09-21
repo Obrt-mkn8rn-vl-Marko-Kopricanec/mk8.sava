@@ -191,7 +191,10 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
         var effective = new List<BlobRecord>(blobs.Count);
         foreach (var blob in blobs)
-            effective.Add(await CompleteRehydrationIfDueAsync(blob, cancellationToken));
+        {
+            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
+            effective.Add(await CompleteRehydrationIfDueAsync(copy, cancellationToken));
+        }
         return effective;
     }
 
@@ -208,6 +211,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
                    ?? throw AzureStorageException.BlobNotFound();
+        blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
         return await CompleteRehydrationIfDueAsync(blob, cancellationToken);
     }
 
@@ -369,6 +373,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         long? expectedMaximumSize,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
@@ -399,7 +404,8 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow(),
             Lease = current.Lease,
-            AppendBlockCount = checked(current.AppendBlockCount + 1)
+            AppendBlockCount = checked(current.AppendBlockCount + 1),
+            Copy = null
         };
         return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
     }
@@ -412,6 +418,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         bool clear,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         if (current.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
@@ -445,6 +452,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Stream destination,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(blob);
         if (string.Equals(blob.AccessTier, "Archive", StringComparison.Ordinal))
         {
             throw new AzureStorageException(
@@ -460,13 +468,15 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Dictionary<string, string> userMetadata,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         var updated = current with
         {
             Metadata = userMetadata,
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow()
+            LastModified = metadata.GetUtcNow(),
+            Copy = null
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
@@ -477,10 +487,11 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Dictionary<string, string> tags,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         if (tags.Count > 10)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
-        var updated = current with { Tags = tags, Revision = MetadataStore.NewRevision() };
+        var updated = current with { Tags = tags, Copy = null, Revision = MetadataStore.NewRevision() };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
     }
@@ -493,6 +504,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? sequenceAction,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         var nextSequence = current.SequenceNumber;
         if (sequenceNumber.HasValue || sequenceAction is not null)
@@ -534,6 +546,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                     .Select(range => new PageRange(range.Start, Math.Min(range.End, resizeTo.Value - 1)))
                     .ToList()
                 : current.PageRanges,
+            Copy = null,
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
@@ -550,6 +563,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task<BlobRecord> SealAppendBlobAsync(BlobRecord current, CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
@@ -558,7 +572,8 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             IsSealed = true,
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow()
+            LastModified = metadata.GetUtcNow(),
+            Copy = null
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
@@ -570,6 +585,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? rehydratePriority,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         if (current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
@@ -608,6 +624,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 ArchiveStatus = requestedStatus,
                 RehydratePriority = priority,
                 RehydrateCompleteAt = completion,
+                Copy = null,
                 Revision = MetadataStore.NewRevision()
             };
             pending = true;
@@ -627,6 +644,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
+                Copy = null,
                 Revision = MetadataStore.NewRevision(),
                 AccessTierChangedAt = now
             };
@@ -637,8 +655,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
-        var updated = current with { ExpiresAt = expiresAt, Revision = MetadataStore.NewRevision() };
+        var updated = current with { ExpiresAt = expiresAt, Copy = null, Revision = MetadataStore.NewRevision() };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
     }
@@ -649,6 +668,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         bool locked,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         if (expiresOn <= metadata.GetUtcNow())
             throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", expiresOn.ToString("R", CultureInfo.InvariantCulture));
         if (current.ImmutabilityLocked)
@@ -661,6 +681,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         {
             ImmutabilityUntil = expiresOn,
             ImmutabilityLocked = locked,
+            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
@@ -671,12 +692,14 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         BlobRecord current,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         if (current.ImmutabilityLocked)
             throw BlobImmutableDueToPolicy();
         var updated = current with
         {
             ImmutabilityUntil = null,
             ImmutabilityLocked = false,
+            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
@@ -688,9 +711,11 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         bool hasLegalHold,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         var updated = current with
         {
             HasLegalHold = hasLegalHold,
+            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
@@ -702,6 +727,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         LeaseRecord lease,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         var updated = current with
         {
             Lease = lease,
@@ -711,14 +737,18 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         return updated;
     }
 
-    public Task<BlobRecord> CreateSnapshotAsync(BlobRecord current, CancellationToken cancellationToken) =>
-        metadata.CreateSnapshotAsync(current, metadata.GetUtcNow(), cancellationToken);
+    public Task<BlobRecord> CreateSnapshotAsync(BlobRecord current, CancellationToken cancellationToken)
+    {
+        EnsureNoPendingCopy(current);
+        return metadata.CreateSnapshotAsync(current, metadata.GetUtcNow(), cancellationToken);
+    }
 
     public async Task DeleteBlobAsync(
         BlobRecord current,
         string? deleteSnapshots,
         CancellationToken cancellationToken)
     {
+        EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         var records = await metadata.ListBlobsAsync(
             current.Account,
@@ -795,7 +825,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw AzureStorageException.BlobNotFound();
     }
 
-    public async Task<BlobRecord> CopyFromAsync(
+    public async Task<BlobRecord> BeginCopyFromBlobAsync(
         string account,
         string container,
         string name,
@@ -806,29 +836,156 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         if (!chunks.IsInDomain(account, source.Content))
             throw new InvalidOperationException("Cross-account copies must pass through a verified plaintext transfer.");
         using var sourcePin = chunks.Pin(source.Content);
+        return await BeginCopyAsync(
+            account,
+            container,
+            name,
+            source.Kind,
+            source.Content,
+            source.SequenceNumber,
+            source.IsSealed,
+            source.AppendBlockCount,
+            source.CommittedBlocks,
+            source.PageRanges,
+            options,
+            sourceUri,
+            expectedGeneration,
+            expectedRevision,
+            cancellationToken);
+    }
+
+    public async Task<BlobRecord> BeginCopyFromStreamAsync(
+        string account,
+        string container,
+        string name,
+        Stream source,
+        BlobWriteOptions options,
+        string sourceUri,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
+        return await BeginCopyAsync(
+            account,
+            container,
+            name,
+            BlobKind.BlockBlob,
+            content.Manifest,
+            sequenceNumber: 0,
+            isSealed: false,
+            appendBlockCount: 0,
+            committedBlocks: [],
+            pageRanges: [],
+            options,
+            sourceUri,
+            expectedGeneration,
+            expectedRevision,
+            cancellationToken);
+    }
+
+    private async Task<BlobRecord> BeginCopyAsync(
+        string account,
+        string container,
+        string name,
+        BlobKind sourceKind,
+        ContentManifest sourceContent,
+        long sequenceNumber,
+        bool isSealed,
+        int appendBlockCount,
+        IReadOnlyList<CommittedBlockRecord> committedBlocks,
+        IReadOnlyList<PageRange> pageRanges,
+        BlobWriteOptions options,
+        string sourceUri,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        if (!chunks.IsInDomain(account, sourceContent))
+            throw new InvalidOperationException("Copy source content must be staged in the destination encryption domain.");
+        using var sourcePin = chunks.Pin(sourceContent);
         var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, source.Kind, source.Content, options, now) with
+        var copyId = Guid.NewGuid().ToString();
+        var proposed = NewBlob(account, container, name, sourceKind, chunks.Empty(account), options, now) with
         {
-            SequenceNumber = source.SequenceNumber,
-            IsSealed = source.IsSealed,
-            AppendBlockCount = source.AppendBlockCount,
-            CommittedBlocks = source.CommittedBlocks,
-            PageRanges = [.. source.PageRanges],
+            SequenceNumber = sequenceNumber,
+            IsSealed = isSealed,
+            AppendBlockCount = appendBlockCount,
+            CommittedBlocks = [.. committedBlocks],
+            PageRanges = [.. pageRanges],
+            PendingCopyContent = sourceContent,
             Copy = new CopyState
             {
-                Id = Guid.NewGuid().ToString(),
+                Id = copyId,
                 Source = sourceUri,
-                Status = "success",
-                BytesCopied = source.Content.Length,
-                TotalBytes = source.Content.Length,
-                CompletedAt = now
+                Status = "pending",
+                BytesCopied = 0,
+                TotalBytes = sourceContent.Length,
+                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay)
             }
         };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+    }
+
+    public async Task<BlobRecord> AbortCopyAsync(
+        BlobRecord current,
+        string copyId,
+        CancellationToken cancellationToken)
+    {
+        if (current.Copy is null || current.Copy.Status != "pending" || current.PendingCopyContent is null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "NoPendingCopyOperation",
+                "There is currently no pending copy operation.");
+        }
+        if (!string.Equals(current.Copy.Id, copyId, StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "CopyIdMismatch",
+                "The specified copy ID did not match the pending copy operation.");
+        }
+
+        var now = metadata.GetUtcNow();
+        var updated = current with
+        {
+            Content = chunks.Empty(current.Account),
+            PendingCopyContent = null,
+            CommittedBlocks = [],
+            PageRanges = [],
+            AppendBlockCount = 0,
+            IsSealed = false,
+            Copy = current.Copy with
+            {
+                Status = "aborted",
+                BytesCopied = 0,
+                CompletedAt = now,
+                ReadyAt = null
+            },
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = now
+        };
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        return updated;
+    }
+
+    public async Task<int> CompletePendingCopiesAsync(CancellationToken cancellationToken)
+    {
+        var completed = 0;
+        foreach (var blob in await metadata.ListPendingCopiesAsync(cancellationToken))
+        {
+            var updated = await CompleteCopyIfDueAsync(blob, cancellationToken);
+            if (updated.Copy?.Status == "success")
+                completed++;
+        }
+        return completed;
     }
 
     public Task<IReadOnlyList<StagedBlockRecord>> ListStagedBlocksAsync(
@@ -854,6 +1011,54 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 deleted++;
         }
         return deleted;
+    }
+
+    private async Task<BlobRecord> CompleteCopyIfDueAsync(
+        BlobRecord blob,
+        CancellationToken cancellationToken)
+    {
+        if (blob.Copy?.Status != "pending" ||
+            blob.PendingCopyContent is null ||
+            !blob.Copy.ReadyAt.HasValue ||
+            blob.Copy.ReadyAt.Value > metadata.GetUtcNow())
+        {
+            return blob;
+        }
+
+        using var contentPin = chunks.Pin(blob.PendingCopyContent);
+        var now = metadata.GetUtcNow();
+        var updated = blob with
+        {
+            Content = blob.PendingCopyContent,
+            PendingCopyContent = null,
+            Copy = blob.Copy with
+            {
+                Status = "success",
+                BytesCopied = blob.Copy.TotalBytes,
+                CompletedAt = now,
+                ReadyAt = null
+            },
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = now
+        };
+        try
+        {
+            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+            return updated;
+        }
+        catch (StorageConcurrencyException)
+        {
+            return await metadata.GetBlobAsync(
+                       blob.Account,
+                       blob.Container,
+                       blob.Name,
+                       blob.VersionId,
+                       blob.Snapshot,
+                       includeDeleted: false,
+                       cancellationToken)
+                   ?? throw AzureStorageException.BlobNotFound();
+        }
     }
 
     private async Task<BlobRecord> CompleteRehydrationIfDueAsync(
@@ -1039,6 +1244,17 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobImmutableDueToLegalHold", "This operation is not permitted because the blob has a legal hold.");
         if (blob.ImmutabilityUntil > metadata.GetUtcNow())
             throw BlobImmutableDueToPolicy();
+    }
+
+    private static void EnsureNoPendingCopy(BlobRecord blob)
+    {
+        if (blob.Copy?.Status == "pending")
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "PendingCopyOperation",
+                "There is currently a pending copy operation.");
+        }
     }
 
     private static AzureStorageException BlobImmutableDueToPolicy() => new(

@@ -175,6 +175,15 @@ public sealed class AzureResponseWriter
                 }
                 if (includes.Contains("legalhold"))
                     writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
+                if (includes.Contains("copy") && blob.Copy is not null)
+                {
+                    writer.WriteElementString("CopyId", blob.Copy.Id);
+                    writer.WriteElementString("CopySource", blob.Copy.Source);
+                    writer.WriteElementString("CopyStatus", blob.Copy.Status);
+                    writer.WriteElementString("CopyProgress", $"{blob.Copy.BytesCopied}/{blob.Copy.TotalBytes}");
+                    WriteOptional(writer, "CopyCompletionTime", blob.Copy.CompletedAt?.ToString("R", CultureInfo.InvariantCulture));
+                    WriteOptional(writer, "CopyStatusDescription", blob.Copy.Description);
+                }
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
                     WriteMetadata(writer, blob.Metadata);
@@ -380,6 +389,7 @@ public sealed class AzureResponseWriter
             response.Headers["x-ms-copy-progress"] = $"{blob.Copy.BytesCopied}/{blob.Copy.TotalBytes}";
             if (blob.Copy.CompletedAt.HasValue)
                 response.Headers["x-ms-copy-completion-time"] = blob.Copy.CompletedAt.Value.ToString("R", CultureInfo.InvariantCulture);
+            SetOptional(response.Headers, "x-ms-copy-status-description", blob.Copy.Description);
         }
     }
 

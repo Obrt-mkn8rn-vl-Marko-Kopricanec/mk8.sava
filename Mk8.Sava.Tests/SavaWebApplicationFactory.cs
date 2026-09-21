@@ -40,7 +40,9 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:CompressionQuality"] = "5",
                 ["Sava:CompressionMinimumSavingsBytes"] = "32",
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
-                ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200"
+                ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
+                ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
+                ["Sava:MaintenanceScanInterval"] = "00:00:00.050"
             });
         });
     }

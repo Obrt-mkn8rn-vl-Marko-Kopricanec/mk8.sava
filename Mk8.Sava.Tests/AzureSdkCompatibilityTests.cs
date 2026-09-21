@@ -521,6 +521,57 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task AsynchronousCopiesCompleteDurablyAndCanBeAborted()
+    {
+        var remoteBytes = Enumerable.Range(0, 48 * 1024).Select(index => (byte)(index % 241)).ToArray();
+        await using var remote = await LoopbackSource.StartAsync(remoteBytes);
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"copy-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        var abortDestination = container.GetBlobClient("abort.bin");
+        var credentialedSource = new UriBuilder(remote.Uri) { Query = "source=remote&sig=must-not-leak" }.Uri;
+        var abortOperation = await abortDestination.StartCopyFromUriAsync(
+            credentialedSource,
+            new BlobCopyFromUriOptions
+            {
+                Metadata = new Dictionary<string, string> { ["copy"] = "abort" }
+            });
+        Assert.Equal(202, abortOperation.GetRawResponse().Status);
+        Assert.False(abortOperation.HasCompleted);
+        var pending = (await abortDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(CopyStatus.Pending, pending.CopyStatus);
+        Assert.Equal(0, pending.ContentLength);
+        Assert.DoesNotContain("sig=", pending.CopySource.AbsoluteUri, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("abort", pending.Metadata["copy"]);
+
+        var aborted = await abortDestination.AbortCopyFromUriAsync(abortOperation.Id);
+        Assert.Equal(204, aborted.Status);
+        var abortedProperties = (await abortDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(CopyStatus.Aborted, abortedProperties.CopyStatus);
+        Assert.Equal(0, abortedProperties.ContentLength);
+        Assert.Equal("abort", abortedProperties.Metadata["copy"]);
+
+        var source = container.GetBlobClient("source.bin");
+        await source.UploadAsync(BinaryData.FromBytes(remoteBytes), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string> { ["origin"] = "internal" },
+            Tags = new Dictionary<string, string> { ["class"] = "copy" }
+        });
+        var completedDestination = container.GetBlobClient("completed.bin");
+        var completion = await completedDestination.StartCopyFromUriAsync(source.Uri);
+        Assert.Equal(CopyStatus.Pending, (await completedDestination.GetPropertiesAsync()).Value.CopyStatus);
+        await completion.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+
+        var completed = (await completedDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(CopyStatus.Success, completed.CopyStatus);
+        Assert.Equal($"{remoteBytes.LongLength}/{remoteBytes.LongLength}", completed.CopyProgress);
+        Assert.Equal("internal", completed.Metadata["origin"]);
+        Assert.Empty((await completedDestination.GetTagsAsync()).Value.Tags);
+        Assert.Equal(remoteBytes, (await completedDestination.DownloadContentAsync()).Value.Content.ToArray());
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);

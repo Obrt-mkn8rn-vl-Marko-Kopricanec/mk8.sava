@@ -36,6 +36,13 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
                 exception.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
                 exception.Message));
         }
+        catch (StoragePendingCopyException exception)
+        {
+            await WriteErrorAsync(context, new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "PendingCopyOperation",
+                exception.Message));
+        }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             context.Abort();
