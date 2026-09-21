@@ -394,6 +394,7 @@ public static class BlobProtocolEndpoint
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             EvaluateContainerConditions(http.Request, container);
+            ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
         }
@@ -478,6 +479,7 @@ public static class BlobProtocolEndpoint
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             EvaluateContainerConditions(http.Request, container);
+            ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
         }
@@ -486,7 +488,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EvaluateContainerConditions(http.Request, container);
-            EnsureLease(http.Request, container.Lease, "container");
+            ValidateOptionalLease(http.Request, container.Lease, "container");
             var updated = await service.SetContainerMetadataAsync(container, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
             AzureResponseWriter.AddContainerHeaders(http.Response, updated);
             return;
@@ -495,6 +497,8 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsGet(http.Request.Method) && comp == "acl")
         {
             Require(request, 'r');
+            EvaluateContainerConditions(http.Request, container);
+            ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             await writer.WriteAclAsync(http, container, cancellationToken);
             return;
@@ -504,7 +508,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EvaluateContainerConditions(http.Request, container);
-            EnsureLease(http.Request, container.Lease, "container");
+            ValidateOptionalLease(http.Request, container.Lease, "container");
             var policies = http.Request.ContentLength is null or 0
                 ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
                 : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken);
@@ -520,6 +524,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
         {
             Require(request, 'w');
+            EvaluateContainerConditions(http.Request, container);
             await HandleContainerLeaseAsync(http, service, container, cancellationToken);
             return;
         }
@@ -1112,6 +1117,10 @@ public static class BlobProtocolEndpoint
                 EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
             else
                 EvaluateReadConditions(http.Request, current);
+            ValidateOptionalLease(
+                http.Request,
+                current?.Lease ?? LeaseRecord.Available,
+                "blob");
             var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken);
             if (current is null && staged.Count == 0)
                 throw AzureStorageException.BlobNotFound();
@@ -1242,6 +1251,7 @@ public static class BlobProtocolEndpoint
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
             var encryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
             EvaluateReadConditions(http.Request, blob);
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             await WriteBlobAsync(http, service, blob, encryption, cancellationToken);
             return;
         }
@@ -1251,6 +1261,7 @@ public static class BlobProtocolEndpoint
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
             EnsureCustomerProvidedKey(http.Request, blob, write: false);
             EvaluateReadConditions(http.Request, blob);
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             AzureResponseWriter.AddBlobHeaders(http.Response, blob);
             return;
         }
@@ -1403,8 +1414,7 @@ public static class BlobProtocolEndpoint
             if (blob.Kind != BlobKind.PageBlob)
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
             EvaluateReadConditions(http.Request, blob);
-            if (ProtocolParsing.First(http.Request.Headers, "x-ms-lease-id") is not null)
-                EnsureLease(http.Request, blob.Lease, "blob");
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
             var encryption = new BlobEncryption(
                 blob.EncryptionScope,
@@ -1546,6 +1556,7 @@ public static class BlobProtocolEndpoint
                         blobName,
                         source.Content,
                         ReadUrlWriteOptions(http.Request, source),
+                        current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
                         cancellationToken),
@@ -1577,6 +1588,7 @@ public static class BlobProtocolEndpoint
                     source,
                     ReadCopyWriteOptions(http.Request, source),
                     publicSource,
+                    current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
                     cancellationToken);
@@ -1599,6 +1611,7 @@ public static class BlobProtocolEndpoint
                         source.Content,
                         ReadUrlWriteOptions(http.Request, source),
                         publicSource,
+                        current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
                         cancellationToken),
@@ -1626,6 +1639,7 @@ public static class BlobProtocolEndpoint
                         blobName,
                         body,
                         ReadWriteOptions(http.Request, current),
+                        current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
                         cancellationToken),
@@ -1639,6 +1653,7 @@ public static class BlobProtocolEndpoint
                     containerName,
                     blobName,
                     ReadWriteOptions(http.Request, current),
+                    current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
                     cancellationToken);
@@ -1654,6 +1669,7 @@ public static class BlobProtocolEndpoint
                     length,
                     ReadWriteOptions(http.Request, current),
                     sequence,
+                    current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
                     cancellationToken);
@@ -1828,8 +1844,7 @@ public static class BlobProtocolEndpoint
         }
 
         EvaluateReadConditions(http.Request, blob);
-        if (ProtocolParsing.First(http.Request.Headers, "x-ms-lease-id") is not null)
-            EnsureLease(http.Request, blob.Lease, "blob");
+        ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
         var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken);
         AzureResponseWriter.AddBlobHeaders(http.Response, blob);
@@ -2046,13 +2061,12 @@ public static class BlobProtocolEndpoint
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
-        var (lease, status, remaining) = ApplyLeaseAction(http.Request, container.Lease, isContainer: true);
-        await service.SetContainerLeaseAsync(container, lease, cancellationToken);
-        http.Response.StatusCode = status;
-        if (lease.Id is not null)
-            http.Response.Headers["x-ms-lease-id"] = lease.Id;
-        if (remaining.HasValue)
-            http.Response.Headers["x-ms-lease-time"] = remaining.Value.ToString(CultureInfo.InvariantCulture);
+        var (action, transition) = ApplyLeaseAction(http.Request, container.Lease);
+        var updated = await service.SetContainerLeaseAsync(container, transition.Lease, cancellationToken);
+        http.Response.StatusCode = LeaseStatusCode(action);
+        http.Response.Headers.ETag = updated.ETag;
+        http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        AddLeaseResponseHeaders(http.Response, action, transition);
     }
 
     private static async Task HandleBlobLeaseAsync(
@@ -2061,76 +2075,78 @@ public static class BlobProtocolEndpoint
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
-        var (lease, status, remaining) = ApplyLeaseAction(http.Request, blob.Lease, isContainer: false);
-        var updated = await service.SetBlobLeaseAsync(blob, lease, cancellationToken);
-        http.Response.StatusCode = status;
+        var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease);
+        var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken);
+        http.Response.StatusCode = LeaseStatusCode(action);
         http.Response.Headers.ETag = updated.ETag;
         http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
-        if (lease.Id is not null)
-            http.Response.Headers["x-ms-lease-id"] = lease.Id;
-        if (remaining.HasValue)
-            http.Response.Headers["x-ms-lease-time"] = remaining.Value.ToString(CultureInfo.InvariantCulture);
+        AddLeaseResponseHeaders(http.Response, action, transition);
     }
 
-    private static (LeaseRecord Lease, int Status, int? Remaining) ApplyLeaseAction(
+    private static (LeaseAction Action, LeaseTransition Transition) ApplyLeaseAction(
         HttpRequest request,
-        LeaseRecord current,
-        bool isContainer)
+        LeaseRecord current)
     {
-        current = EffectiveLease(current);
-        var action = ProtocolParsing.First(request.Headers, "x-ms-lease-action")?.ToLowerInvariant()
-                     ?? throw AzureStorageException.InvalidHeader("x-ms-lease-action");
-        var suppliedId = ProtocolParsing.First(request.Headers, "x-ms-lease-id");
-        var proposedId = ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id");
-        var now = DateTimeOffset.UtcNow;
-        switch (action)
+        var actionValue = ProtocolParsing.First(request.Headers, "x-ms-lease-action")
+                          ?? throw AzureStorageException.MissingHeader("x-ms-lease-action");
+        if (!Enum.TryParse<LeaseAction>(actionValue, ignoreCase: true, out var action))
+            throw AzureStorageException.InvalidHeader("x-ms-lease-action", actionValue);
+
+        var duration = action == LeaseAction.Acquire
+            ? ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-duration", required: true)
+            : null;
+        var breakPeriod = action == LeaseAction.Break
+            ? ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-break-period", required: false)
+            : null;
+        var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
+        return (action, leases.Apply(
+            current,
+            action,
+            duration,
+            breakPeriod,
+            ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
+            ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id")));
+    }
+
+    private static void AddLeaseResponseHeaders(
+        HttpResponse response,
+        LeaseAction action,
+        LeaseTransition transition)
+    {
+        if ((action is LeaseAction.Acquire or LeaseAction.Renew or LeaseAction.Change) &&
+            transition.Lease.Id is not null)
         {
-            case "acquire":
-                if (current.State == LeaseState.Leased)
-                    throw new AzureStorageException(StatusCodes.Status409Conflict, isContainer ? "LeaseAlreadyPresent" : "LeaseAlreadyPresent", "There is already a lease present.");
-                var duration = (int)ProtocolParsing.ParseLongHeader(request.Headers, "x-ms-lease-duration", required: true);
-                if (duration != -1 && duration is < 15 or > 60)
-                    throw AzureStorageException.InvalidHeader("x-ms-lease-duration", duration.ToString(CultureInfo.InvariantCulture));
-                var id = proposedId ?? Guid.NewGuid().ToString();
-                if (!Guid.TryParse(id, out _))
-                    throw AzureStorageException.InvalidHeader("x-ms-proposed-lease-id", id);
-                return (new LeaseRecord
-                {
-                    Id = id,
-                    State = LeaseState.Leased,
-                    DurationSeconds = duration,
-                    AcquiredAt = now,
-                    ExpiresAt = duration == -1 ? null : now.AddSeconds(duration)
-                }, StatusCodes.Status201Created, null);
-            case "renew":
-                RequireLeaseId(current, suppliedId);
-                return (current with
-                {
-                    State = LeaseState.Leased,
-                    AcquiredAt = now,
-                    ExpiresAt = current.DurationSeconds == -1 ? null : now.AddSeconds(current.DurationSeconds ?? 60),
-                    BreakEndsAt = null
-                }, StatusCodes.Status200OK, null);
-            case "change":
-                RequireLeaseId(current, suppliedId);
-                if (!Guid.TryParse(proposedId, out _))
-                    throw AzureStorageException.InvalidHeader("x-ms-proposed-lease-id", proposedId);
-                return (current with { Id = proposedId }, StatusCodes.Status200OK, null);
-            case "release":
-                RequireLeaseId(current, suppliedId);
-                return (LeaseRecord.Available, StatusCodes.Status200OK, null);
-            case "break":
-                if (current.State is LeaseState.Available or LeaseState.Broken)
-                    throw new AzureStorageException(StatusCodes.Status409Conflict, "LeaseNotPresentWithLeaseOperation", "There is currently no lease on the resource.");
-                var requested = TryParseLongHeader(request.Headers, "x-ms-lease-break-period") is { } seconds ? (int?)seconds : null;
-                var remaining = current.ExpiresAt.HasValue ? Math.Max(0, (int)(current.ExpiresAt.Value - now).TotalSeconds) : 60;
-                var period = requested.HasValue ? Math.Clamp(requested.Value, 0, Math.Min(60, remaining)) : 0;
-                return period == 0
-                    ? (new LeaseRecord { State = LeaseState.Broken }, StatusCodes.Status202Accepted, 0)
-                    : (current with { State = LeaseState.Breaking, BreakEndsAt = now.AddSeconds(period) }, StatusCodes.Status202Accepted, period);
-            default:
-                throw AzureStorageException.InvalidHeader("x-ms-lease-action", action);
+            response.Headers["x-ms-lease-id"] = transition.Lease.Id;
         }
+        if (transition.RemainingSeconds.HasValue)
+        {
+            response.Headers["x-ms-lease-time"] =
+                transition.RemainingSeconds.Value.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
+    private static int LeaseStatusCode(LeaseAction action) => action switch
+    {
+        LeaseAction.Acquire => StatusCodes.Status201Created,
+        LeaseAction.Break => StatusCodes.Status202Accepted,
+        _ => StatusCodes.Status200OK
+    };
+
+    private static int? ParseLeaseIntegerHeader(
+        IHeaderDictionary headers,
+        string name,
+        bool required)
+    {
+        var value = ProtocolParsing.First(headers, name);
+        if (value is null)
+        {
+            if (required)
+                throw AzureStorageException.MissingHeader(name);
+            return null;
+        }
+        if (!int.TryParse(value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var parsed))
+            throw AzureStorageException.InvalidHeader(name, value);
+        return parsed;
     }
 
     private static IReadOnlyList<PageRange> SelectPageRanges(BlobRecord blob, string? requestedRange)
@@ -2544,36 +2560,20 @@ public static class BlobProtocolEndpoint
 
     private static void EnsureLease(HttpRequest request, LeaseRecord lease, string resource)
     {
-        lease = EffectiveLease(lease);
-        var supplied = ProtocolParsing.First(request.Headers, "x-ms-lease-id");
-        if (lease.State == LeaseState.Leased && !string.Equals(supplied, lease.Id, StringComparison.Ordinal))
-            throw AzureStorageException.LeaseMismatch();
-        if (lease.State != LeaseState.Leased && supplied is not null)
-            throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, $"LeaseNotPresentWith{CultureInfo.InvariantCulture.TextInfo.ToTitleCase(resource)}Operation", "There is currently no lease on the resource.");
+        var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
+        leases.EnsureWriteAccess(
+            lease,
+            ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
+            resource);
     }
 
     private static void ValidateOptionalLease(HttpRequest request, LeaseRecord lease, string resource)
     {
-        if (ProtocolParsing.First(request.Headers, "x-ms-lease-id") is not null)
-            EnsureLease(request, lease, resource);
-    }
-
-    private static LeaseRecord EffectiveLease(LeaseRecord lease)
-    {
-        var now = DateTimeOffset.UtcNow;
-        if (lease.State == LeaseState.Breaking && lease.BreakEndsAt <= now)
-            return new LeaseRecord { State = LeaseState.Broken };
-        if (lease.State == LeaseState.Leased && lease.ExpiresAt <= now)
-            return lease with { State = LeaseState.Expired, Id = null };
-        return lease;
-    }
-
-    private static void RequireLeaseId(LeaseRecord current, string? suppliedId)
-    {
-        if (current.State != LeaseState.Leased)
-            throw new AzureStorageException(StatusCodes.Status409Conflict, "LeaseNotPresentWithLeaseOperation", "There is currently no lease on the resource.");
-        if (!string.Equals(current.Id, suppliedId, StringComparison.Ordinal))
-            throw AzureStorageException.LeaseMismatch();
+        var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
+        leases.ValidateOptionalAccess(
+            lease,
+            ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
+            resource);
     }
 
     private static async Task<BlobRecord?> TryGetCurrentBlobAsync(

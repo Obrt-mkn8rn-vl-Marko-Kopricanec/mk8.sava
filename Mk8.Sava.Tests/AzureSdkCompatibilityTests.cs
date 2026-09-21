@@ -1989,6 +1989,205 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task BlobLeaseTransitionsMatchAzureStateAndErrorContracts()
+    {
+        var clock = new AdjustableTimeProvider(DateTimeOffset.UtcNow);
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "01:00:00"
+            });
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"lease-state-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blob = container.GetBlobClient("state.bin");
+            await blob.UploadAsync(BinaryData.FromString("leased payload"));
+
+            var leaseId = Guid.NewGuid().ToString();
+            var lease = blob.GetBlobLeaseClient(leaseId);
+            var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+            Assert.Equal(leaseId, acquired.Value.LeaseId);
+            var leased = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, leased.LeaseState);
+            Assert.Equal(LeaseStatus.Locked, leased.LeaseStatus);
+            Assert.Equal(LeaseDurationType.Fixed, leased.LeaseDuration);
+
+            await blob.UploadAsync(
+                BinaryData.FromString("authorized overwrite"),
+                new BlobUploadOptions
+                {
+                    Conditions = new BlobRequestConditions { LeaseId = leaseId }
+                });
+            Assert.Equal(
+                Azure.Storage.Blobs.Models.LeaseState.Leased,
+                (await blob.GetPropertiesAsync()).Value.LeaseState);
+
+            await lease.AcquireAsync(TimeSpan.FromSeconds(30));
+            var competing = blob.GetBlobLeaseClient(Guid.NewGuid().ToString());
+            var alreadyLeased = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                competing.AcquireAsync(TimeSpan.FromSeconds(15)));
+            Assert.Equal(409, alreadyLeased.Status);
+            Assert.Equal("LeaseAlreadyPresent", alreadyLeased.ErrorCode);
+
+            clock.Advance(TimeSpan.FromSeconds(31));
+            var expired = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Expired, expired.LeaseState);
+            Assert.Equal(LeaseStatus.Unlocked, expired.LeaseStatus);
+            Assert.Equal(default, expired.LeaseDuration);
+
+            await lease.RenewAsync();
+            Assert.Equal(
+                Azure.Storage.Blobs.Models.LeaseState.Leased,
+                (await blob.GetPropertiesAsync()).Value.LeaseState);
+
+            var changedId = Guid.NewGuid().ToString();
+            var changed = await lease.ChangeAsync(changedId);
+            Assert.Equal(changedId, changed.Value.LeaseId);
+            leaseId = changedId;
+            lease = blob.GetBlobLeaseClient(leaseId);
+
+            var initialBreak = await lease.BreakAsync();
+            Assert.Equal(30, initialBreak.Value.LeaseTime);
+            var breaking = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Breaking, breaking.LeaseState);
+            Assert.Equal(LeaseStatus.Locked, breaking.LeaseStatus);
+            Assert.Equal(default, breaking.LeaseDuration);
+
+            var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                blob.SetMetadataAsync(new Dictionary<string, string> { ["breaking"] = "missing" }));
+            Assert.Equal(412, missing.Status);
+            Assert.Equal("LeaseIdMissing", missing.ErrorCode);
+            await blob.SetMetadataAsync(
+                new Dictionary<string, string> { ["breaking"] = "authorized" },
+                new BlobRequestConditions { LeaseId = leaseId });
+
+            var unchangedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(60));
+            Assert.Equal(30, unchangedBreak.Value.LeaseTime);
+            var shortenedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(2, shortenedBreak.Value.LeaseTime);
+            clock.Advance(TimeSpan.FromSeconds(3));
+            var broken = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Broken, broken.LeaseState);
+            Assert.Equal(LeaseStatus.Unlocked, broken.LeaseStatus);
+
+            var brokenRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync());
+            Assert.Equal(409, brokenRenew.Status);
+            Assert.Equal("LeaseIsBrokenAndCannotBeRenewed", brokenRenew.ErrorCode);
+            await lease.ReleaseAsync();
+
+            await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+            clock.Advance(TimeSpan.FromSeconds(16));
+            await blob.SetMetadataAsync(new Dictionary<string, string> { ["expired"] = "rewritten" });
+            Assert.Equal(
+                Azure.Storage.Blobs.Models.LeaseState.Available,
+                (await blob.GetPropertiesAsync()).Value.LeaseState);
+            var invalidatedRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync());
+            Assert.Equal(409, invalidatedRenew.Status);
+            Assert.Equal("LeaseIdMismatchWithLeaseOperation", invalidatedRenew.ErrorCode);
+
+            var infiniteId = Guid.NewGuid().ToString();
+            var infinite = blob.GetBlobLeaseClient(infiniteId);
+            await infinite.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+            using var transport = new HttpClient(application.Server.CreateHandler());
+            var leaseUri = AppendQuery(
+                blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "comp=lease");
+            using (var invalidBreak = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                invalidBreak.Headers.Add("x-ms-version", "2025-11-05");
+                invalidBreak.Headers.Add("x-ms-lease-action", "break");
+                invalidBreak.Headers.Add("x-ms-lease-break-period", "61");
+                using var invalidBreakResponse = await transport.SendAsync(invalidBreak);
+                Assert.Equal(HttpStatusCode.BadRequest, invalidBreakResponse.StatusCode);
+                Assert.Equal("InvalidHeaderValue", invalidBreakResponse.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            var immediateBreak = await infinite.BreakAsync();
+            Assert.Equal(0, immediateBreak.Value.LeaseTime);
+            using (var invalidProposed = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                invalidProposed.Headers.Add("x-ms-version", "2025-11-05");
+                invalidProposed.Headers.Add("x-ms-lease-action", "acquire");
+                invalidProposed.Headers.Add("x-ms-lease-duration", "15");
+                invalidProposed.Headers.Add("x-ms-proposed-lease-id", "not-a-guid");
+                using var invalidProposedResponse = await transport.SendAsync(invalidProposed);
+                Assert.Equal(HttpStatusCode.BadRequest, invalidProposedResponse.StatusCode);
+                Assert.Equal("InvalidHeaderValue", invalidProposedResponse.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var missingDuration = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                missingDuration.Headers.Add("x-ms-version", "2025-11-05");
+                missingDuration.Headers.Add("x-ms-lease-action", "acquire");
+                using var missingDurationResponse = await transport.SendAsync(missingDuration);
+                Assert.Equal(HttpStatusCode.BadRequest, missingDurationResponse.StatusCode);
+                Assert.Equal("MissingRequiredHeader", missingDurationResponse.Headers.GetValues("x-ms-error-code").Single());
+            }
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ContainerLeasesGuardDeletionButNotOrdinaryContainerWrites()
+    {
+        var clock = new AdjustableTimeProvider(DateTimeOffset.UtcNow);
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "01:00:00"
+            });
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"container-lease-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var leaseId = Guid.NewGuid().ToString();
+            var lease = container.GetBlobLeaseClient(leaseId);
+            await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+
+            await container.SetMetadataAsync(new Dictionary<string, string> { ["active"] = "allowed" });
+            var missing = await Assert.ThrowsAsync<RequestFailedException>(() => container.DeleteAsync());
+            Assert.Equal(412, missing.Status);
+            Assert.Equal("LeaseIdMissing", missing.ErrorCode);
+
+            clock.Advance(TimeSpan.FromSeconds(16));
+            Assert.Equal(
+                Azure.Storage.Blobs.Models.LeaseState.Expired,
+                (await container.GetPropertiesAsync()).Value.LeaseState);
+            await container.SetMetadataAsync(new Dictionary<string, string> { ["expired"] = "retained" });
+            await lease.RenewAsync();
+            Assert.Equal(
+                Azure.Storage.Blobs.Models.LeaseState.Leased,
+                (await container.GetPropertiesAsync()).Value.LeaseState);
+
+            await container.DeleteAsync(new BlobRequestConditions { LeaseId = leaseId });
+            Assert.False((await container.ExistsAsync()).Value);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task DeduplicationIsIsolatedAcrossAccountsAndChunksAreEncryptedAtRest()
     {
         var content = Enumerable.Repeat((byte)'Q', 96 * 1024).ToArray();
