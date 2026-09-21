@@ -448,15 +448,55 @@ public sealed partial class AzureResponseWriter
     {
         response.Headers.ETag = container.ETag;
         response.Headers.LastModified = container.LastModified.ToString("R", CultureInfo.InvariantCulture);
-        if (container.Lease.State != Storage.LeaseState.Available)
+    }
+
+    public static void AddContainerMetadataHeaders(HttpResponse response, ContainerRecord container)
+    {
+        AddContainerHeaders(response, container);
+        foreach (var (name, value) in container.Metadata)
+            response.Headers[$"x-ms-meta-{name}"] = value;
+    }
+
+    public static void AddContainerPropertiesHeaders(HttpResponse response, ContainerRecord container)
+    {
+        AddContainerMetadataHeaders(response, container);
+        var request = StorageRequestContext.Get(response.HttpContext);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
         {
             response.Headers["x-ms-lease-status"] = LeaseStatus(container.Lease);
             response.Headers["x-ms-lease-state"] = LeaseStateValue(container.Lease);
             if (container.Lease.State == Storage.LeaseState.Leased)
                 response.Headers["x-ms-lease-duration"] = container.Lease.DurationSeconds == -1 ? "infinite" : "fixed";
         }
-        foreach (var (name, value) in container.Metadata)
+        AddContainerPublicAccessHeader(response, container);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+        {
+            response.Headers["x-ms-has-immutability-policy"] = "false";
+            response.Headers["x-ms-has-legal-hold"] = "false";
+        }
+    }
+
+    public static void AddContainerAccessPolicyHeaders(HttpResponse response, ContainerRecord container)
+    {
+        AddContainerHeaders(response, container);
+        AddContainerPublicAccessHeader(response, container);
+    }
+
+    public static void AddBlobMetadataHeaders(HttpResponse response, BlobRecord blob)
+    {
+        AddBlobEntityHeaders(response, blob);
+        foreach (var (name, value) in blob.Metadata)
             response.Headers[$"x-ms-meta-{name}"] = value;
+    }
+
+    public static void AddBlobEntityHeaders(HttpResponse response, BlobRecord blob)
+    {
+        response.Headers.ETag = blob.ETag;
+        response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
+    }
+
+    private static void AddContainerPublicAccessHeader(HttpResponse response, ContainerRecord container)
+    {
         if (container.PublicAccess is not null)
             response.Headers["x-ms-blob-public-access"] = container.PublicAccess;
     }
@@ -464,8 +504,7 @@ public sealed partial class AzureResponseWriter
     public static void AddBlobHeaders(HttpResponse response, BlobRecord blob)
     {
         var request = StorageRequestContext.Get(response.HttpContext);
-        response.Headers.ETag = blob.ETag;
-        response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        AddBlobEntityHeaders(response, blob);
         if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);

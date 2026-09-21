@@ -420,7 +420,7 @@ public static class BlobProtocolEndpoint
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
-            AzureResponseWriter.AddContainerHeaders(http.Response, container);
+            AzureResponseWriter.AddContainerPropertiesHeaders(http.Response, container);
             return;
         }
 
@@ -500,11 +500,12 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "metadata")
+        if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
+            comp == "metadata")
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
-            AzureResponseWriter.AddContainerHeaders(http.Response, container);
+            AzureResponseWriter.AddContainerMetadataHeaders(http.Response, container);
             return;
         }
 
@@ -521,12 +522,14 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "acl")
+        if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
+            comp == "acl")
         {
             Require(request, 'r');
             ValidateOptionalLease(http.Request, container.Lease, "container");
-            AzureResponseWriter.AddContainerHeaders(http.Response, container);
-            await writer.WriteAclAsync(http, container, cancellationToken);
+            AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
+            if (HttpMethods.IsGet(http.Request.Method))
+                await writer.WriteAclAsync(http, container, cancellationToken);
             return;
         }
 
@@ -1294,13 +1297,14 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "metadata")
+        if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
+            comp == "metadata")
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
             EnsureCustomerProvidedKey(http.Request, blob, write: false);
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
-            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            AzureResponseWriter.AddBlobMetadataHeaders(http.Response, blob);
             return;
         }
 
@@ -1323,7 +1327,9 @@ public static class BlobProtocolEndpoint
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var updated = await service.SetBlobMetadataAsync(blob, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            AzureResponseWriter.AddBlobEntityHeaders(http.Response, updated);
+            AddRequestServerEncryptedHeader(http.Response);
+            AddEncryptionResponseHeaders(http.Response, EncryptionOf(updated));
             return;
         }
 
