@@ -195,6 +195,124 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task BlobTagConditionsHonorSqlGrammarPermissionsAndSourceSemantics()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"tag-conditions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlobClient("source.txt");
+        await source.UploadAsync(
+            BinaryData.FromString("conditioned"),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string>
+                {
+                    ["Status"] = "Done",
+                    ["Priority"] = "07",
+                    ["special key"] = "yes"
+                }
+            });
+
+        var successfulRead = await source.DownloadContentAsync(new BlobDownloadOptions
+        {
+            Conditions = new BlobRequestConditions
+            {
+                TagConditions = "(Status <> 'Pending' AND Priority >= '05') OR \"special key\" = 'no'"
+            }
+        });
+        Assert.Equal("conditioned", successfulRead.Value.Content.ToString());
+
+        var metadata = await source.SetMetadataAsync(
+            new Dictionary<string, string> { ["condition"] = "passed" },
+            new BlobRequestConditions
+            {
+                TagConditions = "Status = 'Pending' AND Priority >= '05' OR \"special key\" = 'yes'"
+            });
+        Assert.Equal(200, metadata.GetRawResponse().Status);
+
+        var falseCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Conditions = new BlobRequestConditions
+                {
+                    TagConditions = "(Status = 'Pending' OR Priority < '05') AND \"special key\" = 'yes'"
+                }
+            }));
+        Assert.Equal(412, falseCondition.Status);
+        Assert.Equal("ConditionNotMet", falseCondition.ErrorCode);
+
+        var missingTagIsNotUnequal = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Conditions = new BlobRequestConditions { TagConditions = "Missing <> 'value'" }
+            }));
+        Assert.Equal(412, missingTagIsNotUnequal.Status);
+
+        var invalidCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Conditions = new BlobRequestConditions { TagConditions = "Status = 'Done' OR OR Priority = '07'" }
+            }));
+        Assert.Equal(400, invalidCondition.Status);
+        Assert.Equal("InvalidHeaderValue", invalidCondition.ErrorCode);
+
+        var excessiveCondition = string.Join(
+            " OR ",
+            Enumerable.Range(0, 12).Select(index => $"Status = 'value-{index}'"));
+        var excessiveOperations = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            source.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Conditions = new BlobRequestConditions { TagConditions = excessiveCondition }
+            }));
+        Assert.Equal(400, excessiveOperations.Status);
+        Assert.Equal("InvalidHeaderValue", excessiveOperations.ErrorCode);
+
+        var destination = container.GetBlobClient("destination.txt");
+        var copy = await destination.StartCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions
+            {
+                SourceConditions = new BlobRequestConditions
+                {
+                    TagConditions = "Status = 'Done' AND Priority <= '07'"
+                }
+            });
+        Assert.Equal(202, copy.GetRawResponse().Status);
+
+        var rejectedCopy = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("rejected-copy.txt").StartCopyFromUriAsync(
+                source.Uri,
+                new BlobCopyFromUriOptions
+                {
+                    SourceConditions = new BlobRequestConditions { TagConditions = "Status = 'Pending'" }
+                }));
+        Assert.Equal(412, rejectedCopy.Status);
+        Assert.Equal("SourceConditionNotMet", rejectedCopy.ErrorCode);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        var readOnlyUri = source.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using var unauthorizedRequest = new HttpRequestMessage(HttpMethod.Get, readOnlyUri);
+        unauthorizedRequest.Headers.Add("x-ms-version", "2023-11-03");
+        unauthorizedRequest.Headers.Add("x-ms-if-tags", "Status = 'Done'");
+        using var unauthorizedResponse = await transport.SendAsync(unauthorizedRequest);
+        Assert.Equal(HttpStatusCode.Forbidden, unauthorizedResponse.StatusCode);
+        Assert.Equal(
+            "AuthorizationPermissionMismatch",
+            unauthorizedResponse.Headers.GetValues("x-ms-error-code").Single());
+
+        var taggedReadUri = source.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Tag,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using var authorizedRequest = new HttpRequestMessage(HttpMethod.Get, taggedReadUri);
+        authorizedRequest.Headers.Add("x-ms-version", "2023-11-03");
+        authorizedRequest.Headers.Add("x-ms-if-tags", "Status = 'Done'");
+        using var authorizedResponse = await transport.SendAsync(authorizedRequest);
+        Assert.Equal(HttpStatusCode.OK, authorizedResponse.StatusCode);
+    }
+
+    [Fact]
     public async Task PagedFlatVersionSnapshotAndHierarchyListingsNeverSkipOrRepeatEntries()
     {
         var application = new SavaWebApplicationFactory();
