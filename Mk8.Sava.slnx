@@ -1,6 +1,4 @@
 <Solution>
-  <Folder Name="/Projects/">
-    <Project Path="Projects/Mk8.Sava.Tests/Mk8.Sava.Tests.csproj" />
-    <Project Path="Projects/Mk8.Sava/Mk8.Sava.csproj" />
-  </Folder>
+  <Project Path="Mk8.Sava.Tests/Mk8.Sava.Tests.csproj" />
+  <Project Path="Mk8.Sava/Mk8.Sava.csproj" />
 </Solution>
