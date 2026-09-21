@@ -337,30 +337,56 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
     }
 
-    public async Task<IReadOnlyList<BlobRecord>> ListPendingCopiesAsync(CancellationToken cancellationToken)
-    {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT data FROM blobs WHERE is_deleted = 0;";
-        var blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
-        return blobs.Where(blob => blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null).ToArray();
-    }
-
-    public async Task<IReadOnlyList<BlobRecord>> ListBlobsForMaintenanceAsync(CancellationToken cancellationToken)
-    {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT data FROM blobs ORDER BY modified_ticks;";
-        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
-    }
-
-    public async Task<IReadOnlyList<ContainerRecord>> ListDeletedContainersForMaintenanceAsync(
+    internal async Task<KeysetPage<BlobRecord>> ListBlobMaintenancePageAsync(
+        string? afterGenerationId,
+        int maximum,
         CancellationToken cancellationToken)
     {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT data FROM containers WHERE deleted = 1 ORDER BY modified_ticks;";
-        return await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken);
+        command.CommandText = """
+            SELECT data FROM blobs
+            WHERE generation_id > $after
+            ORDER BY generation_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$after", afterGenerationId ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken)).ToList();
+        var hasMore = records.Count > maximum;
+        if (hasMore)
+            records.RemoveAt(records.Count - 1);
+        return new KeysetPage<BlobRecord>(records, hasMore);
+    }
+
+    internal async Task<KeysetPage<ContainerRecord>> ListContainerMaintenancePageAsync(
+        ContainerKey? after,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT data FROM containers
+            WHERE $has_after = 0
+               OR account > $account
+               OR (account = $account AND name > $name)
+            ORDER BY account, name
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$has_after", after.HasValue ? 1 : 0);
+        command.Parameters.AddWithValue("$account", after?.Account ?? string.Empty);
+        command.Parameters.AddWithValue("$name", after?.Name ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken)).ToList();
+        var hasMore = records.Count > maximum;
+        if (hasMore)
+            records.RemoveAt(records.Count - 1);
+        return new KeysetPage<ContainerRecord>(records, hasMore);
     }
 
     public async Task<BlobRecord> PublishBlobAsync(
@@ -811,15 +837,27 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
 
     public async Task<int> DeleteStagedBlocksOlderThanAsync(
         DateTimeOffset cutoff,
+        int maximum,
         CancellationToken cancellationToken)
     {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
         await _writeGate.WaitAsync(cancellationToken);
         try
         {
             await using var connection = await OpenAsync(cancellationToken);
             await using var command = connection.CreateCommand();
-            command.CommandText = "DELETE FROM staged_blocks WHERE created_ticks < $cutoff;";
+            command.CommandText = """
+                DELETE FROM staged_blocks
+                WHERE rowid IN (
+                    SELECT rowid FROM staged_blocks
+                    WHERE created_ticks < $cutoff
+                    ORDER BY created_ticks, account, container, blob_name, block_id
+                    LIMIT $limit
+                );
+                """;
             command.Parameters.AddWithValue("$cutoff", cutoff.UtcTicks);
+            command.Parameters.AddWithValue("$limit", maximum);
             return await command.ExecuteNonQueryAsync(cancellationToken);
         }
         finally

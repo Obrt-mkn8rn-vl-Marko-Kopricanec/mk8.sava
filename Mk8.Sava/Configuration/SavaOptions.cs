@@ -36,6 +36,9 @@ public sealed class SavaOptions : IValidatableObject
     public TimeSpan UncommittedBlockRetention { get; init; } = TimeSpan.FromDays(7);
     public TimeSpan AbandonedStagingRetention { get; init; } = TimeSpan.FromDays(1);
     public int MaximumStagingFilesPerMaintenancePass { get; init; } = 256;
+    public int BlobRecordsPerMaintenancePass { get; init; } = 256;
+    public int ContainerRecordsPerMaintenancePass { get; init; } = 256;
+    public int UncommittedBlocksPerMaintenancePass { get; init; } = 256;
     public int GarbageCollectionChunksPerMaintenancePass { get; init; } = 256;
     public int IntegrityScanChunksPerMaintenancePass { get; init; } = 256;
     public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
@@ -136,6 +139,21 @@ public sealed class SavaOptions : IValidatableObject
             yield return new ValidationResult(
                 "MaximumStagingFilesPerMaintenancePass must be positive.",
                 [nameof(MaximumStagingFilesPerMaintenancePass)]);
+
+        if (BlobRecordsPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "BlobRecordsPerMaintenancePass must be positive.",
+                [nameof(BlobRecordsPerMaintenancePass)]);
+
+        if (ContainerRecordsPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "ContainerRecordsPerMaintenancePass must be positive.",
+                [nameof(ContainerRecordsPerMaintenancePass)]);
+
+        if (UncommittedBlocksPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "UncommittedBlocksPerMaintenancePass must be positive.",
+                [nameof(UncommittedBlocksPerMaintenancePass)]);
 
         if (GarbageCollectionChunksPerMaintenancePass <= 0)
             yield return new ValidationResult(

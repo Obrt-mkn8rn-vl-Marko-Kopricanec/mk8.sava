@@ -52,6 +52,8 @@ public sealed class BlobService(
     private int _integrityCustomerKey;
     private int _integrityMissing;
     private int _integrityCorrupt;
+    private string? _blobMaintenanceCursor;
+    private ContainerKey? _containerMaintenanceCursor;
     private string? _garbageCollectionCursor;
     private string? _recompressionCursor;
 
@@ -1285,18 +1287,6 @@ public sealed class BlobService(
         return updated;
     }
 
-    public async Task<int> CompletePendingCopiesAsync(CancellationToken cancellationToken)
-    {
-        var completed = 0;
-        foreach (var blob in await metadata.ListPendingCopiesAsync(cancellationToken))
-        {
-            var updated = await CompleteCopyIfDueAsync(blob, cancellationToken);
-            if (updated.Copy?.Status == "success")
-                completed++;
-        }
-        return completed;
-    }
-
     public Task<IReadOnlyList<StagedBlockRecord>> ListStagedBlocksAsync(
         string account,
         string container,
@@ -1325,7 +1315,7 @@ public sealed class BlobService(
 
     private async Task<StorageMaintenanceResult> RunMaintenanceCoreAsync(CancellationToken cancellationToken)
     {
-        var completedCopies = await CompletePendingCopiesAsync(cancellationToken);
+        var completedCopies = 0;
         var completedRehydrations = 0;
         var expiredBlobs = 0;
         var purgedBlobs = 0;
@@ -1333,12 +1323,23 @@ public sealed class BlobService(
         var now = metadata.GetUtcNow();
         var serviceProperties = new Dictionary<string, ServiceProperties>(StringComparer.Ordinal);
 
-        foreach (var candidate in await metadata.ListBlobsForMaintenanceAsync(cancellationToken))
+        var blobPage = await metadata.ListBlobMaintenancePageAsync(
+            _blobMaintenanceCursor,
+            _options.BlobRecordsPerMaintenancePass,
+            cancellationToken);
+        foreach (var candidate in blobPage.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var blob = candidate;
+                if (blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null)
+                {
+                    var pendingCopy = blob;
+                    blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
+                    if (pendingCopy.Copy.Status == "pending" && blob.Copy?.Status == "success")
+                        completedCopies++;
+                }
                 if (blob.IsDeleted && blob.DeletedAt is not null)
                 {
                     var retentionUntil = blob.DeleteRetentionUntil;
@@ -1382,8 +1383,15 @@ public sealed class BlobService(
                 // A concurrent request changed the resource; the next pass evaluates its new state.
             }
         }
+        _blobMaintenanceCursor = blobPage.HasMore && blobPage.Items.Count > 0
+            ? blobPage.Items[^1].GenerationId
+            : null;
 
-        foreach (var container in await metadata.ListDeletedContainersForMaintenanceAsync(cancellationToken))
+        var containerPage = await metadata.ListContainerMaintenancePageAsync(
+            _containerMaintenanceCursor,
+            _options.ContainerRecordsPerMaintenancePass,
+            cancellationToken);
+        foreach (var container in containerPage.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (container.DeletedAt is null)
@@ -1416,9 +1424,13 @@ public sealed class BlobService(
                 // A restore or mutation won the race; the next pass evaluates the current record.
             }
         }
+        _containerMaintenanceCursor = containerPage.HasMore && containerPage.Items.Count > 0
+            ? new ContainerKey(containerPage.Items[^1].Account, containerPage.Items[^1].Name)
+            : null;
 
         var expiredBlocks = await metadata.DeleteStagedBlocksOlderThanAsync(
             now.Subtract(_options.UncommittedBlockRetention),
+            _options.UncommittedBlocksPerMaintenancePass,
             cancellationToken);
         var reclaimedStagingFiles = chunks.DeleteAbandonedStagingFiles(
             now.Subtract(_options.AbandonedStagingRetention),
