@@ -108,7 +108,10 @@ public sealed class StorageTelemetry
     }
 }
 
-public sealed class StorageTelemetryMiddleware(RequestDelegate next, StorageTelemetry telemetry)
+public sealed class StorageTelemetryMiddleware(
+    RequestDelegate next,
+    StorageTelemetry telemetry,
+    ILogger<StorageTelemetryMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
     {
@@ -126,7 +129,16 @@ public sealed class StorageTelemetryMiddleware(RequestDelegate next, StorageTele
         }
         finally
         {
-            telemetry.RecordRequest(context.Response.StatusCode, Stopwatch.GetTimestamp() - started);
+            var elapsed = Stopwatch.GetTimestamp() - started;
+            telemetry.RecordRequest(context.Response.StatusCode, elapsed);
+            var request = Mk8.Sava.Protocol.StorageRequestContext.TryGet(context);
+            logger.LogInformation(
+                "Storage request {RequestId} {Method} {ResourceKind} completed with {StatusCode} in {ElapsedMilliseconds:F3} ms.",
+                request?.RequestId ?? context.TraceIdentifier,
+                context.Request.Method,
+                request?.ResourceKind.ToString() ?? "Unknown",
+                context.Response.StatusCode,
+                elapsed * 1000d / Stopwatch.Frequency);
         }
     }
 }

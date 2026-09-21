@@ -1,11 +1,15 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Tests;
 
 public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
+    private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
+
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
     public const string SecondAccountName = "devstoreaccount2";
@@ -14,13 +18,28 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public SavaWebApplicationFactory()
-        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"))
+        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath)
+        : this(dataPath, null)
+    {
+    }
+
+    internal SavaWebApplicationFactory(Func<HttpMessageHandler> urlTransferHandlerFactory)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            urlTransferHandlerFactory)
+    {
+    }
+
+    private SavaWebApplicationFactory(
+        string dataPath,
+        Func<HttpMessageHandler>? urlTransferHandlerFactory)
     {
         DataPath = dataPath;
+        _urlTransferHandlerFactory = urlTransferHandlerFactory;
     }
 
     public string DataPath { get; }
@@ -58,6 +77,12 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
             });
         });
+        if (_urlTransferHandlerFactory is not null)
+        {
+            builder.ConfigureServices(services =>
+                services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
+                    .ConfigurePrimaryHttpMessageHandler(_urlTransferHandlerFactory));
+        }
     }
 
     public Task InitializeAsync()

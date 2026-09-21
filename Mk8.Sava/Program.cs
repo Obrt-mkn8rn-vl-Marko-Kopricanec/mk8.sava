@@ -8,6 +8,7 @@ using Mk8.Sava.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
 var operatorCommand = ParseOperatorCommand(args);
+builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
 
 builder.Services.AddOptions<SavaOptions>()
     .Bind(builder.Configuration.GetSection(SavaOptions.SectionName))
@@ -52,6 +53,7 @@ builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<AzureResponseWriter>();
 builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
+    .RemoveAllLoggers()
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
         AllowAutoRedirect = true,
