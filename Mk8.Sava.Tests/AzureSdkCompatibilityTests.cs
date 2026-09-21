@@ -1148,6 +1148,86 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task AccountInformationUsesAzureRoutingAcrossResourceClients()
+    {
+        var service = CreateClient(factory);
+        var missingContainer = service.GetBlobContainerClient($"account-info-{Guid.NewGuid():N}");
+        var missingBlob = missingContainer.GetBlobClient("does-not-exist.bin");
+
+        static void AssertAccountInfo(AccountInfo info)
+        {
+            Assert.Equal(SkuName.StandardLrs, info.SkuName);
+            Assert.Equal(AccountKind.StorageV2, info.AccountKind);
+            Assert.False(info.IsHierarchicalNamespaceEnabled);
+        }
+
+        AssertAccountInfo((await service.GetAccountInfoAsync()).Value);
+        AssertAccountInfo((await missingContainer.GetAccountInfoAsync()).Value);
+        AssertAccountInfo((await missingBlob.GetAccountInfoAsync()).Value);
+
+        var sasBlob = CreateBlobClient(
+            factory,
+            missingBlob.GenerateSasUri(
+                BlobSasPermissions.Read,
+                DateTimeOffset.UtcNow.AddMinutes(5)));
+        AssertAccountInfo((await sasBlob.GetAccountInfoAsync()).Value);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var legacyRequest = new HttpRequestMessage(
+            HttpMethod.Head,
+            AppendQuery(sasBlob.Uri, "restype=account&comp=properties"));
+        legacyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
+        using var legacyResponse = await transport.SendAsync(legacyRequest);
+        Assert.Equal(HttpStatusCode.OK, legacyResponse.StatusCode);
+        Assert.Equal("Standard_LRS", legacyResponse.Headers.GetValues("x-ms-sku-name").Single());
+        Assert.Equal("StorageV2", legacyResponse.Headers.GetValues("x-ms-account-kind").Single());
+        Assert.False(legacyResponse.Headers.Contains("x-ms-is-hns-enabled"));
+        Assert.Equal(0, legacyResponse.Content.Headers.ContentLength);
+    }
+
+    [Fact]
+    public async Task BlobTagSasRequiresTheDedicatedTagPermission()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"tag-sas-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("tagged.bin");
+        await blob.UploadAsync(
+            BinaryData.FromString("tag permission payload"),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string> { ["state"] = "initial" }
+            });
+
+        var readOnly = CreateBlobClient(
+            factory,
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        var deniedRead = await Assert.ThrowsAsync<RequestFailedException>(() => readOnly.GetTagsAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedRead.Status);
+        Assert.Equal("AuthorizationPermissionMismatch", deniedRead.ErrorCode);
+
+        var writeOnly = CreateBlobClient(
+            factory,
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)));
+        var deniedWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writeOnly.SetTagsAsync(new Dictionary<string, string> { ["state"] = "wrong" }));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedWrite.Status);
+        Assert.Equal("AuthorizationPermissionMismatch", deniedWrite.ErrorCode);
+
+        var tagOnly = CreateBlobClient(
+            factory,
+            blob.GenerateSasUri(BlobSasPermissions.Tag, DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.Equal("initial", (await tagOnly.GetTagsAsync()).Value.Tags["state"]);
+        await tagOnly.SetTagsAsync(new Dictionary<string, string> { ["state"] = "updated" });
+        Assert.Equal("updated", (await tagOnly.GetTagsAsync()).Value.Tags["state"]);
+
+        var deniedContentRead = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            tagOnly.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedContentRead.Status);
+        Assert.Equal("AuthorizationPermissionMismatch", deniedContentRead.ErrorCode);
+    }
+
+    [Fact]
     public async Task ServiceAnalyticsPropertiesRoundTripAndPartialUpdatesPreserveOtherGroups()
     {
         var service = CreateClient(factory);

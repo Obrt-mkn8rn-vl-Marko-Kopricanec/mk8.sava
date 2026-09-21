@@ -33,6 +33,15 @@ public static class BlobProtocolEndpoint
         if (request.ResourceKind != StorageResourceKind.StaticWebsite)
             await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken);
 
+        if (string.Equals(
+                http.Request.Query["restype"].ToString(),
+                "account",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            await HandleAccountInformationAsync(http, request);
+            return;
+        }
+
         switch (request.ResourceKind)
         {
             case StorageResourceKind.Service:
@@ -50,6 +59,31 @@ public static class BlobProtocolEndpoint
             default:
                 throw new ArgumentOutOfRangeException();
         }
+    }
+
+    private static Task HandleAccountInformationAsync(
+        HttpContext http,
+        StorageRequestContext request)
+    {
+        if (!string.Equals(
+                http.Request.Query["comp"].ToString(),
+                "properties",
+                StringComparison.OrdinalIgnoreCase) ||
+            !HttpMethods.IsGet(http.Request.Method) && !HttpMethods.IsHead(http.Request.Method))
+        {
+            throw UnsupportedOperation();
+        }
+
+        RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Get Account Information");
+        if (request.Authorization.Kind == StorageAuthorizationKind.Anonymous)
+            throw AzureStorageException.AuthenticationFailed();
+
+        http.Response.Headers["x-ms-sku-name"] = "Standard_LRS";
+        http.Response.Headers["x-ms-account-kind"] = "StorageV2";
+        if (IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
+            http.Response.Headers["x-ms-is-hns-enabled"] = "false";
+        http.Response.ContentLength = 0;
+        return Task.CompletedTask;
     }
 
     private static async Task HandleServiceAsync(
@@ -118,14 +152,6 @@ public static class BlobProtocolEndpoint
                 cancellationToken);
             await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
-            return;
-        }
-
-        if (comp == "accountinfo" && HttpMethods.IsGet(http.Request.Method))
-        {
-            Require(request, 'r');
-            http.Response.Headers["x-ms-sku-name"] = "Standard_LRS";
-            http.Response.Headers["x-ms-account-kind"] = "StorageV2";
             return;
         }
 
@@ -1281,7 +1307,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsGet(http.Request.Method) && comp == "tags")
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Get Blob Tags");
-            RequireAny(request, 't', 'r');
+            Require(request, 't');
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
@@ -1304,7 +1330,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "tags")
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tags");
-            RequireAny(request, 't', 'w');
+            Require(request, 't');
             EnsureMutableVersion(blob);
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: true);
@@ -2435,7 +2461,7 @@ public static class BlobProtocolEndpoint
         if (!request.Authorization.Allows(permission))
             throw request.Authorization.Kind == StorageAuthorizationKind.Anonymous
                 ? AzureStorageException.AuthenticationFailed()
-                : AzureStorageException.AuthorizationFailure();
+                : AzureStorageException.AuthorizationPermissionMismatch();
     }
 
     private static void RequireAny(StorageRequestContext request, params char[] permissions)
@@ -2443,7 +2469,7 @@ public static class BlobProtocolEndpoint
         if (!permissions.Any(request.Authorization.Allows))
             throw request.Authorization.Kind == StorageAuthorizationKind.Anonymous
                 ? AzureStorageException.AuthenticationFailed()
-                : AzureStorageException.AuthorizationFailure();
+                : AzureStorageException.AuthorizationPermissionMismatch();
     }
 
     private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
