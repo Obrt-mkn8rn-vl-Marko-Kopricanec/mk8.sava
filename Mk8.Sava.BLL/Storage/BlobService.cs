@@ -416,6 +416,13 @@ public sealed class BlobService(
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var encryption = EncryptionOf(options);
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+        if (options.GenerateContentMd5 && options.Http.ContentMd5 is null)
+        {
+            options = options with
+            {
+                Http = options.Http with { ContentMd5 = content.ContentMd5 }
+            };
+        }
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content.Manifest, options, now) with
         {

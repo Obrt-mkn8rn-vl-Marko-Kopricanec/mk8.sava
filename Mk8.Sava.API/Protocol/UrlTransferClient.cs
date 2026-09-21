@@ -13,6 +13,7 @@ internal sealed record UrlSource(
     Stream Content,
     long? ContentLength,
     BlobHttpProperties Http,
+    Dictionary<string, string> Metadata,
     string? ETag);
 
 internal sealed record UrlTransferResult<TResult>(TResult Value, TransactionalChecksums Checksums);
@@ -131,6 +132,7 @@ internal sealed class UrlTransferClient(
                 new LengthLimitedReadStream(source, effectiveMaximumBytes),
                 contentLength,
                 ReadHttpProperties(response),
+                ReadMetadata(response),
                 response.Headers.ETag?.ToString());
             return await ConsumeWithChecksumValidationAsync(
                 destinationRequest,
@@ -368,6 +370,17 @@ internal sealed class UrlTransferClient(
         ContentDisposition = response.Content.Headers.ContentDisposition?.ToString(),
         ContentMd5 = response.Content.Headers.ContentMD5 is { Length: > 0 } md5 ? Convert.ToBase64String(md5) : null
     };
+
+    private static Dictionary<string, string> ReadMetadata(HttpResponseMessage response)
+    {
+        var headers = new HeaderDictionary();
+        foreach (var header in response.Headers.Concat(response.Content.Headers))
+        {
+            if (header.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase))
+                headers.Append(header.Key, header.Value.ToArray());
+        }
+        return ProtocolParsing.ReadMetadata(headers);
+    }
 
     private static string? Join(IEnumerable<string> values)
     {

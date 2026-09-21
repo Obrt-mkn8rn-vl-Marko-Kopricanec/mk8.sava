@@ -960,7 +960,7 @@ public static class BlobProtocolEndpoint
                 async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken),
                 allowStructured: false,
                 maximumBodyBytes: ProtocolParsing.MaximumBlockListBodyBytes);
-            var options = ReadWriteOptions(http.Request, current, useStandardContentType: false);
+            var options = ReadWriteOptions(http.Request, current, useStandardProperties: false);
             var committed = await service.CommitBlockListAsync(
                 request.Account,
                 containerName,
@@ -1380,7 +1380,9 @@ public static class BlobProtocolEndpoint
             var sequence = TryParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number");
             var updated = await service.SetBlobPropertiesAsync(
                 blob,
-                ProtocolParsing.ReadHttpProperties(http.Request.Headers, blob.Http),
+                ProtocolParsing.HasBlobHttpPropertyHeaders(http.Request.Headers)
+                    ? ProtocolParsing.ReadHttpProperties(http.Request.Headers, useStandardProperties: false)
+                    : blob.Http,
                 resizeTo,
                 sequence,
                 ProtocolParsing.First(http.Request.Headers, "x-ms-sequence-number-action"),
@@ -1617,7 +1619,7 @@ public static class BlobProtocolEndpoint
                         containerName,
                         blobName,
                         source.Content,
-                        ReadUrlWriteOptions(http.Request, source),
+                        ReadUrlWriteOptions(http.Request, source, putBlobFromUrl: true),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
@@ -1697,18 +1699,25 @@ public static class BlobProtocolEndpoint
         {
             case "BlockBlob":
                 created = null!;
+                var persistedMd5 = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-content-md5");
                 checksums = await WithIntegrityValidationAsync(http.Request, async body =>
                     created = await service.PutBlockBlobAsync(
                         request.Account,
                         containerName,
                         blobName,
                         body,
-                        ReadWriteOptions(http.Request, current),
+                        ReadWriteOptions(
+                            http.Request,
+                            current,
+                            generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12))),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
                         cancellationToken),
-                    maximumBodyBytes: GetMaximumPutBlobBytes(request));
+                    maximumBodyBytes: GetMaximumPutBlobBytes(request),
+                    expectedMd5HeaderName: persistedMd5 is null
+                        ? "Content-MD5"
+                        : "x-ms-blob-content-md5");
                 break;
             case "AppendBlob":
                 RequireFeatureVersion(request, new DateOnly(2015, 2, 21), "Append Blob");
@@ -2611,13 +2620,14 @@ public static class BlobProtocolEndpoint
     private static BlobWriteOptions ReadWriteOptions(
         HttpRequest request,
         BlobRecord? fallback,
-        bool useStandardContentType = true)
+        bool useStandardProperties = true,
+        bool generateContentMd5 = false)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
         var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
-            ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
+            ProtocolParsing.ReadHttpProperties(request.Headers, useStandardProperties: useStandardProperties),
             ProtocolParsing.ReadMetadata(request.Headers),
             ReadTagsHeader(request),
             ReadAccessTier(request, fallback?.AccessTier),
@@ -2629,7 +2639,8 @@ public static class BlobProtocolEndpoint
             encryption.CustomerProvidedKey,
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? fallback?.AccessTierInferred
-                : false);
+                : false,
+            generateContentMd5);
     }
 
     private static string? ReadAccessTier(HttpRequest request, string? fallback)
@@ -2822,14 +2833,26 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.InvalidHeader("x-ms-structured-content-length", structuredLength);
     }
 
-    private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
+    private static BlobWriteOptions ReadUrlWriteOptions(
+        HttpRequest request,
+        UrlSource source,
+        bool putBlobFromUrl = false)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
         var encryption = ReadRequestEncryption(request, write: true);
+        var copySourceProperties = putBlobFromUrl
+            ? ReadCopySourceBlobProperties(request)
+            : true;
+        var hasReplacementMetadata = request.Headers.Keys.Any(name =>
+            name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
         return new BlobWriteOptions(
-            ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
-            ProtocolParsing.ReadMetadata(request.Headers),
+            ProtocolParsing.ReadHttpProperties(
+                request.Headers,
+                copySourceProperties ? source.Http : new BlobHttpProperties()),
+            hasReplacementMetadata
+                ? ProtocolParsing.ReadMetadata(request.Headers)
+                : new Dictionary<string, string>(source.Metadata, StringComparer.OrdinalIgnoreCase),
             ReadTagsHeader(request),
             ReadAccessTier(request, fallback: null),
             until,
@@ -2838,7 +2861,19 @@ public static class BlobProtocolEndpoint
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
             encryption.CustomerProvidedKey,
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null ? null : false);
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null ? null : false,
+            GenerateContentMd5: putBlobFromUrl);
+    }
+
+    private static bool ReadCopySourceBlobProperties(HttpRequest request)
+    {
+        const string headerName = "x-ms-copy-source-blob-properties";
+        var value = ProtocolParsing.First(request.Headers, headerName);
+        if (value is null)
+            return true;
+        if (bool.TryParse(value, out var parsed))
+            return parsed;
+        throw AzureStorageException.InvalidHeader(headerName, value);
     }
 
     private static BlobWriteOptions ReadCopyWriteOptions(HttpRequest request, BlobRecord source)
@@ -3148,9 +3183,10 @@ public static class BlobProtocolEndpoint
         HttpRequest request,
         Func<Stream, Task> action,
         bool allowStructured = true,
-        long maximumBodyBytes = long.MaxValue)
+        long maximumBodyBytes = long.MaxValue,
+        string expectedMd5HeaderName = "Content-MD5")
     {
-        var expectedMd5 = ProtocolParsing.First(request.Headers, "Content-MD5");
+        var expectedMd5 = ProtocolParsing.First(request.Headers, expectedMd5HeaderName);
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
         var structuredBody = ProtocolParsing.First(request.Headers, "x-ms-structured-body");
         var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
@@ -3257,7 +3293,7 @@ public static class BlobProtocolEndpoint
         var expected = DecodeChecksum(
             expectedMd5 ?? expectedCrc64!,
             expectedMd5 is null ? 8 : 16,
-            expectedMd5 is null ? "x-ms-content-crc64" : "Content-MD5");
+            expectedMd5 is null ? "x-ms-content-crc64" : expectedMd5HeaderName);
         var paths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
         var temporaryPath = Path.Combine(paths.Staging, $"validated-{Guid.NewGuid():N}.tmp");
         try
