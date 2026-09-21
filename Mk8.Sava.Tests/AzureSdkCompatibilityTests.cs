@@ -19,6 +19,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
+using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
@@ -701,6 +702,207 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task MaintenanceExpiresUncommittedBlocksAndNeverReclaimsPinnedContent()
+    {
+        var client = CreateClient(factory);
+        var containerName = $"maintenance-{Guid.NewGuid():N}";
+        var container = client.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        var blobService = factory.Services.GetRequiredService<BlobService>();
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var chunkStore = factory.Services.GetRequiredService<ChunkStore>();
+
+        var protectedBlob = container.GetBlobClient("active-reader.bin");
+        var protectedBytes = RandomNumberGenerator.GetBytes(48 * 1024);
+        await protectedBlob.UploadAsync(BinaryData.FromBytes(protectedBytes));
+        var protectedRecord = await blobService.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            containerName,
+            protectedBlob.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        var protectedChunkPaths = protectedRecord.Content.Chunks
+            .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Select(chunk => ChunkPath(factory.DataPath, chunk.Id))
+            .ToArray();
+
+        using (chunkStore.Pin(protectedRecord.Content))
+        {
+            await protectedBlob.DeleteAsync();
+            await blobService.RunMaintenanceAsync(CancellationToken.None);
+            Assert.All(protectedChunkPaths, path => Assert.True(File.Exists(path)));
+        }
+
+        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        Assert.All(protectedChunkPaths, path => Assert.False(File.Exists(path)));
+
+        var expiring = container.GetBlobClient("expiring.bin");
+        await expiring.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(20 * 1024)));
+        var expiringRecord = await blobService.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            containerName,
+            expiring.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        await blobService.SetExpiryAsync(
+            expiringRecord,
+            DateTimeOffset.UtcNow.AddMilliseconds(100),
+            CancellationToken.None);
+        await Task.Delay(150);
+        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        Assert.False((await expiring.ExistsAsync()).Value);
+
+        var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
+        var blockId = Convert.ToBase64String("stale-block-0001"u8);
+        await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(32 * 1024)));
+        var staged = Assert.Single(await blobService.ListStagedBlocksAsync(
+            SavaWebApplicationFactory.AccountName,
+            containerName,
+            uncommitted.Name,
+            CancellationToken.None));
+        await metadata.PutStagedBlockAsync(
+            staged with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) },
+            CancellationToken.None);
+
+        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        Assert.Empty(await blobService.ListStagedBlocksAsync(
+            SavaWebApplicationFactory.AccountName,
+            containerName,
+            uncommitted.Name,
+            CancellationToken.None));
+        Assert.All(
+            staged.Content.Chunks.Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal)),
+            chunk => Assert.False(File.Exists(ChunkPath(factory.DataPath, chunk.Id))));
+    }
+
+    [Fact]
+    public async Task SoftDeleteRetentionSurvivesPolicyChangesAndExpiredRecordsArePurged()
+    {
+        var client = CreateClient(factory);
+        var original = (await client.GetPropertiesAsync()).Value;
+        var containerName = $"retention-{Guid.NewGuid():N}";
+        var container = client.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("retained.bin");
+        await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(24 * 1024)));
+        var blobService = factory.Services.GetRequiredService<BlobService>();
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+
+        try
+        {
+            var enabled = (await client.GetPropertiesAsync()).Value;
+            enabled.DeleteRetentionPolicy.Enabled = true;
+            enabled.DeleteRetentionPolicy.Days = 1;
+            await client.SetPropertiesAsync(enabled);
+            await blob.DeleteAsync();
+
+            var deleted = await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                containerName,
+                blob.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: true,
+                CancellationToken.None);
+            Assert.NotNull(deleted?.DeleteRetentionUntil);
+            Assert.InRange(
+                deleted!.DeleteRetentionUntil!.Value - deleted.DeletedAt!.Value,
+                TimeSpan.FromHours(23.9),
+                TimeSpan.FromHours(24.1));
+
+            var disabled = (await client.GetPropertiesAsync()).Value;
+            disabled.DeleteRetentionPolicy.Enabled = false;
+            await client.SetPropertiesAsync(disabled);
+            await blob.UndeleteAsync();
+            Assert.True((await blob.ExistsAsync()).Value);
+
+            enabled = (await client.GetPropertiesAsync()).Value;
+            enabled.DeleteRetentionPolicy.Enabled = true;
+            enabled.DeleteRetentionPolicy.Days = 1;
+            await client.SetPropertiesAsync(enabled);
+            await blob.DeleteAsync();
+            deleted = await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                containerName,
+                blob.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: true,
+                CancellationToken.None);
+            Assert.NotNull(deleted);
+            await metadata.PutBlobRecordAsync(
+                deleted! with
+                {
+                    Revision = MetadataStore.NewRevision(),
+                    DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
+                },
+                deleted.Revision,
+                CancellationToken.None);
+
+            await blobService.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Null(await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                containerName,
+                blob.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: true,
+                CancellationToken.None));
+        }
+        finally
+        {
+            await client.SetPropertiesAsync(original);
+        }
+    }
+
+    [Fact]
+    public async Task ConcurrentPublicationAndReclamationPreserveEveryAcknowledgedBlob()
+    {
+        var client = CreateClient(factory);
+        var container = client.GetBlobContainerClient($"gc-race-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var content = RandomNumberGenerator.GetBytes(96 * 1024);
+        var blobService = factory.Services.GetRequiredService<BlobService>();
+        using var stop = new CancellationTokenSource();
+        var sweeper = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    stop.Token.ThrowIfCancellationRequested();
+                    await blobService.CollectGarbageAsync(stop.Token);
+                    await Task.Yield();
+                }
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+            }
+        });
+
+        try
+        {
+            await Task.WhenAll(Enumerable.Range(0, 16).Select(index =>
+                container.GetBlobClient($"published-{index:D2}.bin").UploadAsync(BinaryData.FromBytes(content))));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await sweeper;
+        }
+
+        foreach (var index in Enumerable.Range(0, 16))
+        {
+            var downloaded = await container.GetBlobClient($"published-{index:D2}.bin").DownloadContentAsync();
+            Assert.Equal(content, downloaded.Value.Content.ToArray());
+        }
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);
@@ -909,6 +1111,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>
         Directory.EnumerateFiles(Path.Combine(dataPath, "chunks"), "*.chunk", SearchOption.AllDirectories)
             .Select(path => new FileInfo(path));
+
+    private static string ChunkPath(string dataPath, string chunkId) =>
+        Path.Combine(dataPath, "chunks", chunkId.Replace('/', Path.DirectorySeparatorChar) + ".chunk");
 
     private sealed class LoopbackSource(WebApplication application, Uri uri) : IAsyncDisposable
     {

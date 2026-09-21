@@ -63,6 +63,13 @@ public sealed class AzureResponseWriter
                     writer.WriteElementString("Deleted", container.DeletedAt.HasValue ? "true" : "false");
                     if (container.DeletedVersion is not null)
                         writer.WriteElementString("Version", container.DeletedVersion);
+                    WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
+                    if (container.DeleteRetentionUntil.HasValue)
+                    {
+                        writer.WriteElementString(
+                            "RemainingRetentionDays",
+                            RemainingRetentionDays(container.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
+                    }
                 }
                 writer.WriteEndElement();
                 if (includeMetadata)
@@ -164,6 +171,17 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
                 WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
                 WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
+                WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
+                if (blob.IsDeleted)
+                {
+                    WriteOptional(writer, "DeletedTime", blob.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
+                    if (blob.DeleteRetentionUntil.HasValue)
+                    {
+                        writer.WriteElementString(
+                            "RemainingRetentionDays",
+                            RemainingRetentionDays(blob.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
+                    }
+                }
                 writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
                 writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
                 if (blob.Kind == Storage.BlobKind.AppendBlob)
@@ -355,6 +373,7 @@ public sealed class AzureResponseWriter
         SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
         SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
         SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
+        SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
         response.Headers["x-ms-lease-state"] = LeaseStateValue(blob.Lease);
         response.Headers["Accept-Ranges"] = "bytes";
@@ -453,6 +472,9 @@ public sealed class AzureResponseWriter
         if (value is not null)
             headers[name] = value;
     }
+
+    private static int RemainingRetentionDays(DateTimeOffset retentionUntil) =>
+        Math.Max(0, (int)Math.Ceiling((retentionUntil - DateTimeOffset.UtcNow).TotalDays));
 
     private static string BlobType(Storage.BlobKind kind) => kind switch
     {

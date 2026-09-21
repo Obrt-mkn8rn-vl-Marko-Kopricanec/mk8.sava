@@ -919,8 +919,12 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
-            var expiry = ParseExpiry(http.Request.Headers, metadataNow: DateTimeOffset.UtcNow);
-            await service.SetExpiryAsync(blob, expiry, cancellationToken);
+            EvaluateWriteConditions(http.Request, blob);
+            EnsureLease(http.Request, blob.Lease, "blob");
+            var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, DateTimeOffset.UtcNow);
+            var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
+            http.Response.Headers.ETag = updated.ETag;
+            http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
             return;
         }
 
@@ -1927,26 +1931,35 @@ public static class BlobProtocolEndpoint
             http.Response.Headers["x-ms-content-crc64"] = crc64;
     }
 
-    private static DateTimeOffset? ParseExpiry(IHeaderDictionary headers, DateTimeOffset metadataNow)
+    private static DateTimeOffset? ParseExpiry(
+        IHeaderDictionary headers,
+        DateTimeOffset createdAt,
+        DateTimeOffset metadataNow)
     {
         var option = ProtocolParsing.First(headers, "x-ms-expiry-option")?.ToLowerInvariant()
                      ?? throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
-        var value = ProtocolParsing.First(headers, "x-ms-expiry-time")
-                    ?? throw AzureStorageException.InvalidHeader("x-ms-expiry-time");
-        return option switch
+        var value = ProtocolParsing.First(headers, "x-ms-expiry-time");
+        switch (option)
         {
-            "neverexpire" => null,
-            "absolut" or "absolute" => DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var absolute)
-                ? absolute
-                : throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value),
-            "relativetonow" => long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var milliseconds)
-                ? metadataNow.AddMilliseconds(milliseconds)
-                : throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value),
-            "relativetocreation" => long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var fromCreation)
-                ? metadataNow.AddMilliseconds(fromCreation)
-                : throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value),
-            _ => throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option)
-        };
+            case "neverexpire":
+                if (value is not null)
+                    throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
+                return null;
+            case "absolute":
+                if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var absolute))
+                    throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
+                return absolute;
+            case "relativetonow":
+                if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var milliseconds) || milliseconds <= 0)
+                    throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
+                return metadataNow.AddMilliseconds(milliseconds);
+            case "relativetocreation":
+                if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var fromCreation) || fromCreation <= 0)
+                    throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
+                return createdAt.AddMilliseconds(fromCreation);
+            default:
+                throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option);
+        }
     }
 
     private static bool MatchesETag(string header, string etag, bool requireMatch) =>

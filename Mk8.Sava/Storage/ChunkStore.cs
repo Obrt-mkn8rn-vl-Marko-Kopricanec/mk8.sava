@@ -27,6 +27,7 @@ public sealed class ChunkStore
     private readonly ContentDefinedChunker _chunker;
     private readonly object _pinGate = new();
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ChunkReclamationReservation> _reclamationReservations = new(StringComparer.Ordinal);
 
     public ChunkStore(StoragePaths paths, IOptions<SavaOptions> options)
     {
@@ -66,8 +67,8 @@ public sealed class ChunkStore
                 else
                 {
                     var id = await StoreVerifiedChunkAsync(domain, bytes, encryption.CustomerProvidedKey, cancellationToken);
-                    if (pinnedIds.Add(id))
-                        PinId(id);
+                    if (!pinnedIds.Add(id))
+                        UnpinId(id);
                     references.Add(new ChunkReference(id, offset, bytes.Length));
                 }
                 offset += bytes.Length;
@@ -97,8 +98,7 @@ public sealed class ChunkStore
             .Select(chunk => chunk.Id)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
-        foreach (var id in ids)
-            PinId(id);
+        PinIds(ids);
         return new PinLease(this, ids);
     }
 
@@ -354,17 +354,21 @@ public sealed class ChunkStore
         Directory.EnumerateFiles(_paths.Chunks, "*.chunk", SearchOption.AllDirectories)
             .Select(path => Path.GetRelativePath(_paths.Chunks, path)[..^".chunk".Length].Replace(Path.DirectorySeparatorChar, '/'));
 
-    public bool DeleteChunk(string id)
+    internal ChunkReclamationReservation? TryReserveForReclamation(string id)
     {
         lock (_pinGate)
         {
-            if (_pins.ContainsKey(id))
-                return false;
             var path = GetChunkPath(id);
-            if (!File.Exists(path))
-                return false;
-            File.Delete(path);
-            return true;
+            if (_pins.ContainsKey(id) ||
+                _reclamationReservations.ContainsKey(id) ||
+                !File.Exists(path))
+            {
+                return null;
+            }
+
+            var reservation = new ChunkReclamationReservation(this, id);
+            _reclamationReservations.Add(id, reservation);
+            return reservation;
         }
     }
 
@@ -508,34 +512,58 @@ public sealed class ChunkStore
             var name = collision == 0 ? baseName : $"{baseName}-{collision}";
             var id = $"{domain}/{hash[..2]}/{hash[2..4]}/{name}";
             var finalPath = GetChunkPath(id);
-            if (File.Exists(finalPath))
+            while (true)
             {
-                var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
-                if (CryptographicOperations.FixedTimeEquals(existing, bytes))
-                    return id;
-                continue;
-            }
+                if (await TryPinIdAsync(id, cancellationToken))
+                {
+                    var keepPin = false;
+                    try
+                    {
+                        var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
+                        if (CryptographicOperations.FixedTimeEquals(existing, bytes))
+                        {
+                            keepPin = true;
+                            return id;
+                        }
+                    }
+                    finally
+                    {
+                        if (!keepPin)
+                            UnpinId(id);
+                    }
+                    break;
+                }
 
-            var temporaryPath = Path.Combine(_paths.Staging, $"chunk-{Guid.NewGuid():N}.tmp");
-            try
-            {
-                await WriteChunkFileAsync(temporaryPath, domain, bytes, customerProvidedKey, cancellationToken);
+                var temporaryPath = Path.Combine(_paths.Staging, $"chunk-{Guid.NewGuid():N}.tmp");
                 try
                 {
-                    File.Move(temporaryPath, finalPath, overwrite: false);
-                    return id;
-                }
-                catch (IOException) when (File.Exists(finalPath))
-                {
-                    var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
-                    if (CryptographicOperations.FixedTimeEquals(existing, bytes))
+                    await WriteChunkFileAsync(temporaryPath, domain, bytes, customerProvidedKey, cancellationToken);
+                    Task? reservationCompletion = null;
+                    var created = false;
+                    lock (_pinGate)
+                    {
+                        if (_reclamationReservations.TryGetValue(id, out var reservation))
+                        {
+                            reservationCompletion = reservation.Completion;
+                        }
+                        else if (!File.Exists(finalPath))
+                        {
+                            File.Move(temporaryPath, finalPath, overwrite: false);
+                            _pins[id] = _pins.GetValueOrDefault(id) + 1;
+                            created = true;
+                        }
+                    }
+
+                    if (created)
                         return id;
+                    if (reservationCompletion is not null)
+                        await reservationCompletion.WaitAsync(cancellationToken);
                 }
-            }
-            finally
-            {
-                if (File.Exists(temporaryPath))
-                    File.Delete(temporaryPath);
+                finally
+                {
+                    if (File.Exists(temporaryPath))
+                        File.Delete(temporaryPath);
+                }
             }
         }
     }
@@ -738,10 +766,61 @@ public sealed class ChunkStore
     private static bool IsZero(ChunkReference reference, string domain) =>
         string.Equals(reference.Id, ZeroId(domain), StringComparison.Ordinal);
 
-    private void PinId(string id)
+    private void PinIds(IReadOnlyList<string> ids)
     {
-        lock (_pinGate)
-            _pins[id] = _pins.GetValueOrDefault(id) + 1;
+        while (true)
+        {
+            Task? reservationCompletion = null;
+            lock (_pinGate)
+            {
+                foreach (var id in ids)
+                {
+                    if (_reclamationReservations.TryGetValue(id, out var reservation))
+                    {
+                        reservationCompletion = reservation.Completion;
+                        break;
+                    }
+                }
+
+                if (reservationCompletion is null)
+                {
+                    foreach (var id in ids)
+                    {
+                        if (!File.Exists(GetChunkPath(id)))
+                            throw new InvalidDataException($"Chunk '{id}' is missing.");
+                    }
+                    foreach (var id in ids)
+                        _pins[id] = _pins.GetValueOrDefault(id) + 1;
+                    return;
+                }
+            }
+
+            reservationCompletion.GetAwaiter().GetResult();
+        }
+    }
+
+    private async Task<bool> TryPinIdAsync(string id, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            Task? reservationCompletion;
+            lock (_pinGate)
+            {
+                if (_reclamationReservations.TryGetValue(id, out var reservation))
+                {
+                    reservationCompletion = reservation.Completion;
+                }
+                else
+                {
+                    if (!File.Exists(GetChunkPath(id)))
+                        return false;
+                    _pins[id] = _pins.GetValueOrDefault(id) + 1;
+                    return true;
+                }
+            }
+
+            await reservationCompletion.WaitAsync(cancellationToken);
+        }
     }
 
     private void UnpinId(string id)
@@ -769,5 +848,72 @@ public sealed class ChunkStore
             foreach (var id in _ids)
                 owner.UnpinId(id);
         }
+    }
+
+    internal sealed class ChunkReclamationReservation : IDisposable
+    {
+        private readonly ChunkStore _owner;
+        private int _completed;
+
+        internal ChunkReclamationReservation(ChunkStore owner, string id)
+        {
+            _owner = owner;
+            Id = id;
+        }
+
+        internal TaskCompletionSource<bool> CompletionSource { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal Task Completion => CompletionSource.Task;
+
+        public string Id { get; }
+
+        public bool TryDelete()
+        {
+            if (Interlocked.CompareExchange(ref _completed, 1, 0) != 0)
+                return false;
+            try
+            {
+                return _owner.CompleteReclamation(this, delete: true);
+            }
+            catch
+            {
+                _owner.CompleteReclamation(this, delete: false);
+                throw;
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.CompareExchange(ref _completed, 1, 0) == 0)
+                _owner.CompleteReclamation(this, delete: false);
+        }
+    }
+
+    private bool CompleteReclamation(ChunkReclamationReservation reservation, bool delete)
+    {
+        var deleted = false;
+        lock (_pinGate)
+        {
+            if (!_reclamationReservations.TryGetValue(reservation.Id, out var current) ||
+                !ReferenceEquals(current, reservation))
+            {
+                return false;
+            }
+            if (delete && _pins.ContainsKey(reservation.Id))
+                throw new InvalidOperationException("A reserved chunk became pinned during reclamation.");
+            if (delete)
+            {
+                var path = GetChunkPath(reservation.Id);
+                if (File.Exists(path))
+                {
+                    File.Delete(path);
+                    deleted = true;
+                }
+            }
+            _reclamationReservations.Remove(reservation.Id);
+        }
+        reservation.CompletionSource.TrySetResult(true);
+        return deleted;
     }
 }

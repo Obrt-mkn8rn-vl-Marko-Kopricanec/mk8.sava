@@ -22,17 +22,37 @@ public sealed record PageRange(long Start, long End);
 
 public sealed record BlobTierUpdate(BlobRecord Blob, bool Pending);
 
+public sealed record StorageMaintenanceResult(
+    int CompletedCopies,
+    int CompletedRehydrations,
+    int ExpiredBlobs,
+    int PurgedSoftDeletedBlobs,
+    int PurgedSoftDeletedContainers,
+    int ExpiredUncommittedBlocks,
+    int ReclaimedChunks);
+
 public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
-    public Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
+    public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
-        CancellationToken cancellationToken) =>
-        metadata.ListContainersAsync(account, includeDeleted, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var containers = await metadata.ListContainersAsync(account, includeDeleted, cancellationToken);
+        if (!includeDeleted || !containers.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
+            return containers;
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        return containers.Select(container => container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
+            ? container with
+            {
+                DeleteRetentionUntil = container.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays)
+            }
+            : container).ToArray();
+    }
 
     public async Task<ContainerRecord> CreateContainerAsync(
         string account,
@@ -124,13 +144,15 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
         if (properties.ContainerSoftDeleteEnabled)
         {
+            var deletedAt = metadata.GetUtcNow();
             var deleted = current with
             {
                 Revision = MetadataStore.NewRevision(),
-                DeletedAt = metadata.GetUtcNow(),
+                DeletedAt = deletedAt,
+                DeleteRetentionUntil = deletedAt.AddDays(properties.ContainerSoftDeleteRetentionDays),
                 DeletedVersion = Guid.NewGuid().ToString("N"),
                 ETag = MetadataStore.NewETag(),
-                LastModified = metadata.GetUtcNow()
+                LastModified = deletedAt
             };
             await metadata.PutContainerAsync(deleted, current.Revision, cancellationToken);
         }
@@ -150,8 +172,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         if (current.DeletedAt is null || !string.Equals(current.DeletedVersion, deletedVersion, StringComparison.Ordinal))
             throw AzureStorageException.ContainerNotFound();
         var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
-        if (!properties.ContainerSoftDeleteEnabled ||
-            current.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays) < metadata.GetUtcNow())
+        var retentionUntil = current.DeleteRetentionUntil ??
+                             current.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays);
+        if (retentionUntil < metadata.GetUtcNow())
         {
             throw AzureStorageException.ContainerNotFound();
         }
@@ -160,6 +183,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         {
             Revision = MetadataStore.NewRevision(),
             DeletedAt = null,
+            DeleteRetentionUntil = null,
             DeletedVersion = null,
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
@@ -193,10 +217,19 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
         var effective = new List<BlobRecord>(blobs.Count);
+        var properties = includeDeleted && blobs.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue)
+            ? await metadata.GetServicePropertiesAsync(account, cancellationToken)
+            : null;
         foreach (var blob in blobs)
         {
             var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
-            effective.Add(await CompleteRehydrationIfDueAsync(copy, cancellationToken));
+            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
+            effective.Add(properties is not null && rehydrated.DeletedAt.HasValue && !rehydrated.DeleteRetentionUntil.HasValue
+                ? rehydrated with
+                {
+                    DeleteRetentionUntil = rehydrated.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays)
+                }
+                : rehydrated);
         }
         return effective;
     }
@@ -675,7 +708,16 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
-        var updated = current with { ExpiresAt = expiresAt, Copy = null, Revision = MetadataStore.NewRevision() };
+        if (expiresAt <= metadata.GetUtcNow())
+            throw AzureStorageException.InvalidHeader("x-ms-expiry-time", expiresAt.Value.ToString("R", CultureInfo.InvariantCulture));
+        var updated = current with
+        {
+            ExpiresAt = expiresAt,
+            Copy = null,
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = metadata.GetUtcNow()
+        };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
     }
@@ -800,10 +842,12 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         {
             if (properties.BlobSoftDeleteEnabled)
             {
+                var deletedAt = metadata.GetUtcNow();
                 await metadata.PutBlobRecordAsync(target with
                 {
                     IsDeleted = true,
-                    DeletedAt = metadata.GetUtcNow(),
+                    DeletedAt = deletedAt,
+                    DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
                     IsCurrent = target.IsCurrent,
                     Revision = MetadataStore.NewRevision()
                 }, target.Revision, cancellationToken);
@@ -827,14 +871,17 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var restored = false;
         foreach (var record in records.Where(item => item.Name == name && item.IsDeleted))
         {
-            if (!properties.BlobSoftDeleteEnabled ||
-                record.DeletedAt is null ||
-                record.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays) < now)
+            if (record.DeletedAt is null)
+                continue;
+            var retentionUntil = record.DeleteRetentionUntil ??
+                                 record.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays);
+            if (retentionUntil < now)
                 continue;
             await metadata.PutBlobRecordAsync(record with
             {
                 IsDeleted = false,
                 DeletedAt = null,
+                DeleteRetentionUntil = null,
                 Revision = MetadataStore.NewRevision()
             }, record.Revision, cancellationToken);
             restored = true;
@@ -1021,14 +1068,143 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
     public Task PutServicePropertiesAsync(string account, ServiceProperties properties, CancellationToken cancellationToken) =>
         metadata.PutServicePropertiesAsync(account, properties, cancellationToken);
 
+    public async Task<StorageMaintenanceResult> RunMaintenanceAsync(CancellationToken cancellationToken)
+    {
+        var completedCopies = await CompletePendingCopiesAsync(cancellationToken);
+        var completedRehydrations = 0;
+        var expiredBlobs = 0;
+        var purgedBlobs = 0;
+        var purgedContainers = 0;
+        var now = metadata.GetUtcNow();
+        var serviceProperties = new Dictionary<string, ServiceProperties>(StringComparer.Ordinal);
+
+        foreach (var candidate in await metadata.ListBlobsForMaintenanceAsync(cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var blob = candidate;
+                if (blob.IsDeleted && blob.DeletedAt is not null)
+                {
+                    var retentionUntil = blob.DeleteRetentionUntil;
+                    if (!retentionUntil.HasValue)
+                    {
+                        if (!serviceProperties.TryGetValue(blob.Account, out var properties))
+                        {
+                            properties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken);
+                            serviceProperties.Add(blob.Account, properties);
+                        }
+                        retentionUntil = blob.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays);
+                    }
+                    if (retentionUntil <= now &&
+                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                    {
+                        purgedBlobs++;
+                    }
+                    continue;
+                }
+
+                if (blob.RehydrateCompleteAt <= now)
+                {
+                    var rehydrated = await CompleteRehydrationIfDueAsync(blob, cancellationToken);
+                    if (rehydrated.RehydrateCompleteAt is null && blob.RehydrateCompleteAt is not null)
+                        completedRehydrations++;
+                    blob = rehydrated;
+                }
+
+                if (blob.IsCurrent &&
+                    blob.Snapshot is null &&
+                    blob.ExpiresAt <= now &&
+                    !blob.HasLegalHold &&
+                    (!blob.ImmutabilityUntil.HasValue || blob.ImmutabilityUntil <= now) &&
+                    await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                {
+                    expiredBlobs++;
+                }
+            }
+            catch (StorageConcurrencyException)
+            {
+                // A concurrent request changed the resource; the next pass evaluates its new state.
+            }
+        }
+
+        foreach (var container in await metadata.ListDeletedContainersForMaintenanceAsync(cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (container.DeletedAt is null)
+                continue;
+            var retentionUntil = container.DeleteRetentionUntil;
+            if (!retentionUntil.HasValue)
+            {
+                if (!serviceProperties.TryGetValue(container.Account, out var properties))
+                {
+                    properties = await metadata.GetServicePropertiesAsync(container.Account, cancellationToken);
+                    serviceProperties.Add(container.Account, properties);
+                }
+                retentionUntil = container.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays);
+            }
+            if (retentionUntil > now)
+                continue;
+            try
+            {
+                if (await metadata.DeleteContainerPermanentlyAsync(
+                        container.Account,
+                        container.Name,
+                        container.Revision,
+                        cancellationToken))
+                {
+                    purgedContainers++;
+                }
+            }
+            catch (StorageConcurrencyException)
+            {
+                // A restore or mutation won the race; the next pass evaluates the current record.
+            }
+        }
+
+        var expiredBlocks = await metadata.DeleteStagedBlocksOlderThanAsync(
+            now.Subtract(_options.UncommittedBlockRetention),
+            cancellationToken);
+        var reclaimedChunks = await CollectGarbageAsync(cancellationToken);
+        return new StorageMaintenanceResult(
+            completedCopies,
+            completedRehydrations,
+            expiredBlobs,
+            purgedBlobs,
+            purgedContainers,
+            expiredBlocks,
+            reclaimedChunks);
+    }
+
     public async Task<int> CollectGarbageAsync(CancellationToken cancellationToken)
     {
-        var reachable = await metadata.GetReachableChunkIdsAsync(cancellationToken);
+        var firstReachabilitySnapshot = await metadata.GetReachableChunkIdsAsync(cancellationToken);
+        var reservations = new List<ChunkStore.ChunkReclamationReservation>();
         var deleted = 0;
-        foreach (var chunk in chunks.EnumerateChunkIds())
+        try
         {
-            if (!reachable.Contains(chunk) && chunks.DeleteChunk(chunk))
-                deleted++;
+            foreach (var chunk in chunks.EnumerateChunkIds())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (firstReachabilitySnapshot.Contains(chunk))
+                    continue;
+                var reservation = chunks.TryReserveForReclamation(chunk);
+                if (reservation is not null)
+                    reservations.Add(reservation);
+            }
+
+            var confirmedReachable = await metadata.GetReachableChunkIdsAsync(cancellationToken);
+            foreach (var reservation in reservations)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!confirmedReachable.Contains(reservation.Id) && reservation.TryDelete())
+                    deleted++;
+            }
+        }
+        finally
+        {
+            foreach (var reservation in reservations)
+                reservation.Dispose();
         }
         return deleted;
     }

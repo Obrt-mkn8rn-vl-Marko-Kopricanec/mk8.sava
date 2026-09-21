@@ -29,6 +29,7 @@ public sealed class SavaOptions : IValidatableObject
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
     public TimeSpan AsyncCopyCompletionDelay { get; init; } = TimeSpan.FromSeconds(1);
     public TimeSpan MaintenanceScanInterval { get; init; } = TimeSpan.FromSeconds(1);
+    public TimeSpan UncommittedBlockRetention { get; init; } = TimeSpan.FromDays(7);
     public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
@@ -87,6 +88,9 @@ public sealed class SavaOptions : IValidatableObject
 
         if (MaintenanceScanInterval <= TimeSpan.Zero)
             yield return new ValidationResult("MaintenanceScanInterval must be positive.", [nameof(MaintenanceScanInterval)]);
+
+        if (UncommittedBlockRetention <= TimeSpan.Zero)
+            yield return new ValidationResult("UncommittedBlockRetention must be positive.", [nameof(UncommittedBlockRetention)]);
 
         if (BearerAuthentication.Enabled)
         {

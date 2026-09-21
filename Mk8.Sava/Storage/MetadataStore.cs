@@ -307,6 +307,23 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         return blobs.Where(blob => blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null).ToArray();
     }
 
+    public async Task<IReadOnlyList<BlobRecord>> ListBlobsForMaintenanceAsync(CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT data FROM blobs ORDER BY modified_ticks;";
+        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<ContainerRecord>> ListDeletedContainersForMaintenanceAsync(
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT data FROM containers WHERE deleted = 1 ORDER BY modified_ticks;";
+        return await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken);
+    }
+
     public async Task<BlobRecord> PublishBlobAsync(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
@@ -588,6 +605,25 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 await command.ExecuteNonQueryAsync(cancellationToken);
             }
             await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    public async Task<int> DeleteStagedBlocksOlderThanAsync(
+        DateTimeOffset cutoff,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM staged_blocks WHERE created_ticks < $cutoff;";
+            command.Parameters.AddWithValue("$cutoff", cutoff.UtcTicks);
+            return await command.ExecuteNonQueryAsync(cancellationToken);
         }
         finally
         {

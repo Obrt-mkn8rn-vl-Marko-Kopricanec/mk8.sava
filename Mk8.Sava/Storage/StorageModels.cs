@@ -63,6 +63,7 @@ public sealed record ContainerRecord
     public string? PublicAccess { get; init; }
     public LeaseRecord Lease { get; init; } = LeaseRecord.Available;
     public DateTimeOffset? DeletedAt { get; init; }
+    public DateTimeOffset? DeleteRetentionUntil { get; init; }
     public string? DeletedVersion { get; init; }
     public bool HasLegalHold { get; init; }
     public DateTimeOffset? ImmutabilityUntil { get; init; }
@@ -88,6 +89,7 @@ public sealed record BlobRecord
     public bool IsCurrent { get; init; }
     public bool IsDeleted { get; init; }
     public DateTimeOffset? DeletedAt { get; init; }
+    public DateTimeOffset? DeleteRetentionUntil { get; init; }
     public required BlobKind Kind { get; init; }
     public required ContentManifest Content { get; init; }
     public required string ETag { get; init; }
