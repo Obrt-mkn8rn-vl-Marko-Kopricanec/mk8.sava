@@ -9,19 +9,28 @@ public sealed class AzureStorageException : Exception
         string errorCode,
         string message,
         string? headerName = null,
-        string? headerValue = null)
+        string? headerValue = null,
+        IReadOnlyDictionary<string, string>? responseHeaders = null,
+        IReadOnlyDictionary<string, string>? details = null)
         : base(message)
     {
         StatusCode = statusCode;
         ErrorCode = errorCode;
         HeaderName = headerName;
         HeaderValue = headerValue;
+        ResponseHeaders = responseHeaders ?? EmptyValues;
+        Details = details ?? EmptyValues;
     }
+
+    private static readonly IReadOnlyDictionary<string, string> EmptyValues =
+        new Dictionary<string, string>(StringComparer.Ordinal);
 
     public int StatusCode { get; }
     public string ErrorCode { get; }
     public string? HeaderName { get; }
     public string? HeaderValue { get; }
+    public IReadOnlyDictionary<string, string> ResponseHeaders { get; }
+    public IReadOnlyDictionary<string, string> Details { get; }
 
     public static AzureStorageException InvalidQuery(string parameter) => new(
         (int)HttpStatusCode.BadRequest,

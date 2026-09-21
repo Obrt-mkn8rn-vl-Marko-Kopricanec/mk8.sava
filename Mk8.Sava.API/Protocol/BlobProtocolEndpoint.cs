@@ -752,6 +752,8 @@ public static class BlobProtocolEndpoint
             }
             var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
             headers["x-ms-error-code"] = storageException.ErrorCode;
+            foreach (var header in storageException.ResponseHeaders)
+                headers[header.Key] = header.Value;
             headers["Content-Type"] = "application/xml";
             if (storageException.StatusCode == StatusCodes.Status401Unauthorized)
                 headers["WWW-Authenticate"] = "Bearer resource_id=\"https://storage.azure.com/\"";
@@ -821,6 +823,8 @@ public static class BlobProtocolEndpoint
                 writer.WriteElementString("HeaderName", exception.HeaderName);
             if (exception.HeaderValue is not null)
                 writer.WriteElementString("HeaderValue", exception.HeaderValue);
+            foreach (var detail in exception.Details)
+                writer.WriteElementString(detail.Key, detail.Value);
             writer.WriteEndElement();
         }
         return Encoding.UTF8.GetBytes(builder.ToString());
