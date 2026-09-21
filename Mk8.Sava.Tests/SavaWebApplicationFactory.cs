@@ -38,7 +38,9 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:TargetChunkBytes"] = "8192",
                 ["Sava:MaximumChunkBytes"] = "16384",
                 ["Sava:CompressionQuality"] = "5",
-                ["Sava:CompressionMinimumSavingsBytes"] = "32"
+                ["Sava:CompressionMinimumSavingsBytes"] = "32",
+                ["Sava:StandardRehydrationDelay"] = "00:00:05",
+                ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200"
             });
         });
     }

@@ -159,6 +159,9 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
                 writer.WriteElementString("AccessTier", blob.AccessTier);
+                WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
+                WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
+                WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
                 writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
                 if (blob.Kind == Storage.BlobKind.AppendBlob)
@@ -336,6 +339,9 @@ public sealed class AzureResponseWriter
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         response.Headers["x-ms-server-encrypted"] = "true";
         response.Headers["x-ms-access-tier"] = blob.AccessTier;
+        SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
+        SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
+        SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
         response.Headers["x-ms-lease-state"] = LeaseStateValue(blob.Lease);
         response.Headers["Accept-Ranges"] = "bytes";

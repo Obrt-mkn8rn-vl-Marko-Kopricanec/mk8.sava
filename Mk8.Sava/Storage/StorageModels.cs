@@ -96,6 +96,9 @@ public sealed record BlobRecord
     public bool IsSealed { get; init; }
     public string AccessTier { get; init; } = "Hot";
     public DateTimeOffset? AccessTierChangedAt { get; init; }
+    public string? ArchiveStatus { get; init; }
+    public string? RehydratePriority { get; init; }
+    public DateTimeOffset? RehydrateCompleteAt { get; init; }
     public DateTimeOffset? ExpiresAt { get; init; }
     public DateTimeOffset? ImmutabilityUntil { get; init; }
     public bool ImmutabilityLocked { get; init; }

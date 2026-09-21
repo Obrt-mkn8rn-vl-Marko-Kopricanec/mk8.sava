@@ -600,10 +600,15 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "tier")
         {
             Require(request, 'w');
-            EnsureMutableVersion(blob);
+            EvaluateWriteConditions(http.Request, blob);
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
-            await service.SetTierAsync(blob, tier, cancellationToken);
+            var updated = await service.SetTierAsync(
+                blob,
+                tier,
+                ProtocolParsing.First(http.Request.Headers, "x-ms-rehydrate-priority"),
+                cancellationToken);
+            http.Response.StatusCode = updated.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK;
             return;
         }
 

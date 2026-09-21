@@ -476,6 +476,51 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ArchiveTierBlocksReadsAndRehydratesThroughPendingState()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"archive-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("cold.bin");
+        var content = Enumerable.Range(0, 32 * 1024).Select(index => (byte)(index % 251)).ToArray();
+        await blob.UploadAsync(BinaryData.FromBytes(content));
+
+        var archived = await blob.SetAccessTierAsync(AccessTier.Archive);
+        Assert.Equal(200, archived.Status);
+        var archivedProperties = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Archive, archivedProperties.AccessTier);
+        Assert.Null(archivedProperties.ArchiveStatus);
+        var offline = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DownloadContentAsync());
+        Assert.Equal(409, offline.Status);
+        Assert.Equal("BlobArchived", offline.ErrorCode);
+
+        var pending = await blob.SetAccessTierAsync(
+            AccessTier.Hot,
+            rehydratePriority: RehydratePriority.Standard);
+        Assert.Equal(202, pending.Status);
+        var pendingProperties = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Archive, pendingProperties.AccessTier);
+        Assert.Equal("rehydrate-pending-to-hot", pendingProperties.ArchiveStatus);
+        Assert.Equal("Standard", pendingProperties.RehydratePriority);
+
+        var wrongTarget = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetAccessTierAsync(AccessTier.Cool, rehydratePriority: RehydratePriority.High));
+        Assert.Equal("BlobBeingRehydrated", wrongTarget.ErrorCode);
+
+        var prioritized = await blob.SetAccessTierAsync(
+            AccessTier.Hot,
+            rehydratePriority: RehydratePriority.High);
+        Assert.Equal(202, prioritized.Status);
+        Assert.Equal("High", (await blob.GetPropertiesAsync()).Value.RehydratePriority);
+
+        await Task.Delay(300);
+        var online = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(AccessTier.Hot, online.AccessTier);
+        Assert.Null(online.ArchiveStatus);
+        Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);

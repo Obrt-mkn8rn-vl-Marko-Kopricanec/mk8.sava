@@ -17,6 +17,8 @@ public sealed record BlobWriteOptions(
 
 public sealed record PageRange(long Start, long End);
 
+public sealed record BlobTierUpdate(BlobRecord Blob, bool Pending);
+
 public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
@@ -186,7 +188,11 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         CancellationToken cancellationToken)
     {
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        return await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
+        var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
+        var effective = new List<BlobRecord>(blobs.Count);
+        foreach (var blob in blobs)
+            effective.Add(await CompleteRehydrationIfDueAsync(blob, cancellationToken));
+        return effective;
     }
 
     public async Task<BlobRecord> GetBlobAsync(
@@ -200,8 +206,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
     {
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        return await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
-               ?? throw AzureStorageException.BlobNotFound();
+        var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
+                   ?? throw AzureStorageException.BlobNotFound();
+        return await CompleteRehydrationIfDueAsync(blob, cancellationToken);
     }
 
     public async Task<BlobRecord> PutBlockBlobAsync(
@@ -436,8 +443,17 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         long offset,
         long length,
         Stream destination,
-        CancellationToken cancellationToken) =>
+        CancellationToken cancellationToken)
+    {
+        if (string.Equals(blob.AccessTier, "Archive", StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobArchived",
+                "This operation is not permitted on an archived blob.");
+        }
         await chunks.WriteRangeAsync(blob.Content, offset, length, destination, cancellationToken);
+    }
 
     public async Task<BlobRecord> SetBlobMetadataAsync(
         BlobRecord current,
@@ -548,18 +564,75 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         return updated;
     }
 
-    public async Task<BlobRecord> SetTierAsync(BlobRecord current, string tier, CancellationToken cancellationToken)
+    public async Task<BlobTierUpdate> SetTierAsync(
+        BlobRecord current,
+        string tier,
+        string? rehydratePriority,
+        CancellationToken cancellationToken)
     {
-        if (tier is not ("Hot" or "Cool" or "Cold" or "Archive"))
+        if (current.Kind != BlobKind.BlockBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", tier);
-        var updated = current with
+        if (rehydratePriority is not null && rehydratePriority is not ("Standard" or "High"))
+            throw AzureStorageException.InvalidHeader("x-ms-rehydrate-priority", rehydratePriority);
+
+        var now = metadata.GetUtcNow();
+        BlobRecord updated;
+        var pending = false;
+        if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal) && tier != "Archive")
         {
-            AccessTier = tier,
-            Revision = MetadataStore.NewRevision(),
-            AccessTierChangedAt = metadata.GetUtcNow()
-        };
+            if (!current.IsCurrent || current.Snapshot is not null)
+                throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobArchived", "This operation is not permitted on an archived blob.");
+
+            var requestedStatus = $"rehydrate-pending-to-{tier.ToLowerInvariant()}";
+            if (current.ArchiveStatus is not null && !string.Equals(current.ArchiveStatus, requestedStatus, StringComparison.Ordinal))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "BlobBeingRehydrated",
+                    "This operation is not permitted because the blob is being rehydrated.");
+            }
+
+            var priority = current.RehydratePriority == "High" || rehydratePriority == "High" ? "High" : "Standard";
+            var delay = priority == "High" ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
+            var completion = now.Add(delay);
+            if (current.RehydrateCompleteAt.HasValue &&
+                current.RehydratePriority == priority &&
+                current.RehydrateCompleteAt.Value < completion)
+            {
+                completion = current.RehydrateCompleteAt.Value;
+            }
+            updated = current with
+            {
+                ArchiveStatus = requestedStatus,
+                RehydratePriority = priority,
+                RehydrateCompleteAt = completion,
+                Revision = MetadataStore.NewRevision()
+            };
+            pending = true;
+        }
+        else
+        {
+            if (current.ArchiveStatus is not null)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "BlobBeingRehydrated",
+                    "This operation is not permitted because the blob is being rehydrated.");
+            }
+            updated = current with
+            {
+                AccessTier = tier,
+                ArchiveStatus = null,
+                RehydratePriority = null,
+                RehydrateCompleteAt = null,
+                Revision = MetadataStore.NewRevision(),
+                AccessTierChangedAt = now
+            };
+        }
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
-        return updated;
+        return new BlobTierUpdate(updated, pending);
     }
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
@@ -781,6 +854,53 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 deleted++;
         }
         return deleted;
+    }
+
+    private async Task<BlobRecord> CompleteRehydrationIfDueAsync(
+        BlobRecord blob,
+        CancellationToken cancellationToken)
+    {
+        if (blob.ArchiveStatus is null ||
+            !blob.RehydrateCompleteAt.HasValue ||
+            blob.RehydrateCompleteAt.Value > metadata.GetUtcNow())
+        {
+            return blob;
+        }
+
+        var targetTier = blob.ArchiveStatus switch
+        {
+            "rehydrate-pending-to-hot" => "Hot",
+            "rehydrate-pending-to-cool" => "Cool",
+            "rehydrate-pending-to-cold" => "Cold",
+            "rehydrate-pending-to-smart" => "Smart",
+            _ => throw new InvalidDataException("The blob has an invalid archive rehydration status.")
+        };
+        var updated = blob with
+        {
+            AccessTier = targetTier,
+            AccessTierChangedAt = metadata.GetUtcNow(),
+            ArchiveStatus = null,
+            RehydratePriority = null,
+            RehydrateCompleteAt = null,
+            Revision = MetadataStore.NewRevision()
+        };
+        try
+        {
+            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+            return updated;
+        }
+        catch (StorageConcurrencyException)
+        {
+            return await metadata.GetBlobAsync(
+                       blob.Account,
+                       blob.Container,
+                       blob.Name,
+                       blob.VersionId,
+                       blob.Snapshot,
+                       includeDeleted: false,
+                       cancellationToken)
+                   ?? throw AzureStorageException.BlobNotFound();
+        }
     }
 
     private static BlobRecord NewBlob(
