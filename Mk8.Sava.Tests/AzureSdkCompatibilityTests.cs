@@ -5224,6 +5224,188 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ConditionalHeadersMatchAzureCombinationPriorityAndOperationRules()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"conditions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("condition-matrix.bin");
+        await blob.UploadAsync(BinaryData.FromString("conditional payload"));
+        var properties = (await blob.GetPropertiesAsync()).Value;
+        var etag = properties.ETag.ToString();
+        var before = properties.LastModified.AddMinutes(-1).ToString("R", CultureInfo.InvariantCulture);
+        var same = properties.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        var after = properties.LastModified.AddMinutes(1).ToString("R", CultureInfo.InvariantCulture);
+        var blobUri = blob.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        static void AddVersion(HttpRequestMessage request, string version = "2023-11-03") =>
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", same);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
+            Assert.False(response.Headers.Contains("x-ms-error-code"));
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+            Assert.Equal("ConditionNotMet", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", $"\"missing\", {etag}");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", [same, before]);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(
+                "MultipleConditionHeadersNotSupported",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
+        {
+            AddVersion(request, "2012-02-12");
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
+        }
+
+        var metadataUri = AppendQuery(blobUri, "comp=metadata");
+        using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-None-Match", "\"missing\"");
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", after);
+            request.Headers.TryAddWithoutValidation("x-ms-meta-state", "none-match-priority");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        properties = (await blob.GetPropertiesAsync()).Value;
+        etag = properties.ETag.ToString();
+        using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", etag);
+            request.Headers.TryAddWithoutValidation("If-Unmodified-Since", before);
+            request.Headers.TryAddWithoutValidation("x-ms-meta-state", "match-priority");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        properties = (await blob.GetPropertiesAsync()).Value;
+        etag = properties.ETag.ToString();
+        using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", etag);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
+            request.Headers.TryAddWithoutValidation("x-ms-meta-state", "must-not-apply");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(
+                "MultipleConditionHeadersNotSupported",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", $"{etag}, \"missing\"");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(
+                "MultipleConditionHeadersNotSupported",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.Equal("match-priority", (await blob.GetPropertiesAsync()).Value.Metadata["state"]);
+
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Read);
+        var accountCredential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var containerUri = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}" +
+            $"?restype=container&{accountSas.ToSasQueryParameters(accountCredential)}");
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   containerUri))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Modified-Since", after);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   AppendQuery(blobUri, "comp=blocklist&blocklisttype=all")))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, AppendQuery(blobUri, "comp=tags")))
+        {
+            AddVersion(request);
+            request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+    }
+
+    [Fact]
     public async Task CorsAndConditionalResponsesMatchHttpSemantics()
     {
         var service = CreateClient(factory);
