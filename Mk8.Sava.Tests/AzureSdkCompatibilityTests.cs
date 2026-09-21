@@ -414,6 +414,68 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"worm-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("retained.txt");
+        var expiresOn = DateTimeOffset.UtcNow.AddHours(2);
+
+        await blob.UploadAsync(BinaryData.FromString("retained payload"), new BlobUploadOptions
+        {
+            ImmutabilityPolicy = new BlobImmutabilityPolicy
+            {
+                ExpiresOn = expiresOn,
+                PolicyMode = BlobImmutabilityPolicyMode.Unlocked
+            },
+            LegalHold = true
+        });
+
+        var properties = (await blob.GetPropertiesAsync()).Value;
+        Assert.True(properties.HasLegalHold);
+        Assert.Equal(BlobImmutabilityPolicyMode.Unlocked, properties.ImmutabilityPolicy.PolicyMode);
+        Assert.Equal(expiresOn.ToUnixTimeSeconds(), properties.ImmutabilityPolicy.ExpiresOn!.Value.ToUnixTimeSeconds());
+
+        var held = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetMetadataAsync(new Dictionary<string, string> { ["attempt"] = "held" }));
+        Assert.Equal(409, held.Status);
+        Assert.Equal("BlobImmutableDueToLegalHold", held.ErrorCode);
+
+        await blob.SetLegalHoldAsync(false);
+        var retained = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetMetadataAsync(new Dictionary<string, string> { ["attempt"] = "retained" }));
+        Assert.Equal(409, retained.Status);
+        Assert.Equal("BlobImmutableDueToPolicy", retained.ErrorCode);
+
+        await blob.DeleteImmutabilityPolicyAsync();
+        await blob.SetMetadataAsync(new Dictionary<string, string> { ["state"] = "mutable" });
+        Assert.Equal("mutable", (await blob.GetPropertiesAsync()).Value.Metadata["state"]);
+
+        var locked = container.GetBlobClient("locked.txt");
+        await locked.UploadAsync(BinaryData.FromString("locked payload"));
+        await locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
+        {
+            ExpiresOn = expiresOn,
+            PolicyMode = BlobImmutabilityPolicyMode.Unlocked
+        });
+        await locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
+        {
+            ExpiresOn = expiresOn.AddHours(1),
+            PolicyMode = BlobImmutabilityPolicyMode.Locked
+        });
+        var cannotUnlock = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
+            {
+                ExpiresOn = expiresOn.AddHours(2),
+                PolicyMode = BlobImmutabilityPolicyMode.Unlocked
+            }));
+        Assert.Equal("BlobImmutableDueToPolicy", cannotUnlock.ErrorCode);
+        var cannotDelete = await Assert.ThrowsAsync<RequestFailedException>(() => locked.DeleteImmutabilityPolicyAsync());
+        Assert.Equal("BlobImmutableDueToPolicy", cannotDelete.ErrorCode);
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);

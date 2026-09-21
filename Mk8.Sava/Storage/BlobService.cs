@@ -10,7 +10,10 @@ public sealed record BlobWriteOptions(
     BlobHttpProperties Http,
     Dictionary<string, string> Metadata,
     Dictionary<string, string>? Tags = null,
-    string? AccessTier = null);
+    string? AccessTier = null,
+    DateTimeOffset? ImmutabilityUntil = null,
+    bool ImmutabilityLocked = false,
+    bool HasLegalHold = false);
 
 public sealed record PageRange(long Start, long End);
 
@@ -359,6 +362,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         long? expectedMaximumSize,
         CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.IsSealed)
@@ -401,6 +405,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         bool clear,
         CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         if (current.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
@@ -439,6 +444,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Dictionary<string, string> userMetadata,
         CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         var updated = current with
         {
             Metadata = userMetadata,
@@ -455,6 +461,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Dictionary<string, string> tags,
         CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         if (tags.Count > 10)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
         var updated = current with { Tags = tags, Revision = MetadataStore.NewRevision() };
@@ -470,6 +477,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? sequenceAction,
         CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         var nextSequence = current.SequenceNumber;
         if (sequenceNumber.HasValue || sequenceAction is not null)
         {
@@ -526,6 +534,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task<BlobRecord> SealAppendBlobAsync(BlobRecord current, CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         var updated = current with
@@ -555,7 +564,62 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
     {
+        EnsureBlobMutable(current);
         var updated = current with { ExpiresAt = expiresAt, Revision = MetadataStore.NewRevision() };
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        return updated;
+    }
+
+    public async Task<BlobRecord> SetBlobImmutabilityPolicyAsync(
+        BlobRecord current,
+        DateTimeOffset expiresOn,
+        bool locked,
+        CancellationToken cancellationToken)
+    {
+        if (expiresOn <= metadata.GetUtcNow())
+            throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", expiresOn.ToString("R", CultureInfo.InvariantCulture));
+        if (current.ImmutabilityLocked)
+        {
+            if (!locked || current.ImmutabilityUntil.HasValue && expiresOn < current.ImmutabilityUntil.Value)
+                throw BlobImmutableDueToPolicy();
+        }
+
+        var updated = current with
+        {
+            ImmutabilityUntil = expiresOn,
+            ImmutabilityLocked = locked,
+            Revision = MetadataStore.NewRevision()
+        };
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        return updated;
+    }
+
+    public async Task<BlobRecord> DeleteBlobImmutabilityPolicyAsync(
+        BlobRecord current,
+        CancellationToken cancellationToken)
+    {
+        if (current.ImmutabilityLocked)
+            throw BlobImmutableDueToPolicy();
+        var updated = current with
+        {
+            ImmutabilityUntil = null,
+            ImmutabilityLocked = false,
+            Revision = MetadataStore.NewRevision()
+        };
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        return updated;
+    }
+
+    public async Task<BlobRecord> SetBlobLegalHoldAsync(
+        BlobRecord current,
+        bool hasLegalHold,
+        CancellationToken cancellationToken)
+    {
+        var updated = current with
+        {
+            HasLegalHold = hasLegalHold,
+            Revision = MetadataStore.NewRevision()
+        };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
     }
@@ -606,6 +670,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             if (deleteSnapshots is "include" or "only")
                 targets.AddRange(relatedSnapshots);
         }
+
+        foreach (var target in targets)
+            EnsureBlobMutable(target);
 
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
         foreach (var target in targets)
@@ -723,24 +790,37 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         BlobKind kind,
         ContentManifest content,
         BlobWriteOptions options,
-        DateTimeOffset now) => new()
+        DateTimeOffset now)
     {
-        Account = account,
-        Container = container,
-        Name = name,
-        GenerationId = Guid.NewGuid().ToString("N"),
-        Revision = MetadataStore.NewRevision(),
-        IsCurrent = true,
-        Kind = kind,
-        Content = content,
-        ETag = MetadataStore.NewETag(),
-        CreatedAt = now,
-        LastModified = now,
-        Metadata = options.Metadata,
-        Tags = options.Tags ?? new Dictionary<string, string>(StringComparer.Ordinal),
-        Http = options.Http,
-        AccessTier = options.AccessTier ?? "Hot"
-    };
+        if (options.ImmutabilityLocked && !options.ImmutabilityUntil.HasValue || options.ImmutabilityUntil <= now)
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-immutability-policy-until-date",
+                options.ImmutabilityUntil?.ToString("R", CultureInfo.InvariantCulture));
+        }
+
+        return new BlobRecord
+        {
+            Account = account,
+            Container = container,
+            Name = name,
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = MetadataStore.NewRevision(),
+            IsCurrent = true,
+            Kind = kind,
+            Content = content,
+            ETag = MetadataStore.NewETag(),
+            CreatedAt = now,
+            LastModified = now,
+            Metadata = options.Metadata,
+            Tags = options.Tags ?? new Dictionary<string, string>(StringComparer.Ordinal),
+            Http = options.Http,
+            AccessTier = options.AccessTier ?? "Hot",
+            ImmutabilityUntil = options.ImmutabilityUntil,
+            ImmutabilityLocked = options.ImmutabilityLocked,
+            HasLegalHold = options.HasLegalHold
+        };
+    }
 
     private static List<PageRange> UpdatePageRanges(
         IReadOnlyList<PageRange> current,
@@ -833,11 +913,16 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw new AzureStorageException(StatusCodes.Status409Conflict, "ContainerImmutabilityPolicyLocked", "The container has a locked immutability policy.");
     }
 
-    private static void EnsureBlobMutable(BlobRecord blob)
+    private void EnsureBlobMutable(BlobRecord blob)
     {
         if (blob.HasLegalHold)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobImmutableDueToLegalHold", "This operation is not permitted because the blob has a legal hold.");
-        if (blob.ImmutabilityLocked && blob.ImmutabilityUntil > DateTimeOffset.UtcNow)
-            throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobImmutableDueToPolicy", "This operation is not permitted because the blob is immutable.");
+        if (blob.ImmutabilityUntil > metadata.GetUtcNow())
+            throw BlobImmutableDueToPolicy();
     }
+
+    private static AzureStorageException BlobImmutableDueToPolicy() => new(
+        StatusCodes.Status409Conflict,
+        "BlobImmutableDueToPolicy",
+        "This operation is not permitted because the blob is immutable.");
 }

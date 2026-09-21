@@ -463,6 +463,52 @@ public static class BlobProtocolEndpoint
             includeDeleted: false,
             cancellationToken);
 
+        if (HttpMethods.IsPut(http.Request.Method) && comp == "immutabilitypolicies")
+        {
+            Require(request, 'i');
+            EvaluateWriteConditions(http.Request, blob);
+            var untilValue = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-until-date")
+                             ?? throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date");
+            if (!DateTimeOffset.TryParseExact(
+                    untilValue,
+                    "R",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out var until))
+            {
+                throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", untilValue);
+            }
+            var mode = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-mode") ?? "unlocked";
+            var locked = mode.ToLowerInvariant() switch
+            {
+                "locked" => true,
+                "unlocked" => false,
+                _ => throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-mode", mode)
+            };
+            var updated = await service.SetBlobImmutabilityPolicyAsync(blob, until, locked, cancellationToken);
+            AddImmutabilityHeaders(http.Response, updated);
+            return;
+        }
+
+        if (HttpMethods.IsDelete(http.Request.Method) && comp == "immutabilitypolicies")
+        {
+            Require(request, 'i');
+            EvaluateWriteConditions(http.Request, blob);
+            await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken);
+            return;
+        }
+
+        if (HttpMethods.IsPut(http.Request.Method) && comp == "legalhold")
+        {
+            Require(request, 'i');
+            var value = ProtocolParsing.First(http.Request.Headers, "x-ms-legal-hold");
+            if (!bool.TryParse(value, out var hasLegalHold))
+                throw AzureStorageException.InvalidHeader("x-ms-legal-hold", value);
+            var updated = await service.SetBlobLegalHoldAsync(blob, hasLegalHold, cancellationToken);
+            http.Response.Headers["x-ms-legal-hold"] = updated.HasLegalHold ? "true" : "false";
+            return;
+        }
+
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
@@ -1159,17 +1205,71 @@ public static class BlobProtocolEndpoint
     private static BlobWriteOptions ReadWriteOptions(
         HttpRequest request,
         BlobRecord? fallback,
-        bool useStandardContentType = true) => new(
-        ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
-        ProtocolParsing.ReadMetadata(request.Headers),
-        ProtocolParsing.ReadTagsHeader(request.Headers),
-        ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? fallback?.AccessTier);
+        bool useStandardContentType = true)
+    {
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        return new BlobWriteOptions(
+            ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
+            ProtocolParsing.ReadMetadata(request.Headers),
+            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? fallback?.AccessTier,
+            until,
+            locked,
+            legalHold);
+    }
 
-    private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source) => new(
-        ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
-        ProtocolParsing.ReadMetadata(request.Headers),
-        ProtocolParsing.ReadTagsHeader(request.Headers),
-        ProtocolParsing.First(request.Headers, "x-ms-access-tier"));
+    private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
+    {
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        return new BlobWriteOptions(
+            ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
+            ProtocolParsing.ReadMetadata(request.Headers),
+            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier"),
+            until,
+            locked,
+            legalHold);
+    }
+
+    private static (DateTimeOffset? Until, bool Locked, bool LegalHold) ReadImmutabilityHeaders(IHeaderDictionary headers)
+    {
+        var untilValue = ProtocolParsing.First(headers, "x-ms-immutability-policy-until-date");
+        var modeValue = ProtocolParsing.First(headers, "x-ms-immutability-policy-mode");
+        if (untilValue is null && modeValue is not null)
+            throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date");
+
+        DateTimeOffset? until = null;
+        var locked = false;
+        if (untilValue is not null)
+        {
+            if (!DateTimeOffset.TryParse(untilValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed))
+                throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", untilValue);
+            until = parsed.ToUniversalTime();
+            locked = (modeValue ?? "unlocked").ToLowerInvariant() switch
+            {
+                "locked" => true,
+                "unlocked" => false,
+                _ => throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-mode", modeValue)
+            };
+        }
+
+        var legalHoldValue = ProtocolParsing.First(headers, "x-ms-legal-hold");
+        var legalHold = legalHoldValue is not null &&
+                        (bool.TryParse(legalHoldValue, out var parsedLegalHold)
+                            ? parsedLegalHold
+                            : throw AzureStorageException.InvalidHeader("x-ms-legal-hold", legalHoldValue));
+        return (until, locked, legalHold);
+    }
+
+    private static void AddImmutabilityHeaders(HttpResponse response, BlobRecord blob)
+    {
+        if (blob.ImmutabilityUntil.HasValue)
+        {
+            response.Headers["x-ms-immutability-policy-until-date"] = blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture);
+            response.Headers["x-ms-immutability-policy-mode"] = blob.ImmutabilityLocked ? "locked" : "unlocked";
+        }
+        response.Headers["x-ms-legal-hold"] = blob.HasLegalHold ? "true" : "false";
+    }
 
     private static async Task WithIntegrityValidationAsync(HttpRequest request, Func<Stream, Task> action)
     {

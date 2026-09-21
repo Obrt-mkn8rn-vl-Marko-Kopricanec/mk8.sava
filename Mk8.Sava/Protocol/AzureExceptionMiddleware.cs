@@ -29,6 +29,13 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
         {
             await WriteErrorAsync(context, AzureStorageException.ConditionNotMet());
         }
+        catch (StorageImmutabilityException exception)
+        {
+            await WriteErrorAsync(context, new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                exception.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
+                exception.Message));
+        }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             context.Abort();

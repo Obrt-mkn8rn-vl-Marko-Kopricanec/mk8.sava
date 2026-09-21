@@ -356,6 +356,13 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken);
             if (current is not null)
             {
+                var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > _timeProvider.GetUtcNow();
+                var createsProtectedHistoricalVersion = serviceProperties.VersioningEnabled &&
+                                                        current.Kind == BlobKind.BlockBlob &&
+                                                        proposed.Kind == BlobKind.BlockBlob;
+                if (protectedByRetention && !createsProtectedHistoricalVersion)
+                    throw new StorageImmutabilityException(current.HasLegalHold);
+
                 if (serviceProperties.VersioningEnabled)
                 {
                     var historical = current with
@@ -825,4 +832,12 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
 public sealed class StorageConcurrencyException : Exception
 {
     public StorageConcurrencyException() : base("The logical storage resource changed concurrently.") { }
+}
+
+public sealed class StorageImmutabilityException(bool legalHold) : Exception(
+    legalHold
+        ? "The blob is protected by a legal hold."
+        : "The blob is protected by a time-based retention policy.")
+{
+    public bool LegalHold { get; } = legalHold;
 }

@@ -165,6 +165,13 @@ public sealed class AzureResponseWriter
                     writer.WriteElementString("CommittedBlockCount", blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture));
                 if (includes.Contains("tags"))
                     writer.WriteElementString("TagCount", blob.Tags.Count.ToString(CultureInfo.InvariantCulture));
+                if (includes.Contains("immutabilitypolicy") && blob.ImmutabilityUntil.HasValue)
+                {
+                    writer.WriteElementString("ImmutabilityPolicyUntilDate", blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture));
+                    writer.WriteElementString("ImmutabilityPolicyMode", blob.ImmutabilityLocked ? "locked" : "unlocked");
+                }
+                if (includes.Contains("legalhold"))
+                    writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
                     WriteMetadata(writer, blob.Metadata);
@@ -348,6 +355,12 @@ public sealed class AzureResponseWriter
             response.Headers["x-ms-snapshot"] = blob.Snapshot;
         if (blob.Kind == Storage.BlobKind.PageBlob)
             response.Headers["x-ms-blob-sequence-number"] = blob.SequenceNumber.ToString(CultureInfo.InvariantCulture);
+        if (blob.ImmutabilityUntil.HasValue)
+        {
+            response.Headers["x-ms-immutability-policy-until-date"] = blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture);
+            response.Headers["x-ms-immutability-policy-mode"] = blob.ImmutabilityLocked ? "locked" : "unlocked";
+        }
+        response.Headers["x-ms-legal-hold"] = blob.HasLegalHold ? "true" : "false";
         if (blob.Kind == Storage.BlobKind.AppendBlob)
         {
             response.Headers["x-ms-blob-committed-block-count"] = blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture);
