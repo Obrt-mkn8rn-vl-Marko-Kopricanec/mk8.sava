@@ -228,6 +228,25 @@ internal sealed record BlobListPage(IReadOnlyList<BlobListEntry> Items, bool Has
 
 internal sealed record ContainerListPage(IReadOnlyList<ContainerRecord> Items, bool HasMore);
 
+internal enum BlobTagComparison
+{
+    Equal,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual
+}
+
+internal sealed record BlobTagPredicate(string Key, BlobTagComparison Comparison, string Value);
+
+internal sealed record BlobTagFilter(
+    string? Container,
+    IReadOnlyList<BlobTagPredicate> Predicates);
+
+internal sealed record BlobTagCursor(string Container, string Name, string GenerationId);
+
+internal sealed record TaggedBlobPage(IReadOnlyList<BlobRecord> Items, bool HasMore);
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable

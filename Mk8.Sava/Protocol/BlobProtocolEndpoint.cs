@@ -129,7 +129,13 @@ public static class BlobProtocolEndpoint
         if (comp == "blobs" && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'f');
-            await WriteFindByTagsAsync(http, request, service, writer, cancellationToken);
+            await WriteFindByTagsAsync(
+                http,
+                request,
+                service,
+                writer,
+                scopedContainer: null,
+                cancellationToken);
             return;
         }
 
@@ -161,9 +167,27 @@ public static class BlobProtocolEndpoint
         }
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
             !request.Authorization.IsAccountSas &&
-            !(HttpMethods.IsGet(http.Request.Method) && comp == "list"))
+            !(HttpMethods.IsGet(http.Request.Method) && comp is "list" or "blobs"))
         {
             throw AzureStorageException.AuthorizationFailure();
+        }
+
+        if (HttpMethods.IsGet(http.Request.Method) && comp == "blobs")
+        {
+            Require(request, 'f');
+            _ = await service.GetContainerAsync(
+                request.Account,
+                containerName,
+                includeDeleted: false,
+                cancellationToken);
+            await WriteFindByTagsAsync(
+                http,
+                request,
+                service,
+                writer,
+                containerName,
+                cancellationToken);
+            return;
         }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
@@ -945,6 +969,7 @@ public static class BlobProtocolEndpoint
             EvaluateWriteConditions(http.Request, blob);
             var tags = await ProtocolParsing.ReadTagsBodyAsync(http.Request.Body, cancellationToken);
             await service.SetBlobTagsAsync(blob, tags, cancellationToken);
+            http.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
         }
 
@@ -1605,43 +1630,92 @@ public static class BlobProtocolEndpoint
         StorageRequestContext request,
         BlobService service,
         AzureResponseWriter writer,
+        string? scopedContainer,
         CancellationToken cancellationToken)
     {
-        var expression = http.Request.Query["where"].ToString();
-        var match = System.Text.RegularExpressions.Regex.Match(expression, "^\\s*\"(?<key>[^\"]+)\"\\s*=\\s*'(?<value>[^']*)'\\s*$", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-        if (!match.Success)
-            throw AzureStorageException.InvalidQuery("where");
-        var containers = await service.ListContainersAsync(request.Account, includeDeleted: false, cancellationToken);
-        var matches = new List<BlobRecord>();
-        foreach (var container in containers)
+        if (!DateOnly.TryParseExact(
+                request.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var serviceVersion) ||
+            serviceVersion < new DateOnly(2019, 12, 12))
         {
-            var blobs = await service.ListBlobsAsync(request.Account, container.Name, false, false, false, cancellationToken);
-            matches.AddRange(blobs.Where(blob => blob.Tags.TryGetValue(match.Groups["key"].Value, out var value) && value == match.Groups["value"].Value));
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Find Blobs by Tags requires service version 2019-12-12 or later.");
         }
+
+        var expression = http.Request.Query["where"].ToString();
+        var filter = BlobTagQuery.ParseFindExpression(expression);
+        if (scopedContainer is not null)
+        {
+            if (filter.Container is not null &&
+                !string.Equals(filter.Container, scopedContainer, StringComparison.Ordinal))
+            {
+                throw AzureStorageException.InvalidQuery("where");
+            }
+            filter = filter with { Container = scopedContainer };
+        }
+        var markerValue = http.Request.Query["marker"].ToString();
+        var marker = BlobTagQuery.DecodeMarker(request, expression, markerValue);
+        if (filter.Container is not null &&
+            marker is not null &&
+            !string.Equals(filter.Container, marker.Container, StringComparison.Ordinal))
+        {
+            throw AzureStorageException.InvalidQuery("marker");
+        }
+        var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+        var page = await service.FindBlobsByTagsPageAsync(
+            request.Account,
+            filter,
+            marker,
+            maxResults,
+            cancellationToken);
+        var nextMarker = page.HasMore && page.Items.Count > 0
+            ? BlobTagQuery.EncodeMarker(
+                request,
+                expression,
+                new BlobTagCursor(
+                    page.Items[^1].Container,
+                    page.Items[^1].Name,
+                    page.Items[^1].GenerationId))
+            : string.Empty;
+        var endpoint = $"{http.Request.Scheme}://{http.Request.Host}/{request.Account}";
         await writer.WriteXmlAsync(http, xml =>
         {
             xml.WriteStartElement("EnumerationResults");
+            xml.WriteAttributeString("ServiceEndpoint", endpoint);
+            xml.WriteElementString("Where", expression);
             xml.WriteStartElement("Blobs");
-            foreach (var blob in matches)
+            foreach (var blob in page.Items)
             {
                 xml.WriteStartElement("Blob");
                 xml.WriteElementString("Name", blob.Name);
                 xml.WriteElementString("ContainerName", blob.Container);
-                xml.WriteStartElement("Tags");
-                xml.WriteStartElement("TagSet");
-                foreach (var (key, value) in blob.Tags)
+                if (serviceVersion >= new DateOnly(2020, 4, 8))
                 {
-                    xml.WriteStartElement("Tag");
-                    xml.WriteElementString("Key", key);
-                    xml.WriteElementString("Value", value);
+                    xml.WriteStartElement("Tags");
+                    xml.WriteStartElement("TagSet");
+                    foreach (var key in filter.Predicates
+                                 .Select(predicate => predicate.Key)
+                                 .Distinct(StringComparer.Ordinal))
+                    {
+                        if (!blob.Tags.TryGetValue(key, out var value))
+                            continue;
+                        xml.WriteStartElement("Tag");
+                        xml.WriteElementString("Key", key);
+                        xml.WriteElementString("Value", value);
+                        xml.WriteEndElement();
+                    }
+                    xml.WriteEndElement();
                     xml.WriteEndElement();
                 }
                 xml.WriteEndElement();
-                xml.WriteEndElement();
-                xml.WriteEndElement();
             }
             xml.WriteEndElement();
-            xml.WriteElementString("NextMarker", string.Empty);
+            xml.WriteElementString("NextMarker", nextMarker);
             xml.WriteEndElement();
         }, cancellationToken);
     }

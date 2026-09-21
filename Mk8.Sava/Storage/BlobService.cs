@@ -348,6 +348,28 @@ public sealed class BlobService(
         return new BlobListPage(effective, page.HasMore);
     }
 
+    internal async Task<TaggedBlobPage> FindBlobsByTagsPageAsync(
+        string account,
+        BlobTagFilter filter,
+        BlobTagCursor? cursor,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        var page = await metadata.FindBlobsByTagsPageAsync(
+            account,
+            filter,
+            cursor,
+            maximum,
+            cancellationToken);
+        var effective = new List<BlobRecord>(page.Items.Count);
+        foreach (var blob in page.Items)
+        {
+            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
+            effective.Add(await CompleteRehydrationIfDueAsync(copy, cancellationToken));
+        }
+        return new TaggedBlobPage(effective, page.HasMore);
+    }
+
     public async Task<BlobRecord> GetBlobAsync(
         string account,
         string container,

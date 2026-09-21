@@ -7,7 +7,8 @@ namespace Mk8.Sava.Storage;
 
 public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
+    private const int ChunkIndexSchemaVersion = 2;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -101,6 +102,16 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 CREATE INDEX IF NOT EXISTS ix_blob_chunk_references_chunk
                     ON blob_chunk_references(chunk_id);
 
+                CREATE TABLE IF NOT EXISTS blob_tags (
+                    generation_id TEXT NOT NULL,
+                    tag_key TEXT NOT NULL,
+                    tag_value TEXT NOT NULL,
+                    PRIMARY KEY (generation_id, tag_key),
+                    FOREIGN KEY (generation_id) REFERENCES blobs(generation_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS ix_blob_tags_search
+                    ON blob_tags(tag_key, tag_value, generation_id);
+
                 CREATE TABLE IF NOT EXISTS staged_block_chunk_references (
                     account TEXT NOT NULL,
                     container TEXT NOT NULL,
@@ -120,7 +131,12 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 );
                 """, cancellationToken);
             if (schemaVersion == 1)
+            {
                 await MigrateVersion1ToVersion2Async(connection, cancellationToken);
+                schemaVersion = ChunkIndexSchemaVersion;
+            }
+            if (schemaVersion == ChunkIndexSchemaVersion)
+                await MigrateVersion2ToVersion3Async(connection, cancellationToken);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             await VerifyForeignKeysAsync(connection, cancellationToken);
@@ -520,6 +536,84 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         if (hasMore)
             items.RemoveAt(items.Count - 1);
         return new BlobListPage(items, hasMore);
+    }
+
+    internal async Task<TaggedBlobPage> FindBlobsByTagsPageAsync(
+        string account,
+        BlobTagFilter filter,
+        BlobTagCursor? cursor,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        if (filter.Predicates.Count == 0)
+            throw new ArgumentException("At least one tag predicate is required.", nameof(filter));
+
+        var predicates = new List<string>
+        {
+            "blob.account = $account",
+            "blob.is_current = 1",
+            "blob.is_deleted = 0",
+            "blob.snapshot IS NULL"
+        };
+        if (filter.Container is not null)
+            predicates.Add("blob.container = $container");
+        for (var index = 0; index < filter.Predicates.Count; index++)
+        {
+            var comparison = filter.Predicates[index].Comparison switch
+            {
+                BlobTagComparison.Equal => "=",
+                BlobTagComparison.GreaterThan => ">",
+                BlobTagComparison.GreaterThanOrEqual => ">=",
+                BlobTagComparison.LessThan => "<",
+                BlobTagComparison.LessThanOrEqual => "<=",
+                _ => throw new ArgumentOutOfRangeException(nameof(filter))
+            };
+            predicates.Add($"""
+                EXISTS (
+                    SELECT 1 FROM blob_tags AS tag{index}
+                    WHERE tag{index}.generation_id = blob.generation_id
+                      AND tag{index}.tag_key = $key{index}
+                      AND tag{index}.tag_value {comparison} $value{index}
+                )
+                """);
+        }
+
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT blob.data
+            FROM blobs AS blob
+            WHERE {string.Join(" AND ", predicates)}
+              AND ($has_cursor = 0
+                   OR blob.container > $cursor_container
+                   OR (blob.container = $cursor_container AND blob.name > $cursor_name)
+                   OR (blob.container = $cursor_container AND blob.name = $cursor_name
+                       AND blob.generation_id > $cursor_generation))
+            ORDER BY blob.container COLLATE BINARY,
+                     blob.name COLLATE BINARY,
+                     blob.generation_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", filter.Container ?? string.Empty);
+        command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
+        command.Parameters.AddWithValue("$cursor_container", cursor?.Container ?? string.Empty);
+        command.Parameters.AddWithValue("$cursor_name", cursor?.Name ?? string.Empty);
+        command.Parameters.AddWithValue("$cursor_generation", cursor?.GenerationId ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        for (var index = 0; index < filter.Predicates.Count; index++)
+        {
+            command.Parameters.AddWithValue($"$key{index}", filter.Predicates[index].Key);
+            command.Parameters.AddWithValue($"$value{index}", filter.Predicates[index].Value);
+        }
+
+        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken)).ToList();
+        var hasMore = records.Count > maximum;
+        if (hasMore)
+            records.RemoveAt(records.Count - 1);
+        return new TaggedBlobPage(records, hasMore);
     }
 
     internal async Task<KeysetPage<BlobRecord>> ListBlobMaintenancePageAsync(
@@ -1300,7 +1394,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         CancellationToken cancellationToken)
     {
         var authoritative = await ReadManifestStorageInventoryAsync(connection, cancellationToken);
-        if (await ReadSchemaVersionAsync(connection, cancellationToken) < 2)
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+        if (schemaVersion < ChunkIndexSchemaVersion)
             return authoritative;
 
         var indexed = await ReadIndexedStorageInventoryAsync(connection, cancellationToken);
@@ -1312,7 +1407,43 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         {
             throw new InvalidDataException("The metadata chunk-reference index does not match the authoritative manifests.");
         }
+        if (schemaVersion >= 3)
+            await VerifyBlobTagIndexAsync(connection, cancellationToken);
         return authoritative;
+    }
+
+    private static async Task VerifyBlobTagIndexAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var expected = new Dictionary<(string GenerationId, string Key), string>();
+        await using (var blobs = connection.CreateCommand())
+        {
+            blobs.CommandText = "SELECT data FROM blobs;";
+            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var blob = Deserialize<BlobRecord>(reader.GetString(0));
+                foreach (var (key, value) in blob.Tags)
+                    expected.Add((blob.GenerationId, key), value);
+            }
+        }
+
+        var actual = new Dictionary<(string GenerationId, string Key), string>();
+        await using (var tags = connection.CreateCommand())
+        {
+            tags.CommandText = "SELECT generation_id, tag_key, tag_value FROM blob_tags;";
+            await using var reader = await tags.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                actual.Add((reader.GetString(0), reader.GetString(1)), reader.GetString(2));
+        }
+
+        if (expected.Count != actual.Count ||
+            expected.Any(pair => !actual.TryGetValue(pair.Key, out var value) ||
+                                 !string.Equals(pair.Value, value, StringComparison.Ordinal)))
+        {
+            throw new InvalidDataException("The metadata blob-tag index does not match the authoritative blob records.");
+        }
     }
 
     private static async Task<StorageMetadataInventory> ReadIndexedStorageInventoryAsync(
@@ -1499,6 +1630,33 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken);
         }
 
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            $"PRAGMA user_version={ChunkIndexSchemaVersion};",
+            cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task MigrateVersion2ToVersion3Async(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<BlobRecord> blobs;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT data FROM blobs;";
+            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+        }
+
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            "DELETE FROM blob_tags;",
+            cancellationToken);
+        foreach (var blob in blobs)
+            await ReplaceBlobTagsAsync(connection, transaction, blob, cancellationToken);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
@@ -1693,6 +1851,7 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         AddBlobParameters(command, record);
         await command.ExecuteNonQueryAsync(cancellationToken);
         await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
+        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken);
     }
 
     private static async Task UpdateBlobRowAsync(
@@ -1722,6 +1881,7 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
             throw new StorageConcurrencyException();
         await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
+        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken);
     }
 
     private static async Task DeleteBlobRowAsync(
@@ -1762,6 +1922,35 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 """;
             insert.Parameters.AddWithValue("$generation", record.GenerationId);
             insert.Parameters.AddWithValue("$chunk", chunkId);
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static async Task ReplaceBlobTagsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord record,
+        CancellationToken cancellationToken)
+    {
+        await using (var clear = connection.CreateCommand())
+        {
+            clear.Transaction = transaction;
+            clear.CommandText = "DELETE FROM blob_tags WHERE generation_id = $generation;";
+            clear.Parameters.AddWithValue("$generation", record.GenerationId);
+            await clear.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var (key, value) in record.Tags)
+        {
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO blob_tags(generation_id, tag_key, tag_value)
+                VALUES ($generation, $key, $value);
+                """;
+            insert.Parameters.AddWithValue("$generation", record.GenerationId);
+            insert.Parameters.AddWithValue("$key", key);
+            insert.Parameters.AddWithValue("$value", value);
             await insert.ExecuteNonQueryAsync(cancellationToken);
         }
     }

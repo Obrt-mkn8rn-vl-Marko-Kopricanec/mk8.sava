@@ -111,12 +111,13 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 2 and the backup container format is version 1. Schema 2 adds
+version 3 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
-the JSON blob/block manifests remain authoritative and backup validation checks
-the index against them. The service migrates schema 1 on startup and can validate
-or restore a schema-1 backup. It refuses metadata newer than it understands and
-a restore refuses unsupported backup or schema versions.
+schema 3 adds a transactional blob-tag search index. The JSON blob/block
+manifests remain authoritative and startup and backup validation check both
+indexes against them. The service migrates schema 1 or 2 on startup and can
+validate or restore backups using either older schema. It refuses metadata newer
+than it understands and a restore refuses unsupported backup or schema versions.
 
 Before deploying a build that changes either format:
 

@@ -77,6 +77,124 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task IndexedTagQueriesAreBoundedScopedAndTransactionallyVerified()
+    {
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        var rejectedBackupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-tag-index-{Guid.NewGuid():N}");
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var token = Guid.NewGuid().ToString("N");
+            var firstContainer = service.GetBlobContainerClient($"tag-a-{Guid.NewGuid():N}");
+            var secondContainer = service.GetBlobContainerClient($"tag-b-{Guid.NewGuid():N}");
+            await firstContainer.CreateAsync();
+            await secondContainer.CreateAsync();
+
+            async Task UploadTaggedAsync(BlobContainerClient container, string name, string project, string rank)
+            {
+                await container.GetBlobClient(name).UploadAsync(
+                    BinaryData.FromString(name),
+                    new BlobUploadOptions
+                    {
+                        Tags = new Dictionary<string, string>
+                        {
+                            ["project"] = project,
+                            ["rank"] = rank,
+                            ["unselected"] = "not returned"
+                        }
+                    });
+            }
+
+            await UploadTaggedAsync(firstContainer, "a", token, "010");
+            await UploadTaggedAsync(firstContainer, "b", token, "050");
+            await UploadTaggedAsync(firstContainer, "c", token, "150");
+            await UploadTaggedAsync(secondContainer, "d", token, "075");
+            await UploadTaggedAsync(secondContainer, "e", "another-project", "020");
+
+            var expression = $"\"project\" = '{token}' AND rank >= '010' AND rank < '100'";
+            var matches = new List<TaggedBlobItem>();
+            var markers = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var page in service.FindBlobsByTagsAsync(expression).AsPages(pageSizeHint: 1))
+            {
+                Assert.Single(page.Values);
+                matches.Add(page.Values[0]);
+                if (!string.IsNullOrEmpty(page.ContinuationToken))
+                {
+                    Assert.StartsWith("mk8t1.", page.ContinuationToken, StringComparison.Ordinal);
+                    Assert.True(markers.Add(page.ContinuationToken));
+                }
+            }
+            Assert.Equal(
+                [
+                    $"{firstContainer.Name}/a",
+                    $"{firstContainer.Name}/b",
+                    $"{secondContainer.Name}/d"
+                ],
+                matches.Select(item => $"{item.BlobContainerName}/{item.BlobName}"));
+            Assert.Equal(2, markers.Count);
+            Assert.All(matches, item =>
+            {
+                Assert.Equal(2, item.Tags.Count);
+                Assert.Equal(token, item.Tags["project"]);
+                Assert.False(item.Tags.ContainsKey("unselected"));
+            });
+
+            var scoped = new List<string>();
+            await foreach (var item in firstContainer.FindBlobsByTagsAsync($"\"project\" = '{token}'"))
+                scoped.Add(item.BlobName);
+            Assert.Equal(["a", "b", "c"], scoped);
+
+            await firstContainer.GetBlobClient("b").SetTagsAsync(new Dictionary<string, string>
+            {
+                ["project"] = "changed",
+                ["rank"] = "050"
+            });
+            var afterUpdate = new List<string>();
+            await foreach (var item in service.FindBlobsByTagsAsync(expression))
+                afterUpdate.Add($"{item.BlobContainerName}/{item.BlobName}");
+            Assert.Equal([$"{firstContainer.Name}/a", $"{secondContainer.Name}/d"], afterUpdate);
+
+            var invalidExpression = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+            {
+                await foreach (var _ in service.FindBlobsByTagsAsync(
+                                   $"\"project\" > '{token}' AND \"project\" >= '{token}'"))
+                {
+                }
+            });
+            Assert.Equal(400, invalidExpression.Status);
+
+            var invalidTag = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                firstContainer.GetBlobClient("a").SetTagsAsync(
+                    new Dictionary<string, string> { ["bad?"] = "value" }));
+            Assert.Equal(400, invalidTag.Status);
+            Assert.Equal("InvalidTag", invalidTag.ErrorCode);
+
+            await using (var connection = new SqliteConnection(
+                             $"Data Source={Path.Combine(application.DataPath, "metadata.db")}"))
+            {
+                await connection.OpenAsync();
+                await using var corruptIndex = connection.CreateCommand();
+                corruptIndex.CommandText = "DELETE FROM blob_tags WHERE tag_key = 'project';";
+                Assert.True(await corruptIndex.ExecuteNonQueryAsync() > 0);
+            }
+            var backup = application.Services.GetRequiredService<StorageBackupService>();
+            var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                backup.CreateAsync(rejectedBackupPath, CancellationToken.None));
+            Assert.Contains("blob-tag index", mismatch.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+            if (Directory.Exists(rejectedBackupPath))
+                Directory.Delete(rejectedBackupPath, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task PagedFlatVersionSnapshotAndHierarchyListingsNeverSkipOrRepeatEntries()
     {
         var application = new SavaWebApplicationFactory();
@@ -1820,7 +1938,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 await connection.OpenAsync();
                 await using var version = connection.CreateCommand();
                 version.CommandText = "PRAGMA user_version;";
-                Assert.Equal(2L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                Assert.Equal(3L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
                 await using var references = connection.CreateCommand();
                 references.CommandText = """
                     SELECT
@@ -1828,6 +1946,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                         (SELECT COUNT(*) FROM staged_block_chunk_references);
                     """;
                 Assert.Equal(2L, Convert.ToInt64(await references.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                await using var tags = connection.CreateCommand();
+                tags.CommandText = "SELECT COUNT(*) FROM blob_tags;";
+                Assert.Equal(1L, Convert.ToInt64(await tags.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
             }
 
             var backup = application.Services.GetRequiredService<StorageBackupService>();
@@ -2327,7 +2448,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [new ChunkReference(domain + "/$zero", 0, 1024)]),
             ETag = MetadataStore.NewETag(),
             CreatedAt = now,
-            LastModified = now
+            LastModified = now,
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["legacy"] = "indexed"
+            }
         };
         var block = new StagedBlockRecord
         {
