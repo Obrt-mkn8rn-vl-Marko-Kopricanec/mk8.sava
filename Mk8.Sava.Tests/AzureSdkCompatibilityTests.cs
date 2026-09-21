@@ -932,6 +932,155 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ServiceAnalyticsPropertiesRoundTripAndPartialUpdatesPreserveOtherGroups()
+    {
+        var service = CreateClient(factory);
+        var original = (await service.GetPropertiesAsync()).Value;
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var sasBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Service,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        sasBuilder.SetPermissions(AccountSasPermissions.Read | AccountSasPermissions.Write);
+        var sas = sasBuilder.ToSasQueryParameters(credential);
+        var propertiesUri = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            $"?restype=service&comp=properties&{sas}");
+
+        try
+        {
+            var configured = (await service.GetPropertiesAsync()).Value;
+            configured.Logging = new BlobAnalyticsLogging
+            {
+                Version = "1.0",
+                Delete = true,
+                Read = true,
+                Write = false,
+                RetentionPolicy = new BlobRetentionPolicy { Enabled = true, Days = 11 }
+            };
+            configured.HourMetrics = new BlobMetrics
+            {
+                Version = "1.0",
+                Enabled = true,
+                IncludeApis = true,
+                RetentionPolicy = new BlobRetentionPolicy { Enabled = true, Days = 12 }
+            };
+            configured.MinuteMetrics = new BlobMetrics
+            {
+                Version = "1.0",
+                Enabled = true,
+                IncludeApis = false,
+                RetentionPolicy = new BlobRetentionPolicy { Enabled = false }
+            };
+            configured.Cors.Clear();
+            configured.Cors.Add(new BlobCorsRule
+            {
+                AllowedOrigins = "https://example.test",
+                AllowedMethods = "GET,HEAD",
+                AllowedHeaders = "x-ms-meta-*",
+                ExposedHeaders = "x-ms-request-id",
+                MaxAgeInSeconds = 321
+            });
+            await service.SetPropertiesAsync(configured);
+
+            var roundTrip = (await service.GetPropertiesAsync()).Value;
+            Assert.Equal("1.0", roundTrip.Logging.Version);
+            Assert.True(roundTrip.Logging.Delete);
+            Assert.True(roundTrip.Logging.Read);
+            Assert.False(roundTrip.Logging.Write);
+            Assert.True(roundTrip.Logging.RetentionPolicy.Enabled);
+            Assert.Equal(11, roundTrip.Logging.RetentionPolicy.Days);
+            Assert.True(roundTrip.HourMetrics.Enabled);
+            Assert.True(roundTrip.HourMetrics.IncludeApis);
+            Assert.Equal(12, roundTrip.HourMetrics.RetentionPolicy.Days);
+            Assert.True(roundTrip.MinuteMetrics.Enabled);
+            Assert.False(roundTrip.MinuteMetrics.IncludeApis);
+            Assert.False(roundTrip.MinuteMetrics.RetentionPolicy.Enabled);
+            Assert.Equal("https://example.test", Assert.Single(roundTrip.Cors).AllowedOrigins);
+
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+            using (var partialUpdate = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
+            {
+                Content = new StringContent(
+                    """
+                    <?xml version="1.0" encoding="utf-8"?>
+                    <StorageServiceProperties>
+                      <Logging>
+                        <Version>1.0</Version>
+                        <Delete>false</Delete>
+                        <Read>false</Read>
+                        <Write>true</Write>
+                        <RetentionPolicy><Enabled>false</Enabled></RetentionPolicy>
+                      </Logging>
+                    </StorageServiceProperties>
+                    """,
+                    Encoding.UTF8,
+                    "application/xml")
+            })
+            {
+                partialUpdate.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(partialUpdate);
+                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            }
+
+            roundTrip = (await service.GetPropertiesAsync()).Value;
+            Assert.False(roundTrip.Logging.Delete);
+            Assert.False(roundTrip.Logging.Read);
+            Assert.True(roundTrip.Logging.Write);
+            Assert.False(roundTrip.Logging.RetentionPolicy.Enabled);
+            Assert.True(roundTrip.HourMetrics.Enabled);
+            Assert.Equal(12, roundTrip.HourMetrics.RetentionPolicy.Days);
+            Assert.Equal("https://example.test", Assert.Single(roundTrip.Cors).AllowedOrigins);
+
+            using (var invalidMetrics = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
+            {
+                Content = new StringContent(
+                    """
+                    <StorageServiceProperties>
+                      <HourMetrics>
+                        <Version>1.0</Version>
+                        <Enabled>true</Enabled>
+                        <RetentionPolicy><Enabled>false</Enabled></RetentionPolicy>
+                      </HourMetrics>
+                    </StorageServiceProperties>
+                    """,
+                    Encoding.UTF8,
+                    "application/xml")
+            })
+            {
+                invalidMetrics.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(invalidMetrics);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidXmlDocument", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var legacyGet = new HttpRequestMessage(HttpMethod.Get, propertiesUri))
+            {
+                legacyGet.Headers.TryAddWithoutValidation("x-ms-version", "2012-02-12");
+                using var response = await transport.SendAsync(legacyGet);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                var xml = await response.Content.ReadAsStringAsync();
+                Assert.Contains("<Logging>", xml, StringComparison.Ordinal);
+                Assert.Contains("<Metrics>", xml, StringComparison.Ordinal);
+                Assert.DoesNotContain("<HourMetrics>", xml, StringComparison.Ordinal);
+                Assert.DoesNotContain("<MinuteMetrics>", xml, StringComparison.Ordinal);
+                Assert.DoesNotContain("<Cors>", xml, StringComparison.Ordinal);
+                Assert.DoesNotContain("<DeleteRetentionPolicy>", xml, StringComparison.Ordinal);
+            }
+        }
+        finally
+        {
+            await service.SetPropertiesAsync(original);
+        }
+    }
+
+    [Fact]
     public async Task BlobFamilyMutationsAreIndexedAndAtomic()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
