@@ -48,6 +48,13 @@ public enum BlockListMode
     Uncommitted
 }
 
+public enum BlobDeleteSnapshotsOption
+{
+    Unspecified,
+    Include,
+    Only
+}
+
 public sealed record BlockListEntry(string Id, BlockListMode Mode);
 
 public sealed record ContainerRecord

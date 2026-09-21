@@ -55,6 +55,7 @@ public sealed class RequestContextMiddleware(
 
         var parsed = Parse(context);
         StorageRequestContext.Set(context, parsed);
+        BlobProtocolEndpoint.ValidateBlobVersionRequest(parsed);
         parsed.Authorization = parsed.ResourceKind == StorageResourceKind.StaticWebsite
             ? StorageAuthorization.Anonymous
             : await authenticator.AuthenticateAsync(context, parsed, context.RequestAborted);

@@ -1072,7 +1072,8 @@ public sealed class BlobService(
 
     public async Task DeleteBlobAsync(
         BlobRecord current,
-        string? deleteSnapshots,
+        bool hasExplicitSnapshotOrVersion,
+        BlobDeleteSnapshotsOption deleteSnapshots,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -1084,19 +1085,23 @@ public sealed class BlobService(
             includeDeleted: true,
             cancellationToken);
         var relatedSnapshots = records.Where(item => item.Name == current.Name && item.Snapshot is not null && !item.IsDeleted).ToArray();
-        if (current.Snapshot is null && relatedSnapshots.Length > 0 && deleteSnapshots is null)
+        if (!hasExplicitSnapshotOrVersion &&
+            relatedSnapshots.Length > 0 &&
+            deleteSnapshots == BlobDeleteSnapshotsOption.Unspecified)
+        {
             throw new AzureStorageException(StatusCodes.Status409Conflict, "SnapshotsPresent", "This operation is not permitted while the blob has snapshots.");
+        }
 
         var targets = new List<BlobRecord>();
-        if (current.Snapshot is not null || current.VersionId is not null && !current.IsCurrent)
+        if (hasExplicitSnapshotOrVersion)
         {
             targets.Add(current);
         }
         else
         {
-            if (!string.Equals(deleteSnapshots, "only", StringComparison.OrdinalIgnoreCase))
+            if (deleteSnapshots != BlobDeleteSnapshotsOption.Only)
                 targets.Add(current);
-            if (deleteSnapshots is "include" or "only")
+            if (deleteSnapshots is BlobDeleteSnapshotsOption.Include or BlobDeleteSnapshotsOption.Only)
                 targets.AddRange(relatedSnapshots);
         }
 
@@ -1108,7 +1113,8 @@ public sealed class BlobService(
         foreach (var target in targets)
         {
             BlobRecord? replacement;
-            if (target.IsCurrent &&
+            if (!hasExplicitSnapshotOrVersion &&
+                target.IsCurrent &&
                 target.Snapshot is null &&
                 properties.VersioningEnabled)
             {
