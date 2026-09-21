@@ -268,7 +268,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
             var resourceType = query["sr"].ToString();
             signedResource = resourceType;
-            if (!ServiceSasCoversRequest(resourceType, request))
+            if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
 
             var objectId = query["skoid"].ToString();
@@ -363,7 +363,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             fields.Add(version);
             fields.Add(resourceType);
             if (signedVersion >= new DateOnly(2020, 2, 10))
-                fields.Add(query["snapshot"].ToString());
+                fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
             if (signedVersion >= new DateOnly(2020, 12, 6))
                 fields.Add(query["ses"].ToString());
             if (signedVersion >= new DateOnly(2026, 4, 6))
@@ -382,7 +382,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         {
             var resourceType = query["sr"].ToString();
             signedResource = resourceType;
-            if (!ServiceSasCoversRequest(resourceType, request))
+            if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
             var canonicalizedResource = BuildSasCanonicalResource(request, resourceType);
             var fields = new List<string>
@@ -399,7 +399,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             if (signedVersion >= new DateOnly(2018, 11, 9))
             {
                 fields.Add(resourceType);
-                fields.Add(query["snapshot"].ToString());
+                fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
             }
             if (signedVersion >= new DateOnly(2020, 12, 6))
                 fields.Add(query["ses"].ToString());
@@ -577,14 +577,33 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             _ => false
         };
 
-    private static bool ServiceSasCoversRequest(string resourceType, StorageRequestContext request) => resourceType switch
-    {
-        "c" => request.Container is not null,
-        "b" => request.ResourceKind == StorageResourceKind.Blob && request.Blob is not null,
-        "bs" => request.ResourceKind == StorageResourceKind.Blob && request.Blob is not null && !string.IsNullOrEmpty(request.Snapshot),
-        "bv" => request.ResourceKind == StorageResourceKind.Blob && request.Blob is not null && !string.IsNullOrEmpty(request.VersionId),
-        _ => false
-    };
+    private static bool ServiceSasCoversRequest(
+        string resourceType,
+        StorageRequestContext request,
+        DateOnly signedVersion) => resourceType switch
+        {
+            "c" => request.Container is not null,
+            "b" => request.ResourceKind == StorageResourceKind.Blob &&
+                   request.Blob is not null &&
+                   (signedVersion < new DateOnly(2018, 11, 9) ||
+                    request.Snapshot is null && request.VersionId is null),
+            "bs" => signedVersion >= new DateOnly(2018, 11, 9) &&
+                    request.ResourceKind == StorageResourceKind.Blob &&
+                    request.Blob is not null &&
+                    request.Snapshot is not null &&
+                    request.VersionId is null,
+            "bv" => signedVersion >= new DateOnly(2018, 11, 9) &&
+                    request.ResourceKind == StorageResourceKind.Blob &&
+                    request.Blob is not null &&
+                    request.VersionId is not null &&
+                    request.Snapshot is null,
+            _ => false
+        };
+
+    private static string GetSignedSnapshotOrVersion(IQueryCollection query, string resourceType) =>
+        resourceType == "bv"
+            ? query["versionid"].ToString()
+            : query["snapshot"].ToString();
 
     private static string BuildSasCanonicalResource(StorageRequestContext request, string resourceType)
     {

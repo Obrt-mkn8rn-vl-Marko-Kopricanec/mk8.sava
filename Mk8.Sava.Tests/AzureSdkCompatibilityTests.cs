@@ -1308,6 +1308,156 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task DeleteBlobEnforcesSnapshotHeaderScopeAndValues()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var container = service.GetBlobContainerClient($"delete-snapshots-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        try
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with { VersioningEnabled = false, BlobSoftDeleteEnabled = false },
+                CancellationToken.None);
+            var blob = container.GetBlobClient("family.txt");
+            await blob.UploadAsync(BinaryData.FromString("family"));
+            var firstSnapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+            var secondSnapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+            var firstSnapshot = blob.WithSnapshot(firstSnapshotId);
+            var secondSnapshot = blob.WithSnapshot(secondSnapshotId);
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+
+            using (var invalidValue = new HttpRequestMessage(
+                       HttpMethod.Delete,
+                       blob.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                invalidValue.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                invalidValue.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "Include");
+                using var response = await transport.SendAsync(invalidValue);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var scopedToSnapshot = new HttpRequestMessage(
+                       HttpMethod.Delete,
+                       firstSnapshot.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "include");
+                using var response = await transport.SendAsync(scopedToSnapshot);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            var snapshotsPresent = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DeleteAsync());
+            Assert.Equal(409, snapshotsPresent.Status);
+            Assert.Equal("SnapshotsPresent", snapshotsPresent.ErrorCode);
+            Assert.True((await blob.ExistsAsync()).Value);
+            Assert.True((await firstSnapshot.ExistsAsync()).Value);
+            Assert.True((await secondSnapshot.ExistsAsync()).Value);
+
+            var only = await blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots);
+            Assert.Equal(202, only.Status);
+            Assert.True((await blob.ExistsAsync()).Value);
+            Assert.False((await firstSnapshot.ExistsAsync()).Value);
+            Assert.False((await secondSnapshot.ExistsAsync()).Value);
+
+            var includedSnapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+            var includedSnapshot = blob.WithSnapshot(includedSnapshotId);
+            var include = await blob.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
+            Assert.Equal(202, include.Status);
+            Assert.True(include.Headers.TryGetValue("x-ms-delete-type-permanent", out var permanentHeader));
+            Assert.Equal("true", permanentHeader);
+            Assert.False((await blob.ExistsAsync()).Value);
+            Assert.False((await includedSnapshot.ExistsAsync()).Value);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task DeleteBlobUsesExplicitVersionTargetAndDeleteVersionPermission()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var container = service.GetBlobContainerClient($"delete-version-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        try
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with { VersioningEnabled = true, BlobSoftDeleteEnabled = false },
+                CancellationToken.None);
+            var blob = container.GetBlobClient("versioned.txt");
+            var firstVersionId = (await blob.UploadAsync(BinaryData.FromString("first"))).Value.VersionId;
+            var secondVersionId = (await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true)).Value.VersionId;
+            Assert.False(string.IsNullOrEmpty(firstVersionId));
+            Assert.False(string.IsNullOrEmpty(secondVersionId));
+            var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+            var snapshot = blob.WithSnapshot(snapshotId);
+            var currentVersionId = (await blob.GetPropertiesAsync()).Value.VersionId;
+            Assert.False(string.IsNullOrEmpty(currentVersionId));
+
+            var historicalDelete = await blob.WithVersion(firstVersionId).DeleteAsync();
+            Assert.Equal(202, historicalDelete.Status);
+            Assert.False((await blob.WithVersion(firstVersionId).ExistsAsync()).Value);
+            Assert.True((await blob.WithVersion(secondVersionId).ExistsAsync()).Value);
+            Assert.True((await snapshot.ExistsAsync()).Value);
+            Assert.True((await blob.ExistsAsync()).Value);
+
+            var currentVersion = blob.WithVersion(currentVersionId);
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+            using (var ordinaryDelete = new HttpRequestMessage(
+                       HttpMethod.Delete,
+                       currentVersion.GenerateSasUri(
+                           BlobSasPermissions.Delete,
+                           DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                ordinaryDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(ordinaryDelete);
+                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            }
+            Assert.True((await currentVersion.ExistsAsync()).Value);
+
+            var versionDeleteUri = currentVersion.GenerateSasUri(
+                BlobSasPermissions.DeleteBlobVersion,
+                DateTimeOffset.UtcNow.AddMinutes(5));
+            using (var versionDelete = new HttpRequestMessage(HttpMethod.Delete, versionDeleteUri))
+            {
+                versionDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(versionDelete);
+                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+                Assert.Equal("true", response.Headers.GetValues("x-ms-delete-type-permanent").Single());
+            }
+            Assert.False((await currentVersion.ExistsAsync()).Value);
+            Assert.False((await blob.ExistsAsync()).Value);
+            Assert.True((await snapshot.ExistsAsync()).Value);
+            Assert.True((await blob.WithVersion(secondVersionId).ExistsAsync()).Value);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task BlobFamilyMutationsAreIndexedAndAtomic()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
@@ -1762,42 +1912,95 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task BearerDelegationKeysProduceScopedUserDelegationSasTokens()
     {
         var owner = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
         var containerName = $"delegation-{Guid.NewGuid():N}";
         var blobName = "delegated.txt";
         var container = owner.GetBlobContainerClient(containerName);
         await container.CreateAsync();
-        await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString("delegated payload"));
 
-        var token = CreateJwt(
-            SavaWebApplicationFactory.AccountKey,
-            SavaWebApplicationFactory.DelegatorObjectId,
-            SavaWebApplicationFactory.TenantId);
-        var delegator = CreateBearerClient(factory, token);
-        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
-        var expiresOn = DateTimeOffset.UtcNow.AddHours(1);
-        var key = await delegator.GetUserDelegationKeyAsync(
-            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
-        Assert.Equal(SavaWebApplicationFactory.DelegatorObjectId, key.Value.SignedObjectId);
-        Assert.Equal(SavaWebApplicationFactory.TenantId, key.Value.SignedTenantId);
-
-        var builder = new BlobSasBuilder
+        try
         {
-            BlobContainerName = containerName,
-            BlobName = blobName,
-            Resource = "b",
-            StartsOn = startsOn,
-            ExpiresOn = expiresOn,
-            Protocol = SasProtocol.HttpsAndHttp
-        };
-        builder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.Delete);
-        var sas = builder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
-        var delegatedBlob = CreateBlobClient(
-            factory,
-            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with { VersioningEnabled = true },
+                CancellationToken.None);
+            var versionId = (await container.GetBlobClient(blobName).UploadAsync(
+                BinaryData.FromString("delegated payload"))).Value.VersionId;
+            Assert.False(string.IsNullOrEmpty(versionId));
 
-        Assert.Equal("delegated payload", (await delegatedBlob.DownloadContentAsync()).Value.Content.ToString());
-        var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => delegatedBlob.DeleteAsync());
-        Assert.Equal(403, deniedDelete.Status);
+            var token = CreateJwt(
+                SavaWebApplicationFactory.AccountKey,
+                SavaWebApplicationFactory.DelegatorObjectId,
+                SavaWebApplicationFactory.TenantId);
+            var delegator = CreateBearerClient(factory, token);
+            var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+            var expiresOn = DateTimeOffset.UtcNow.AddHours(1);
+            var key = await delegator.GetUserDelegationKeyAsync(
+                new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
+            Assert.Equal(SavaWebApplicationFactory.DelegatorObjectId, key.Value.SignedObjectId);
+            Assert.Equal(SavaWebApplicationFactory.TenantId, key.Value.SignedTenantId);
+
+            var builder = new BlobSasBuilder
+            {
+                BlobContainerName = containerName,
+                BlobName = blobName,
+                Resource = "b",
+                StartsOn = startsOn,
+                ExpiresOn = expiresOn,
+                Protocol = SasProtocol.HttpsAndHttp
+            };
+            builder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.Delete);
+            var sas = builder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
+            var delegatedBlob = CreateBlobClient(
+                factory,
+                new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
+
+            Assert.Equal("delegated payload", (await delegatedBlob.DownloadContentAsync()).Value.Content.ToString());
+            var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => delegatedBlob.DeleteAsync());
+            Assert.Equal(403, deniedDelete.Status);
+
+            var versionBuilder = new BlobSasBuilder
+            {
+                BlobContainerName = containerName,
+                BlobName = blobName,
+                BlobVersionId = versionId,
+                Resource = "bv",
+                StartsOn = startsOn,
+                ExpiresOn = expiresOn,
+                Protocol = SasProtocol.HttpsAndHttp
+            };
+            versionBuilder.SetPermissions(BlobSasPermissions.Read);
+            var versionSas = versionBuilder.ToSasQueryParameters(
+                key.Value,
+                SavaWebApplicationFactory.AccountName);
+            var delegatedVersion = CreateBlobClient(
+                factory,
+                new Uri(
+                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?versionid={Uri.EscapeDataString(versionId!)}&{versionSas}"));
+            Assert.Equal(
+                "delegated payload",
+                (await delegatedVersion.DownloadContentAsync()).Value.Content.ToString());
+
+            var versionTokenOnBaseBlob = CreateBlobClient(
+                factory,
+                new Uri(
+                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?{versionSas}"));
+            var wrongResource = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                versionTokenOnBaseBlob.DownloadContentAsync());
+            Assert.Equal(403, wrongResource.Status);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
     }
 
     [Fact]
