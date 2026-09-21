@@ -358,6 +358,43 @@ public sealed class BlobService(
         return await CompleteRehydrationIfDueAsync(blob, cancellationToken);
     }
 
+    public async Task<BlobRecord> RecordSmartTierAccessAsync(
+        BlobRecord current,
+        CancellationToken cancellationToken)
+    {
+        while (string.Equals(current.AccessTier, "Smart", StringComparison.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var now = metadata.GetUtcNow();
+            var movedToHot = !string.Equals(current.SmartAccessTier, "Hot", StringComparison.Ordinal);
+            var updated = current with
+            {
+                Revision = MetadataStore.NewRevision(),
+                SmartAccessTier = "Hot",
+                SmartTierLastAccessedAt = now,
+                AccessTierChangedAt = movedToHot ? now : current.AccessTierChangedAt
+            };
+            try
+            {
+                await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+                return updated;
+            }
+            catch (StorageConcurrencyException)
+            {
+                current = await metadata.GetBlobAsync(
+                              current.Account,
+                              current.Container,
+                              current.Name,
+                              current.VersionId,
+                              current.Snapshot,
+                              includeDeleted: false,
+                              cancellationToken)
+                          ?? throw AzureStorageException.BlobNotFound();
+            }
+        }
+        return current;
+    }
+
     public async Task<BlobRecord> PutBlockBlobAsync(
         string account,
         string container,
@@ -912,6 +949,7 @@ public sealed class BlobService(
             {
                 AccessTier = tier,
                 SmartAccessTier = tier == "Smart" ? "Hot" : null,
+                SmartTierLastAccessedAt = tier == "Smart" ? now : null,
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
@@ -1412,6 +1450,7 @@ public sealed class BlobService(
     {
         var completedCopies = 0;
         var completedRehydrations = 0;
+        var completedSmartTierTransitions = 0;
         var expiredBlobs = 0;
         var purgedBlobs = 0;
         var purgedContainers = 0;
@@ -1435,6 +1474,19 @@ public sealed class BlobService(
                     if (pendingCopy.Copy.Status == "pending" && blob.Copy?.Status == "success")
                         completedCopies++;
                 }
+                if (blob.RehydrateCompleteAt <= now)
+                {
+                    var rehydrated = await CompleteRehydrationIfDueAsync(blob, cancellationToken);
+                    if (rehydrated.RehydrateCompleteAt is null && blob.RehydrateCompleteAt is not null)
+                        completedRehydrations++;
+                    blob = rehydrated;
+                }
+
+                var smartTiered = await TransitionSmartTierIfDueAsync(blob, now, cancellationToken);
+                if (!string.Equals(smartTiered.SmartAccessTier, blob.SmartAccessTier, StringComparison.Ordinal))
+                    completedSmartTierTransitions++;
+                blob = smartTiered;
+
                 if (blob.IsDeleted && blob.DeletedAt is not null)
                 {
                     var retentionUntil = blob.DeleteRetentionUntil;
@@ -1453,14 +1505,6 @@ public sealed class BlobService(
                         purgedBlobs++;
                     }
                     continue;
-                }
-
-                if (blob.RehydrateCompleteAt <= now)
-                {
-                    var rehydrated = await CompleteRehydrationIfDueAsync(blob, cancellationToken);
-                    if (rehydrated.RehydrateCompleteAt is null && blob.RehydrateCompleteAt is not null)
-                        completedRehydrations++;
-                    blob = rehydrated;
                 }
 
                 if (blob.IsCurrent &&
@@ -1557,6 +1601,7 @@ public sealed class BlobService(
         var result = new StorageMaintenanceResult(
             completedCopies,
             completedRehydrations,
+            completedSmartTierTransitions,
             expiredBlobs,
             purgedBlobs,
             purgedContainers,
@@ -1844,11 +1889,13 @@ public sealed class BlobService(
             "rehydrate-pending-to-smart" => "Smart",
             _ => throw new InvalidDataException("The blob has an invalid archive rehydration status.")
         };
+        var now = metadata.GetUtcNow();
         var updated = blob with
         {
             AccessTier = targetTier,
             SmartAccessTier = targetTier == "Smart" ? "Hot" : null,
-            AccessTierChangedAt = metadata.GetUtcNow(),
+            SmartTierLastAccessedAt = targetTier == "Smart" ? now : null,
+            AccessTierChangedAt = now,
             ArchiveStatus = null,
             RehydratePriority = null,
             RehydrateCompleteAt = null,
@@ -1871,6 +1918,44 @@ public sealed class BlobService(
                        cancellationToken)
                    ?? throw AzureStorageException.BlobNotFound();
         }
+    }
+
+    private async Task<BlobRecord> TransitionSmartTierIfDueAsync(
+        BlobRecord blob,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (blob.Kind != BlobKind.BlockBlob ||
+            !string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) ||
+            blob.ArchiveStatus is not null)
+        {
+            return blob;
+        }
+
+        const long minimumManagedLength = 128L * 1024;
+        var lastAccessedAt = blob.SmartTierLastAccessedAt
+                             ?? blob.AccessTierChangedAt
+                             ?? blob.CreatedAt;
+        var inactiveFor = now - lastAccessedAt;
+        var target = blob.Content.Length <= minimumManagedLength
+            ? "Hot"
+            : inactiveFor >= TimeSpan.FromDays(90)
+                ? "Cold"
+                : inactiveFor >= TimeSpan.FromDays(30)
+                    ? "Cool"
+                    : "Hot";
+        if (string.Equals(blob.SmartAccessTier, target, StringComparison.Ordinal))
+            return blob;
+
+        var updated = blob with
+        {
+            Revision = MetadataStore.NewRevision(),
+            SmartAccessTier = target,
+            SmartTierLastAccessedAt = lastAccessedAt,
+            AccessTierChangedAt = now
+        };
+        await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+        return updated;
     }
 
     private static BlobRecord NewBlob(
@@ -1916,7 +2001,8 @@ public sealed class BlobService(
             ImmutabilityLocked = options.ImmutabilityLocked,
             HasLegalHold = options.HasLegalHold,
             EncryptionScope = options.EncryptionScope,
-            CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256
+            CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256,
+            SmartTierLastAccessedAt = options.AccessTier == "Smart" ? now : null
         };
     }
 

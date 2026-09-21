@@ -13,6 +13,7 @@ public sealed class StorageTelemetry : IStorageTelemetry
     private long _maintenanceFailures;
     private long _completedCopies;
     private long _completedRehydrations;
+    private long _completedSmartTierTransitions;
     private long _expiredBlobs;
     private long _purgedSoftDeletedBlobs;
     private long _purgedSoftDeletedContainers;
@@ -44,6 +45,7 @@ public sealed class StorageTelemetry : IStorageTelemetry
         Interlocked.Increment(ref _maintenancePasses);
         Interlocked.Add(ref _completedCopies, result.CompletedCopies);
         Interlocked.Add(ref _completedRehydrations, result.CompletedRehydrations);
+        Interlocked.Add(ref _completedSmartTierTransitions, result.CompletedSmartTierTransitions);
         Interlocked.Add(ref _expiredBlobs, result.ExpiredBlobs);
         Interlocked.Add(ref _purgedSoftDeletedBlobs, result.PurgedSoftDeletedBlobs);
         Interlocked.Add(ref _purgedSoftDeletedContainers, result.PurgedSoftDeletedContainers);
@@ -91,6 +93,7 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_maintenance_failures_total", "Failed maintenance passes.", Interlocked.Read(ref _maintenanceFailures));
         AppendMetric(builder, "mk8_sava_maintenance_completed_copies_total", "Asynchronous copies completed by maintenance.", Interlocked.Read(ref _completedCopies));
         AppendMetric(builder, "mk8_sava_maintenance_completed_rehydrations_total", "Archive rehydrations completed by maintenance.", Interlocked.Read(ref _completedRehydrations));
+        AppendMetric(builder, "mk8_sava_maintenance_smart_tier_transitions_total", "Smart-tier capacity transitions completed by maintenance.", Interlocked.Read(ref _completedSmartTierTransitions));
         AppendMetric(builder, "mk8_sava_maintenance_expired_blobs_total", "Expired blobs removed by maintenance.", Interlocked.Read(ref _expiredBlobs));
         AppendMetric(builder, "mk8_sava_maintenance_purged_soft_deleted_blobs_total", "Soft-deleted blob records permanently purged.", Interlocked.Read(ref _purgedSoftDeletedBlobs));
         AppendMetric(builder, "mk8_sava_maintenance_purged_soft_deleted_containers_total", "Soft-deleted containers permanently purged.", Interlocked.Read(ref _purgedSoftDeletedContainers));

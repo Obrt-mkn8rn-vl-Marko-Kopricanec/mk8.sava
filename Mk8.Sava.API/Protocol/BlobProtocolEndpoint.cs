@@ -1392,8 +1392,6 @@ public static class BlobProtocolEndpoint
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
-        AzureResponseWriter.AddBlobHeaders(http.Response, blob);
-        ApplySasResponseOverrides(http);
         long start = 0;
         long end = blob.Content.Length - 1;
         var rangeHeader = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
@@ -1408,6 +1406,8 @@ public static class BlobProtocolEndpoint
         var length = blob.Content.Length == 0 ? 0 : end - start + 1;
         if (HttpMethods.IsHead(http.Request.Method))
         {
+            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            ApplySasResponseOverrides(http);
             http.Response.ContentLength = length;
             return;
         }
@@ -1448,6 +1448,9 @@ public static class BlobProtocolEndpoint
                     "Structured response bodies require service version 2025-01-05 or later.");
             }
 
+            blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            ApplySasResponseOverrides(http);
             http.Response.Headers["x-ms-structured-body"] = structuredBody;
             http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
             http.Response.ContentLength = StructuredBodyEncoder.GetEncodedLength(length);
@@ -1466,9 +1469,6 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        http.Response.ContentLength = length;
-        if (length == 0)
-            return;
         if (wantMd5 || wantCrc64)
         {
             if (rangeHeader is null || length > 4 * 1024 * 1024)
@@ -1477,6 +1477,16 @@ public static class BlobProtocolEndpoint
                     wantMd5 ? "x-ms-range-get-content-md5" : "x-ms-range-get-content-crc64",
                     "true");
             }
+        }
+
+        blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+        AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+        ApplySasResponseOverrides(http);
+        http.Response.ContentLength = length;
+        if (length == 0)
+            return;
+        if (wantMd5 || wantCrc64)
+        {
             using var buffer = new MemoryStream((int)length);
             await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken);
             var bytes = buffer.ToArray();

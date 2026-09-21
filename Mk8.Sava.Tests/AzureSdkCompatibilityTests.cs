@@ -1570,6 +1570,123 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task SmartTierTracksDataAccessAndTransitionsOnlyEligibleBlobs()
+    {
+        var clock = new AdjustableTimeProvider(DateTimeOffset.UtcNow);
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "01:00:00"
+            });
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"smart-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var blobs = application.Services.GetRequiredService<BlobService>();
+            var serviceProperties = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                serviceProperties with
+                {
+                    BlobSoftDeleteEnabled = true,
+                    BlobSoftDeleteRetentionDays = 365
+                },
+                CancellationToken.None);
+
+            var managedBytes = Enumerable.Range(0, 128 * 1024 + 1)
+                .Select(index => (byte)(index % 251))
+                .ToArray();
+            var managed = container.GetBlobClient("managed.bin");
+            await managed.UploadAsync(
+                BinaryData.FromBytes(managedBytes),
+                new BlobUploadOptions { AccessTier = AccessTier.Smart });
+            var small = container.GetBlobClient("small.bin");
+            await small.UploadAsync(
+                BinaryData.FromBytes(new byte[128 * 1024]),
+                new BlobUploadOptions { AccessTier = AccessTier.Smart });
+            var deleted = container.GetBlobClient("deleted.bin");
+            await deleted.UploadAsync(
+                BinaryData.FromBytes(managedBytes),
+                new BlobUploadOptions { AccessTier = AccessTier.Smart });
+            await deleted.DeleteAsync();
+
+            var original = (await managed.GetPropertiesAsync()).Value;
+            Assert.Equal(AccessTier.Smart, original.AccessTier);
+            Assert.Equal("Hot", original.SmartAccessTier);
+
+            clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
+            var early = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(0, early.CompletedSmartTierTransitions);
+            Assert.Equal("Hot", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
+
+            clock.Advance(TimeSpan.FromTicks(1));
+            var cooled = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(2, cooled.CompletedSmartTierTransitions);
+            var coolProperties = (await managed.GetPropertiesAsync()).Value;
+            Assert.Equal("Cool", coolProperties.SmartAccessTier);
+            Assert.Equal(original.ETag, coolProperties.ETag);
+            Assert.Equal(original.LastModified, coolProperties.LastModified);
+            Assert.Equal("Hot", (await small.GetPropertiesAsync()).Value.SmartAccessTier);
+            var deletedRecord = await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                container.Name,
+                deleted.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: true,
+                CancellationToken.None);
+            Assert.Equal("Cool", deletedRecord?.SmartAccessTier);
+
+            _ = await managed.GetPropertiesAsync();
+            _ = await managed.GetTagsAsync();
+            await managed.SetMetadataAsync(new Dictionary<string, string> { ["observed"] = "without-access" });
+            clock.Advance(TimeSpan.FromDays(60));
+            var chilled = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(2, chilled.CompletedSmartTierTransitions);
+            Assert.Equal("Cold", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
+            Assert.Equal("Hot", (await small.GetPropertiesAsync()).Value.SmartAccessTier);
+
+            Assert.Equal(managedBytes, (await managed.DownloadContentAsync()).Value.Content.ToArray());
+            var reheated = (await managed.GetPropertiesAsync()).Value;
+            Assert.Equal("Hot", reheated.SmartAccessTier);
+            var accessedRecord = await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                container.Name,
+                managed.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                CancellationToken.None);
+            Assert.Equal(clock.GetUtcNow(), accessedRecord?.SmartTierLastAccessedAt);
+
+            clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
+            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal("Hot", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
+            clock.Advance(TimeSpan.FromTicks(1));
+            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal("Cool", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
+
+            clock.Advance(TimeSpan.FromDays(60));
+            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal("Cold", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
+            await managed.UploadAsync(BinaryData.FromBytes(managedBytes), overwrite: true);
+            var rewritten = (await managed.GetPropertiesAsync()).Value;
+            Assert.Equal(AccessTier.Smart, rewritten.AccessTier);
+            Assert.Equal("Hot", rewritten.SmartAccessTier);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task AsynchronousCopiesCompleteDurablyAndCanBeAborted()
     {
         var remoteBytes = Enumerable.Range(0, 48 * 1024).Select(index => (byte)(index % 241)).ToArray();
@@ -4065,6 +4182,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         public List<long> Values { get; } = [];
 
         public void Report(long value) => Values.Add(value);
+    }
+
+    private sealed class AdjustableTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private long _utcTicks = utcNow.UtcDateTime.Ticks;
+
+        public override DateTimeOffset GetUtcNow() =>
+            new(Interlocked.Read(ref _utcTicks), TimeSpan.Zero);
+
+        public void Advance(TimeSpan value) =>
+            Interlocked.Add(ref _utcTicks, value.Ticks);
     }
 
     private sealed class DeclaredLengthContent(long length) : HttpContent
