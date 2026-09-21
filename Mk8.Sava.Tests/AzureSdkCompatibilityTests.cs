@@ -6,6 +6,7 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
+using System.Buffers.Binary;
 using System.IdentityModel.Tokens.Jwt;
 using System.Globalization;
 using System.Net;
@@ -23,6 +24,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Data.Sqlite;
+using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
@@ -71,7 +73,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("fixture", (await blob.GetTagsAsync()).Value.Tags["kind"]);
 
         var names = new List<string>();
-        await foreach (var item in container.GetBlobsAsync(BlobTraits.Metadata | BlobTraits.Tags, prefix: "folder/"))
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Traits = BlobTraits.Metadata | BlobTraits.Tags,
+            Prefix = "folder/"
+        }))
             names.Add(item.Name);
         Assert.Contains("folder/blob.bin", names);
     }
@@ -355,10 +361,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var listed = new List<BlobItem>();
             var flatTokens = new HashSet<string>(StringComparer.Ordinal);
             await foreach (var page in container
-                               .GetBlobsAsync(
-                                   BlobTraits.None,
-                                   BlobStates.Version | BlobStates.Snapshots,
-                                   prefix: versioned.Name)
+                               .GetBlobsAsync(new GetBlobsOptions
+                               {
+                                   States = BlobStates.Version | BlobStates.Snapshots,
+                                   Prefix = versioned.Name
+                               })
                                .AsPages(pageSizeHint: 1))
             {
                 Assert.Single(page.Values);
@@ -394,7 +401,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var hierarchy = new List<string>();
             var hierarchyTokens = new HashSet<string>(StringComparer.Ordinal);
             await foreach (var page in container
-                               .GetBlobsByHierarchyAsync(delimiter: "/", prefix: "folders/")
+                               .GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+                               {
+                                   Delimiter = "/",
+                                   Prefix = "folders/"
+                               })
                                .AsPages(pageSizeHint: 1))
             {
                 Assert.Single(page.Values);
@@ -413,7 +424,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await container.GetBlobClient(livePrefix + "d").UploadAsync(BinaryData.FromString("d"));
             Page<BlobItem>? firstLivePage = null;
             await foreach (var page in container
-                               .GetBlobsAsync(prefix: livePrefix)
+                               .GetBlobsAsync(new GetBlobsOptions { Prefix = livePrefix })
                                .AsPages(pageSizeHint: 1))
             {
                 firstLivePage = page;
@@ -426,7 +437,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await container.GetBlobClient(livePrefix + "c").UploadAsync(BinaryData.FromString("c"));
             var resumedLiveNames = new List<string>();
             await foreach (var page in container
-                               .GetBlobsAsync(prefix: livePrefix)
+                               .GetBlobsAsync(new GetBlobsOptions { Prefix = livePrefix })
                                .AsPages(firstLivePage.ContinuationToken, pageSizeHint: 1))
             {
                 resumedLiveNames.AddRange(page.Values.Select(item => item.Name));
@@ -927,7 +938,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var delegator = CreateBearerClient(factory, token);
         var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
         var expiresOn = DateTimeOffset.UtcNow.AddHours(1);
-        var key = await delegator.GetUserDelegationKeyAsync(startsOn, expiresOn);
+        var key = await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
         Assert.Equal(SavaWebApplicationFactory.DelegatorObjectId, key.Value.SignedObjectId);
         Assert.Equal(SavaWebApplicationFactory.TenantId, key.Value.SignedTenantId);
 
@@ -1323,7 +1335,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("IncrementalCopyBlobMismatch", replacedSource.ErrorCode);
 
         var listed = new List<BlobItem>();
-        await foreach (var item in container.GetBlobsAsync(BlobTraits.None, BlobStates.Snapshots, prefix: destination.Name))
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Snapshots,
+            Prefix = destination.Name
+        }))
             listed.Add(item);
         var listedBase = Assert.Single(listed, item => item.Snapshot is null);
         Assert.Equal(secondProperties.DestinationSnapshot, listedBase.Properties.DestinationSnapshot);
@@ -1580,7 +1596,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(content, (await normalService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin").DownloadContentAsync()).Value.Content.ToArray());
 
         var listed = new List<BlobItem>();
-        await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(BlobTraits.Metadata))
+        await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(
+                           new GetBlobsOptions { Traits = BlobTraits.Metadata }))
             listed.Add(item);
         var listedKeyed = Assert.Single(listed, item => item.Name == "keyed.bin");
         Assert.Equal(expectedHash, listedKeyed.Properties.CustomerProvidedKeySha256);
@@ -2502,9 +2519,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("after overwrite", (await overwritten.DownloadContentAsync()).Value.Content.ToString());
 
             var deletedSnapshots = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(
-                               states: BlobStates.Deleted | BlobStates.Snapshots,
-                               prefix: overwritten.Name))
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+            {
+                States = BlobStates.Deleted | BlobStates.Snapshots,
+                Prefix = overwritten.Name
+            }))
             {
                 if (item.Deleted && item.Snapshot is not null)
                     deletedSnapshots.Add(item);
@@ -2524,9 +2543,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await recreated.UndeleteAsync();
 
             BlobItem? recreatedSnapshot = null;
-            await foreach (var item in container.GetBlobsAsync(
-                               states: BlobStates.Snapshots,
-                               prefix: recreated.Name))
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+            {
+                States = BlobStates.Snapshots,
+                Prefix = recreated.Name
+            }))
             {
                 if (item.Name == recreated.Name && item.Snapshot is not null)
                     recreatedSnapshot = item;
@@ -2544,9 +2565,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var typeChangedBlock = container.GetBlockBlobClient(typeChangedName);
             await typeChangedBlock.UploadAsync(new MemoryStream("block replacement"u8.ToArray()));
             var retainedDifferentType = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(
-                               states: BlobStates.Deleted | BlobStates.Snapshots,
-                               prefix: typeChangedName))
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+            {
+                States = BlobStates.Deleted | BlobStates.Snapshots,
+                Prefix = typeChangedName
+            }))
             {
                 if (item.Name == typeChangedName && item.Deleted)
                     retainedDifferentType.Add(item);
@@ -2573,7 +2596,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.False((await versioned.ExistsAsync()).Value);
 
             var versions = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(states: BlobStates.Version, prefix: versioned.Name))
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+            {
+                States = BlobStates.Version,
+                Prefix = versioned.Name
+            }))
             {
                 if (item.Name == versioned.Name && item.VersionId is not null)
                     versions.Add(item);
@@ -2641,12 +2668,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
-    public async Task TransactionalCrc64IsValidatedBeforePublication()
+    public async Task StructuredAndTransactionalCrc64AreValidatedBeforePublication()
     {
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"crc-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        var content = Enumerable.Range(0, 64 * 1024).Select(index => (byte)(index % 239)).ToArray();
+        var content = new byte[4 * 1024 * 1024 + 257];
+        for (var index = 0; index < content.Length; index++)
+            content[index] = (byte)(index % 239);
         var valid = container.GetBlobClient("valid.bin");
         await valid.UploadAsync(new MemoryStream(content), new BlobUploadOptions
         {
@@ -2657,19 +2686,99 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         });
         Assert.Equal(content, (await valid.DownloadContentAsync()).Value.Content.ToArray());
 
-        var invalid = container.GetBlobClient("invalid.bin");
-        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            invalid.UploadAsync(new MemoryStream(content), new BlobUploadOptions
+        var stagedContent = "structured staged block"u8.ToArray();
+        var blockId = Convert.ToBase64String("block-0001"u8);
+        var blockBlob = container.GetBlockBlobClient("staged.bin");
+        await blockBlob.StageBlockAsync(
+            blockId,
+            new MemoryStream(stagedContent),
+            new BlockBlobStageBlockOptions
             {
                 TransferValidation = new UploadTransferValidationOptions
                 {
-                    ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64,
-                    PrecalculatedChecksum = new byte[8]
+                    ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
                 }
-            }));
-        Assert.Equal(400, rejected.Status);
-        Assert.Equal("Crc64Mismatch", rejected.ErrorCode);
+            });
+        await blockBlob.CommitBlockListAsync([blockId]);
+        Assert.Equal(stagedContent, (await blockBlob.DownloadContentAsync()).Value.Content.ToArray());
+
+        var appendContent = "structured append block"u8.ToArray();
+        var appendBlob = container.GetAppendBlobClient("append.bin");
+        await appendBlob.CreateAsync();
+        await appendBlob.AppendBlockAsync(
+            new MemoryStream(appendContent),
+            new AppendBlobAppendBlockOptions
+            {
+                TransferValidation = new UploadTransferValidationOptions
+                {
+                    ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+                }
+            });
+        Assert.Equal(appendContent, (await appendBlob.DownloadContentAsync()).Value.Content.ToArray());
+
+        var pageContent = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
+        var pageBlob = container.GetPageBlobClient("page.bin");
+        await pageBlob.CreateAsync(pageContent.Length);
+        await pageBlob.UploadPagesAsync(
+            new MemoryStream(pageContent),
+            0,
+            new PageBlobUploadPagesOptions
+            {
+                TransferValidation = new UploadTransferValidationOptions
+                {
+                    ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+                }
+            });
+        Assert.Equal(pageContent, (await pageBlob.DownloadContentAsync()).Value.Content.ToArray());
+
+        var invalid = container.GetBlobClient("invalid.bin");
+        var invalidContent = "structured checksum mismatch"u8.ToArray();
+        var invalidStructuredBody = EncodeStructuredBody(invalidContent);
+        invalidStructuredBody[^1] ^= 0x01;
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using (var structuredRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   invalid.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent(invalidStructuredBody)
+        })
+        {
+            structuredRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            structuredRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            structuredRequest.Headers.TryAddWithoutValidation(
+                "x-ms-structured-body",
+                StructuredBodyDecoder.ContentType);
+            structuredRequest.Headers.TryAddWithoutValidation(
+                "x-ms-structured-content-length",
+                invalidContent.Length.ToString(CultureInfo.InvariantCulture));
+            using var structuredResponse = await transport.SendAsync(structuredRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, structuredResponse.StatusCode);
+            Assert.Equal("Crc64Mismatch", structuredResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
         Assert.False((await invalid.ExistsAsync()).Value);
+
+        var invalidTransactional = container.GetBlobClient("invalid-transactional.bin");
+        using (var transactionalRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   invalidTransactional.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent(invalidContent)
+        })
+        {
+            transactionalRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            transactionalRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            transactionalRequest.Headers.TryAddWithoutValidation(
+                "x-ms-content-crc64",
+                Convert.ToBase64String(new byte[8]));
+            using var transactionalResponse = await transport.SendAsync(transactionalRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, transactionalResponse.StatusCode);
+            Assert.Equal("Crc64Mismatch", transactionalResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await invalidTransactional.ExistsAsync()).Value);
     }
 
     [Fact]
@@ -2821,6 +2930,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+
+    private static byte[] EncodeStructuredBody(ReadOnlySpan<byte> content)
+    {
+        const int headerLength = 13;
+        const int segmentHeaderLength = 10;
+        const int checksumLength = 8;
+        var encoded = new byte[headerLength + segmentHeaderLength + content.Length + checksumLength * 2];
+        encoded[0] = 1;
+        BinaryPrimitives.WriteUInt64LittleEndian(encoded.AsSpan(1), (ulong)encoded.Length);
+        BinaryPrimitives.WriteUInt16LittleEndian(encoded.AsSpan(9), 0x0001);
+        BinaryPrimitives.WriteUInt16LittleEndian(encoded.AsSpan(11), 1);
+        BinaryPrimitives.WriteUInt16LittleEndian(encoded.AsSpan(headerLength), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(encoded.AsSpan(headerLength + sizeof(ushort)), (ulong)content.Length);
+        content.CopyTo(encoded.AsSpan(headerLength + segmentHeaderLength));
+
+        var crc64 = new Mk8.Sava.Protocol.StorageCrc64();
+        crc64.Append(content);
+        var checksum = crc64.GetHash();
+        checksum.CopyTo(encoded.AsSpan(headerLength + segmentHeaderLength + content.Length));
+        checksum.CopyTo(encoded.AsSpan(encoded.Length - checksumLength));
+        return encoded;
+    }
 
     private static async Task CreateVersionOneDatabaseAsync(string dataPath, string containerName)
     {
