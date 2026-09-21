@@ -15,6 +15,8 @@ internal sealed record UrlSource(
     BlobHttpProperties Http,
     string? ETag);
 
+internal sealed record UrlTransferResult<TResult>(TResult Value, TransactionalChecksums Checksums);
+
 internal sealed class SourceCustomerProvidedKey(
     string encodedKey,
     string encodedHash,
@@ -32,7 +34,7 @@ internal sealed class UrlTransferClient(
 {
     private readonly SavaOptions _options = configuredOptions.Value;
 
-    public async Task<TResult> ReadAsync<TResult>(
+    public async Task<UrlTransferResult<TResult>> ReadAsync<TResult>(
         HttpRequest destinationRequest,
         string sourceValue,
         string? sourceRange,
@@ -139,7 +141,7 @@ internal sealed class UrlTransferClient(
         }
     }
 
-    private async Task<TResult> ConsumeWithChecksumValidationAsync<TResult>(
+    private async Task<UrlTransferResult<TResult>> ConsumeWithChecksumValidationAsync<TResult>(
         HttpRequest request,
         UrlSource source,
         long maximumBytes,
@@ -156,7 +158,11 @@ internal sealed class UrlTransferClient(
                 "Both CRC64 and MD5 were specified for the source. Specify only one checksum.");
         }
         if (expectedMd5Text is null && expectedCrc64Text is null)
-            return await consume(source);
+        {
+            using var hashingSource = new TransactionalChecksumReadStream(source.Content);
+            var value = await consume(source with { Content = hashingSource });
+            return new UrlTransferResult<TResult>(value, hashingSource.Complete());
+        }
 
         var headerName = expectedMd5Text is null ? "x-ms-source-content-crc64" : "x-ms-source-content-md5";
         var expected = DecodeChecksum(expectedMd5Text ?? expectedCrc64Text!, expectedMd5Text is null ? 8 : 16, headerName);
@@ -170,8 +176,8 @@ internal sealed class UrlTransferClient(
                 FileShare.None,
                 128 * 1024,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var md5 = expectedMd5Text is null ? null : IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-            var crc64 = expectedCrc64Text is null ? null : new StorageCrc64();
+            using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+            var crc64 = new StorageCrc64();
             var buffer = new byte[128 * 1024];
             long length = 0;
             while (true)
@@ -182,12 +188,13 @@ internal sealed class UrlTransferClient(
                 length = checked(length + read);
                 if (length > maximumBytes)
                     throw new RequestBodyTooLargeException(maximumBytes);
-                md5?.AppendData(buffer, 0, read);
-                crc64?.Append(buffer.AsSpan(0, read));
+                md5.AppendData(buffer, 0, read);
+                crc64.Append(buffer.AsSpan(0, read));
                 await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
             }
 
-            var actual = md5?.GetHashAndReset() ?? crc64!.GetHash();
+            var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
+            var actual = expectedMd5Text is null ? checksums.Crc64 : checksums.Md5;
             if (!CryptographicOperations.FixedTimeEquals(expected, actual))
             {
                 throw new AzureStorageException(
@@ -197,7 +204,8 @@ internal sealed class UrlTransferClient(
             }
 
             temporary.Position = 0;
-            return await consume(source with { Content = temporary, ContentLength = length });
+            var value = await consume(source with { Content = temporary, ContentLength = length });
+            return new UrlTransferResult<TResult>(value, checksums);
         }
         finally
         {

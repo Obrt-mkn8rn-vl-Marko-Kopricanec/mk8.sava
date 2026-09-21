@@ -2608,6 +2608,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.False(wholeUploadHeaders.TryGetValue("x-ms-blob-type", out _));
         Assert.False(wholeUploadHeaders.TryGetValue("x-ms-lease-status", out _));
         Assert.False(wholeUploadHeaders.TryGetValue("x-ms-meta-marker", out _));
+        Assert.Equal(
+            Convert.ToBase64String(MD5.HashData(sourceBytes)),
+            ResponseHeader(wholeUpload.GetRawResponse(), "Content-MD5"));
+        Assert.Equal(
+            StorageCrc64Base64(sourceBytes),
+            ResponseHeader(wholeUpload.GetRawResponse(), "x-ms-content-crc64"));
         Assert.Equal(sourceBytes, (await whole.DownloadContentAsync()).Value.Content.ToArray());
 
         const int blockOffset = 900;
@@ -2615,11 +2621,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var block = container.GetBlockBlobClient("block.bin");
         var blockId = Convert.ToBase64String("url-block-1"u8);
         var blockSlice = sourceBytes.AsSpan(blockOffset, blockLength).ToArray();
-        await block.StageBlockFromUriAsync(source.Uri, blockId, new StageBlockFromUriOptions
+        var stagedFromUri = await block.StageBlockFromUriAsync(source.Uri, blockId, new StageBlockFromUriOptions
         {
             SourceRange = new HttpRange(blockOffset, blockLength),
             SourceContentHash = MD5.HashData(blockSlice)
         });
+        Assert.Equal(
+            Convert.ToBase64String(MD5.HashData(blockSlice)),
+            ResponseHeader(stagedFromUri.GetRawResponse(), "Content-MD5"));
+        Assert.Equal(
+            StorageCrc64Base64(blockSlice),
+            ResponseHeader(stagedFromUri.GetRawResponse(), "x-ms-content-crc64"));
         await block.CommitBlockListAsync([blockId]);
         Assert.Equal(blockSlice, (await block.DownloadContentAsync()).Value.Content.ToArray());
 
@@ -2628,21 +2640,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var append = container.GetAppendBlobClient("append.bin");
         await append.CreateAsync();
         var appendSlice = sourceBytes.AsSpan(appendOffset, appendLength).ToArray();
-        await append.AppendBlockFromUriAsync(source.Uri, new AppendBlobAppendBlockFromUriOptions
+        var appendedFromUri = await append.AppendBlockFromUriAsync(source.Uri, new AppendBlobAppendBlockFromUriOptions
         {
             SourceRange = new HttpRange(appendOffset, appendLength),
             SourceContentHash = MD5.HashData(appendSlice)
         });
+        Assert.Equal(
+            Convert.ToBase64String(MD5.HashData(appendSlice)),
+            ResponseHeader(appendedFromUri.GetRawResponse(), "Content-MD5"));
+        Assert.Equal(
+            StorageCrc64Base64(appendSlice),
+            ResponseHeader(appendedFromUri.GetRawResponse(), "x-ms-content-crc64"));
         Assert.Equal(appendSlice, (await append.DownloadContentAsync()).Value.Content.ToArray());
 
         var page = container.GetPageBlobClient("page.bin");
         await page.CreateAsync(1024);
         var pageSlice = sourceBytes.AsSpan(0, 512).ToArray();
-        await page.UploadPagesFromUriAsync(
+        var pagesFromUri = await page.UploadPagesFromUriAsync(
             source.Uri,
             new HttpRange(0, 512),
             new HttpRange(512, 512),
             new PageBlobUploadPagesFromUriOptions { SourceContentHash = MD5.HashData(pageSlice) });
+        Assert.Equal(
+            Convert.ToBase64String(MD5.HashData(pageSlice)),
+            ResponseHeader(pagesFromUri.GetRawResponse(), "Content-MD5"));
+        Assert.Equal(
+            StorageCrc64Base64(pageSlice),
+            ResponseHeader(pagesFromUri.GetRawResponse(), "x-ms-content-crc64"));
         var expectedPage = new byte[1024];
         pageSlice.CopyTo(expectedPage, 512);
         Assert.Equal(expectedPage, (await page.DownloadContentAsync()).Value.Content.ToArray());
@@ -5878,6 +5902,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         checksum.CopyTo(encoded.AsSpan(headerLength + segmentHeaderLength + content.Length));
         checksum.CopyTo(encoded.AsSpan(encoded.Length - checksumLength));
         return encoded;
+    }
+
+    private static string StorageCrc64Base64(ReadOnlySpan<byte> content)
+    {
+        var crc64 = new Mk8.Sava.Protocol.StorageCrc64();
+        crc64.Append(content);
+        return Convert.ToBase64String(crc64.GetHash());
+    }
+
+    private static string ResponseHeader(Response response, string name)
+    {
+        Assert.True(response.Headers.TryGetValue(name, out var value), $"Missing response header: {name}");
+        return value;
     }
 
     private static async Task CreateVersionOneDatabaseAsync(string dataPath, string containerName)
