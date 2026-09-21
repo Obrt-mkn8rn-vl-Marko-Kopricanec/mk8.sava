@@ -575,16 +575,13 @@ public static class BlobProtocolEndpoint
     {
         try
         {
-            var segments = subrequest.RawPath.Split('/', StringSplitOptions.None).Skip(1).ToArray();
+            var segments = StorageResourcePath.DecodeSegments(subrequest.RawPath);
             var offset = segments.Length >= 3 &&
-                         string.Equals(Uri.UnescapeDataString(segments[0]), account, StringComparison.Ordinal)
+                         string.Equals(segments[0], account, StringComparison.Ordinal)
                 ? 1
                 : 0;
-            if (segments.Length - offset < 2 || string.IsNullOrEmpty(segments[offset]))
-                throw InvalidBatchSubrequest("A batch subrequest does not identify a blob.");
-            var container = Uri.UnescapeDataString(segments[offset]);
-            var blob = string.Join('/', segments.Skip(offset + 1).Select(Uri.UnescapeDataString));
-            if (string.IsNullOrEmpty(blob))
+            var (container, blob) = StorageResourcePath.ResolveBlob(segments, offset);
+            if (string.IsNullOrEmpty(container) || string.IsNullOrEmpty(blob))
                 throw InvalidBatchSubrequest("A batch subrequest does not identify a blob.");
             if (scopedContainer is not null && !string.Equals(container, scopedContainer, StringComparison.Ordinal))
             {
@@ -629,7 +626,8 @@ public static class BlobProtocolEndpoint
         inner.Connection.RemoteIpAddress = outer.Connection.RemoteIpAddress;
         foreach (var header in resolved.Request.Headers)
             inner.Request.Headers[header.Key] = header.Value;
-        inner.Features.Get<IHttpRequestFeature>()!.RawTarget = resolved.Request.RawPath + resolved.Request.QueryString;
+        inner.Features.Get<IHttpRequestFeature>()!.RawTarget =
+            resolved.Request.RawPath + (resolved.Request.QueryString.Value ?? string.Empty);
 
         var subrequestContext = new StorageRequestContext
         {
@@ -1917,13 +1915,10 @@ public static class BlobProtocolEndpoint
         string? hostAccount = null;
         if (!string.Equals(sourceUri.Host, destinationHost, StringComparison.OrdinalIgnoreCase))
             return null;
-        if (destinationHost.StartsWith(destinationRequest.Account + ".", StringComparison.OrdinalIgnoreCase))
+        if (StorageResourcePath.HostIdentifiesAccount(destinationHost, destinationRequest.Account))
             hostAccount = destinationRequest.Account;
 
-        var segments = sourceUri.AbsolutePath
-            .Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Select(Uri.UnescapeDataString)
-            .ToArray();
+        var segments = StorageResourcePath.DecodeSegments(sourceUri.AbsolutePath);
         var account = hostAccount;
         var offset = 0;
         if (account is null)
@@ -1933,18 +1928,13 @@ public static class BlobProtocolEndpoint
             account = segments[0];
             offset = 1;
         }
-        else if (segments.Length >= 3 && string.Equals(segments[0], account, StringComparison.Ordinal))
-        {
-            offset = 1;
-        }
 
         if (!string.Equals(account, destinationRequest.Account, StringComparison.Ordinal))
             return null;
 
-        if (segments.Length - offset < 2)
+        var (container, name) = StorageResourcePath.ResolveBlob(segments, offset);
+        if (string.IsNullOrEmpty(container) || string.IsNullOrEmpty(name))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-        var container = segments[offset];
-        var name = string.Join('/', segments.Skip(offset + 1));
         var query = QueryHelpers.ParseQuery(sourceUri.Query);
         return new ResolvedInternalCopySource(
             sourceUri,
@@ -2175,14 +2165,13 @@ public static class BlobProtocolEndpoint
     {
         if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
             throw AzureStorageException.InvalidHeader("x-ms-previous-snapshot-url", value);
-        var segments = uri.AbsolutePath
-            .Split('/', StringSplitOptions.RemoveEmptyEntries)
-            .Select(Uri.UnescapeDataString)
-            .ToArray();
-        var offset = segments.Length > 0 && string.Equals(segments[0], account, StringComparison.Ordinal) ? 1 : 0;
-        if (segments.Length - offset < 2 ||
-            !string.Equals(segments[offset], container, StringComparison.Ordinal) ||
-            !string.Equals(string.Join('/', segments.Skip(offset + 1)), blobName, StringComparison.Ordinal))
+        var segments = StorageResourcePath.DecodeSegments(uri.AbsolutePath);
+        var offset = StorageResourcePath.HostIdentifiesAccount(uri.Host, account)
+            ? 0
+            : segments.Length > 0 && string.Equals(segments[0], account, StringComparison.Ordinal) ? 1 : 0;
+        var (resolvedContainer, resolvedBlob) = StorageResourcePath.ResolveBlob(segments, offset);
+        if (!string.Equals(resolvedContainer, container, StringComparison.Ordinal) ||
+            !string.Equals(resolvedBlob, blobName, StringComparison.Ordinal))
         {
             throw AzureStorageException.InvalidHeader("x-ms-previous-snapshot-url", value);
         }

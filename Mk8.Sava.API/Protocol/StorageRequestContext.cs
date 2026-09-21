@@ -65,8 +65,7 @@ public sealed class RequestContextMiddleware(
 
     private StorageRequestContext Parse(HttpContext context)
     {
-        var rawPath = context.Request.Path.Value ?? "/";
-        var segments = rawPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var segments = StorageResourcePath.DecodeRequestSegments(context.Request);
         var account = ResolveHostAccount(context.Request.Host.Host);
         var staticWebsite = account is not null && IsStaticWebsiteHost(context.Request.Host.Host);
         var pathOffset = 0;
@@ -77,7 +76,7 @@ public sealed class RequestContextMiddleware(
                 account = _options.DefaultAccount;
             else
             {
-                account = Uri.UnescapeDataString(segments[0]);
+                account = segments[0];
                 pathOffset = 1;
             }
         }
@@ -88,11 +87,11 @@ public sealed class RequestContextMiddleware(
         var remaining = segments.Skip(pathOffset).ToArray();
         var container = staticWebsite
             ? "$web"
-            : remaining.Length > 0 ? Uri.UnescapeDataString(remaining[0]) : null;
+            : remaining.Length > 0 ? remaining[0] : null;
         var blob = staticWebsite
-            ? string.Join('/', remaining.Select(Uri.UnescapeDataString))
+            ? string.Join('/', remaining)
             : remaining.Length > 1
-                ? string.Join('/', remaining.Skip(1).Select(Uri.UnescapeDataString))
+                ? string.Join('/', remaining.Skip(1))
                 : null;
         var restype = context.Request.Query["restype"].ToString();
         var resourceKind = staticWebsite
