@@ -827,6 +827,14 @@ public static class BlobProtocolEndpoint
         string? VersionId,
         string? DeleteType);
 
+    private sealed record ResolvedInternalCopySource(
+        Uri Uri,
+        string Account,
+        string Container,
+        string Blob,
+        string? Snapshot,
+        string? VersionId);
+
     private static async Task HandleBlobAsync(
         HttpContext http,
         StorageRequestContext request,
@@ -1071,7 +1079,18 @@ public static class BlobProtocolEndpoint
             }
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-            var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
+            _ = SanitizeCopySource(copySource);
+            var resolvedSource = ResolveInternalCopySource(http.Request, request, copySource)
+                                 ?? throw new AzureStorageException(
+                                     StatusCodes.Status409Conflict,
+                                     "CannotVerifyCopySource",
+                                     "The incremental copy source is not hosted by this Blob service endpoint.");
+            var source = await ResolveCopySourceAsync(
+                http,
+                request,
+                service,
+                resolvedSource,
+                cancellationToken);
             EvaluateCopySourceConditions(http.Request, source);
             var copied = await service.BeginIncrementalCopyAsync(
                 request.Account,
@@ -1543,10 +1562,15 @@ public static class BlobProtocolEndpoint
 
             var publicSource = SanitizeCopySource(copySource);
             BlobRecord copied;
-            if (Uri.TryCreate(copySource, UriKind.Absolute, out var copyUri) &&
-                string.Equals(copyUri.Host, http.Request.Host.Host, StringComparison.OrdinalIgnoreCase))
+            var internalSource = ResolveInternalCopySource(http.Request, request, copySource);
+            if (internalSource is not null)
             {
-                var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
+                var source = await ResolveCopySourceAsync(
+                    http,
+                    request,
+                    service,
+                    internalSource,
+                    cancellationToken);
                 EvaluateCopySourceConditions(http.Request, source);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
@@ -1880,29 +1904,148 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static async Task<BlobRecord> ResolveCopySourceAsync(
+    private static ResolvedInternalCopySource? ResolveInternalCopySource(
+        HttpRequest destination,
         StorageRequestContext destinationRequest,
-        BlobService service,
-        string sourceValue,
-        CancellationToken cancellationToken)
+        string sourceValue)
     {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-        var segments = sourceUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.UnescapeDataString).ToArray();
-        var offset = segments.Length > 0 && string.Equals(segments[0], destinationRequest.Account, StringComparison.Ordinal) ? 1 : 0;
+
+        var options = destination.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+        var destinationHost = destination.Host.Host;
+        string? hostAccount = null;
+        if (!string.Equals(sourceUri.Host, destinationHost, StringComparison.OrdinalIgnoreCase))
+            return null;
+        if (destinationHost.StartsWith(destinationRequest.Account + ".", StringComparison.OrdinalIgnoreCase))
+            hostAccount = destinationRequest.Account;
+
+        var segments = sourceUri.AbsolutePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.UnescapeDataString)
+            .ToArray();
+        var account = hostAccount;
+        var offset = 0;
+        if (account is null)
+        {
+            if (segments.Length == 0 || !options.Accounts.ContainsKey(segments[0]))
+                return null;
+            account = segments[0];
+            offset = 1;
+        }
+        else if (segments.Length >= 3 && string.Equals(segments[0], account, StringComparison.Ordinal))
+        {
+            offset = 1;
+        }
+
+        if (!string.Equals(account, destinationRequest.Account, StringComparison.Ordinal))
+            return null;
+
         if (segments.Length - offset < 2)
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-        if (destinationRequest.Authorization.Kind != StorageAuthorizationKind.SharedKey)
-            throw AzureStorageException.AuthorizationFailure();
         var container = segments[offset];
         var name = string.Join('/', segments.Skip(offset + 1));
-        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(sourceUri.Query);
-        return await service.GetBlobAsync(
-            destinationRequest.Account,
+        var query = QueryHelpers.ParseQuery(sourceUri.Query);
+        return new ResolvedInternalCopySource(
+            sourceUri,
+            account,
             container,
             name,
-            query.TryGetValue("versionid", out var version) ? version.ToString() : null,
-            query.TryGetValue("snapshot", out var snapshot) ? snapshot.ToString() : null,
+            query.TryGetValue("snapshot", out var snapshot) ? NullIfEmpty(snapshot.ToString()) : null,
+            query.TryGetValue("versionid", out var version) ? NullIfEmpty(version.ToString()) : null);
+    }
+
+    private static async Task<BlobRecord> ResolveCopySourceAsync(
+        HttpContext destination,
+        StorageRequestContext destinationRequest,
+        BlobService service,
+        ResolvedInternalCopySource source,
+        CancellationToken cancellationToken)
+    {
+        using var sourceScope = destination.RequestServices.CreateScope();
+        var sourceHttp = new DefaultHttpContext
+        {
+            RequestServices = sourceScope.ServiceProvider
+        };
+        sourceHttp.Request.Scheme = source.Uri.Scheme;
+        sourceHttp.Request.Host = HostString.FromUriComponent(source.Uri);
+        sourceHttp.Request.Method = HttpMethods.Get;
+        sourceHttp.Request.Path = PathString.FromUriComponent(source.Uri);
+        sourceHttp.Request.QueryString = QueryString.FromUriComponent(source.Uri);
+        sourceHttp.Connection.RemoteIpAddress = destination.Connection.RemoteIpAddress;
+        sourceHttp.Features.Get<IHttpRequestFeature>()!.RawTarget = source.Uri.PathAndQuery;
+
+        var sourceContext = new StorageRequestContext
+        {
+            RequestId = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16)),
+            Account = source.Account,
+            Container = source.Container,
+            Blob = source.Blob,
+            Snapshot = source.Snapshot,
+            VersionId = source.VersionId,
+            ResourceKind = StorageResourceKind.Blob,
+            CanonicalResourcePath = $"/{source.Account}/{source.Container}/{source.Blob}",
+            ServiceVersion = destinationRequest.ServiceVersion,
+            Authorization = StorageAuthorization.Anonymous
+        };
+        StorageRequestContext.Set(sourceHttp, sourceContext);
+        ValidateBlobVersionRequest(sourceContext);
+
+        var sourceAuthorization = ProtocolParsing.First(
+            destination.Request.Headers,
+            "x-ms-copy-source-authorization");
+        if (sourceAuthorization is not null)
+        {
+            RequireFeatureVersion(destinationRequest, new DateOnly(2020, 10, 2), "Copy source authorization");
+            if (!sourceAuthorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+                throw AzureStorageException.InvalidHeader("x-ms-copy-source-authorization", sourceAuthorization);
+            sourceHttp.Request.Headers.Authorization = sourceAuthorization;
+        }
+
+        if (sourceAuthorization is null &&
+            string.Equals(source.Account, destinationRequest.Account, StringComparison.Ordinal) &&
+            destinationRequest.Authorization.Kind == StorageAuthorizationKind.SharedKey)
+        {
+            sourceContext.Authorization = destinationRequest.Authorization;
+        }
+        else if (sourceAuthorization is null &&
+                 string.Equals(source.Account, destinationRequest.Account, StringComparison.Ordinal) &&
+                 destinationRequest.Authorization.Kind == StorageAuthorizationKind.Bearer &&
+                 destinationRequest.Authorization.Allows('r') &&
+                 !QueryHelpers.ParseQuery(source.Uri.Query).ContainsKey("sig"))
+        {
+            sourceContext.Authorization = destinationRequest.Authorization;
+        }
+        else
+        {
+            var authenticator = sourceScope.ServiceProvider.GetRequiredService<StorageAuthenticator>();
+            sourceContext.Authorization = await authenticator.AuthenticateAsync(
+                sourceHttp,
+                sourceContext,
+                cancellationToken);
+        }
+
+        if (sourceContext.Authorization.Kind == StorageAuthorizationKind.Anonymous)
+        {
+            var sourceContainer = await service.GetContainerAsync(
+                source.Account,
+                source.Container,
+                includeDeleted: false,
+                cancellationToken);
+            if (!service.AllowsAnonymousPublicAccess || sourceContainer.PublicAccess is not ("blob" or "container"))
+                throw AzureStorageException.AuthorizationFailure();
+        }
+        else if (!sourceContext.Authorization.Allows('r'))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+
+        return await service.GetBlobAsync(
+            source.Account,
+            source.Container,
+            source.Blob,
+            source.VersionId,
+            source.Snapshot,
             false,
             cancellationToken);
     }
