@@ -77,6 +77,21 @@ public sealed class AzureStorageException : Exception
         "ConditionNotMet",
         "The condition specified using HTTP conditional header(s) is not met.");
 
+    public static AzureStorageException NotModified() => new(
+        (int)HttpStatusCode.NotModified,
+        "ConditionNotMet",
+        "The condition specified using HTTP conditional header(s) is not met.");
+
+    public static AzureStorageException SourceConditionNotMet() => new(
+        (int)HttpStatusCode.PreconditionFailed,
+        "SourceConditionNotMet",
+        "The source condition specified using HTTP conditional header(s) is not met.");
+
+    public static AzureStorageException MultipleConditionHeadersNotSupported() => new(
+        (int)HttpStatusCode.BadRequest,
+        "MultipleConditionHeadersNotSupported",
+        "Multiple condition headers are not supported.");
+
     public static AzureStorageException LeaseIdMissing(string resource) => new(
         (int)HttpStatusCode.PreconditionFailed,
         "LeaseIdMissing",

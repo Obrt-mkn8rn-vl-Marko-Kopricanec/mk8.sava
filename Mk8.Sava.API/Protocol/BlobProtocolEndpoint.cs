@@ -393,7 +393,6 @@ public static class BlobProtocolEndpoint
             string.IsNullOrEmpty(comp))
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
-            EvaluateContainerConditions(http.Request, container);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
@@ -478,7 +477,6 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsGet(http.Request.Method) && comp == "metadata")
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
-            EvaluateContainerConditions(http.Request, container);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
@@ -487,7 +485,10 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "metadata")
         {
             Require(request, 'w');
-            EvaluateContainerConditions(http.Request, container);
+            BlobConditionEvaluator.EvaluateContainerWrite(
+                http.Request,
+                container.LastModified,
+                supportsIfUnmodifiedSince: false);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             var updated = await service.SetContainerMetadataAsync(container, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
             AzureResponseWriter.AddContainerHeaders(http.Response, updated);
@@ -497,7 +498,6 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsGet(http.Request.Method) && comp == "acl")
         {
             Require(request, 'r');
-            EvaluateContainerConditions(http.Request, container);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             await writer.WriteAclAsync(http, container, cancellationToken);
@@ -507,7 +507,10 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "acl")
         {
             Require(request, 'w');
-            EvaluateContainerConditions(http.Request, container);
+            BlobConditionEvaluator.EvaluateContainerWrite(
+                http.Request,
+                container.LastModified,
+                supportsIfUnmodifiedSince: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             var policies = http.Request.ContentLength is null or 0
                 ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
@@ -524,7 +527,10 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
         {
             Require(request, 'w');
-            EvaluateContainerConditions(http.Request, container);
+            BlobConditionEvaluator.EvaluateContainerWrite(
+                http.Request,
+                container.LastModified,
+                supportsIfUnmodifiedSince: true);
             await HandleContainerLeaseAsync(http, service, container, cancellationToken);
             return;
         }
@@ -532,7 +538,10 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
             Require(request, 'd');
-            EvaluateContainerConditions(http.Request, container);
+            BlobConditionEvaluator.EvaluateContainerWrite(
+                http.Request,
+                container.LastModified,
+                supportsIfUnmodifiedSince: true);
             EnsureLease(http.Request, container.Lease, "container");
             await service.DeleteContainerAsync(container, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
@@ -708,7 +717,7 @@ public static class BlobProtocolEndpoint
 
                 case BlobBatchOperationKind.SetTier:
                     Require(subrequestContext, 'w');
-                    EvaluateWriteConditions(inner.Request, blob);
+                    EvaluateTagCondition(inner.Request, blob, "x-ms-if-tags", source: false);
                     var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
                                ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
                     ValidateAccessTierVersion(inner.Request, tier);
@@ -1116,7 +1125,7 @@ public static class BlobProtocolEndpoint
             if (current is null)
                 EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
             else
-                EvaluateReadConditions(http.Request, current);
+                EvaluateTagCondition(http.Request, current, "x-ms-if-tags", source: false);
             ValidateOptionalLease(
                 http.Request,
                 current?.Lease ?? LeaseRecord.Available,
@@ -1184,7 +1193,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Set Blob Immutability Policy");
             Require(request, 'i');
-            EvaluateWriteConditions(http.Request, blob);
+            BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
             var untilValue = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-until-date")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date");
             if (!DateTimeOffset.TryParseExact(
@@ -1212,7 +1221,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Delete Blob Immutability Policy");
             Require(request, 'i');
-            EvaluateWriteConditions(http.Request, blob);
+            BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
             await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken);
             return;
         }
@@ -1233,7 +1242,6 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
-            EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var action = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-action");
             if (!string.Equals(action, "abort", StringComparison.OrdinalIgnoreCase))
@@ -1270,7 +1278,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Get Blob Tags");
             RequireAny(request, 't', 'r');
-            EvaluateReadConditions(http.Request, blob);
+            EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             await writer.WriteTagsAsync(http, blob.Tags, cancellationToken);
@@ -1294,7 +1302,7 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tags");
             RequireAny(request, 't', 'w');
             EnsureMutableVersion(blob);
-            EvaluateWriteConditions(http.Request, blob);
+            EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: true);
             EnsureLease(http.Request, blob.Lease, "blob");
             Dictionary<string, string> tags = null!;
@@ -1359,7 +1367,6 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Append Blob Seal");
             Require(request, 'w');
             EnsureMutableVersion(blob);
-            EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var updated = await service.SealAppendBlobAsync(blob, cancellationToken);
             AzureResponseWriter.AddBlobHeaders(http.Response, updated);
@@ -1372,7 +1379,7 @@ public static class BlobProtocolEndpoint
             if (snapshot is not null)
                 RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tier on a snapshot");
             Require(request, 'w');
-            EvaluateWriteConditions(http.Request, blob);
+            EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
             ValidateAccessTierVersion(http.Request, tier);
@@ -1390,7 +1397,6 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
-            EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, DateTimeOffset.UtcNow);
             var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
@@ -1488,6 +1494,9 @@ public static class BlobProtocolEndpoint
             var deleteSnapshots = ReadDeleteSnapshotsOption(http.Request, hasExplicitSnapshotOrVersion);
             Require(request, permanentDelete ? 'y' : versionId is not null ? 'x' : 'd');
             EvaluateWriteConditions(http.Request, blob);
+            BlobConditionEvaluator.EvaluateAccessTierDeleteConditions(
+                http.Request,
+                blob.AccessTierChangedAt);
             EnsureLease(http.Request, blob.Lease, "blob");
             if (permanentDelete)
             {
@@ -2448,35 +2457,13 @@ public static class BlobProtocolEndpoint
 
     private static void EvaluateReadConditions(HttpRequest request, BlobRecord blob)
     {
-        var ifMatch = ProtocolParsing.First(request.Headers, "If-Match");
-        if (!string.IsNullOrEmpty(ifMatch) && !MatchesETag(ifMatch, blob.ETag, requireMatch: true))
-            throw AzureStorageException.ConditionNotMet();
-        var ifNoneMatch = ProtocolParsing.First(request.Headers, "If-None-Match");
-        if (!string.IsNullOrEmpty(ifNoneMatch) && MatchesETag(ifNoneMatch, blob.ETag, requireMatch: true))
-            throw new AzureStorageException(StatusCodes.Status304NotModified, "ConditionNotMet", "The condition specified using HTTP conditional header(s) is not met.");
-        var ifModified = ParseHttpDate(request.Headers, "If-Modified-Since");
-        if (ifModified.HasValue && blob.LastModified <= ifModified.Value.AddSeconds(1))
-            throw new AzureStorageException(StatusCodes.Status304NotModified, "ConditionNotMet", "The condition specified using HTTP conditional header(s) is not met.");
-        var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
-        if (ifUnmodified.HasValue && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
+        BlobConditionEvaluator.EvaluateRead(request, blob.ETag, blob.LastModified);
         EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
     }
 
     private static void EvaluateWriteConditions(HttpRequest request, BlobRecord? blob)
     {
-        var ifMatch = ProtocolParsing.First(request.Headers, "If-Match");
-        if (!string.IsNullOrEmpty(ifMatch) && (blob is null || !MatchesETag(ifMatch, blob.ETag, true)))
-            throw AzureStorageException.ConditionNotMet();
-        var ifNoneMatch = ProtocolParsing.First(request.Headers, "If-None-Match");
-        if (!string.IsNullOrEmpty(ifNoneMatch) && blob is not null && MatchesETag(ifNoneMatch, blob.ETag, true))
-            throw AzureStorageException.ConditionNotMet();
-        var ifModified = ParseHttpDate(request.Headers, "If-Modified-Since");
-        if (ifModified.HasValue && blob is not null && blob.LastModified <= ifModified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
-        var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
-        if (ifUnmodified.HasValue && blob is not null && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
+        BlobConditionEvaluator.EvaluateWrite(request, blob?.ETag, blob?.LastModified);
         EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
     }
 
@@ -2506,30 +2493,10 @@ public static class BlobProtocolEndpoint
                 "Blob tag ETag and date conditions require service version 2025-11-05 or later.");
         }
 
-        if (!string.IsNullOrEmpty(ifMatch) && !MatchesETag(ifMatch, blob.ETag, requireMatch: true))
-            throw AzureStorageException.ConditionNotMet();
-        if (!string.IsNullOrEmpty(ifNoneMatch) && MatchesETag(ifNoneMatch, blob.ETag, requireMatch: true))
-        {
-            throw write
-                ? AzureStorageException.ConditionNotMet()
-                : new AzureStorageException(
-                    StatusCodes.Status304NotModified,
-                    "ConditionNotMet",
-                    "The condition specified using HTTP conditional header(s) is not met.");
-        }
-        var ifModified = ParseHttpDate(request.Headers, ifModifiedName);
-        if (ifModified.HasValue && blob.LastModified <= ifModified.Value.AddSeconds(1))
-        {
-            throw write
-                ? AzureStorageException.ConditionNotMet()
-                : new AzureStorageException(
-                    StatusCodes.Status304NotModified,
-                    "ConditionNotMet",
-                    "The condition specified using HTTP conditional header(s) is not met.");
-        }
-        var ifUnmodified = ParseHttpDate(request.Headers, ifUnmodifiedName);
-        if (ifUnmodified.HasValue && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
+        if (write)
+            BlobConditionEvaluator.EvaluateBlobTagWrite(request, blob.ETag, blob.LastModified);
+        else
+            BlobConditionEvaluator.EvaluateBlobTagRead(request, blob.ETag, blob.LastModified);
     }
 
     private static void EvaluatePageSequenceConditions(HttpRequest request, BlobRecord blob)
@@ -2546,16 +2513,6 @@ public static class BlobProtocolEndpoint
                 "SequenceNumberConditionNotMet",
                 "The sequence number condition specified was not met.");
         }
-    }
-
-    private static void EvaluateContainerConditions(HttpRequest request, ContainerRecord container)
-    {
-        var ifModified = ParseHttpDate(request.Headers, "If-Modified-Since");
-        if (ifModified.HasValue && container.LastModified <= ifModified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
-        var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
-        if (ifUnmodified.HasValue && container.LastModified > ifUnmodified.Value.AddSeconds(1))
-            throw AzureStorageException.ConditionNotMet();
     }
 
     private static void EnsureLease(HttpRequest request, LeaseRecord lease, string resource)
@@ -3068,18 +3025,7 @@ public static class BlobProtocolEndpoint
 
     private static void EvaluateCopySourceConditions(HttpRequest request, BlobRecord source)
     {
-        var ifMatch = ProtocolParsing.First(request.Headers, "x-ms-source-if-match");
-        if (!string.IsNullOrEmpty(ifMatch) && !MatchesETag(ifMatch, source.ETag, requireMatch: true))
-            throw SourceConditionNotMet();
-        var ifNoneMatch = ProtocolParsing.First(request.Headers, "x-ms-source-if-none-match");
-        if (!string.IsNullOrEmpty(ifNoneMatch) && MatchesETag(ifNoneMatch, source.ETag, requireMatch: true))
-            throw SourceConditionNotMet();
-        var ifModified = ParseHttpDate(request.Headers, "x-ms-source-if-modified-since");
-        if (ifModified.HasValue && source.LastModified <= ifModified.Value.AddSeconds(1))
-            throw SourceConditionNotMet();
-        var ifUnmodified = ParseHttpDate(request.Headers, "x-ms-source-if-unmodified-since");
-        if (ifUnmodified.HasValue && source.LastModified > ifUnmodified.Value.AddSeconds(1))
-            throw SourceConditionNotMet();
+        BlobConditionEvaluator.EvaluateCopySource(request, source.ETag, source.LastModified);
         var tagCondition = ProtocolParsing.First(request.Headers, "x-ms-source-if-tags");
         if (tagCondition is not null)
             EvaluateTagCondition(request, source, "x-ms-source-if-tags", source: true);
@@ -3122,10 +3068,8 @@ public static class BlobProtocolEndpoint
         throw source ? SourceConditionNotMet() : AzureStorageException.ConditionNotMet();
     }
 
-    private static AzureStorageException SourceConditionNotMet() => new(
-        StatusCodes.Status412PreconditionFailed,
-        "SourceConditionNotMet",
-        "The source condition specified using HTTP conditional header(s) is not met.");
+    private static AzureStorageException SourceConditionNotMet() =>
+        AzureStorageException.SourceConditionNotMet();
 
     private static string SanitizeCopySource(string sourceValue)
     {
@@ -3376,19 +3320,6 @@ public static class BlobProtocolEndpoint
             default:
                 throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option);
         }
-    }
-
-    private static bool MatchesETag(string header, string etag, bool requireMatch) =>
-        header.Trim() == "*" || header.Split(',').Select(item => item.Trim()).Any(item => string.Equals(item, etag, StringComparison.Ordinal));
-
-    private static DateTimeOffset? ParseHttpDate(IHeaderDictionary headers, string name)
-    {
-        var value = ProtocolParsing.First(headers, name);
-        if (value is null)
-            return null;
-        if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed))
-            throw AzureStorageException.InvalidHeader(name, value);
-        return parsed;
     }
 
     private static int ParseMaxResults(string value, int defaultValue)
