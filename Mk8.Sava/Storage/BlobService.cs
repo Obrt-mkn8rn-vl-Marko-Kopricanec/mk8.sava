@@ -20,6 +20,10 @@ public sealed record BlobWriteOptions(
 
 public sealed record PageRange(long Start, long End);
 
+public sealed record PageRangeDiff(
+    IReadOnlyList<PageRange> PageRanges,
+    IReadOnlyList<PageRange> ClearRanges);
+
 public sealed record BlobTierUpdate(BlobRecord Blob, bool Pending);
 
 public sealed record StorageMaintenanceResult(
@@ -473,26 +477,119 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
             throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
+        if (!clear && end - start + 1 > 4L * 1024 * 1024)
+            throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
+        if (!chunks.IsInDomain(current.Account, encryption, current.Content))
+            throw CustomerProvidedKeyMismatch();
 
-        using var content = await chunks.ReplaceRangePinnedAsync(
-            current.Account,
-            encryption,
-            current.Content,
-            start,
-            end - start + 1,
-            source,
-            clear,
-            cancellationToken);
-        var updated = current with
+        StoredContent content;
+        try
         {
-            GenerationId = Guid.NewGuid().ToString("N"),
-            Revision = MetadataStore.NewRevision(),
-            Content = content.Manifest,
-            PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
-            ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow()
-        };
-        return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
+            content = await chunks.ReplaceRangePinnedAsync(
+                current.Account,
+                encryption,
+                current.Content,
+                start,
+                end - start + 1,
+                source,
+                clear,
+                cancellationToken);
+        }
+        catch (EndOfStreamException)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidPageRange",
+                "The request body length must match the page range length.");
+        }
+        using (content)
+        {
+            var updated = current with
+            {
+                GenerationId = Guid.NewGuid().ToString("N"),
+                Revision = MetadataStore.NewRevision(),
+                Content = content.Manifest,
+                PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
+                ETag = MetadataStore.NewETag(),
+                LastModified = metadata.GetUtcNow()
+            };
+            return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
+        }
+    }
+
+    public async Task<PageRangeDiff> GetPageRangeDiffAsync(
+        BlobRecord current,
+        BlobRecord previous,
+        BlobEncryption encryption,
+        long start,
+        long end,
+        CancellationToken cancellationToken)
+    {
+        if (current.Kind != BlobKind.PageBlob || previous.Kind != BlobKind.PageBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (current.CreatedAt != previous.CreatedAt ||
+            !string.Equals(current.Content.Domain, previous.Content.Domain, StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOverwritten",
+                "The page blob was overwritten after the previous snapshot was created.");
+        }
+        if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
+            throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
+        if (!chunks.IsInDomain(current.Account, encryption, current.Content))
+            throw CustomerProvidedKeyMismatch();
+
+        var changed = new List<PageRange>();
+        var cleared = new List<PageRange>();
+        var currentRanges = ClipPageRanges(current.PageRanges, start, end);
+        var previousRanges = ClipPageRanges(previous.PageRanges, start, Math.Min(end, previous.Content.Length - 1));
+        var currentIndex = 0;
+        var previousIndex = 0;
+        var cursor = start;
+        var rangeEndExclusive = checked(end + 1);
+
+        while (cursor < rangeEndExclusive)
+        {
+            while (currentIndex < currentRanges.Count && currentRanges[currentIndex].End < cursor)
+                currentIndex++;
+            while (previousIndex < previousRanges.Count && previousRanges[previousIndex].End < cursor)
+                previousIndex++;
+
+            var currentAllocated = currentIndex < currentRanges.Count && currentRanges[currentIndex].Start <= cursor;
+            var previousAllocated = previousIndex < previousRanges.Count && previousRanges[previousIndex].Start <= cursor;
+            var currentBoundary = currentAllocated
+                ? checked(currentRanges[currentIndex].End + 1)
+                : currentIndex < currentRanges.Count ? currentRanges[currentIndex].Start : rangeEndExclusive;
+            var previousBoundary = previousAllocated
+                ? checked(previousRanges[previousIndex].End + 1)
+                : previousIndex < previousRanges.Count ? previousRanges[previousIndex].Start : rangeEndExclusive;
+            var boundary = Math.Min(rangeEndExclusive, Math.Min(currentBoundary, previousBoundary));
+
+            if (currentAllocated && !previousAllocated)
+            {
+                AddMergedPageRange(changed, cursor, boundary - 1);
+            }
+            else if (!currentAllocated && previousAllocated)
+            {
+                AddMergedPageRange(cleared, cursor, boundary - 1);
+            }
+            else if (currentAllocated)
+            {
+                await CompareAllocatedPagesAsync(
+                    current,
+                    previous,
+                    encryption,
+                    cursor,
+                    boundary,
+                    changed,
+                    cancellationToken);
+            }
+
+            cursor = boundary;
+        }
+
+        return new PageRangeDiff(changed, cleared);
     }
 
     public async Task WriteContentAsync(
@@ -1430,6 +1527,59 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             merged[^1] = new PageRange(merged[^1].Start, Math.Max(merged[^1].End, range.End));
         }
         return merged;
+    }
+
+    private async Task CompareAllocatedPagesAsync(
+        BlobRecord current,
+        BlobRecord previous,
+        BlobEncryption encryption,
+        long start,
+        long endExclusive,
+        List<PageRange> changed,
+        CancellationToken cancellationToken)
+    {
+        const int comparisonBatchBytes = 4 * 1024 * 1024;
+        var cursor = start;
+        while (cursor < endExclusive)
+        {
+            var length = checked((int)Math.Min(comparisonBatchBytes, endExclusive - cursor));
+            using var currentBytes = new MemoryStream(length);
+            using var previousBytes = new MemoryStream(length);
+            await chunks.WriteRangeAsync(current.Content, encryption, cursor, length, currentBytes, cancellationToken);
+            await chunks.WriteRangeAsync(previous.Content, encryption, cursor, length, previousBytes, cancellationToken);
+
+            var currentSpan = currentBytes.GetBuffer().AsSpan(0, length);
+            var previousSpan = previousBytes.GetBuffer().AsSpan(0, length);
+            for (var offset = 0; offset < length; offset += 512)
+            {
+                if (!currentSpan.Slice(offset, 512).SequenceEqual(previousSpan.Slice(offset, 512)))
+                    AddMergedPageRange(changed, cursor + offset, cursor + offset + 511);
+            }
+            cursor += length;
+        }
+    }
+
+    private static IReadOnlyList<PageRange> ClipPageRanges(
+        IReadOnlyList<PageRange> ranges,
+        long start,
+        long end)
+    {
+        if (end < start)
+            return [];
+        return ranges
+            .Where(range => range.End >= start && range.Start <= end)
+            .Select(range => new PageRange(Math.Max(range.Start, start), Math.Min(range.End, end)))
+            .ToArray();
+    }
+
+    private static void AddMergedPageRange(List<PageRange> ranges, long start, long end)
+    {
+        if (ranges.Count > 0 && ranges[^1].End + 1 == start)
+        {
+            ranges[^1] = ranges[^1] with { End = end };
+            return;
+        }
+        ranges.Add(new PageRange(start, end));
     }
 
     private static void ValidateContainerName(string name)

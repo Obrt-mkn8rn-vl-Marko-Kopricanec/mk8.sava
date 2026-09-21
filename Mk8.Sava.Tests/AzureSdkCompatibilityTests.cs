@@ -416,6 +416,68 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task PageBlobSequenceConditionsAndSnapshotDiffsMatchTheSdk()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"page-diff-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var page = container.GetPageBlobClient("disk.vhd");
+        await page.CreateAsync(2048, new PageBlobCreateOptions { SequenceNumber = 7 });
+
+        var first = Enumerable.Repeat((byte)0x11, 512).ToArray();
+        var second = Enumerable.Repeat((byte)0x22, 512).ToArray();
+        await page.UploadPagesAsync(
+            new MemoryStream(first),
+            offset: 0,
+            new PageBlobUploadPagesOptions
+            {
+                Conditions = new PageBlobRequestConditions { IfSequenceNumberEqual = 7 }
+            });
+        await page.UploadPagesAsync(new MemoryStream(second), offset: 512);
+        var snapshot = (await page.CreateSnapshotAsync()).Value.Snapshot;
+
+        var changedFirst = Enumerable.Repeat((byte)0x33, 512).ToArray();
+        var third = Enumerable.Repeat((byte)0x44, 512).ToArray();
+        await page.UploadPagesAsync(
+            new MemoryStream(changedFirst),
+            offset: 0,
+            new PageBlobUploadPagesOptions
+            {
+                Conditions = new PageBlobRequestConditions { IfSequenceNumberLessThanOrEqual = 7 }
+            });
+        await page.ClearPagesAsync(new HttpRange(512, 512));
+        await page.UploadPagesAsync(new MemoryStream(third), offset: 1024);
+
+        var failed = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+            await page.UploadPagesAsync(
+                new MemoryStream(first),
+                offset: 1536,
+                new PageBlobUploadPagesOptions
+                {
+                    Conditions = new PageBlobRequestConditions { IfSequenceNumberLessThan = 7 }
+                }));
+        Assert.Equal(412, failed.Status);
+        Assert.Equal("SequenceNumberConditionNotMet", failed.ErrorCode);
+
+        var diff = (await page.GetPageRangesDiffAsync(previousSnapshot: snapshot)).Value;
+        Assert.Collection(
+            diff.PageRanges,
+            range =>
+            {
+                Assert.Equal(0, range.Offset);
+                Assert.Equal(512, range.Length);
+            },
+            range =>
+            {
+                Assert.Equal(1024, range.Offset);
+                Assert.Equal(512, range.Length);
+            });
+        var cleared = Assert.Single(diff.ClearRanges);
+        Assert.Equal(512, cleared.Offset);
+        Assert.Equal(512, cleared.Length);
+    }
+
+    [Fact]
     public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
     {
         var service = CreateClient(factory);

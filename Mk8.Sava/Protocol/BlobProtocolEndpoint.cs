@@ -668,16 +668,24 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
+            EvaluatePageSequenceConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
-            var encryption = ReadRequestEncryption(http.Request, write: true);
+            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, current, write: true);
+            var encryption = new BlobEncryption(
+                current.EncryptionScope,
+                suppliedEncryption.CustomerProvidedKeySha256,
+                suppliedEncryption.CustomerProvidedKey);
             var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
                              ?? ProtocolParsing.First(http.Request.Headers, "Range")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-range");
             var (start, end) = ProtocolParsing.ParseRange(rangeValue, current.Content.Length);
+            var rangeLength = checked(end - start + 1);
             var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToLowerInvariant();
             BlobRecord updated;
             if (operation == "clear")
             {
+                if (http.Request.ContentLength is > 0)
+                    throw AzureStorageException.InvalidHeader("Content-Length", http.Request.ContentLength.Value.ToString(CultureInfo.InvariantCulture));
                 updated = await service.PutPageAsync(current, start, end, null, clear: true, encryption, cancellationToken);
             }
             else if (operation == "update")
@@ -686,6 +694,8 @@ public static class BlobProtocolEndpoint
                 updated = null!;
                 if (copySource is null)
                 {
+                    if (http.Request.ContentLength is { } contentLength && contentLength != rangeLength)
+                        throw AzureStorageException.InvalidHeader("Content-Length", contentLength.ToString(CultureInfo.InvariantCulture));
                     await WithIntegrityValidationAsync(http.Request, async body =>
                         updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken));
                 }
@@ -961,12 +971,73 @@ public static class BlobProtocolEndpoint
             Require(request, 'r');
             if (blob.Kind != BlobKind.PageBlob)
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+            EvaluateReadConditions(http.Request, blob);
+            if (ProtocolParsing.First(http.Request.Headers, "x-ms-lease-id") is not null)
+                EnsureLease(http.Request, blob.Lease, "blob");
+            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
+            var encryption = new BlobEncryption(
+                blob.EncryptionScope,
+                suppliedEncryption.CustomerProvidedKeySha256,
+                suppliedEncryption.CustomerProvidedKey);
             var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
                              ?? ProtocolParsing.First(http.Request.Headers, "Range");
-            var ranges = SelectPageRanges(blob, rangeValue);
+            var (rangeStart, rangeEnd) = ResolvePageListRange(blob, rangeValue);
+            IReadOnlyList<PageRange> ranges;
+            IReadOnlyList<PageRange> clearRanges;
+            var previousSnapshot = NullIfEmpty(http.Request.Query["prevsnapshot"].ToString());
+            var previousSnapshotUrl = ProtocolParsing.First(http.Request.Headers, "x-ms-previous-snapshot-url");
+            if (previousSnapshot is not null && previousSnapshotUrl is not null)
+                throw AzureStorageException.InvalidQuery("prevsnapshot");
+            if (previousSnapshotUrl is not null)
+                previousSnapshot = ParsePreviousSnapshotUrl(previousSnapshotUrl, request.Account, containerName, blobName);
+
+            if (previousSnapshot is null || rangeEnd < rangeStart)
+            {
+                ranges = SelectPageRanges(blob, rangeValue);
+                clearRanges = [];
+            }
+            else
+            {
+                if (snapshot is not null && string.CompareOrdinal(previousSnapshot, snapshot) >= 0)
+                    throw AzureStorageException.InvalidQuery("prevsnapshot");
+                var previous = await service.GetBlobAsync(
+                    request.Account,
+                    containerName,
+                    blobName,
+                    versionId: null,
+                    snapshot: previousSnapshot,
+                    includeDeleted: false,
+                    cancellationToken);
+                var diff = await service.GetPageRangeDiffAsync(
+                    blob,
+                    previous,
+                    encryption,
+                    rangeStart,
+                    rangeEnd,
+                    cancellationToken);
+                ranges = diff.PageRanges;
+                clearRanges = diff.ClearRanges;
+            }
+
+            var ordered = ranges.Select(range => (Range: range, IsClear: false))
+                .Concat(clearRanges.Select(range => (Range: range, IsClear: true)))
+                .OrderBy(item => item.Range.Start)
+                .ToArray();
+            var maxResults = ParsePageRangeMaxResults(http.Request.Query["maxresults"].ToString());
+            var marker = ParsePageRangeMarker(http.Request.Query["marker"].ToString(), ordered.Length);
+            var page = ordered.Skip(marker).Take(maxResults).ToArray();
+            var nextOffset = marker + page.Length;
+            var nextMarker = nextOffset < ordered.Length
+                ? nextOffset.ToString(CultureInfo.InvariantCulture)
+                : http.Request.Query.ContainsKey("maxresults") || http.Request.Query.ContainsKey("marker") ? string.Empty : null;
             AzureResponseWriter.AddBlobHeaders(http.Response, blob);
             http.Response.Headers["x-ms-blob-content-length"] = blob.Content.Length.ToString(CultureInfo.InvariantCulture);
-            await writer.WritePageRangesAsync(http, ranges, cancellationToken);
+            await writer.WritePageRangesAsync(
+                http,
+                page.Where(item => !item.IsClear).Select(item => item.Range).ToArray(),
+                page.Where(item => item.IsClear).Select(item => item.Range).ToArray(),
+                nextMarker,
+                cancellationToken);
             return;
         }
 
@@ -1408,11 +1479,47 @@ public static class BlobProtocolEndpoint
         if (requestedRange is null)
             return blob.PageRanges;
 
-        var (start, end) = ProtocolParsing.ParseRange(requestedRange, blob.Content.Length);
+        var (start, end) = ResolvePageListRange(blob, requestedRange);
+        if (end < start)
+            return [];
         return blob.PageRanges
             .Where(range => range.End >= start && range.Start <= end)
             .Select(range => new PageRange(Math.Max(range.Start, start), Math.Min(range.End, end)))
             .ToArray();
+    }
+
+    private static (long Start, long End) ResolvePageListRange(BlobRecord blob, string? requestedRange)
+    {
+        if (requestedRange is null)
+            return blob.Content.Length == 0 ? (0, -1) : (0, blob.Content.Length - 1);
+        var (start, end) = ProtocolParsing.ParseRange(requestedRange, blob.Content.Length);
+        if (start % 512 != 0 || (end + 1) % 512 != 0)
+            throw AzureStorageException.InvalidHeader("x-ms-range", requestedRange);
+        return (start, end);
+    }
+
+    private static string ParsePreviousSnapshotUrl(
+        string value,
+        string account,
+        string container,
+        string blobName)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+            throw AzureStorageException.InvalidHeader("x-ms-previous-snapshot-url", value);
+        var segments = uri.AbsolutePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(Uri.UnescapeDataString)
+            .ToArray();
+        var offset = segments.Length > 0 && string.Equals(segments[0], account, StringComparison.Ordinal) ? 1 : 0;
+        if (segments.Length - offset < 2 ||
+            !string.Equals(segments[offset], container, StringComparison.Ordinal) ||
+            !string.Equals(string.Join('/', segments.Skip(offset + 1)), blobName, StringComparison.Ordinal))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-previous-snapshot-url", value);
+        }
+        var query = QueryHelpers.ParseQuery(uri.Query);
+        var snapshot = query.TryGetValue("snapshot", out var snapshots) ? NullIfEmpty(snapshots.ToString()) : null;
+        return snapshot ?? throw AzureStorageException.InvalidHeader("x-ms-previous-snapshot-url", value);
     }
 
     private static async Task WriteFindByTagsAsync(
@@ -1619,6 +1726,22 @@ public static class BlobProtocolEndpoint
         var ifUnmodified = ParseHttpDate(request.Headers, "If-Unmodified-Since");
         if (ifUnmodified.HasValue && blob is not null && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
             throw AzureStorageException.ConditionNotMet();
+    }
+
+    private static void EvaluatePageSequenceConditions(HttpRequest request, BlobRecord blob)
+    {
+        var lessThan = TryParseLongHeader(request.Headers, "x-ms-if-sequence-number-lt");
+        var lessThanOrEqual = TryParseLongHeader(request.Headers, "x-ms-if-sequence-number-le");
+        var equal = TryParseLongHeader(request.Headers, "x-ms-if-sequence-number-eq");
+        if (lessThan.HasValue && blob.SequenceNumber >= lessThan.Value ||
+            lessThanOrEqual.HasValue && blob.SequenceNumber > lessThanOrEqual.Value ||
+            equal.HasValue && blob.SequenceNumber != equal.Value)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status412PreconditionFailed,
+                "SequenceNumberConditionNotMet",
+                "The sequence number condition specified was not met.");
+        }
     }
 
     private static void EvaluateContainerConditions(HttpRequest request, ContainerRecord container)
@@ -2119,6 +2242,24 @@ public static class BlobProtocolEndpoint
             return defaultValue;
         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed is < 1 or > 5000)
             throw AzureStorageException.InvalidQuery("maxresults");
+        return parsed;
+    }
+
+    private static int ParsePageRangeMaxResults(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return 10_000;
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed is < 1 or > 10_000)
+            throw AzureStorageException.InvalidQuery("maxresults");
+        return parsed;
+    }
+
+    private static int ParsePageRangeMarker(string value, int resultCount)
+    {
+        if (string.IsNullOrEmpty(value))
+            return 0;
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed < 0 || parsed > resultCount)
+            throw AzureStorageException.InvalidQuery("marker");
         return parsed;
     }
 

@@ -264,7 +264,12 @@ public sealed class AzureResponseWriter
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WritePageRangesAsync(HttpContext context, IReadOnlyList<PageRange> ranges, CancellationToken cancellationToken) =>
+    public Task WritePageRangesAsync(
+        HttpContext context,
+        IReadOnlyList<PageRange> ranges,
+        IReadOnlyList<PageRange> clearRanges,
+        string? nextMarker,
+        CancellationToken cancellationToken) =>
         WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("PageList");
@@ -275,6 +280,15 @@ public sealed class AzureResponseWriter
                 writer.WriteElementString("End", range.End.ToString(CultureInfo.InvariantCulture));
                 writer.WriteEndElement();
             }
+            foreach (var range in clearRanges)
+            {
+                writer.WriteStartElement("ClearRange");
+                writer.WriteElementString("Start", range.Start.ToString(CultureInfo.InvariantCulture));
+                writer.WriteElementString("End", range.End.ToString(CultureInfo.InvariantCulture));
+                writer.WriteEndElement();
+            }
+            if (nextMarker is not null)
+                writer.WriteElementString("NextMarker", nextMarker);
             writer.WriteEndElement();
         }, cancellationToken);
 
