@@ -2593,7 +2593,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await container.CreateAsync();
 
         var whole = container.GetBlockBlobClient("whole.bin");
-        await whole.SyncUploadFromUriAsync(source.Uri, overwrite: true);
+        var wholeUpload = await whole.SyncUploadFromUriAsync(
+            source.Uri,
+            new BlobSyncUploadFromUriOptions
+            {
+                Metadata = new Dictionary<string, string> { ["marker"] = "must-not-leak" }
+            });
+        var wholeUploadHeaders = wholeUpload.GetRawResponse().Headers;
+        Assert.True(wholeUploadHeaders.TryGetValue("ETag", out _));
+        Assert.True(wholeUploadHeaders.TryGetValue("Last-Modified", out _));
+        Assert.True(wholeUploadHeaders.TryGetValue("x-ms-request-server-encrypted", out var wholeUploadEncrypted));
+        Assert.Equal("true", wholeUploadEncrypted);
+        Assert.False(wholeUploadHeaders.TryGetValue("x-ms-copy-status", out _));
+        Assert.False(wholeUploadHeaders.TryGetValue("x-ms-blob-type", out _));
+        Assert.False(wholeUploadHeaders.TryGetValue("x-ms-lease-status", out _));
+        Assert.False(wholeUploadHeaders.TryGetValue("x-ms-meta-marker", out _));
         Assert.Equal(sourceBytes, (await whole.DownloadContentAsync()).Value.Content.ToArray());
 
         const int blockOffset = 900;
@@ -5769,7 +5783,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blob = container.GetBlockBlobClient("rows.csv");
         await blob.UploadAsync(
             new MemoryStream("100,200,300,400\n300,400,500,600\n"u8.ToArray()),
-            new BlobUploadOptions { Tags = new Dictionary<string, string> { ["kind"] = "query" } });
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string> { ["kind"] = "query" },
+                Metadata = new Dictionary<string, string> { ["marker"] = "must-not-leak" },
+                HttpHeaders = new BlobHttpHeaders
+                {
+                    ContentType = "text/csv",
+                    ContentLanguage = "en-US",
+                    CacheControl = "no-store",
+                    ContentDisposition = "inline"
+                }
+            });
         var properties = await blob.GetPropertiesAsync();
 
         var progress = new CaptureProgress();
@@ -5788,6 +5813,22 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("400\n", await reader.ReadToEndAsync());
         Assert.Equal(200, csvResponse.GetRawResponse().Status);
         Assert.Equal(properties.Value.ETag, csvResponse.Value.Details.ETag);
+        var queryHeaders = csvResponse.GetRawResponse().Headers;
+        Assert.True(queryHeaders.TryGetValue("x-ms-blob-type", out var queryBlobType));
+        Assert.Equal("BlockBlob", queryBlobType);
+        Assert.True(queryHeaders.TryGetValue("x-ms-server-encrypted", out var queryEncrypted));
+        Assert.Equal("true", queryEncrypted);
+        Assert.True(queryHeaders.TryGetValue("Content-Language", out var queryLanguage));
+        Assert.Equal("en-US", queryLanguage);
+        Assert.True(queryHeaders.TryGetValue("Cache-Control", out var queryCacheControl));
+        Assert.Equal("no-store", queryCacheControl);
+        Assert.True(queryHeaders.TryGetValue("Content-Disposition", out var queryDisposition));
+        Assert.Equal("inline", queryDisposition);
+        Assert.False(queryHeaders.TryGetValue("x-ms-meta-marker", out _));
+        Assert.False(queryHeaders.TryGetValue("x-ms-tag-count", out _));
+        Assert.False(queryHeaders.TryGetValue("x-ms-lease-status", out _));
+        Assert.False(queryHeaders.TryGetValue("x-ms-access-tier", out _));
+        Assert.False(queryHeaders.TryGetValue("x-ms-copy-status", out _));
         Assert.Equal([32L, 32L], progress.Values);
 
         var jsonResponse = await blob.QueryAsync(
