@@ -83,6 +83,112 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task MetadataNamesValuesDuplicatesAndSizeMatchAzureLimitsAtomically()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"metadata-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("metadata.bin");
+        await blob.UploadAsync(BinaryData.FromString("metadata payload"), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string>
+            {
+                ["Original"] = "preserved",
+                ["_leading"] = "allowed"
+            }
+        });
+
+        foreach (var invalidName in new[] { "1starts_with_digit", "contains-hyphen", "contains.dot" })
+        {
+            var invalid = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                blob.SetMetadataAsync(new Dictionary<string, string> { [invalidName] = "value" }));
+            Assert.Equal(400, invalid.Status);
+            Assert.Equal("InvalidMetadata", invalid.ErrorCode);
+            var unchanged = (await blob.GetPropertiesAsync()).Value.Metadata;
+            Assert.Equal("preserved", unchanged["Original"]);
+            Assert.Equal("allowed", unchanged["_leading"]);
+        }
+
+        var nonAsciiName = Assert.Throws<AzureStorageException>(() =>
+            ProtocolParsing.ReadMetadata(new HeaderDictionary
+            {
+                ["x-ms-meta-nön_ascii"] = "value"
+            }));
+        Assert.Equal("InvalidMetadata", nonAsciiName.ErrorCode);
+
+        var maximumValue = new string('m', 8 * 1024 - 1);
+        await blob.SetMetadataAsync(new Dictionary<string, string> { ["k"] = maximumValue });
+        var maximumProperties = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(maximumValue, maximumProperties.Metadata["k"]);
+
+        var tooLarge = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetMetadataAsync(new Dictionary<string, string> { ["k"] = maximumValue + "x" }));
+        Assert.Equal(400, tooLarge.Status);
+        Assert.Equal("MetadataTooLarge", tooLarge.ErrorCode);
+        var afterTooLarge = (await blob.GetPropertiesAsync()).Value;
+        Assert.Equal(maximumProperties.ETag, afterTooLarge.ETag);
+        Assert.Equal(maximumValue, afterTooLarge.Metadata["k"]);
+
+        var metadataUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=metadata");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using (var duplicateRequest = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            duplicateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            duplicateRequest.Headers.TryAddWithoutValidation("x-ms-meta-Duplicate", ["one", "two"]);
+            using var response = await transport.SendAsync(duplicateRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidMetadata", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var nonAsciiRequest = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            nonAsciiRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            nonAsciiRequest.Headers.TryAddWithoutValidation("x-ms-meta-Value", "olé");
+            using var response = await transport.SendAsync(nonAsciiRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidMetadata", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.Equal(maximumProperties.ETag, (await blob.GetPropertiesAsync()).Value.ETag);
+
+        var invalidContainer = service.GetBlobContainerClient($"metadata-invalid-{Guid.NewGuid():N}");
+        var invalidContainerCreate = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            invalidContainer.CreateAsync(
+                PublicAccessType.None,
+                new Dictionary<string, string> { ["invalid-name"] = "value" }));
+        Assert.Equal("InvalidMetadata", invalidContainerCreate.ErrorCode);
+        Assert.False((await invalidContainer.ExistsAsync()).Value);
+
+        var invalidUpload = container.GetBlobClient("invalid-upload.bin");
+        var invalidBlobCreate = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            invalidUpload.UploadAsync(BinaryData.FromString("must not publish"), new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string> { ["invalid-name"] = "value" }
+            }));
+        Assert.Equal("InvalidMetadata", invalidBlobCreate.ErrorCode);
+        Assert.False((await invalidUpload.ExistsAsync()).Value);
+
+        var invalidSnapshot = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.CreateSnapshotAsync(
+                new Dictionary<string, string> { ["invalid-name"] = "value" }));
+        Assert.Equal("InvalidMetadata", invalidSnapshot.ErrorCode);
+        var snapshots = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { States = BlobStates.Snapshots }))
+        {
+            if (item.Snapshot is not null)
+                snapshots.Add(item);
+        }
+        Assert.Empty(snapshots);
+    }
+
+    [Fact]
     public async Task IndexedTagQueriesAreBoundedScopedAndTransactionallyVerified()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>

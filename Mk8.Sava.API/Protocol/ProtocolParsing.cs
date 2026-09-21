@@ -15,6 +15,7 @@ internal sealed record UserDelegationKeyRequest(
 internal static class ProtocolParsing
 {
     private const long MaximumBlockListXmlCharacters = 8L * 1024 * 1024;
+    private const int MaximumMetadataBytes = 8 * 1024;
     public const long MaximumBlockListBodyBytes = MaximumBlockListXmlCharacters * sizeof(uint) + 4;
 
     public static Dictionary<string, string> ReadMetadata(IHeaderDictionary headers)
@@ -25,15 +26,40 @@ internal static class ProtocolParsing
             if (!header.Key.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase))
                 continue;
             var name = header.Key[10..];
-            if (string.IsNullOrEmpty(name) || name.Any(character => character > 127 || char.IsControl(character)))
-                throw AzureStorageException.InvalidHeader(header.Key, header.Value.ToString());
+            if (string.IsNullOrEmpty(name))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "EmptyMetadataKey",
+                    "The key for one of the metadata key-value pairs is empty.");
+            }
+            if (!IsMetadataName(name) || header.Value.Count > 1)
+                throw InvalidMetadata();
             var value = header.Value.ToString();
-            if (value.Any(character => character is '\r' or '\n'))
-                throw AzureStorageException.InvalidHeader(header.Key, value);
-            metadata[name] = value;
+            if (value.Any(character => character > 127 || character == 127 || character < 32 && character != '\t'))
+                throw InvalidMetadata();
+            if (!metadata.TryAdd(name, value))
+                throw InvalidMetadata();
+        }
+        if (metadata.Sum(pair => pair.Key.Length + pair.Value.Length) > MaximumMetadataBytes)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "MetadataTooLarge",
+                "The size of the specified metadata exceeds the maximum size permitted.");
         }
         return metadata;
     }
+
+    private static bool IsMetadataName(string name) =>
+        (name[0] is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or '_') &&
+        name.Skip(1).All(character =>
+            character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_');
+
+    private static AzureStorageException InvalidMetadata() => new(
+        StatusCodes.Status400BadRequest,
+        "InvalidMetadata",
+        "The metadata specified is invalid. It has characters that are not permitted.");
 
     public static BlobHttpProperties ReadHttpProperties(
         IHeaderDictionary headers,
