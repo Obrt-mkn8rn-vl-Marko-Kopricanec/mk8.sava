@@ -583,7 +583,11 @@ public static class BlobProtocolEndpoint
             Require(request, 'r');
             if (blob.Kind != BlobKind.PageBlob)
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
-            var ranges = await FindPageRangesAsync(service, blob, cancellationToken);
+            var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
+                             ?? ProtocolParsing.First(http.Request.Headers, "Range");
+            var ranges = SelectPageRanges(blob, rangeValue);
+            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            http.Response.Headers["x-ms-blob-content-length"] = blob.Content.Length.ToString(CultureInfo.InvariantCulture);
             await writer.WritePageRangesAsync(http, ranges, cancellationToken);
             return;
         }
@@ -879,34 +883,16 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static async Task<IReadOnlyList<PageRange>> FindPageRangesAsync(
-        BlobService service,
-        BlobRecord blob,
-        CancellationToken cancellationToken)
+    private static IReadOnlyList<PageRange> SelectPageRanges(BlobRecord blob, string? requestedRange)
     {
-        var ranges = new List<PageRange>();
-        var page = new byte[512];
-        long offset = 0;
-        long? rangeStart = null;
-        while (offset < blob.Content.Length)
-        {
-            using var buffer = new MemoryStream(page, writable: true);
-            buffer.SetLength(0);
-            await service.WriteContentAsync(blob, offset, Math.Min(512, blob.Content.Length - offset), buffer, cancellationToken);
-            var nonzero = page.AsSpan(0, (int)buffer.Length).IndexOfAnyExcept((byte)0) >= 0;
-            if (nonzero && rangeStart is null)
-                rangeStart = offset;
-            if (!nonzero && rangeStart.HasValue)
-            {
-                ranges.Add(new PageRange(rangeStart.Value, offset - 1));
-                rangeStart = null;
-            }
-            offset += 512;
-            Array.Clear(page);
-        }
-        if (rangeStart.HasValue)
-            ranges.Add(new PageRange(rangeStart.Value, blob.Content.Length - 1));
-        return ranges;
+        if (requestedRange is null)
+            return blob.PageRanges;
+
+        var (start, end) = ProtocolParsing.ParseRange(requestedRange, blob.Content.Length);
+        return blob.PageRanges
+            .Where(range => range.End >= start && range.Start <= end)
+            .Select(range => new PageRange(Math.Max(range.Start, start), Math.Min(range.End, end)))
+            .ToArray();
     }
 
     private static async Task WriteFindByTagsAsync(

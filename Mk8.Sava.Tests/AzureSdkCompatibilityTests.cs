@@ -370,6 +370,50 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task PageBlobsUseSparseCapacityAndTrackAllocatedZeroPages()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"pages-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var page = container.GetPageBlobClient("disk.vhd");
+        var chunksBeforeCreate = EnumerateChunkFiles(factory.DataPath).Count();
+        const long initialLength = 1L * 1024 * 1024 * 1024 * 1024;
+        const long allocationOffset = 4L * 1024 * 1024 * 1024;
+
+        await page.CreateAsync(initialLength);
+        Assert.Equal(chunksBeforeCreate, EnumerateChunkFiles(factory.DataPath).Count());
+
+        await page.UploadPagesAsync(new MemoryStream(new byte[512]), allocationOffset);
+        Assert.Equal(chunksBeforeCreate, EnumerateChunkFiles(factory.DataPath).Count());
+        var allocated = (await page.GetPageRangesAsync()).Value.PageRanges.ToArray();
+        var allocatedRange = Assert.Single(allocated);
+        Assert.Equal(allocationOffset, allocatedRange.Offset);
+        Assert.Equal(512, allocatedRange.Length);
+
+        var payload = Enumerable.Repeat((byte)0x5a, 512).ToArray();
+        await page.UploadPagesAsync(new MemoryStream(payload), allocationOffset + 512);
+        var merged = Assert.Single((await page.GetPageRangesAsync()).Value.PageRanges);
+        Assert.Equal(allocationOffset, merged.Offset);
+        Assert.Equal(1024, merged.Length);
+        var downloaded = await page.DownloadStreamingAsync(new BlobDownloadOptions
+        {
+            Range = new HttpRange(allocationOffset, 1024)
+        });
+        using var bytes = new MemoryStream();
+        await downloaded.Value.Content.CopyToAsync(bytes);
+        Assert.Equal(new byte[512].Concat(payload).ToArray(), bytes.ToArray());
+
+        await page.ClearPagesAsync(new HttpRange(allocationOffset, 512));
+        var remaining = Assert.Single((await page.GetPageRangesAsync()).Value.PageRanges);
+        Assert.Equal(allocationOffset + 512, remaining.Offset);
+        Assert.Equal(512, remaining.Length);
+
+        await page.ResizeAsync(4096);
+        Assert.Empty((await page.GetPageRangesAsync()).Value.PageRanges);
+        Assert.Equal(4096, (await page.GetPropertiesAsync()).Value.ContentLength);
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);

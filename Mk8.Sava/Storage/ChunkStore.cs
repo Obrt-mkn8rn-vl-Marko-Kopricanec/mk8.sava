@@ -54,10 +54,21 @@ public sealed class ChunkStore
             await foreach (var bytes in _chunker.ReadChunksAsync(source, _options.MaximumRequestBodyBytes, cancellationToken))
             {
                 completeHash.AppendData(bytes);
-                var id = await StoreVerifiedChunkAsync(domain, bytes, cancellationToken);
-                if (pinnedIds.Add(id))
-                    PinId(id);
-                references.Add(new ChunkReference(id, offset, bytes.Length));
+                if (bytes.AsSpan().IndexOfAnyExcept((byte)0) < 0)
+                {
+                    var zeroId = ZeroId(domain);
+                    if (references.Count > 0 && references[^1].Id == zeroId)
+                        references[^1] = references[^1] with { Length = checked(references[^1].Length + bytes.Length) };
+                    else
+                        references.Add(new ChunkReference(zeroId, offset, bytes.Length));
+                }
+                else
+                {
+                    var id = await StoreVerifiedChunkAsync(domain, bytes, cancellationToken);
+                    if (pinnedIds.Add(id))
+                        PinId(id);
+                    references.Add(new ChunkReference(id, offset, bytes.Length));
+                }
                 offset += bytes.Length;
             }
 
@@ -80,13 +91,31 @@ public sealed class ChunkStore
     public IDisposable Pin(ContentManifest manifest)
     {
         ValidateManifest(manifest);
-        var ids = manifest.Chunks.Select(chunk => chunk.Id).Distinct(StringComparer.Ordinal).ToArray();
+        var ids = manifest.Chunks
+            .Where(chunk => !IsZero(chunk, manifest.Domain))
+            .Select(chunk => chunk.Id)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
         foreach (var id in ids)
             PinId(id);
         return new PinLease(this, ids);
     }
 
     public ContentManifest Empty(string account) => ContentManifest.Empty(ResolveDomain(account));
+
+    public ContentManifest Sparse(string account, long length)
+    {
+        if (length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        var domain = ResolveDomain(account);
+        return length == 0
+            ? ContentManifest.Empty(domain)
+            : new ContentManifest(
+                domain,
+                length,
+                ContentManifest.SparseHash,
+                [new ChunkReference(ZeroId(domain), 0, length)]);
+    }
 
     public bool IsInDomain(string account, ContentManifest manifest) =>
         string.Equals(ResolveDomain(account), manifest.Domain, StringComparison.Ordinal);
@@ -100,6 +129,19 @@ public sealed class ChunkStore
         if (manifests.Any(manifest => !string.Equals(manifest.Domain, domain, StringComparison.Ordinal)))
             throw new InvalidOperationException("Content from different encryption domains must be copied through verified plaintext.");
 
+        if (manifests.Any(manifest => manifest.Sha256 == ContentManifest.SparseHash))
+        {
+            var sparseReferences = new List<ChunkReference>();
+            foreach (var manifest in manifests)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                ValidateManifest(manifest);
+                foreach (var chunk in manifest.Chunks)
+                    AddReference(sparseReferences, chunk.Id, chunk.Length, domain);
+            }
+            return CreateSparseManifest(domain, sparseReferences);
+        }
+
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var references = new List<ChunkReference>();
         long offset = 0;
@@ -108,8 +150,18 @@ public sealed class ChunkStore
             ValidateManifest(manifest);
             foreach (var chunk in manifest.Chunks)
             {
+                if (IsZero(chunk, domain))
+                {
+                    AppendZeroesToHash(hash, chunk.Length);
+                    if (references.Count > 0 && references[^1].Id == chunk.Id)
+                        references[^1] = references[^1] with { Length = checked(references[^1].Length + chunk.Length) };
+                    else
+                        references.Add(new ChunkReference(chunk.Id, offset, chunk.Length));
+                    offset += chunk.Length;
+                    continue;
+                }
                 var bytes = await ReadVerifiedChunkAsync(chunk.Id, domain, cancellationToken);
-                if (bytes.Length != chunk.Length)
+                if (bytes.LongLength != chunk.Length)
                     throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
                 hash.AppendData(bytes);
                 references.Add(new ChunkReference(chunk.Id, offset, chunk.Length));
@@ -118,6 +170,87 @@ public sealed class ChunkStore
         }
 
         return new ContentManifest(domain, offset, Convert.ToHexStringLower(hash.GetHashAndReset()), references);
+    }
+
+    public async Task<StoredContent> ReplaceRangePinnedAsync(
+        string account,
+        ContentManifest current,
+        long start,
+        long length,
+        Stream? replacement,
+        bool clear,
+        CancellationToken cancellationToken)
+    {
+        ValidateManifest(current);
+        if (!IsInDomain(account, current) || start < 0 || length < 0 || start > current.Length || length > current.Length - start)
+            throw new ArgumentOutOfRangeException(nameof(start));
+        if (!clear && replacement is null)
+            throw new ArgumentNullException(nameof(replacement));
+
+        var references = new List<ChunkReference>();
+        var temporaryPins = new List<IDisposable>();
+        try
+        {
+            await AppendSliceAsync(account, current, 0, start, references, temporaryPins, cancellationToken);
+            if (clear)
+            {
+                AddReference(references, ZeroId(current.Domain), length, current.Domain);
+            }
+            else
+            {
+                var stored = await StorePinnedAsync(account, replacement!, cancellationToken);
+                temporaryPins.Add(stored);
+                if (stored.Manifest.Length != length)
+                    throw new EndOfStreamException("The replacement stream length did not match the requested range.");
+                foreach (var chunk in stored.Manifest.Chunks)
+                    AddReference(references, chunk.Id, chunk.Length, current.Domain);
+            }
+            await AppendSliceAsync(
+                account,
+                current,
+                start + length,
+                current.Length - start - length,
+                references,
+                temporaryPins,
+                cancellationToken);
+            return PinSparseManifest(current.Domain, references, temporaryPins);
+        }
+        catch
+        {
+            foreach (var pin in temporaryPins)
+                pin.Dispose();
+            throw;
+        }
+    }
+
+    public async Task<StoredContent> ResizeSparsePinnedAsync(
+        string account,
+        ContentManifest current,
+        long length,
+        CancellationToken cancellationToken)
+    {
+        ValidateManifest(current);
+        if (!IsInDomain(account, current) || length < 0)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        if (length == current.Length)
+            return new StoredContent(current, Pin(current));
+
+        var references = new List<ChunkReference>();
+        var temporaryPins = new List<IDisposable>();
+        try
+        {
+            var retained = Math.Min(length, current.Length);
+            await AppendSliceAsync(account, current, 0, retained, references, temporaryPins, cancellationToken);
+            if (length > current.Length)
+                AddReference(references, ZeroId(current.Domain), length - current.Length, current.Domain);
+            return PinSparseManifest(current.Domain, references, temporaryPins);
+        }
+        catch
+        {
+            foreach (var pin in temporaryPins)
+                pin.Dispose();
+            throw;
+        }
     }
 
     public async Task WriteRangeAsync(
@@ -134,7 +267,9 @@ public sealed class ChunkStore
             return;
 
         using var pin = Pin(manifest);
-        IncrementalHash? completeHash = offset == 0 && length == manifest.Length
+        IncrementalHash? completeHash = offset == 0 &&
+                                        length == manifest.Length &&
+                                        manifest.Sha256 != ContentManifest.SparseHash
             ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
             : null;
         try
@@ -148,13 +283,19 @@ public sealed class ChunkStore
                 if (chunk.Offset >= rangeEnd)
                     break;
 
-                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, cancellationToken);
-                if (bytes.Length != chunk.Length)
-                    throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
+                var startInChunk = Math.Max(0, offset - chunk.Offset);
+                var endInChunk = Math.Min(chunk.Length, rangeEnd - chunk.Offset);
+                var sliceLength = endInChunk - startInChunk;
+                if (IsZero(chunk, manifest.Domain))
+                {
+                    await WriteZeroesAsync(destination, sliceLength, completeHash, cancellationToken);
+                    continue;
+                }
 
-                var startInChunk = (int)Math.Max(0, offset - chunk.Offset);
-                var endInChunk = (int)Math.Min(chunk.Length, rangeEnd - chunk.Offset);
-                var slice = bytes.AsMemory(startInChunk, endInChunk - startInChunk);
+                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, cancellationToken);
+                if (bytes.LongLength != chunk.Length)
+                    throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
+                var slice = bytes.AsMemory(checked((int)startInChunk), checked((int)sliceLength));
                 completeHash?.AppendData(slice.Span);
                 await destination.WriteAsync(slice, cancellationToken);
             }
@@ -206,6 +347,129 @@ public sealed class ChunkStore
                 return false;
             File.Delete(path);
             return true;
+        }
+    }
+
+    private async Task AppendSliceAsync(
+        string account,
+        ContentManifest manifest,
+        long start,
+        long length,
+        List<ChunkReference> destination,
+        List<IDisposable> temporaryPins,
+        CancellationToken cancellationToken)
+    {
+        if (length == 0)
+            return;
+        var end = checked(start + length);
+        foreach (var chunk in manifest.Chunks)
+        {
+            var chunkEnd = checked(chunk.Offset + chunk.Length);
+            if (chunkEnd <= start)
+                continue;
+            if (chunk.Offset >= end)
+                break;
+            var overlapStart = Math.Max(start, chunk.Offset);
+            var overlapEnd = Math.Min(end, chunkEnd);
+            var overlapLength = overlapEnd - overlapStart;
+            if (IsZero(chunk, manifest.Domain))
+            {
+                AddReference(destination, ZeroId(manifest.Domain), overlapLength, manifest.Domain);
+                continue;
+            }
+            if (overlapStart == chunk.Offset && overlapLength == chunk.Length)
+            {
+                AddReference(destination, chunk.Id, chunk.Length, manifest.Domain);
+                continue;
+            }
+
+            var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, cancellationToken);
+            if (bytes.LongLength != chunk.Length)
+                throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
+            var offset = checked((int)(overlapStart - chunk.Offset));
+            var count = checked((int)overlapLength);
+            using var slice = new MemoryStream(bytes, offset, count, writable: false);
+            var stored = await StorePinnedAsync(account, slice, cancellationToken);
+            temporaryPins.Add(stored);
+            foreach (var storedChunk in stored.Manifest.Chunks)
+                AddReference(destination, storedChunk.Id, storedChunk.Length, manifest.Domain);
+        }
+    }
+
+    private StoredContent PinSparseManifest(
+        string domain,
+        List<ChunkReference> references,
+        List<IDisposable> temporaryPins)
+    {
+        try
+        {
+            var manifest = CreateSparseManifest(domain, references);
+            return new StoredContent(manifest, Pin(manifest));
+        }
+        finally
+        {
+            foreach (var pin in temporaryPins)
+                pin.Dispose();
+            temporaryPins.Clear();
+        }
+    }
+
+    private static ContentManifest CreateSparseManifest(string domain, IReadOnlyList<ChunkReference> references)
+    {
+        var normalized = new List<ChunkReference>(references.Count);
+        long offset = 0;
+        foreach (var reference in references)
+        {
+            normalized.Add(reference with { Offset = offset });
+            offset = checked(offset + reference.Length);
+        }
+        return offset == 0
+            ? ContentManifest.Empty(domain)
+            : new ContentManifest(domain, offset, ContentManifest.SparseHash, normalized);
+    }
+
+    private static void AddReference(
+        List<ChunkReference> references,
+        string id,
+        long length,
+        string domain)
+    {
+        if (length == 0)
+            return;
+        if (references.Count > 0 &&
+            id == ZeroId(domain) &&
+            references[^1].Id == id)
+        {
+            references[^1] = references[^1] with { Length = checked(references[^1].Length + length) };
+            return;
+        }
+        references.Add(new ChunkReference(id, 0, length));
+    }
+
+    private static async Task WriteZeroesAsync(
+        Stream destination,
+        long length,
+        IncrementalHash? hash,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[128 * 1024];
+        while (length > 0)
+        {
+            var count = (int)Math.Min(buffer.Length, length);
+            hash?.AppendData(buffer.AsSpan(0, count));
+            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+            length -= count;
+        }
+    }
+
+    private static void AppendZeroesToHash(IncrementalHash hash, long length)
+    {
+        var buffer = new byte[128 * 1024];
+        while (length > 0)
+        {
+            var count = (int)Math.Min(buffer.Length, length);
+            hash.AppendData(buffer.AsSpan(0, count));
+            length -= count;
         }
     }
 
@@ -394,18 +658,28 @@ public sealed class ChunkStore
 
     private static void ValidateManifest(ContentManifest manifest)
     {
-        if (string.IsNullOrEmpty(manifest.Domain) || manifest.Length < 0 || manifest.Sha256.Length != 64)
+        if (string.IsNullOrEmpty(manifest.Domain) ||
+            manifest.Length < 0 ||
+            manifest.Sha256.Length != 64 && manifest.Sha256 != ContentManifest.SparseHash)
             throw new InvalidDataException("The content manifest is invalid.");
         long expectedOffset = 0;
         foreach (var chunk in manifest.Chunks)
         {
-            if (chunk.Offset != expectedOffset || chunk.Length <= 0 || !chunk.Id.StartsWith(manifest.Domain + "/", StringComparison.Ordinal))
+            if (chunk.Offset != expectedOffset ||
+                chunk.Length <= 0 ||
+                !chunk.Id.StartsWith(manifest.Domain + "/", StringComparison.Ordinal) ||
+                !IsZero(chunk, manifest.Domain) && chunk.Length > int.MaxValue)
                 throw new InvalidDataException("The content manifest contains an invalid chunk reference.");
             expectedOffset = checked(expectedOffset + chunk.Length);
         }
         if (expectedOffset != manifest.Length || (manifest.Length == 0 && manifest.Chunks.Count != 0))
             throw new InvalidDataException("The content manifest length is inconsistent.");
     }
+
+    private static string ZeroId(string domain) => domain + "/$zero";
+
+    private static bool IsZero(ChunkReference reference, string domain) =>
+        string.Equals(reference.Id, ZeroId(domain), StringComparison.Ordinal);
 
     private void PinId(string id)
     {

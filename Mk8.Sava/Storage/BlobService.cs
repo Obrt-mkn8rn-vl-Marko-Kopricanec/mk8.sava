@@ -247,31 +247,16 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        if (length < 0 || length % 512 != 0)
+        const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
+        if (length < 0 || length > maximumPageBlobBytes || length % 512 != 0)
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-
-        var temporary = Path.GetTempFileName();
-        try
+        var now = metadata.GetUtcNow();
+        var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, length), options, now) with
         {
-            await using (var stream = new FileStream(temporary, FileMode.Open, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous))
-            {
-                stream.SetLength(length);
-                await stream.FlushAsync(cancellationToken);
-            }
-            await using var source = new FileStream(temporary, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
-            var now = metadata.GetUtcNow();
-            var proposed = NewBlob(account, container, name, BlobKind.PageBlob, content.Manifest, options, now) with
-            {
-                SequenceNumber = sequenceNumber
-            };
-            return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
-        }
-        finally
-        {
-            File.Delete(temporary);
-        }
+            SequenceNumber = sequenceNumber
+        };
+        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
     }
 
     public async Task StageBlockAsync(
@@ -421,49 +406,24 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
             throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
 
-        var path = await chunks.MaterializeAsync(current.Content, cancellationToken);
-        try
+        using var content = await chunks.ReplaceRangePinnedAsync(
+            current.Account,
+            current.Content,
+            start,
+            end - start + 1,
+            source,
+            clear,
+            cancellationToken);
+        var updated = current with
         {
-            await using (var file = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous))
-            {
-                file.Position = start;
-                var length = end - start + 1;
-                if (clear)
-                {
-                    var zeroes = new byte[64 * 1024];
-                    while (length > 0)
-                    {
-                        var count = (int)Math.Min(zeroes.Length, length);
-                        await file.WriteAsync(zeroes.AsMemory(0, count), cancellationToken);
-                        length -= count;
-                    }
-                }
-                else
-                {
-                    if (source is null)
-                        throw new ArgumentNullException(nameof(source));
-                    await CopyExactlyAsync(source, file, length, cancellationToken);
-                }
-                await file.FlushAsync(cancellationToken);
-                file.Flush(flushToDisk: true);
-            }
-
-            await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var content = await chunks.StorePinnedAsync(current.Account, input, cancellationToken);
-            var updated = current with
-            {
-                GenerationId = Guid.NewGuid().ToString("N"),
-                Revision = MetadataStore.NewRevision(),
-                Content = content.Manifest,
-                ETag = MetadataStore.NewETag(),
-                LastModified = metadata.GetUtcNow()
-            };
-            return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
-        }
-        finally
-        {
-            File.Delete(path);
-        }
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = MetadataStore.NewRevision(),
+            Content = content.Manifest,
+            PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
+            ETag = MetadataStore.NewETag(),
+            LastModified = metadata.GetUtcNow()
+        };
+        return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
     }
 
     public async Task WriteContentAsync(
@@ -510,27 +470,32 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? sequenceAction,
         CancellationToken cancellationToken)
     {
+        var nextSequence = current.SequenceNumber;
+        if (sequenceNumber.HasValue || sequenceAction is not null)
+        {
+            if (current.Kind != BlobKind.PageBlob)
+                throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The sequence number is only valid for page blobs.");
+            if (sequenceNumber < 0)
+                throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.Value.ToString(CultureInfo.InvariantCulture));
+            nextSequence = sequenceAction?.ToLowerInvariant() switch
+            {
+                "max" when sequenceNumber.HasValue => Math.Max(nextSequence, sequenceNumber.Value),
+                "increment" => checked(nextSequence + 1),
+                "update" when sequenceNumber.HasValue => sequenceNumber.Value,
+                null when sequenceNumber.HasValue => sequenceNumber.Value,
+                _ => throw AzureStorageException.InvalidHeader("x-ms-sequence-number-action", sequenceAction)
+            };
+        }
+
         var content = current.Content;
         StoredContent? resized = null;
         if (resizeTo.HasValue)
         {
-            if (current.Kind != BlobKind.PageBlob || resizeTo < 0 || resizeTo % 512 != 0)
+            const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
+            if (current.Kind != BlobKind.PageBlob || resizeTo < 0 || resizeTo > maximumPageBlobBytes || resizeTo % 512 != 0)
                 throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", resizeTo.Value.ToString(CultureInfo.InvariantCulture));
-            resized = await ResizeAsync(current.Account, current.Content, resizeTo.Value, cancellationToken);
+            resized = await chunks.ResizeSparsePinnedAsync(current.Account, current.Content, resizeTo.Value, cancellationToken);
             content = resized.Manifest;
-        }
-
-        var nextSequence = current.SequenceNumber;
-        if (sequenceNumber.HasValue)
-        {
-            if (current.Kind != BlobKind.PageBlob)
-                throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The sequence number is only valid for page blobs.");
-            nextSequence = sequenceAction?.ToLowerInvariant() switch
-            {
-                "max" => Math.Max(nextSequence, sequenceNumber.Value),
-                "increment" => checked(nextSequence + 1),
-                _ => sequenceNumber.Value
-            };
         }
 
         var updated = current with
@@ -539,6 +504,12 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             Content = content,
             Http = http,
             SequenceNumber = nextSequence,
+            PageRanges = resizeTo.HasValue
+                ? current.PageRanges
+                    .Where(range => range.Start < resizeTo.Value)
+                    .Select(range => new PageRange(range.Start, Math.Min(range.End, resizeTo.Value - 1)))
+                    .ToList()
+                : current.PageRanges,
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
@@ -706,6 +677,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             IsSealed = source.IsSealed,
             AppendBlockCount = source.AppendBlockCount,
             CommittedBlocks = source.CommittedBlocks,
+            PageRanges = [.. source.PageRanges],
             Copy = new CopyState
             {
                 Id = Guid.NewGuid().ToString(),
@@ -770,44 +742,42 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         AccessTier = options.AccessTier ?? "Hot"
     };
 
-    private async Task<StoredContent> ResizeAsync(
-        string account,
-        ContentManifest manifest,
-        long length,
-        CancellationToken cancellationToken)
+    private static List<PageRange> UpdatePageRanges(
+        IReadOnlyList<PageRange> current,
+        long start,
+        long end,
+        bool clear)
     {
-        var path = await chunks.MaterializeAsync(manifest, cancellationToken);
-        try
+        if (clear)
         {
-            await using (var file = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous))
+            var remaining = new List<PageRange>();
+            foreach (var range in current)
             {
-                file.SetLength(length);
-                await file.FlushAsync(cancellationToken);
-                file.Flush(flushToDisk: true);
+                if (range.End < start || range.Start > end)
+                {
+                    remaining.Add(range);
+                    continue;
+                }
+                if (range.Start < start)
+                    remaining.Add(new PageRange(range.Start, start - 1));
+                if (range.End > end)
+                    remaining.Add(new PageRange(end + 1, range.End));
             }
-            await using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            return await chunks.StorePinnedAsync(account, source, cancellationToken);
+            return remaining;
         }
-        finally
-        {
-            File.Delete(path);
-        }
-    }
 
-    private static async Task CopyExactlyAsync(Stream source, Stream destination, long length, CancellationToken cancellationToken)
-    {
-        var buffer = new byte[128 * 1024];
-        while (length > 0)
+        var ordered = current.Append(new PageRange(start, end)).OrderBy(range => range.Start).ToArray();
+        var merged = new List<PageRange>();
+        foreach (var range in ordered)
         {
-            var count = (int)Math.Min(buffer.Length, length);
-            var read = await source.ReadAsync(buffer.AsMemory(0, count), cancellationToken);
-            if (read == 0)
-                throw new EndOfStreamException();
-            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            length -= read;
+            if (merged.Count == 0 || range.Start > merged[^1].End + 1)
+            {
+                merged.Add(range);
+                continue;
+            }
+            merged[^1] = new PageRange(merged[^1].Start, Math.Max(merged[^1].End, range.End));
         }
-        if (await source.ReadAsync(buffer.AsMemory(0, 1), cancellationToken) != 0)
-            throw AzureStorageException.InvalidHeader("Content-Length");
+        return merged;
     }
 
     private static void ValidateContainerName(string name)

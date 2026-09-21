@@ -20,7 +20,7 @@ public enum LeaseState
     Broken
 }
 
-public sealed record ChunkReference(string Id, long Offset, int Length);
+public sealed record ChunkReference(string Id, long Offset, long Length);
 
 public sealed record ContentManifest(
     string Domain,
@@ -28,6 +28,8 @@ public sealed record ContentManifest(
     string Sha256,
     IReadOnlyList<ChunkReference> Chunks)
 {
+    public const string SparseHash = "sparse";
+
     public static ContentManifest Empty(string domain) =>
         new(domain, 0, Convert.ToHexStringLower(SHA256.HashData([])), []);
 }
@@ -101,6 +103,7 @@ public sealed record BlobRecord
     public CopyState? Copy { get; init; }
     public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
+    public List<PageRange> PageRanges { get; init; } = [];
 }
 
 public sealed record BlobHttpProperties
