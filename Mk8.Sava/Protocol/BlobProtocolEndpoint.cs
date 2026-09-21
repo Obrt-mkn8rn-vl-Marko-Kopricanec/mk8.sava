@@ -866,6 +866,11 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: true);
+            var contentEncryption = new BlobEncryption(
+                blob.EncryptionScope,
+                suppliedEncryption.CustomerProvidedKeySha256,
+                suppliedEncryption.CustomerProvidedKey);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var resizeTo = TryParseLongHeader(http.Request.Headers, "x-ms-blob-content-length");
@@ -876,6 +881,7 @@ public static class BlobProtocolEndpoint
                 resizeTo,
                 sequence,
                 ProtocolParsing.First(http.Request.Headers, "x-ms-sequence-number-action"),
+                contentEncryption,
                 cancellationToken);
             AzureResponseWriter.AddBlobHeaders(http.Response, updated);
             return;
@@ -887,8 +893,15 @@ public static class BlobProtocolEndpoint
             EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
-            var created = await service.CreateSnapshotAsync(blob, cancellationToken);
+            var hasSnapshotMetadata = http.Request.Headers.Keys.Any(name =>
+                name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
+            var created = await service.CreateSnapshotAsync(
+                blob,
+                hasSnapshotMetadata ? ProtocolParsing.ReadMetadata(http.Request.Headers) : null,
+                cancellationToken);
             http.Response.Headers["x-ms-snapshot"] = created.Snapshot;
+            if (created.VersionId is not null)
+                http.Response.Headers["x-ms-version-id"] = created.VersionId;
             http.Response.Headers.ETag = created.ETag;
             http.Response.Headers.LastModified = created.LastModified.ToString("R", CultureInfo.InvariantCulture);
             AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));

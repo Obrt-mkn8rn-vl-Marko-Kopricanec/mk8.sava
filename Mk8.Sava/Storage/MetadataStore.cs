@@ -362,8 +362,9 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             await using var connection = await OpenAsync(cancellationToken);
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
             var current = await GetCurrentBlobAsync(connection, transaction, proposed.Account, proposed.Container, proposed.Name, cancellationToken);
-            if (!string.Equals(current?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
-                !string.Equals(current?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
+            var activeCurrent = current is { IsDeleted: false } ? current : null;
+            if (!string.Equals(activeCurrent?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
+                !string.Equals(activeCurrent?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
             if (stagedBlockSnapshot is not null)
@@ -382,27 +383,85 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken);
             if (current is not null)
             {
-                if (current.Copy?.Status == "pending")
+                if (!current.IsDeleted && current.Copy?.Status == "pending")
                     throw new StoragePendingCopyException();
-                var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > _timeProvider.GetUtcNow();
-                var createsProtectedHistoricalVersion = serviceProperties.VersioningEnabled &&
-                                                        current.Kind == BlobKind.BlockBlob &&
-                                                        proposed.Kind == BlobKind.BlockBlob;
-                if (protectedByRetention && !createsProtectedHistoricalVersion)
-                    throw new StorageImmutabilityException(current.HasLegalHold);
-
-                if (serviceProperties.VersioningEnabled)
+                var now = _timeProvider.GetUtcNow();
+                if (current.IsDeleted)
                 {
-                    var historical = current with
+                    if (current.Kind == proposed.Kind)
                     {
-                        IsCurrent = false,
-                        VersionId = current.VersionId ?? CreateVersionId(current.LastModified)
-                    };
-                    await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                        var historical = current with
+                        {
+                            IsCurrent = false,
+                            VersionId = null,
+                            Snapshot = current.Snapshot ?? await CreateUniqueSnapshotIdAsync(
+                                connection,
+                                transaction,
+                                current.Account,
+                                current.Container,
+                                current.Name,
+                                current.DeletedAt ?? now,
+                                cancellationToken),
+                            Lease = LeaseRecord.Available,
+                            Revision = NewRevision()
+                        };
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                    }
+                    else
+                    {
+                        await DeleteSoftDeletedBlobRowsAsync(
+                            connection,
+                            transaction,
+                            current.Account,
+                            current.Container,
+                            current.Name,
+                            cancellationToken);
+                    }
                 }
                 else
                 {
-                    await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken);
+                    var createsHistoricalVersion = serviceProperties.VersioningEnabled;
+                    var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > now;
+                    if (protectedByRetention && !createsHistoricalVersion)
+                        throw new StorageImmutabilityException(current.HasLegalHold);
+
+                    if (createsHistoricalVersion)
+                    {
+                        var historical = current with
+                        {
+                            IsCurrent = false,
+                            VersionId = current.VersionId ?? CreateVersionId(current.LastModified),
+                            Lease = LeaseRecord.Available,
+                            Revision = NewRevision()
+                        };
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                    }
+                    else if (serviceProperties.BlobSoftDeleteEnabled)
+                    {
+                        var historical = current with
+                        {
+                            IsCurrent = false,
+                            IsDeleted = true,
+                            DeletedAt = now,
+                            DeleteRetentionUntil = now.AddDays(serviceProperties.BlobSoftDeleteRetentionDays),
+                            VersionId = null,
+                            Snapshot = await CreateUniqueSnapshotIdAsync(
+                                connection,
+                                transaction,
+                                current.Account,
+                                current.Container,
+                                current.Name,
+                                now,
+                                cancellationToken),
+                            Lease = LeaseRecord.Available,
+                            Revision = NewRevision()
+                        };
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                    }
+                    else
+                    {
+                        await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken);
+                    }
                 }
             }
 
@@ -459,7 +518,11 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         }
     }
 
-    public async Task<BlobRecord> CreateSnapshotAsync(BlobRecord source, DateTimeOffset now, CancellationToken cancellationToken)
+    public async Task<BlobRecord> CreateSnapshotAsync(
+        BlobRecord source,
+        Dictionary<string, string>? snapshotMetadata,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken);
         try
@@ -470,18 +533,58 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             if (current?.GenerationId != source.GenerationId || current.Revision != source.Revision)
                 throw new StorageConcurrencyException();
 
+            var snapshotId = await CreateUniqueSnapshotIdAsync(
+                connection,
+                transaction,
+                source.Account,
+                source.Container,
+                source.Name,
+                now,
+                cancellationToken);
             var snapshot = source with
             {
                 GenerationId = Guid.NewGuid().ToString("N"),
                 Revision = NewRevision(),
                 IsCurrent = false,
                 VersionId = null,
-                Snapshot = CreateVersionId(now),
+                Snapshot = snapshotId,
+                Metadata = snapshotMetadata ?? source.Metadata,
                 Lease = LeaseRecord.Available
             };
+
+            var properties = await GetServicePropertiesAsync(connection, transaction, source.Account, cancellationToken);
+            string? newVersionId = null;
+            if (properties.VersioningEnabled)
+            {
+                var historical = source with
+                {
+                    IsCurrent = false,
+                    VersionId = source.VersionId ?? CreateVersionId(source.LastModified),
+                    Lease = LeaseRecord.Available,
+                    Revision = NewRevision()
+                };
+                await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                newVersionId = await CreateUniqueVersionIdAsync(
+                    connection,
+                    transaction,
+                    source.Account,
+                    source.Container,
+                    source.Name,
+                    now,
+                    cancellationToken);
+                var newCurrent = source with
+                {
+                    GenerationId = Guid.NewGuid().ToString("N"),
+                    Revision = NewRevision(),
+                    VersionId = newVersionId,
+                    Snapshot = null,
+                    IsCurrent = true
+                };
+                await InsertBlobRowAsync(connection, transaction, newCurrent, cancellationToken);
+            }
             await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken);
             await transaction.CommitAsync(cancellationToken);
-            return snapshot;
+            return newVersionId is null ? snapshot : snapshot with { VersionId = newVersionId };
         }
         finally
         {
@@ -758,6 +861,82 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         command.CommandText = "SELECT data FROM blobs WHERE generation_id = $generation;";
         command.Parameters.AddWithValue("$generation", generationId);
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
+    }
+
+    private static async Task DeleteSoftDeletedBlobRowsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string account,
+        string container,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DELETE FROM blobs
+            WHERE account = $account AND container = $container AND name = $name AND is_deleted = 1;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$name", name);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<string> CreateUniqueSnapshotIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string account,
+        string container,
+        string name,
+        DateTimeOffset time,
+        CancellationToken cancellationToken)
+    {
+        for (var tickOffset = 0L; ; tickOffset++)
+        {
+            var candidate = CreateVersionId(time.AddTicks(tickOffset));
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT 1 FROM blobs
+                WHERE account = $account AND container = $container AND name = $name AND snapshot = $snapshot
+                LIMIT 1;
+                """;
+            command.Parameters.AddWithValue("$account", account);
+            command.Parameters.AddWithValue("$container", container);
+            command.Parameters.AddWithValue("$name", name);
+            command.Parameters.AddWithValue("$snapshot", candidate);
+            if (await command.ExecuteScalarAsync(cancellationToken) is null)
+                return candidate;
+        }
+    }
+
+    private static async Task<string> CreateUniqueVersionIdAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string account,
+        string container,
+        string name,
+        DateTimeOffset time,
+        CancellationToken cancellationToken)
+    {
+        for (var tickOffset = 0L; ; tickOffset++)
+        {
+            var candidate = CreateVersionId(time.AddTicks(tickOffset));
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT 1 FROM blobs
+                WHERE account = $account AND container = $container AND name = $name AND version_id = $version
+                LIMIT 1;
+                """;
+            command.Parameters.AddWithValue("$account", account);
+            command.Parameters.AddWithValue("$container", container);
+            command.Parameters.AddWithValue("$name", name);
+            command.Parameters.AddWithValue("$version", candidate);
+            if (await command.ExecuteScalarAsync(cancellationToken) is null)
+                return candidate;
+        }
     }
 
     private static async Task InsertBlobRowAsync(

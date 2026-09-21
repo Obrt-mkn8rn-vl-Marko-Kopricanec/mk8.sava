@@ -529,6 +529,20 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             LastModified = metadata.GetUtcNow(),
             Copy = null
         };
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        if (properties.VersioningEnabled)
+        {
+            return await metadata.PublishBlobAsync(
+                updated with
+                {
+                    GenerationId = Guid.NewGuid().ToString("N"),
+                    VersionId = null,
+                    Snapshot = null
+                },
+                current.GenerationId,
+                current.Revision,
+                cancellationToken);
+        }
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
         return updated;
     }
@@ -553,6 +567,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         long? resizeTo,
         long? sequenceNumber,
         string? sequenceAction,
+        BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -581,7 +596,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
             if (current.Kind != BlobKind.PageBlob || resizeTo < 0 || resizeTo > maximumPageBlobBytes || resizeTo % 512 != 0)
                 throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", resizeTo.Value.ToString(CultureInfo.InvariantCulture));
-            resized = await chunks.ResizeSparsePinnedAsync(current.Account, EncryptionOf(current), current.Content, resizeTo.Value, cancellationToken);
+            resized = await chunks.ResizeSparsePinnedAsync(current.Account, encryption, current.Content, resizeTo.Value, cancellationToken);
             content = resized.Manifest;
         }
 
@@ -797,10 +812,13 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         return updated;
     }
 
-    public Task<BlobRecord> CreateSnapshotAsync(BlobRecord current, CancellationToken cancellationToken)
+    public Task<BlobRecord> CreateSnapshotAsync(
+        BlobRecord current,
+        Dictionary<string, string>? snapshotMetadata,
+        CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
-        return metadata.CreateSnapshotAsync(current, metadata.GetUtcNow(), cancellationToken);
+        return metadata.CreateSnapshotAsync(current, snapshotMetadata, metadata.GetUtcNow(), cancellationToken);
     }
 
     public async Task DeleteBlobAsync(
@@ -840,7 +858,22 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
         foreach (var target in targets)
         {
-            if (properties.BlobSoftDeleteEnabled)
+            if (target.IsCurrent &&
+                target.Snapshot is null &&
+                properties.VersioningEnabled)
+            {
+                await metadata.PutBlobRecordAsync(target with
+                {
+                    IsCurrent = false,
+                    IsDeleted = false,
+                    DeletedAt = null,
+                    DeleteRetentionUntil = null,
+                    VersionId = target.VersionId ?? MetadataStore.CreateVersionId(target.LastModified),
+                    Lease = LeaseRecord.Available,
+                    Revision = MetadataStore.NewRevision()
+                }, target.Revision, cancellationToken);
+            }
+            else if (properties.BlobSoftDeleteEnabled)
             {
                 var deletedAt = metadata.GetUtcNow();
                 await metadata.PutBlobRecordAsync(target with

@@ -694,11 +694,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         var page = container.GetPageBlobClient("page.bin");
         await page.CreateAsync(1024);
-        var pageBytes = RandomNumberGenerator.GetBytes(512);
-        await page.UploadPagesAsync(new MemoryStream(pageBytes), offset: 512);
+        var pageBytes = RandomNumberGenerator.GetBytes(1024);
+        await page.UploadPagesAsync(new MemoryStream(pageBytes), offset: 0);
         var downloaded = (await page.DownloadContentAsync()).Value.Content.ToArray();
-        Assert.Equal(new byte[512], downloaded[..512]);
-        Assert.Equal(pageBytes, downloaded[512..]);
+        Assert.Equal(pageBytes, downloaded);
+        await page.ResizeAsync(512);
+        Assert.Equal(512, (await page.GetPropertiesAsync()).Value.ContentLength);
+        Assert.Equal(pageBytes[..512], (await page.DownloadContentAsync()).Value.Content.ToArray());
     }
 
     [Fact]
@@ -856,6 +858,132 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         finally
         {
             await client.SetPropertiesAsync(original);
+        }
+    }
+
+    [Fact]
+    public async Task SoftDeleteProtectsOverwritesAndVersioningRemovesTheCurrentVersionOnDelete()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var originalProperties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var container = service.GetBlobContainerClient($"overwrite-retention-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        try
+        {
+            var softDelete = (await service.GetPropertiesAsync()).Value;
+            softDelete.DeleteRetentionPolicy.Enabled = true;
+            softDelete.DeleteRetentionPolicy.Days = 7;
+            await service.SetPropertiesAsync(softDelete);
+            var configured = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                configured with { VersioningEnabled = false },
+                CancellationToken.None);
+
+            var overwritten = container.GetBlockBlobClient("overwritten.txt");
+            await overwritten.UploadAsync(new MemoryStream("before overwrite"u8.ToArray()));
+            await overwritten.UploadAsync(new MemoryStream("after overwrite"u8.ToArray()));
+            Assert.Equal("after overwrite", (await overwritten.DownloadContentAsync()).Value.Content.ToString());
+
+            var deletedSnapshots = new List<BlobItem>();
+            await foreach (var item in container.GetBlobsAsync(
+                               states: BlobStates.Deleted | BlobStates.Snapshots,
+                               prefix: overwritten.Name))
+            {
+                if (item.Deleted && item.Snapshot is not null)
+                    deletedSnapshots.Add(item);
+            }
+            var overwrittenSnapshot = Assert.Single(deletedSnapshots);
+
+            await overwritten.UndeleteAsync();
+            var restoredSnapshot = overwritten.WithSnapshot(overwrittenSnapshot.Snapshot);
+            Assert.Equal("before overwrite", (await restoredSnapshot.DownloadContentAsync()).Value.Content.ToString());
+            Assert.Equal("after overwrite", (await overwritten.DownloadContentAsync()).Value.Content.ToString());
+
+            var recreated = container.GetBlockBlobClient("recreated.txt");
+            await recreated.UploadAsync(new MemoryStream("soft-deleted original"u8.ToArray()));
+            await recreated.DeleteAsync();
+            await recreated.UploadAsync(new MemoryStream("replacement"u8.ToArray()));
+            Assert.Equal("replacement", (await recreated.DownloadContentAsync()).Value.Content.ToString());
+            await recreated.UndeleteAsync();
+
+            BlobItem? recreatedSnapshot = null;
+            await foreach (var item in container.GetBlobsAsync(
+                               states: BlobStates.Snapshots,
+                               prefix: recreated.Name))
+            {
+                if (item.Name == recreated.Name && item.Snapshot is not null)
+                    recreatedSnapshot = item;
+            }
+            Assert.NotNull(recreatedSnapshot);
+            Assert.Equal(
+                "soft-deleted original",
+                (await recreated.WithSnapshot(recreatedSnapshot!.Snapshot).DownloadContentAsync()).Value.Content.ToString());
+
+            var typeChangedName = "type-changed";
+            var typeChangedAppend = container.GetAppendBlobClient(typeChangedName);
+            await typeChangedAppend.CreateAsync();
+            await typeChangedAppend.AppendBlockAsync(new MemoryStream("append state"u8.ToArray()));
+            await typeChangedAppend.DeleteAsync();
+            var typeChangedBlock = container.GetBlockBlobClient(typeChangedName);
+            await typeChangedBlock.UploadAsync(new MemoryStream("block replacement"u8.ToArray()));
+            var retainedDifferentType = new List<BlobItem>();
+            await foreach (var item in container.GetBlobsAsync(
+                               states: BlobStates.Deleted | BlobStates.Snapshots,
+                               prefix: typeChangedName))
+            {
+                if (item.Name == typeChangedName && item.Deleted)
+                    retainedDifferentType.Add(item);
+            }
+            Assert.Empty(retainedDifferentType);
+
+            configured = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                configured with { VersioningEnabled = true },
+                CancellationToken.None);
+            var versioned = container.GetBlockBlobClient("versioned.txt");
+            await versioned.UploadAsync(new MemoryStream("version one"u8.ToArray()));
+            await versioned.UploadAsync(new MemoryStream("version two"u8.ToArray()));
+            await versioned.SetMetadataAsync(new Dictionary<string, string> { ["revision"] = "metadata-write" });
+            var versionedSnapshot = await versioned.CreateSnapshotAsync(
+                new Dictionary<string, string> { ["snapshot"] = "override" });
+            Assert.False(string.IsNullOrEmpty(versionedSnapshot.Value.VersionId));
+            var snapshotProperties = await versioned.WithSnapshot(versionedSnapshot.Value.Snapshot).GetPropertiesAsync();
+            Assert.Equal("override", snapshotProperties.Value.Metadata["snapshot"]);
+            await versioned.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
+            Assert.False((await versioned.ExistsAsync()).Value);
+
+            var versions = new List<BlobItem>();
+            await foreach (var item in container.GetBlobsAsync(states: BlobStates.Version, prefix: versioned.Name))
+            {
+                if (item.Name == versioned.Name && item.VersionId is not null)
+                    versions.Add(item);
+            }
+            Assert.Equal(4, versions.Count);
+            Assert.All(versions, item => Assert.False(item.Deleted));
+            Assert.All(versions, item => Assert.False(item.IsLatestVersion));
+            var contents = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var version in versions)
+            {
+                contents.Add((await versioned.WithVersion(version.VersionId).DownloadContentAsync()).Value.Content.ToString());
+            }
+            Assert.Equal(new HashSet<string>(["version one", "version two"], StringComparer.Ordinal), contents);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                originalProperties,
+                CancellationToken.None);
         }
     }
 
