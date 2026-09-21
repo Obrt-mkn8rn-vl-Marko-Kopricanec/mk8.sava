@@ -572,6 +572,47 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task BlobBatchesExecuteIndependentDeleteAndTierSubrequests()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"batch-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var deleteTarget = container.GetBlobClient("delete.bin");
+        await deleteTarget.UploadAsync(BinaryData.FromString("delete me"));
+
+        var serviceBatchClient = service.GetBlobBatchClient();
+        using (var deleteBatch = serviceBatchClient.CreateBatch())
+        {
+            var deleted = deleteBatch.DeleteBlob(container.Name, deleteTarget.Name);
+            var missing = deleteBatch.DeleteBlob(container.Name, "missing.bin");
+            var submitted = await serviceBatchClient.SubmitBatchAsync(deleteBatch, throwOnAnyFailure: false);
+
+            Assert.Equal(202, submitted.Status);
+            Assert.Equal(202, deleted.Status);
+            Assert.Equal(404, missing.Status);
+        }
+        Assert.False(await deleteTarget.ExistsAsync());
+
+        var tierTarget = container.GetBlobClient("tier.bin");
+        await tierTarget.UploadAsync(BinaryData.FromString("tier me"));
+        var containerBatchClient = container.GetBlobBatchClient();
+        using (var tierBatch = containerBatchClient.CreateBatch())
+        {
+            var changed = tierBatch.SetBlobAccessTier(container.Name, tierTarget.Name, AccessTier.Cool);
+            var missing = tierBatch.SetBlobAccessTier(
+                container.Name,
+                "missing-tier.bin",
+                AccessTier.Hot);
+            var submitted = await containerBatchClient.SubmitBatchAsync(tierBatch, throwOnAnyFailure: false);
+
+            Assert.Equal(202, submitted.Status);
+            Assert.Equal(200, changed.Status);
+            Assert.Equal(404, missing.Status);
+        }
+        Assert.Equal(AccessTier.Cool, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);

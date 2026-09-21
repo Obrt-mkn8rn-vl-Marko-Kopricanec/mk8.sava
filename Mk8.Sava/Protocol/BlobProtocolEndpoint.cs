@@ -2,6 +2,8 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Xml;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
@@ -125,7 +127,11 @@ public static class BlobProtocolEndpoint
         }
 
         if (comp == "batch" && HttpMethods.IsPost(http.Request.Method))
-            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidQueryParameterValue", "Blob batch requests require a supported multipart payload.");
+        {
+            Require(request, 'w');
+            await HandleBatchAsync(http, request, service, scopedContainer: null, cancellationToken);
+            return;
+        }
 
         throw UnsupportedOperation();
     }
@@ -139,6 +145,13 @@ public static class BlobProtocolEndpoint
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (comp == "batch" && HttpMethods.IsPost(http.Request.Method))
+        {
+            Require(request, 'w');
+            _ = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken);
+            await HandleBatchAsync(http, request, service, containerName, cancellationToken);
+            return;
+        }
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
             !request.Authorization.IsAccountSas &&
             !(HttpMethods.IsGet(http.Request.Method) && comp == "list"))
@@ -267,6 +280,268 @@ public static class BlobProtocolEndpoint
 
         throw UnsupportedOperation();
     }
+
+    private static async Task HandleBatchAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string? scopedContainer,
+        CancellationToken cancellationToken)
+    {
+        var minimumVersion = scopedContainer is null ? new DateOnly(2018, 11, 9) : new DateOnly(2020, 4, 8);
+        if (!DateOnly.TryParseExact(
+                request.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var version) || version < minimumVersion)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                $"Blob Batch requires service version {minimumVersion:yyyy-MM-dd} or later.");
+        }
+
+        var subrequests = await BlobBatchProtocol.ReadAsync(http.Request, cancellationToken);
+        var resolved = subrequests
+            .Select(subrequest => ResolveBatchSubrequest(request.Account, scopedContainer, subrequest))
+            .ToArray();
+        var responses = new List<BlobBatchSubresponse>(resolved.Length);
+        foreach (var subrequest in resolved)
+            responses.Add(await ExecuteBatchSubrequestAsync(http, request, service, subrequest, cancellationToken));
+        await BlobBatchProtocol.WriteAsync(http.Response, responses, cancellationToken);
+    }
+
+    private static ResolvedBatchSubrequest ResolveBatchSubrequest(
+        string account,
+        string? scopedContainer,
+        BlobBatchSubrequest subrequest)
+    {
+        try
+        {
+            var segments = subrequest.RawPath.Split('/', StringSplitOptions.None).Skip(1).ToArray();
+            var offset = segments.Length >= 3 &&
+                         string.Equals(Uri.UnescapeDataString(segments[0]), account, StringComparison.Ordinal)
+                ? 1
+                : 0;
+            if (segments.Length - offset < 2 || string.IsNullOrEmpty(segments[offset]))
+                throw InvalidBatchSubrequest("A batch subrequest does not identify a blob.");
+            var container = Uri.UnescapeDataString(segments[offset]);
+            var blob = string.Join('/', segments.Skip(offset + 1).Select(Uri.UnescapeDataString));
+            if (string.IsNullOrEmpty(blob))
+                throw InvalidBatchSubrequest("A batch subrequest does not identify a blob.");
+            if (scopedContainer is not null && !string.Equals(container, scopedContainer, StringComparison.Ordinal))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidInput",
+                    "All subrequests in a container-scoped batch must target that container.");
+            }
+
+            var query = QueryHelpers.ParseQuery(subrequest.QueryString.Value ?? string.Empty);
+            return new ResolvedBatchSubrequest(
+                subrequest,
+                container,
+                blob,
+                query.TryGetValue("snapshot", out var snapshot) ? NullIfEmpty(snapshot.ToString()) : null,
+                query.TryGetValue("versionid", out var version) ? NullIfEmpty(version.ToString()) : null);
+        }
+        catch (UriFormatException)
+        {
+            throw InvalidBatchSubrequest("A batch subrequest contains an invalid escaped URI.");
+        }
+    }
+
+    private static async Task<BlobBatchSubresponse> ExecuteBatchSubrequestAsync(
+        HttpContext outer,
+        StorageRequestContext outerRequest,
+        BlobService service,
+        ResolvedBatchSubrequest resolved,
+        CancellationToken cancellationToken)
+    {
+        var inner = new DefaultHttpContext
+        {
+            RequestServices = outer.RequestServices
+        };
+        inner.Request.Scheme = outer.Request.Scheme;
+        inner.Request.Host = outer.Request.Host;
+        inner.Request.Method = resolved.Request.Method;
+        inner.Request.Path = PathString.FromUriComponent(resolved.Request.RawPath);
+        inner.Request.QueryString = resolved.Request.QueryString;
+        inner.Request.Body = Stream.Null;
+        inner.Connection.RemoteIpAddress = outer.Connection.RemoteIpAddress;
+        foreach (var header in resolved.Request.Headers)
+            inner.Request.Headers[header.Key] = header.Value;
+        inner.Features.Get<IHttpRequestFeature>()!.RawTarget = resolved.Request.RawPath + resolved.Request.QueryString;
+
+        var subrequestContext = new StorageRequestContext
+        {
+            RequestId = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16)),
+            Account = outerRequest.Account,
+            Container = resolved.Container,
+            Blob = resolved.Blob,
+            Snapshot = resolved.Snapshot,
+            VersionId = resolved.VersionId,
+            ResourceKind = StorageResourceKind.Blob,
+            CanonicalResourcePath = $"/{outerRequest.Account}/{resolved.Container}/{resolved.Blob}",
+            ServiceVersion = outerRequest.ServiceVersion,
+            Authorization = StorageAuthorization.Anonymous
+        };
+        StorageRequestContext.Set(inner, subrequestContext);
+
+        try
+        {
+            var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
+            subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken);
+            var blob = await service.GetBlobAsync(
+                subrequestContext.Account,
+                resolved.Container,
+                resolved.Blob,
+                resolved.VersionId,
+                resolved.Snapshot,
+                includeDeleted: false,
+                cancellationToken);
+
+            var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
+            switch (resolved.Request.Kind)
+            {
+                case BlobBatchOperationKind.Delete:
+                    Require(subrequestContext, 'd');
+                    EvaluateWriteConditions(inner.Request, blob);
+                    EnsureLease(inner.Request, blob.Lease, "blob");
+                    var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken);
+                    await service.DeleteBlobAsync(
+                        blob,
+                        ProtocolParsing.First(inner.Request.Headers, "x-ms-delete-snapshots"),
+                        cancellationToken);
+                    headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
+                    return new BlobBatchSubresponse(
+                        StatusCodes.Status202Accepted,
+                        headers,
+                        [],
+                        resolved.Request.ContentId);
+
+                case BlobBatchOperationKind.SetTier:
+                    Require(subrequestContext, 'w');
+                    EvaluateWriteConditions(inner.Request, blob);
+                    var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
+                               ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
+                    var tierUpdate = await service.SetTierAsync(
+                        blob,
+                        tier,
+                        ProtocolParsing.First(inner.Request.Headers, "x-ms-rehydrate-priority"),
+                        cancellationToken);
+                    return new BlobBatchSubresponse(
+                        tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
+                        headers,
+                        [],
+                        resolved.Request.ContentId);
+
+                default:
+                    throw new ArgumentOutOfRangeException();
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            var storageException = MapBatchException(exception);
+            if (storageException.ErrorCode == "InternalError")
+            {
+                outer.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger(typeof(BlobProtocolEndpoint))
+                    .LogError(exception, "Blob batch subrequest {RequestId} failed unexpectedly.", subrequestContext.RequestId);
+            }
+            var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
+            headers["x-ms-error-code"] = storageException.ErrorCode;
+            headers["Content-Type"] = "application/xml";
+            if (storageException.StatusCode == StatusCodes.Status401Unauthorized)
+                headers["WWW-Authenticate"] = "Bearer resource_id=\"https://storage.azure.com/\"";
+            var body = BuildBatchErrorBody(storageException, subrequestContext.RequestId);
+            return new BlobBatchSubresponse(
+                storageException.StatusCode,
+                headers,
+                body,
+                resolved.Request.ContentId);
+        }
+    }
+
+    private static Dictionary<string, string> CreateBatchCommonHeaders(
+        StorageRequestContext request,
+        HttpRequest httpRequest)
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["x-ms-request-id"] = request.RequestId,
+            ["x-ms-version"] = request.ServiceVersion,
+            ["Date"] = DateTimeOffset.UtcNow.ToString("R", CultureInfo.InvariantCulture)
+        };
+        var clientRequestId = ProtocolParsing.First(httpRequest.Headers, "x-ms-client-request-id");
+        if (clientRequestId is { Length: <= 1024 })
+            headers["x-ms-client-request-id"] = clientRequestId;
+        return headers;
+    }
+
+    private static AzureStorageException MapBatchException(Exception exception) => exception switch
+    {
+        AzureStorageException storage => storage,
+        StorageConcurrencyException => AzureStorageException.ConditionNotMet(),
+        StorageImmutabilityException immutable => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            immutable.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
+            immutable.Message),
+        StoragePendingCopyException pending => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "PendingCopyOperation",
+            pending.Message),
+        _ => new AzureStorageException(
+            StatusCodes.Status500InternalServerError,
+            "InternalError",
+            "The server encountered an internal error. Please retry the request.")
+    };
+
+    private static byte[] BuildBatchErrorBody(AzureStorageException exception, string requestId)
+    {
+        var builder = new StringBuilder();
+        using (var writer = XmlWriter.Create(builder, new XmlWriterSettings
+        {
+            OmitXmlDeclaration = true,
+            Encoding = Encoding.UTF8,
+            Indent = false
+        }))
+        {
+            writer.WriteStartElement("Error");
+            writer.WriteElementString("Code", exception.ErrorCode);
+            writer.WriteStartElement("Message");
+            writer.WriteString(exception.Message);
+            writer.WriteString("\nRequestId:");
+            writer.WriteString(requestId);
+            writer.WriteString("\nTime:");
+            writer.WriteString(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
+            writer.WriteEndElement();
+            if (exception.HeaderName is not null)
+                writer.WriteElementString("HeaderName", exception.HeaderName);
+            if (exception.HeaderValue is not null)
+                writer.WriteElementString("HeaderValue", exception.HeaderValue);
+            writer.WriteEndElement();
+        }
+        return Encoding.UTF8.GetBytes(builder.ToString());
+    }
+
+    private static AzureStorageException InvalidBatchSubrequest(string message) => new(
+        StatusCodes.Status400BadRequest,
+        "InvalidInput",
+        message);
+
+    private sealed record ResolvedBatchSubrequest(
+        BlobBatchSubrequest Request,
+        string Container,
+        string Blob,
+        string? Snapshot,
+        string? VersionId);
 
     private static async Task HandleBlobAsync(
         HttpContext http,
