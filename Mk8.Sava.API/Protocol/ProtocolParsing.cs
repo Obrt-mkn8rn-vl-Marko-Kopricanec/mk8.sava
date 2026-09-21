@@ -14,6 +14,9 @@ internal sealed record UserDelegationKeyRequest(
 
 internal static class ProtocolParsing
 {
+    private const long MaximumBlockListXmlCharacters = 8L * 1024 * 1024;
+    public const long MaximumBlockListBodyBytes = MaximumBlockListXmlCharacters * sizeof(uint) + 4;
+
     public static Dictionary<string, string> ReadMetadata(IHeaderDictionary headers)
     {
         var metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -95,23 +98,67 @@ internal static class ProtocolParsing
 
     public static async Task<IReadOnlyList<BlockListEntry>> ReadBlockListAsync(Stream body, CancellationToken cancellationToken)
     {
-        using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
-        var blocks = new List<BlockListEntry>();
-        if (document.Root?.Name.LocalName != "BlockList")
+        using var reader = CreateXmlReader(body, MaximumBlockListXmlCharacters);
+        if (await reader.MoveToContentAsync() != XmlNodeType.Element || reader.LocalName != "BlockList")
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
-        foreach (var element in document.Root.Elements())
+
+        var blocks = new List<BlockListEntry>();
+        var rootDepth = reader.Depth;
+        if (reader.IsEmptyElement)
         {
-            var mode = element.Name.LocalName switch
+            await reader.ReadAsync();
+            await EnsureEndOfXmlDocumentAsync(reader, cancellationToken);
+            return blocks;
+        }
+
+        await reader.ReadAsync();
+        while (!reader.EOF)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (reader.NodeType is XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace)
+            {
+                await reader.ReadAsync();
+                continue;
+            }
+            if (reader.NodeType == XmlNodeType.EndElement &&
+                reader.Depth == rootDepth &&
+                reader.LocalName == "BlockList")
+            {
+                await reader.ReadAsync();
+                await EnsureEndOfXmlDocumentAsync(reader, cancellationToken);
+                return blocks;
+            }
+            if (reader.NodeType != XmlNodeType.Element || reader.Depth != rootDepth + 1)
+                throw InvalidBlockListXml();
+
+            var mode = reader.LocalName switch
             {
                 "Latest" => BlockListMode.Latest,
                 "Committed" => BlockListMode.Committed,
                 "Uncommitted" => BlockListMode.Uncommitted,
-                _ => throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The block list contains an invalid element.")
+                _ => throw InvalidBlockListXml()
             };
-            blocks.Add(new BlockListEntry(element.Value, mode));
+            if (blocks.Count == BlobServiceLimits.MaximumCommittedBlockCount)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "BlockCountExceedsLimit",
+                    "The block list may not contain more than 50,000 blocks.");
+            }
+
+            string blockId;
+            try
+            {
+                blockId = await reader.ReadElementContentAsStringAsync();
+            }
+            catch (InvalidOperationException)
+            {
+                throw InvalidBlockListXml();
+            }
+            blocks.Add(new BlockListEntry(blockId, mode));
         }
-        return blocks;
+
+        throw InvalidBlockListXml();
     }
 
     public static async Task<Dictionary<string, StoredAccessPolicy>> ReadAclAsync(Stream body, CancellationToken cancellationToken)
@@ -257,15 +304,33 @@ internal static class ProtocolParsing
     public static string? First(IHeaderDictionary headers, string name) =>
         headers.TryGetValue(name, out var values) && values.Count > 0 ? values[0] : null;
 
-    public static XmlReader CreateXmlReader(Stream stream) => XmlReader.Create(stream, new XmlReaderSettings
+    public static XmlReader CreateXmlReader(Stream stream) => CreateXmlReader(stream, 4L * 1024 * 1024);
+
+    private static XmlReader CreateXmlReader(Stream stream, long maximumCharacters) => XmlReader.Create(stream, new XmlReaderSettings
     {
         Async = true,
         DtdProcessing = DtdProcessing.Prohibit,
         XmlResolver = null,
-        MaxCharactersInDocument = 4 * 1024 * 1024,
+        MaxCharactersInDocument = maximumCharacters,
         IgnoreComments = true,
         IgnoreProcessingInstructions = true
     });
+
+    private static async Task EnsureEndOfXmlDocumentAsync(XmlReader reader, CancellationToken cancellationToken)
+    {
+        while (!reader.EOF)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (reader.NodeType is not (XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace or XmlNodeType.None))
+                throw InvalidBlockListXml();
+            await reader.ReadAsync();
+        }
+    }
+
+    private static AzureStorageException InvalidBlockListXml() => new(
+        StatusCodes.Status400BadRequest,
+        "InvalidXmlDocument",
+        "The specified XML is not syntactically valid.");
 
     private static void ValidateTag(string key, string value)
     {

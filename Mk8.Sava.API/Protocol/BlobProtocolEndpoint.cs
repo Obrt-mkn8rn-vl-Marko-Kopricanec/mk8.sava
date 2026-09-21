@@ -705,7 +705,8 @@ public static class BlobProtocolEndpoint
             await WithIntegrityValidationAsync(
                 http.Request,
                 async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken),
-                allowStructured: false);
+                allowStructured: false,
+                maximumBodyBytes: ProtocolParsing.MaximumBlockListBodyBytes);
             var options = ReadWriteOptions(http.Request, current, useStandardContentType: false);
             var committed = await service.CommitBlockListAsync(
                 request.Account,

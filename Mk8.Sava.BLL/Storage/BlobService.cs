@@ -478,7 +478,8 @@ public sealed class BlobService(
         if (current is not null && !chunks.IsInDomain(account, encryption, current.Content))
             throw CustomerProvidedKeyMismatch();
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
-        if (staged.Count >= 100_000 && staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
+        if (staged.Count >= BlobServiceLimits.MaximumUncommittedBlockCount &&
+            staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The uncommitted block count exceeds the maximum permitted value.");
         var existingId = staged.Select(item => item.BlockId).FirstOrDefault()
                          ?? current?.CommittedBlocks.FirstOrDefault()?.Id;
@@ -508,8 +509,8 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        if (blockList.Count > 50_000)
-            throw new AzureStorageException(StatusCodes.Status400BadRequest, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
+        if (blockList.Count > BlobServiceLimits.MaximumCommittedBlockCount)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
         var encryption = EncryptionOf(options);
@@ -575,7 +576,7 @@ public sealed class BlobService(
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.IsSealed)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobIsSealed", "The specified append blob is sealed.");
-        if (current.AppendBlockCount >= 50_000)
+        if (current.AppendBlockCount >= BlobServiceLimits.MaximumCommittedBlockCount)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The append block count exceeds the maximum permitted value.");
         if (expectedPosition.HasValue && expectedPosition.Value != current.Content.Length)
             throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, "AppendPositionConditionNotMet", "The append position condition specified was not met.");
@@ -2153,7 +2154,7 @@ public sealed class BlobService(
         try
         {
             var length = Convert.FromBase64String(blockId).Length;
-            if (length is 0 or > 64)
+            if (length is 0 or > BlobServiceLimits.MaximumBlockIdBytes)
                 throw new FormatException();
             return length;
         }
