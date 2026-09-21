@@ -855,10 +855,130 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         }
     }
 
-    public async Task<IReadOnlySet<string>> GetReachableChunkIdsAsync(CancellationToken cancellationToken)
+    internal async Task<ChunkIdPage> ListReachableChunkIdsAsync(
+        string? after,
+        int maximum,
+        bool excludeCustomerProvidedKeyDomains,
+        CancellationToken cancellationToken)
     {
-        var inventory = await GetStorageInventoryAsync(cancellationToken);
-        return inventory.ReachableChunkIds;
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT chunk_id
+            FROM (
+                SELECT chunk_id FROM blob_chunk_references
+                UNION
+                SELECT chunk_id FROM staged_block_chunk_references
+            )
+            WHERE chunk_id > $after
+              AND chunk_id NOT LIKE '%/$zero'
+              {(excludeCustomerProvidedKeyDomains ? "AND instr(chunk_id, '/$cpk-') = 0" : string.Empty)}
+            ORDER BY chunk_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$after", after ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var ids = new List<string>(maximum + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            ids.Add(reader.GetString(0));
+        var hasMore = ids.Count > maximum;
+        if (hasMore)
+            ids.RemoveAt(ids.Count - 1);
+        return new ChunkIdPage(ids, hasMore);
+    }
+
+    internal async Task<IReadOnlySet<string>> FindReachableChunkIdsAsync(
+        IReadOnlyList<string> candidates,
+        CancellationToken cancellationToken)
+    {
+        var reachable = new HashSet<string>(StringComparer.Ordinal);
+        if (candidates.Count == 0)
+            return reachable;
+
+        const int maximumParametersPerQuery = 512;
+        var uniqueCandidates = candidates.Distinct(StringComparer.Ordinal).ToArray();
+        await using var connection = await OpenAsync(cancellationToken);
+        for (var offset = 0; offset < uniqueCandidates.Length; offset += maximumParametersPerQuery)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var count = Math.Min(maximumParametersPerQuery, uniqueCandidates.Length - offset);
+            await using var command = connection.CreateCommand();
+            var parameterNames = new string[count];
+            for (var index = 0; index < count; index++)
+            {
+                parameterNames[index] = $"$chunk{index}";
+                command.Parameters.AddWithValue(parameterNames[index], uniqueCandidates[offset + index]);
+            }
+            var values = string.Join(',', parameterNames);
+            command.CommandText = $"""
+                SELECT chunk_id FROM blob_chunk_references WHERE chunk_id IN ({values})
+                UNION
+                SELECT chunk_id FROM staged_block_chunk_references WHERE chunk_id IN ({values});
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                reachable.Add(reader.GetString(0));
+        }
+        return reachable;
+    }
+
+    public async Task<StorageInventorySummary> GetStorageInventorySummaryAsync(
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        long logicalBlobBytes;
+        int blobRecordCount;
+        await using (var blobs = connection.CreateCommand())
+        {
+            blobs.CommandText = """
+                SELECT COALESCE(SUM(logical_length + pending_copy_length), 0), COUNT(*)
+                FROM blobs;
+                """;
+            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new InvalidDataException("The blob inventory query returned no aggregate row.");
+            logicalBlobBytes = reader.GetInt64(0);
+            blobRecordCount = checked((int)reader.GetInt64(1));
+        }
+
+        long logicalStagedBlockBytes;
+        int stagedBlockCount;
+        await using (var blocks = connection.CreateCommand())
+        {
+            blocks.CommandText = "SELECT COALESCE(SUM(logical_length), 0), COUNT(*) FROM staged_blocks;";
+            await using var reader = await blocks.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new InvalidDataException("The staged-block inventory query returned no aggregate row.");
+            logicalStagedBlockBytes = reader.GetInt64(0);
+            stagedBlockCount = checked((int)reader.GetInt64(1));
+        }
+
+        int reachableChunkCount;
+        await using (var chunks = connection.CreateCommand())
+        {
+            chunks.CommandText = """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT chunk_id FROM blob_chunk_references
+                    UNION
+                    SELECT chunk_id FROM staged_block_chunk_references
+                )
+                WHERE chunk_id NOT LIKE '%/$zero';
+                """;
+            reachableChunkCount = checked(Convert.ToInt32(
+                await chunks.ExecuteScalarAsync(cancellationToken),
+                CultureInfo.InvariantCulture));
+        }
+
+        return new StorageInventorySummary(
+            logicalBlobBytes,
+            logicalStagedBlockBytes,
+            blobRecordCount,
+            stagedBlockCount,
+            reachableChunkCount);
     }
 
     public async Task<StorageMetadataInventory> GetStorageInventoryAsync(CancellationToken cancellationToken)

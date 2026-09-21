@@ -1376,6 +1376,67 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ChunkMaintenanceUsesIndependentBoundedKeysetPasses()
+    {
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:GarbageCollectionChunksPerMaintenancePass"] = "1",
+            ["Sava:IntegrityScanChunksPerMaintenancePass"] = "1",
+            ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "1"
+        });
+        try
+        {
+            await application.InitializeAsync();
+            var blobService = application.Services.GetRequiredService<BlobService>();
+            var telemetry = application.Services.GetRequiredService<StorageTelemetry>();
+
+            // Synchronize with the hosted service's initial empty pass before creating content.
+            await blobService.RunMaintenanceAsync(CancellationToken.None);
+
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"bounded-maintenance-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blobs = Enumerable.Range(0, 3)
+                .Select(index => container.GetBlobClient($"chunk-{index}.bin"))
+                .ToArray();
+            var payloads = Enumerable.Range(0, blobs.Length)
+                .Select(_ => RandomNumberGenerator.GetBytes(2048))
+                .ToArray();
+            for (var index = 0; index < blobs.Length; index++)
+                await blobs[index].UploadAsync(BinaryData.FromBytes(payloads[index]));
+
+            Assert.Equal(3, EnumerateChunkFiles(application.DataPath).Count());
+            for (var expectedChecked = 1; expectedChecked <= 3; expectedChecked++)
+            {
+                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
+                var integrity = telemetry.Integrity;
+                Assert.Equal(3, integrity.ReachableChunks);
+                Assert.Equal(expectedChecked, integrity.CheckedChunks);
+                Assert.Equal(expectedChecked, integrity.VerifiedChunks);
+                Assert.Equal(expectedChecked == 3, integrity.Complete);
+                Assert.InRange(result.RecompressedChunks, 0, 1);
+            }
+
+            for (var index = 0; index < blobs.Length; index++)
+                Assert.Equal(payloads[index], (await blobs[index].DownloadContentAsync()).Value.Content.ToArray());
+            foreach (var blob in blobs)
+                await blob.DeleteAsync();
+
+            for (var expectedRemaining = 2; expectedRemaining >= 0; expectedRemaining--)
+            {
+                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
+                Assert.Equal(1, result.ReclaimedChunks);
+                Assert.Equal(expectedRemaining, EnumerateChunkFiles(application.DataPath).Count());
+            }
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task ConsistentBackupRestoresExactSharedSnapshotAndUncommittedContent()
     {
         var source = new SavaWebApplicationFactory();

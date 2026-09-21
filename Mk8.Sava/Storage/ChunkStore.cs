@@ -363,9 +363,78 @@ public sealed class ChunkStore
         return path;
     }
 
-    public IEnumerable<string> EnumerateChunkIds() =>
-        Directory.EnumerateFiles(_paths.Chunks, "*.chunk", SearchOption.AllDirectories)
-            .Select(path => Path.GetRelativePath(_paths.Chunks, path)[..^".chunk".Length].Replace(Path.DirectorySeparatorChar, '/'));
+    internal PhysicalChunkPage EnumerateChunkIdsPage(string? after, int maximum)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        var items = EnumerateChunkIdsOrdered(_paths.Chunks, relativeDirectory: string.Empty, after)
+            .Take(checked(maximum + 1))
+            .ToList();
+        var hasMore = items.Count > maximum;
+        if (hasMore)
+            items.RemoveAt(items.Count - 1);
+        return new PhysicalChunkPage(items, hasMore);
+    }
+
+    private static IEnumerable<string> EnumerateChunkIdsOrdered(
+        string root,
+        string relativeDirectory,
+        string? after)
+    {
+        var directory = relativeDirectory.Length == 0
+            ? root
+            : Path.Combine(root, relativeDirectory.Replace('/', Path.DirectorySeparatorChar));
+        string[] entries;
+        try
+        {
+            entries = Directory.EnumerateFileSystemEntries(directory)
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+        }
+        catch (DirectoryNotFoundException)
+        {
+            yield break;
+        }
+
+        foreach (var path in entries)
+        {
+            FileAttributes attributes;
+            try
+            {
+                attributes = File.GetAttributes(path);
+            }
+            catch (FileNotFoundException)
+            {
+                continue;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                continue;
+            }
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+                continue;
+
+            var name = Path.GetFileName(path);
+            var relative = relativeDirectory.Length == 0 ? name : relativeDirectory + "/" + name;
+            if ((attributes & FileAttributes.Directory) != 0)
+            {
+                var prefix = relative + "/";
+                if (after is null ||
+                    after.StartsWith(prefix, StringComparison.Ordinal) ||
+                    string.CompareOrdinal(prefix, after) > 0)
+                {
+                    foreach (var nestedId in EnumerateChunkIdsOrdered(root, relative, after))
+                        yield return nestedId;
+                }
+                continue;
+            }
+            if (!name.EndsWith(".chunk", StringComparison.Ordinal))
+                continue;
+            var id = relative[..^".chunk".Length];
+            if (after is null || string.CompareOrdinal(id, after) > 0)
+                yield return id;
+        }
+    }
 
     public StoragePhysicalUsage MeasurePhysicalUsage()
     {

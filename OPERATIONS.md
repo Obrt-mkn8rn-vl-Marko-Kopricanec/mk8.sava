@@ -30,6 +30,14 @@ Crash-abandoned `.tmp` files are removed after
 `Sava:MaximumStagingFilesPerMaintenancePass` deletions per pass. A file still
 held by an active request cannot be reclaimed.
 
+Unreachable immutable chunks are considered in filesystem key order, up to
+`Sava:GarbageCollectionChunksPerMaintenancePass` per pass. Reachability is
+checked through the transactional metadata index both before and after an
+exclusive chunk reservation, so reclamation remains bounded without racing a
+concurrent publication. A complete sweep resumes from the beginning; chunks
+created behind an active cursor are therefore considered during the next
+sweep.
+
 Reachable chunks older than `Sava:BackgroundCompressionMinimumAge` are revisited
 in cursor order, up to `Sava:BackgroundCompressionChunksPerMaintenancePass`.
 The service authenticates and reconstructs the plaintext, writes a candidate at
