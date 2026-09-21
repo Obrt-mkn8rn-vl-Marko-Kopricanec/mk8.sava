@@ -691,6 +691,126 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UncommittedBlobsAreListedPagedAndDiscardedByReplacementOrDeletion()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"uncommitted-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var prefix = $"pending-{Guid.NewGuid():N}/";
+        var blockId = Convert.ToBase64String("uncommitted-0001"u8);
+        var pendingNames = new[]
+        {
+            prefix + "a.bin",
+            prefix + "b.bin",
+            prefix + "delete.bin",
+            prefix + "folder/child.bin",
+            prefix + "replace.bin"
+        };
+        foreach (var name in pendingNames)
+        {
+            await container.GetBlockBlobClient(name).StageBlockAsync(
+                blockId,
+                new MemoryStream(Encoding.UTF8.GetBytes(name)));
+        }
+
+        var committed = container.GetBlockBlobClient(prefix + "committed.bin");
+        await committed.UploadAsync(new MemoryStream("committed"u8.ToArray()));
+        await committed.StageBlockAsync(
+            Convert.ToBase64String("uncommitted-0002"u8),
+            new MemoryStream("future block"u8.ToArray()));
+
+        var ordinary = new List<string>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { Prefix = prefix }))
+            ordinary.Add(item.Name);
+        Assert.Equal([committed.Name], ordinary);
+
+        var listed = new List<BlobItem>();
+        var markers = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var page in container
+                           .GetBlobsAsync(new GetBlobsOptions
+                           {
+                               Prefix = prefix,
+                               States = BlobStates.Uncommitted
+                           })
+                           .AsPages(pageSizeHint: 1))
+        {
+            listed.Add(Assert.Single(page.Values));
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                Assert.True(markers.Add(page.ContinuationToken));
+        }
+        Assert.Equal(pendingNames.Append(committed.Name).Order(StringComparer.Ordinal), listed.Select(item => item.Name));
+        Assert.Equal(listed.Count - 1, markers.Count);
+        foreach (var pending in listed.Where(item => item.Name != committed.Name))
+        {
+            Assert.Equal(BlobType.Block, pending.Properties.BlobType);
+            Assert.Equal(0, pending.Properties.ContentLength);
+            Assert.Null(pending.Properties.ContentType);
+        }
+        Assert.Equal("committed"u8.Length, listed.Single(item => item.Name == committed.Name).Properties.ContentLength);
+
+        var hierarchical = new List<string>();
+        await foreach (var item in container.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+        {
+            Delimiter = "/",
+            Prefix = prefix,
+            States = BlobStates.Uncommitted
+        }))
+        {
+            hierarchical.Add(item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}");
+        }
+        Assert.Contains($"P:{prefix}folder/", hierarchical);
+        Assert.DoesNotContain($"B:{prefix}folder/child.bin", hierarchical);
+
+        var arrowNames = new List<string>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Prefix = prefix,
+            States = BlobStates.Uncommitted,
+            ResponseFormat = StorageResponseFormat.Arrow
+        }))
+        {
+            arrowNames.Add(item.Name);
+        }
+        Assert.Equal(listed.Select(item => item.Name), arrowNames);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        var rawUri = AppendQuery(
+            container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
+            $"restype=container&comp=list&include=uncommittedblobs&prefix={Uri.EscapeDataString(prefix)}");
+        using (var rawRequest = new HttpRequestMessage(HttpMethod.Get, rawUri))
+        {
+            rawRequest.Headers.Add("x-ms-version", "2026-06-06");
+            using var rawResponse = await transport.SendAsync(rawRequest);
+            Assert.Equal(HttpStatusCode.OK, rawResponse.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(await rawResponse.Content.ReadAsStringAsync());
+            var pending = document.Descendants("Blob")
+                .Single(element => element.Element("Name")?.Value == pendingNames[0]);
+            var properties = Assert.IsType<System.Xml.Linq.XElement>(pending.Element("Properties"));
+            Assert.Equal("0", properties.Element("Content-Length")?.Value);
+            Assert.Equal("BlockBlob", properties.Element("BlobType")?.Value);
+            Assert.Null(properties.Element("Last-Modified"));
+            Assert.Null(properties.Element("Etag"));
+            Assert.Null(properties.Element("Content-Type"));
+            Assert.Null(pending.Element("Metadata"));
+        }
+
+        var replacement = container.GetBlockBlobClient(prefix + "replace.bin");
+        await replacement.UploadAsync(new MemoryStream("replacement"u8.ToArray()));
+        Assert.Empty((await replacement.GetBlockListAsync(BlockListTypes.Uncommitted)).Value.UncommittedBlocks);
+
+        var deleted = container.GetBlockBlobClient(prefix + "delete.bin");
+        Assert.Equal(202, (await deleted.DeleteAsync()).Status);
+        var deletedError = await Assert.ThrowsAsync<RequestFailedException>(
+            () => deleted.GetBlockListAsync(BlockListTypes.Uncommitted));
+        Assert.Equal((int)HttpStatusCode.NotFound, deletedError.Status);
+
+        await committed.DeleteAsync();
+        var committedError = await Assert.ThrowsAsync<RequestFailedException>(
+            () => committed.GetBlockListAsync(BlockListTypes.Uncommitted));
+        Assert.Equal((int)HttpStatusCode.NotFound, committedError.Status);
+    }
+
+    [Fact]
     public async Task BlobFamilyMutationsAreIndexedAndAtomic()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
