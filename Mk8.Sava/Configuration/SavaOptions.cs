@@ -21,6 +21,10 @@ public sealed class SavaOptions : IValidatableObject
     public int MaximumChunkBytes { get; init; } = 1024 * 1024;
     public int CompressionQuality { get; init; } = 5;
     public int CompressionMinimumSavingsBytes { get; init; } = 64;
+    public int BackgroundCompressionQuality { get; init; } = 11;
+    public int BackgroundCompressionMinimumSavingsBytes { get; init; } = 128;
+    public TimeSpan BackgroundCompressionMinimumAge { get; init; } = TimeSpan.FromHours(1);
+    public int BackgroundCompressionChunksPerMaintenancePass { get; init; } = 8;
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 4L * 1024 * 1024 * 1024;
@@ -76,6 +80,35 @@ public sealed class SavaOptions : IValidatableObject
 
         if (CompressionMinimumSavingsBytes < 0)
             yield return new ValidationResult("CompressionMinimumSavingsBytes cannot be negative.", [nameof(CompressionMinimumSavingsBytes)]);
+
+        if (BackgroundCompressionQuality is < 0 or > 11 ||
+            BackgroundCompressionQuality < CompressionQuality)
+        {
+            yield return new ValidationResult(
+                "BackgroundCompressionQuality must be between CompressionQuality and 11.",
+                [nameof(BackgroundCompressionQuality)]);
+        }
+
+        if (BackgroundCompressionMinimumSavingsBytes < 0)
+        {
+            yield return new ValidationResult(
+                "BackgroundCompressionMinimumSavingsBytes cannot be negative.",
+                [nameof(BackgroundCompressionMinimumSavingsBytes)]);
+        }
+
+        if (BackgroundCompressionMinimumAge < TimeSpan.Zero)
+        {
+            yield return new ValidationResult(
+                "BackgroundCompressionMinimumAge cannot be negative.",
+                [nameof(BackgroundCompressionMinimumAge)]);
+        }
+
+        if (BackgroundCompressionChunksPerMaintenancePass <= 0)
+        {
+            yield return new ValidationResult(
+                "BackgroundCompressionChunksPerMaintenancePass must be positive.",
+                [nameof(BackgroundCompressionChunksPerMaintenancePass)]);
+        }
 
         if (MaximumRequestBodyBytes <= 0)
             yield return new ValidationResult("MaximumRequestBodyBytes must be positive.", [nameof(MaximumRequestBodyBytes)]);

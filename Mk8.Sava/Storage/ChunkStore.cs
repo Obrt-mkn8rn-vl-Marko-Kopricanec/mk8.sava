@@ -28,7 +28,7 @@ public sealed class ChunkStore
     private readonly ContentDefinedChunker _chunker;
     private readonly object _pinGate = new();
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, ChunkReclamationReservation> _reclamationReservations = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
 
     public ChunkStore(StoragePaths paths, IOptions<SavaOptions> options)
     {
@@ -501,20 +501,115 @@ public sealed class ChunkStore
         }
     }
 
-    internal ChunkReclamationReservation? TryReserveForReclamation(string id)
+    public async Task<ChunkRecompressionResult> TryRecompressChunkAsync(
+        string id,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (id.EndsWith("/$zero", StringComparison.Ordinal))
+            return ChunkRecompressionResult.Skipped;
+
+        var domain = GetDomainFromChunkId(id);
+        if (domain.Contains("/$cpk-", StringComparison.Ordinal))
+            return ChunkRecompressionResult.Skipped;
+
+        var path = GetChunkPath(id);
+        var eligibleBefore = now.Subtract(_options.BackgroundCompressionMinimumAge).UtcDateTime;
+        try
+        {
+            if (File.GetLastWriteTimeUtc(path) > eligibleBefore)
+                return ChunkRecompressionResult.Skipped;
+        }
+        catch (FileNotFoundException)
+        {
+            return ChunkRecompressionResult.Skipped;
+        }
+
+        using var reservation = TryReserveForMutation(id);
+        if (reservation is null)
+            return ChunkRecompressionResult.Skipped;
+
+        try
+        {
+            if (File.GetLastWriteTimeUtc(path) > eligibleBefore)
+                return ChunkRecompressionResult.Skipped;
+        }
+        catch (FileNotFoundException)
+        {
+            return ChunkRecompressionResult.Skipped;
+        }
+
+        byte[] plaintext;
+        try
+        {
+            plaintext = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken);
+        }
+        catch (Exception exception) when (exception is InvalidDataException or FileNotFoundException or UnauthorizedAccessException)
+        {
+            return ChunkRecompressionResult.Examined;
+        }
+
+        var temporaryPath = Path.Combine(_paths.Staging, $"recompress-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            var originalLength = new FileInfo(path).Length;
+            await WriteChunkFileAsync(
+                temporaryPath,
+                domain,
+                plaintext,
+                customerProvidedKey: null,
+                _options.BackgroundCompressionQuality,
+                _options.CompressionMinimumSavingsBytes,
+                cancellationToken);
+            var verified = await ReadVerifiedChunkFileAsync(
+                temporaryPath,
+                id,
+                domain,
+                customerProvidedKey: null,
+                cancellationToken);
+            try
+            {
+                if (!CryptographicOperations.FixedTimeEquals(verified, plaintext))
+                    throw new InvalidDataException($"Recompressed chunk '{id}' changed its plaintext content.");
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(verified);
+            }
+
+            var optimizedLength = new FileInfo(temporaryPath).Length;
+            var bytesSaved = originalLength - optimizedLength;
+            if (bytesSaved <= 0 || bytesSaved < _options.BackgroundCompressionMinimumSavingsBytes)
+            {
+                File.SetLastWriteTimeUtc(path, now.UtcDateTime);
+                return ChunkRecompressionResult.Examined;
+            }
+
+            File.Move(temporaryPath, path, overwrite: true);
+            return new ChunkRecompressionResult(1, 1, bytesSaved);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(plaintext);
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+        }
+    }
+
+    internal ChunkMutationReservation? TryReserveForMutation(string id)
     {
         lock (_pinGate)
         {
             var path = GetChunkPath(id);
             if (_pins.ContainsKey(id) ||
-                _reclamationReservations.ContainsKey(id) ||
+                _mutationReservations.ContainsKey(id) ||
                 !File.Exists(path))
             {
                 return null;
             }
 
-            var reservation = new ChunkReclamationReservation(this, id);
-            _reclamationReservations.Add(id, reservation);
+            var reservation = new ChunkMutationReservation(this, id);
+            _mutationReservations.Add(id, reservation);
             return reservation;
         }
     }
@@ -684,12 +779,19 @@ public sealed class ChunkStore
                 var temporaryPath = Path.Combine(_paths.Staging, $"chunk-{Guid.NewGuid():N}.tmp");
                 try
                 {
-                    await WriteChunkFileAsync(temporaryPath, domain, bytes, customerProvidedKey, cancellationToken);
+                    await WriteChunkFileAsync(
+                        temporaryPath,
+                        domain,
+                        bytes,
+                        customerProvidedKey,
+                        _options.CompressionQuality,
+                        _options.CompressionMinimumSavingsBytes,
+                        cancellationToken);
                     Task? reservationCompletion = null;
                     var created = false;
                     lock (_pinGate)
                     {
-                        if (_reclamationReservations.TryGetValue(id, out var reservation))
+                        if (_mutationReservations.TryGetValue(id, out var reservation))
                         {
                             reservationCompletion = reservation.Completion;
                         }
@@ -720,6 +822,8 @@ public sealed class ChunkStore
         string domain,
         byte[] bytes,
         byte[]? customerProvidedKey,
+        int compressionQuality,
+        int compressionMinimumSavingsBytes,
         CancellationToken cancellationToken)
     {
         byte codec = 0;
@@ -728,12 +832,12 @@ public sealed class ChunkStore
         {
             await using (var brotli = new BrotliStream(compressed, new BrotliCompressionOptions
             {
-                Quality = _options.CompressionQuality
+                Quality = compressionQuality
             }, leaveOpen: true))
             {
                 await brotli.WriteAsync(bytes, cancellationToken);
             }
-            if (compressed.Length + _options.CompressionMinimumSavingsBytes < bytes.Length)
+            if (compressed.Length + compressionMinimumSavingsBytes < bytes.Length)
             {
                 codec = 1;
                 encoded = compressed.ToArray();
@@ -749,14 +853,20 @@ public sealed class ChunkStore
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
         RandomNumberGenerator.Fill(header.AsSpan(nonceOffset, NonceLength));
         var ciphertext = new byte[encoded.Length];
-        using (var aes = new AesGcm(DeriveEncryptionKey(domain, customerProvidedKey), TagLength))
+        var encryptionKey = DeriveEncryptionKey(domain, customerProvidedKey);
+        try
         {
+            using var aes = new AesGcm(encryptionKey, TagLength);
             aes.Encrypt(
                 header.AsSpan(nonceOffset, NonceLength),
                 encoded,
                 ciphertext,
                 header.AsSpan(AuthenticatedHeaderLength, TagLength),
                 header.AsSpan(0, AuthenticatedHeaderLength));
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(encryptionKey);
         }
 
         await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
@@ -770,11 +880,23 @@ public sealed class ChunkStore
         string id,
         string domain,
         byte[]? customerProvidedKey,
+        CancellationToken cancellationToken) =>
+        await ReadVerifiedChunkFileAsync(
+            GetChunkPath(id),
+            id,
+            domain,
+            customerProvidedKey,
+            cancellationToken);
+
+    private async Task<byte[]> ReadVerifiedChunkFileAsync(
+        string path,
+        string id,
+        string domain,
+        byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
         if (!id.StartsWith(domain + "/", StringComparison.Ordinal))
             throw new InvalidDataException("A chunk reference escaped its encryption domain.");
-        var path = GetChunkPath(id);
         await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         var header = new byte[HeaderLength];
         await input.ReadExactlyAsync(header, cancellationToken);
@@ -794,19 +916,27 @@ public sealed class ChunkStore
         await input.ReadExactlyAsync(ciphertext, cancellationToken);
         var encoded = new byte[ciphertextLength];
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
+        var encryptionKey = DeriveEncryptionKey(domain, customerProvidedKey);
         try
         {
-            using var aes = new AesGcm(DeriveEncryptionKey(domain, customerProvidedKey), TagLength);
-            aes.Decrypt(
-                header.AsSpan(nonceOffset, NonceLength),
-                ciphertext,
-                header.AsSpan(AuthenticatedHeaderLength, TagLength),
-                encoded,
-                header.AsSpan(0, AuthenticatedHeaderLength));
+            try
+            {
+                using var aes = new AesGcm(encryptionKey, TagLength);
+                aes.Decrypt(
+                    header.AsSpan(nonceOffset, NonceLength),
+                    ciphertext,
+                    header.AsSpan(AuthenticatedHeaderLength, TagLength),
+                    encoded,
+                    header.AsSpan(0, AuthenticatedHeaderLength));
+            }
+            catch (CryptographicException exception)
+            {
+                throw new InvalidDataException($"Chunk '{id}' failed authenticated decryption.", exception);
+            }
         }
-        catch (CryptographicException exception)
+        finally
         {
-            throw new InvalidDataException($"Chunk '{id}' failed authenticated decryption.", exception);
+            CryptographicOperations.ZeroMemory(encryptionKey);
         }
 
         byte[] decoded;
@@ -1000,7 +1130,7 @@ public sealed class ChunkStore
             {
                 foreach (var id in ids)
                 {
-                    if (_reclamationReservations.TryGetValue(id, out var reservation))
+                    if (_mutationReservations.TryGetValue(id, out var reservation))
                     {
                         reservationCompletion = reservation.Completion;
                         break;
@@ -1031,7 +1161,7 @@ public sealed class ChunkStore
             Task? reservationCompletion;
             lock (_pinGate)
             {
-                if (_reclamationReservations.TryGetValue(id, out var reservation))
+                if (_mutationReservations.TryGetValue(id, out var reservation))
                 {
                     reservationCompletion = reservation.Completion;
                 }
@@ -1075,12 +1205,12 @@ public sealed class ChunkStore
         }
     }
 
-    internal sealed class ChunkReclamationReservation : IDisposable
+    internal sealed class ChunkMutationReservation : IDisposable
     {
         private readonly ChunkStore _owner;
         private int _completed;
 
-        internal ChunkReclamationReservation(ChunkStore owner, string id)
+        internal ChunkMutationReservation(ChunkStore owner, string id)
         {
             _owner = owner;
             Id = id;
@@ -1099,11 +1229,11 @@ public sealed class ChunkStore
                 return false;
             try
             {
-                return _owner.CompleteReclamation(this, delete: true);
+                return _owner.CompleteMutation(this, delete: true);
             }
             catch
             {
-                _owner.CompleteReclamation(this, delete: false);
+                _owner.CompleteMutation(this, delete: false);
                 throw;
             }
         }
@@ -1111,22 +1241,22 @@ public sealed class ChunkStore
         public void Dispose()
         {
             if (Interlocked.CompareExchange(ref _completed, 1, 0) == 0)
-                _owner.CompleteReclamation(this, delete: false);
+                _owner.CompleteMutation(this, delete: false);
         }
     }
 
-    private bool CompleteReclamation(ChunkReclamationReservation reservation, bool delete)
+    private bool CompleteMutation(ChunkMutationReservation reservation, bool delete)
     {
         var deleted = false;
         lock (_pinGate)
         {
-            if (!_reclamationReservations.TryGetValue(reservation.Id, out var current) ||
+            if (!_mutationReservations.TryGetValue(reservation.Id, out var current) ||
                 !ReferenceEquals(current, reservation))
             {
                 return false;
             }
             if (delete && _pins.ContainsKey(reservation.Id))
-                throw new InvalidOperationException("A reserved chunk became pinned during reclamation.");
+                throw new InvalidOperationException("A reserved chunk became pinned during an exclusive mutation.");
             if (delete)
             {
                 var path = GetChunkPath(reservation.Id);
@@ -1136,7 +1266,7 @@ public sealed class ChunkStore
                     deleted = true;
                 }
             }
-            _reclamationReservations.Remove(reservation.Id);
+            _mutationReservations.Remove(reservation.Id);
         }
         reservation.CompletionSource.TrySetResult(true);
         return deleted;

@@ -19,6 +19,8 @@ public sealed class StorageTelemetry
     private long _expiredUncommittedBlocks;
     private long _reclaimedChunks;
     private long _reclaimedStagingFiles;
+    private long _recompressedChunks;
+    private long _recompressionBytesSaved;
     private long _lastMaintenanceCompletedUnixSeconds;
     private StorageUsageSnapshot _usage = StorageUsageSnapshot.Empty;
     private StorageIntegritySnapshot _integrity = StorageIntegritySnapshot.Pending;
@@ -46,6 +48,8 @@ public sealed class StorageTelemetry
         Interlocked.Add(ref _expiredUncommittedBlocks, result.ExpiredUncommittedBlocks);
         Interlocked.Add(ref _reclaimedChunks, result.ReclaimedChunks);
         Interlocked.Add(ref _reclaimedStagingFiles, result.ReclaimedStagingFiles);
+        Interlocked.Add(ref _recompressedChunks, result.RecompressedChunks);
+        Interlocked.Add(ref _recompressionBytesSaved, result.RecompressionBytesSaved);
         Interlocked.Exchange(ref _lastMaintenanceCompletedUnixSeconds, DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         Volatile.Write(ref _usage, usage);
     }
@@ -89,6 +93,8 @@ public sealed class StorageTelemetry
         AppendMetric(builder, "mk8_sava_maintenance_expired_uncommitted_blocks_total", "Expired uncommitted blocks removed.", Interlocked.Read(ref _expiredUncommittedBlocks));
         AppendMetric(builder, "mk8_sava_maintenance_reclaimed_chunks_total", "Unreachable chunk files reclaimed.", Interlocked.Read(ref _reclaimedChunks));
         AppendMetric(builder, "mk8_sava_maintenance_reclaimed_staging_files_total", "Crash-abandoned staging files reclaimed.", Interlocked.Read(ref _reclaimedStagingFiles));
+        AppendMetric(builder, "mk8_sava_maintenance_recompressed_chunks_total", "Reachable chunks atomically replaced by a smaller verified representation.", Interlocked.Read(ref _recompressedChunks));
+        AppendMetric(builder, "mk8_sava_maintenance_recompression_bytes_saved_total", "Serialized chunk-file bytes removed by verified background recompression.", Interlocked.Read(ref _recompressionBytesSaved));
         AppendMetric(builder, "mk8_sava_maintenance_last_completed_timestamp_seconds", "Unix timestamp of the last completed maintenance pass.", Interlocked.Read(ref _lastMaintenanceCompletedUnixSeconds), gauge: true);
         return builder.ToString();
     }

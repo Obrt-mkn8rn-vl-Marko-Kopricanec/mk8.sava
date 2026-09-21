@@ -9,6 +9,7 @@ namespace Mk8.Sava.Tests;
 public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, IAsyncLifetime
 {
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
+    private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
 
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
@@ -18,28 +19,39 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public SavaWebApplicationFactory()
-        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null)
+        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath)
-        : this(dataPath, null)
+        : this(dataPath, null, null)
     {
     }
 
     internal SavaWebApplicationFactory(Func<HttpMessageHandler> urlTransferHandlerFactory)
         : this(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
-            urlTransferHandlerFactory)
+            urlTransferHandlerFactory,
+            null)
+    {
+    }
+
+    internal SavaWebApplicationFactory(IReadOnlyDictionary<string, string?> configurationOverrides)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            null,
+            configurationOverrides)
     {
     }
 
     private SavaWebApplicationFactory(
         string dataPath,
-        Func<HttpMessageHandler>? urlTransferHandlerFactory)
+        Func<HttpMessageHandler>? urlTransferHandlerFactory,
+        IReadOnlyDictionary<string, string?>? configurationOverrides)
     {
         DataPath = dataPath;
         _urlTransferHandlerFactory = urlTransferHandlerFactory;
+        _configurationOverrides = configurationOverrides;
     }
 
     public string DataPath { get; }
@@ -68,6 +80,10 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:MaximumChunkBytes"] = "16384",
                 ["Sava:CompressionQuality"] = "5",
                 ["Sava:CompressionMinimumSavingsBytes"] = "32",
+                ["Sava:BackgroundCompressionQuality"] = "11",
+                ["Sava:BackgroundCompressionMinimumSavingsBytes"] = "32",
+                ["Sava:BackgroundCompressionMinimumAge"] = "01:00:00",
+                ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "8",
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
                 ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
@@ -76,6 +92,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:MaximumStagingFilesPerMaintenancePass"] = "1000",
                 ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
             });
+            if (_configurationOverrides is not null)
+                configuration.AddInMemoryCollection(_configurationOverrides);
         });
         if (_urlTransferHandlerFactory is not null)
         {

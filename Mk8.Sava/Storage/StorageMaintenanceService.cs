@@ -20,13 +20,15 @@ public sealed class StorageMaintenanceService(
                 var result = await blobs.RunMaintenanceAsync(stoppingToken);
                 if (result is not { CompletedCopies: 0, CompletedRehydrations: 0, ExpiredBlobs: 0,
                         PurgedSoftDeletedBlobs: 0, PurgedSoftDeletedContainers: 0,
-                        ExpiredUncommittedBlocks: 0, ReclaimedChunks: 0, ReclaimedStagingFiles: 0 })
+                        ExpiredUncommittedBlocks: 0, ReclaimedChunks: 0, ReclaimedStagingFiles: 0,
+                        RecompressedChunks: 0 })
                 {
                     logger.LogInformation(
                         "Storage maintenance completed: {CompletedCopies} copies, {CompletedRehydrations} rehydrations, " +
                         "{ExpiredBlobs} expired blobs, {PurgedBlobs} purged blobs, {PurgedContainers} purged containers, " +
                         "{ExpiredBlocks} expired blocks, {ReclaimedChunks} reclaimed chunks, and " +
-                        "{ReclaimedStagingFiles} reclaimed staging files.",
+                        "{ReclaimedStagingFiles} reclaimed staging files; {RecompressedChunks} chunks recompressed, " +
+                        "saving {RecompressionBytesSaved} bytes.",
                         result.CompletedCopies,
                         result.CompletedRehydrations,
                         result.ExpiredBlobs,
@@ -34,7 +36,9 @@ public sealed class StorageMaintenanceService(
                         result.PurgedSoftDeletedContainers,
                         result.ExpiredUncommittedBlocks,
                         result.ReclaimedChunks,
-                        result.ReclaimedStagingFiles);
+                        result.ReclaimedStagingFiles,
+                        result.RecompressedChunks,
+                        result.RecompressionBytesSaved);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
