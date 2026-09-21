@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using Microsoft.Extensions.Options;
@@ -12,6 +13,16 @@ internal sealed record UrlSource(
     BlobHttpProperties Http,
     string? ETag);
 
+internal sealed class SourceCustomerProvidedKey(
+    string encodedKey,
+    string encodedHash,
+    string algorithm)
+{
+    public string EncodedKey { get; } = encodedKey;
+    public string EncodedHash { get; } = encodedHash;
+    public string Algorithm { get; } = algorithm;
+}
+
 internal sealed class UrlTransferClient(
     HttpClient client,
     StoragePaths paths,
@@ -23,51 +34,67 @@ internal sealed class UrlTransferClient(
         HttpRequest destinationRequest,
         string sourceValue,
         string? sourceRange,
+        bool allowSourceCustomerProvidedKey,
         Func<UrlSource, Task<TResult>> consume,
         CancellationToken cancellationToken)
     {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
             sourceUri.Scheme is not ("http" or "https"))
         {
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
 
         using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         AddSourceAuthorization(destinationRequest, sourceRequest);
         AddSourceConditions(destinationRequest, sourceRequest);
+        AddSourceCustomerProvidedKey(
+            destinationRequest,
+            sourceRequest,
+            sourceUri,
+            allowSourceCustomerProvidedKey);
         if (sourceRange is not null)
             sourceRequest.Headers.TryAddWithoutValidation("Range", sourceRange);
 
-        using var response = await client.SendAsync(
-            sourceRequest,
-            HttpCompletionOption.ResponseHeadersRead,
-            cancellationToken);
-        if (!response.IsSuccessStatusCode)
+        HttpResponseMessage response;
+        try
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "CannotVerifyCopySource",
-                $"The source returned HTTP status {(int)response.StatusCode} ({response.ReasonPhrase}).");
+            response = await client.SendAsync(
+                sourceRequest,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
         }
-        if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
+        catch (HttpRequestException)
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "CannotVerifyCopySource",
-                "The source did not honor the requested byte range.");
+            throw CannotVerifyCopySource("The source could not be reached or did not complete a valid HTTP response.");
         }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw CannotVerifyCopySource("The source did not complete the request before the transfer timeout.");
+        }
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                throw CannotVerifyCopySource(
+                    $"The source returned HTTP status {(int)response.StatusCode} ({response.ReasonPhrase}).");
+            }
+            if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
+            {
+                throw CannotVerifyCopySource("The source did not honor the requested byte range.");
+            }
 
-        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var sourceInfo = new UrlSource(
-            source,
-            response.Content.Headers.ContentRange?.Length ?? response.Content.Headers.ContentLength,
-            ReadHttpProperties(response),
-            response.Headers.ETag?.ToString());
-        return await ConsumeWithChecksumValidationAsync(
-            destinationRequest,
-            sourceInfo,
-            consume,
-            cancellationToken);
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var sourceInfo = new UrlSource(
+                source,
+                response.Content.Headers.ContentRange?.Length ?? response.Content.Headers.ContentLength,
+                ReadHttpProperties(response),
+                response.Headers.ETag?.ToString());
+            return await ConsumeWithChecksumValidationAsync(
+                destinationRequest,
+                sourceInfo,
+                consume,
+                cancellationToken);
+        }
     }
 
     private async Task<TResult> ConsumeWithChecksumValidationAsync<TResult>(
@@ -144,7 +171,7 @@ internal sealed class UrlTransferClient(
         if (!AuthenticationHeaderValue.TryParse(value, out var authorization) ||
             !string.Equals(authorization.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase))
         {
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source-authorization", value);
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source-authorization");
         }
         source.Headers.Authorization = authorization;
     }
@@ -165,6 +192,107 @@ internal sealed class UrlTransferClient(
         }
     }
 
+    private static void AddSourceCustomerProvidedKey(
+        HttpRequest destination,
+        HttpRequestMessage source,
+        Uri sourceUri,
+        bool allowed)
+    {
+        var encryption = ReadSourceCustomerProvidedKey(destination, sourceUri, allowed);
+        if (encryption is null)
+            return;
+        source.Headers.TryAddWithoutValidation("x-ms-encryption-key", encryption.EncodedKey);
+        source.Headers.TryAddWithoutValidation("x-ms-encryption-key-sha256", encryption.EncodedHash);
+        source.Headers.TryAddWithoutValidation("x-ms-encryption-algorithm", encryption.Algorithm);
+        source.Headers.TryAddWithoutValidation(
+            "x-ms-version",
+            StorageRequestContext.Get(destination.HttpContext).ServiceVersion);
+    }
+
+    private static SourceCustomerProvidedKey? ReadSourceCustomerProvidedKey(
+        HttpRequest request,
+        Uri sourceUri,
+        bool allowed)
+    {
+        var encodedKey = ProtocolParsing.First(request.Headers, "x-ms-source-encryption-key");
+        var encodedHash = ProtocolParsing.First(request.Headers, "x-ms-source-encryption-key-sha256");
+        var algorithm = ProtocolParsing.First(request.Headers, "x-ms-source-encryption-algorithm");
+        var present = encodedKey is not null || encodedHash is not null || algorithm is not null;
+        if (!present)
+            return null;
+        if (!allowed)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidHeaderValue",
+                "Source customer-provided key headers are not supported for this operation.",
+                "x-ms-source-encryption-key",
+                null);
+        }
+
+        var context = StorageRequestContext.Get(request.HttpContext);
+        if (!DateOnly.TryParseExact(
+                context.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var version) || version < new DateOnly(2026, 2, 6))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Source customer-provided keys require service version 2026-02-06 or later.");
+        }
+        if (!request.IsHttps || !string.Equals(sourceUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidRequest",
+                "Source customer-provided encryption keys require HTTPS for both request hops.");
+        }
+        if (encodedKey is null)
+            throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key");
+        if (encodedHash is null)
+            throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key-sha256");
+        if (!string.Equals(algorithm, "AES256", StringComparison.Ordinal))
+            throw AzureStorageException.InvalidHeader("x-ms-source-encryption-algorithm", algorithm);
+
+        byte[] key;
+        byte[] suppliedHash;
+        try
+        {
+            key = Convert.FromBase64String(encodedKey);
+        }
+        catch (FormatException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key");
+        }
+        try
+        {
+            try
+            {
+                suppliedHash = Convert.FromBase64String(encodedHash);
+            }
+            catch (FormatException)
+            {
+                throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key-sha256", encodedHash);
+            }
+            if (key.Length != 32)
+                throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key");
+            var actualHash = SHA256.HashData(key);
+            if (suppliedHash.Length != actualHash.Length ||
+                !CryptographicOperations.FixedTimeEquals(suppliedHash, actualHash))
+            {
+                throw AzureStorageException.InvalidHeader("x-ms-source-encryption-key-sha256", encodedHash);
+            }
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(key);
+        }
+        return new SourceCustomerProvidedKey(encodedKey, encodedHash, "AES256");
+    }
+
     private static BlobHttpProperties ReadHttpProperties(HttpResponseMessage response) => new()
     {
         ContentType = response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream",
@@ -180,6 +308,11 @@ internal sealed class UrlTransferClient(
         var value = string.Join(',', values);
         return string.IsNullOrEmpty(value) ? null : value;
     }
+
+    private static AzureStorageException CannotVerifyCopySource(string message) => new(
+        StatusCodes.Status400BadRequest,
+        "CannotVerifyCopySource",
+        message);
 
     private static byte[] DecodeChecksum(string value, int requiredLength, string headerName)
     {

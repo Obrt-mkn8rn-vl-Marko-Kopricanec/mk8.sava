@@ -9,6 +9,7 @@ using Azure.Storage.Sas;
 using System.IdentityModel.Tokens.Jwt;
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security.Claims;
 using System.Text;
@@ -369,6 +370,151 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expectedPage = new byte[1024];
         pageSlice.CopyTo(expectedPage, 512);
         Assert.Equal(expectedPage, (await page.DownloadContentAsync()).Value.Content.ToArray());
+    }
+
+    [Fact]
+    public async Task SourceCustomerKeysAreValidatedAndForwardedForEveryUrlWriteOperation()
+    {
+        var sourceBytes = Enumerable.Range(0, 2048).Select(index => (byte)(index % 239)).ToArray();
+        var sourceKey = RandomNumberGenerator.GetBytes(32);
+        var sourceHash = SHA256.HashData(sourceKey);
+        var source = new EncryptedSourceHandler(sourceBytes, sourceKey, sourceHash);
+        var application = new SavaWebApplicationFactory(() => source);
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var containerName = $"source-cpk-{Guid.NewGuid():N}";
+            var container = service.GetBlobContainerClient(containerName);
+            await container.CreateAsync();
+            using var transport = new HttpClient(application.Server.CreateHandler());
+
+            var destinationKey = RandomNumberGenerator.GetBytes(32);
+            var destinationHash = SHA256.HashData(destinationKey);
+            var whole = container.GetBlobClient("whole.bin");
+            using (var request = CreateSourceKeyRequest(
+                       HttpsSasUri(whole, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                       sourceKey,
+                       sourceHash))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+                AddCustomerKeyHeaders(request, destinationKey, destinationHash);
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            }
+            var encryptedWhole = CreateEncryptedClient(
+                    application,
+                    new CustomerProvidedKey(destinationKey),
+                    encryptionScope: null)
+                .GetBlobContainerClient(containerName)
+                .GetBlobClient(whole.Name);
+            Assert.Equal(sourceBytes, (await encryptedWhole.DownloadContentAsync()).Value.Content.ToArray());
+
+            const int blockStart = 128;
+            const int blockEnd = 1023;
+            var block = container.GetBlockBlobClient("block.bin");
+            var blockId = Convert.ToBase64String("source-cpk-block"u8);
+            var blockUri = AppendQuery(
+                HttpsSasUri(block, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                $"comp=block&blockid={Uri.EscapeDataString(blockId)}");
+            using (var request = CreateSourceKeyRequest(blockUri, sourceKey, sourceHash))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-source-range", $"bytes={blockStart}-{blockEnd}");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            }
+            await block.CommitBlockListAsync([blockId]);
+            Assert.Equal(
+                sourceBytes[blockStart..(blockEnd + 1)],
+                (await block.DownloadContentAsync()).Value.Content.ToArray());
+
+            const int appendStart = 256;
+            const int appendEnd = 767;
+            var append = container.GetAppendBlobClient("append.bin");
+            await append.CreateAsync();
+            var appendUri = AppendQuery(
+                HttpsSasUri(append, BlobSasPermissions.Add | BlobSasPermissions.Write),
+                "comp=appendblock");
+            using (var request = CreateSourceKeyRequest(appendUri, sourceKey, sourceHash))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-source-range", $"bytes={appendStart}-{appendEnd}");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            }
+            Assert.Equal(
+                sourceBytes[appendStart..(appendEnd + 1)],
+                (await append.DownloadContentAsync()).Value.Content.ToArray());
+
+            var page = container.GetPageBlobClient("page.bin");
+            await page.CreateAsync(1024);
+            var pageUri = AppendQuery(
+                HttpsSasUri(page, BlobSasPermissions.Write),
+                "comp=page");
+            using (var request = CreateSourceKeyRequest(pageUri, sourceKey, sourceHash))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
+                request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
+                request.Headers.TryAddWithoutValidation("x-ms-source-range", "bytes=512-1023");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            }
+            var expectedPage = new byte[1024];
+            sourceBytes.AsSpan(512, 512).CopyTo(expectedPage);
+            Assert.Equal(expectedPage, (await page.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.Equal(4, source.RequestCount);
+
+            var invalid = container.GetBlobClient("invalid.bin");
+            using (var request = CreateSourceKeyRequest(
+                       HttpsSasUri(invalid, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                       sourceKey,
+                       sourceHash,
+                       version: "2025-11-05"))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var request = CreateSourceKeyRequest(
+                       HttpsSasUri(invalid, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                       sourceKey,
+                       RandomNumberGenerator.GetBytes(32)))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var request = CreateSourceKeyRequest(
+                       HttpsSasUri(invalid, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                       sourceKey,
+                       sourceHash,
+                       sourceUri: "http://source.example/encrypted"))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidRequest", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var request = CreateSourceKeyRequest(
+                       HttpsSasUri(invalid, BlobSasPermissions.Create | BlobSasPermissions.Write),
+                       sourceKey,
+                       sourceHash))
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-requires-sync", "true");
+                using var response = await transport.SendAsync(request);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            Assert.Equal(4, source.RequestCount);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
     }
 
     [Fact]
@@ -1604,6 +1750,53 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
+    private static HttpRequestMessage CreateSourceKeyRequest(
+        Uri destination,
+        byte[] sourceKey,
+        byte[] sourceHash,
+        string version = "2026-02-06",
+        string sourceUri = "https://source.example/encrypted")
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, destination)
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceUri);
+        request.Headers.TryAddWithoutValidation("x-ms-source-encryption-key", Convert.ToBase64String(sourceKey));
+        request.Headers.TryAddWithoutValidation("x-ms-source-encryption-key-sha256", Convert.ToBase64String(sourceHash));
+        request.Headers.TryAddWithoutValidation("x-ms-source-encryption-algorithm", "AES256");
+        return request;
+    }
+
+    private static void AddCustomerKeyHeaders(HttpRequestMessage request, byte[] key, byte[] hash)
+    {
+        request.Headers.TryAddWithoutValidation("x-ms-encryption-key", Convert.ToBase64String(key));
+        request.Headers.TryAddWithoutValidation("x-ms-encryption-key-sha256", Convert.ToBase64String(hash));
+        request.Headers.TryAddWithoutValidation("x-ms-encryption-algorithm", "AES256");
+    }
+
+    private static Uri HttpsSasUri(BlobBaseClient blob, BlobSasPermissions permissions)
+    {
+        var builder = new UriBuilder(blob.GenerateSasUri(permissions, DateTimeOffset.UtcNow.AddMinutes(10)))
+        {
+            Scheme = Uri.UriSchemeHttps,
+            Port = -1
+        };
+        return builder.Uri;
+    }
+
+    private static Uri AppendQuery(Uri uri, string query)
+    {
+        var builder = new UriBuilder(uri)
+        {
+            Query = string.IsNullOrEmpty(uri.Query)
+                ? query
+                : uri.Query.TrimStart('?') + "&" + query
+        };
+        return builder.Uri;
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app, string accountName, string accountKey)
     {
         var transportClient = new HttpClient(app.Server.CreateHandler())
@@ -1695,6 +1888,53 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static string ChunkPath(string dataPath, string chunkId) =>
         Path.Combine(dataPath, "chunks", chunkId.Replace('/', Path.DirectorySeparatorChar) + ".chunk");
+
+    private sealed class EncryptedSourceHandler(byte[] content, byte[] key, byte[] hash) : HttpMessageHandler
+    {
+        private readonly string _encodedKey = Convert.ToBase64String(key);
+        private readonly string _encodedHash = Convert.ToBase64String(hash);
+        private int _requestCount;
+
+        public int RequestCount => Volatile.Read(ref _requestCount);
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Assert.Equal(Uri.UriSchemeHttps, request.RequestUri?.Scheme);
+            Assert.Equal(_encodedKey, request.Headers.GetValues("x-ms-encryption-key").Single());
+            Assert.Equal(_encodedHash, request.Headers.GetValues("x-ms-encryption-key-sha256").Single());
+            Assert.Equal("AES256", request.Headers.GetValues("x-ms-encryption-algorithm").Single());
+            Assert.Equal("2026-02-06", request.Headers.GetValues("x-ms-version").Single());
+            Assert.False(request.Headers.Contains("x-ms-source-encryption-key"));
+            Interlocked.Increment(ref _requestCount);
+
+            var start = 0;
+            var end = content.Length - 1;
+            var status = HttpStatusCode.OK;
+            var range = request.Headers.Range?.Ranges.SingleOrDefault();
+            if (range is not null)
+            {
+                start = checked((int)(range.From ?? 0));
+                end = checked((int)(range.To ?? end));
+                Assert.InRange(start, 0, content.Length - 1);
+                Assert.InRange(end, start, content.Length - 1);
+                status = HttpStatusCode.PartialContent;
+            }
+
+            var response = new HttpResponseMessage(status)
+            {
+                Content = new ByteArrayContent(content[start..(end + 1)]),
+                RequestMessage = request
+            };
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            if (status == HttpStatusCode.PartialContent)
+                response.Content.Headers.ContentRange = new ContentRangeHeaderValue(start, end, content.Length);
+            response.Headers.ETag = new EntityTagHeaderValue("\"encrypted-source\"");
+            return Task.FromResult(response);
+        }
+    }
 
     private sealed class LoopbackSource(WebApplication application, Uri uri) : IAsyncDisposable
     {

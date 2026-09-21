@@ -585,6 +585,7 @@ public static class BlobProtocolEndpoint
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    allowSourceCustomerProvidedKey: true,
                     async source =>
                     {
                         await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, encryption, cancellationToken);
@@ -646,6 +647,7 @@ public static class BlobProtocolEndpoint
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    allowSourceCustomerProvidedKey: true,
                     async source => updated = await service.AppendBlockAsync(
                         current,
                         source.Content,
@@ -706,6 +708,7 @@ public static class BlobProtocolEndpoint
                         http.Request,
                         copySource,
                         ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                        allowSourceCustomerProvidedKey: true,
                         async source => updated = await service.PutPageAsync(
                             current,
                             start,
@@ -1137,6 +1140,7 @@ public static class BlobProtocolEndpoint
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    allowSourceCustomerProvidedKey: requestedType == "BlockBlob",
                     async source => await service.PutBlockBlobAsync(
                         request.Account,
                         containerName,
@@ -1180,6 +1184,7 @@ public static class BlobProtocolEndpoint
                     http.Request,
                     copySource,
                     sourceRange: null,
+                    allowSourceCustomerProvidedKey: false,
                     async source => await service.BeginCopyFromStreamAsync(
                         request.Account,
                         containerName,
@@ -1414,11 +1419,11 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri))
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         var segments = sourceUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(Uri.UnescapeDataString).ToArray();
         var offset = segments.Length > 0 && string.Equals(segments[0], destinationRequest.Account, StringComparison.Ordinal) ? 1 : 0;
         if (segments.Length - offset < 2)
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         if (destinationRequest.Authorization.Kind != StorageAuthorizationKind.SharedKey)
             throw AzureStorageException.AuthorizationFailure();
         var container = segments[offset];
@@ -2136,7 +2141,7 @@ public static class BlobProtocolEndpoint
     private static string SanitizeCopySource(string sourceValue)
     {
         if (sourceValue.Length > 2048 || !Uri.TryCreate(sourceValue, UriKind.Absolute, out var source))
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(source.Query);
         var values = query
             .Where(pair => !string.Equals(pair.Key, "sig", StringComparison.OrdinalIgnoreCase))
