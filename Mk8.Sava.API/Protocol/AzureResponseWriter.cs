@@ -394,10 +394,22 @@ public sealed partial class AzureResponseWriter
             writer.WriteString(properties.DefaultServiceVersion ?? string.Empty);
             writer.WriteEndElement();
             if (IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
-                WriteRetentionPolicy(writer, "DeleteRetentionPolicy", properties.BlobSoftDeleteEnabled, properties.BlobSoftDeleteRetentionDays);
+                WriteRetentionPolicy(
+                    writer,
+                    "DeleteRetentionPolicy",
+                    properties.BlobSoftDeleteEnabled,
+                    properties.BlobSoftDeleteRetentionDays,
+                    IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10))
+                        ? properties.BlobPermanentDeleteEnabled
+                        : null);
             if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             {
-                WriteRetentionPolicy(writer, "ContainerDeleteRetentionPolicy", properties.ContainerSoftDeleteEnabled, properties.ContainerSoftDeleteRetentionDays);
+                WriteRetentionPolicy(
+                    writer,
+                    "ContainerDeleteRetentionPolicy",
+                    properties.ContainerSoftDeleteEnabled,
+                    properties.ContainerSoftDeleteRetentionDays,
+                    allowPermanentDelete: null);
                 writer.WriteElementString("IsVersioningEnabled", properties.VersioningEnabled ? "true" : "false");
             }
             if (IsServiceVersionAtLeast(request, new DateOnly(2018, 3, 28)))
@@ -605,12 +617,19 @@ public sealed partial class AzureResponseWriter
         writer.WriteEndElement();
     }
 
-    private static void WriteRetentionPolicy(XmlWriter writer, string name, bool enabled, int days)
+    private static void WriteRetentionPolicy(
+        XmlWriter writer,
+        string name,
+        bool enabled,
+        int days,
+        bool? allowPermanentDelete)
     {
         writer.WriteStartElement(name);
         writer.WriteElementString("Enabled", enabled ? "true" : "false");
         if (enabled)
             writer.WriteElementString("Days", days.ToString(CultureInfo.InvariantCulture));
+        if (allowPermanentDelete.HasValue)
+            writer.WriteElementString("AllowPermanentDelete", allowPermanentDelete.Value ? "true" : "false");
         writer.WriteEndElement();
     }
 

@@ -1147,6 +1147,40 @@ public sealed class BlobService(
             clearStagedBlocksForCurrentBlobs: true);
     }
 
+    public async Task PermanentlyDeleteBlobAsync(
+        BlobRecord current,
+        bool hasExplicitSnapshotOrVersion,
+        CancellationToken cancellationToken)
+    {
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        if (!properties.BlobPermanentDeleteEnabled || !properties.BlobSoftDeleteEnabled)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOperationNotSupported",
+                "Permanent deletion is not enabled for this storage account.");
+        }
+        if (!hasExplicitSnapshotOrVersion)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "PermanentDeleteNotSupportedOnRootBlob",
+                "Permanent delete is not supported on a root blob.");
+        }
+        if (!current.IsDeleted)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOperationNotSupported",
+                "Permanent delete is supported only for a soft-deleted blob snapshot or version.");
+        }
+
+        EnsureNoPendingCopy(current);
+        EnsureBlobMutable(current);
+        if (!await metadata.DeleteBlobRecordAsync(current.GenerationId, current.Revision, cancellationToken))
+            throw AzureStorageException.BlobNotFound();
+    }
+
     public async Task UndeleteBlobAsync(
         string account,
         string container,

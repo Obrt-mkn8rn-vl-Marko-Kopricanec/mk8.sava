@@ -367,6 +367,7 @@ public sealed record ServiceProperties
     public int ContainerSoftDeleteRetentionDays { get; init; } = 7;
     public bool BlobSoftDeleteEnabled { get; init; }
     public int BlobSoftDeleteRetentionDays { get; init; } = 7;
+    public bool BlobPermanentDeleteEnabled { get; init; }
     public string? DefaultServiceVersion { get; init; }
     public List<CorsRule> Cors { get; init; } = [];
     public StaticWebsiteProperties StaticWebsite { get; init; } = new();

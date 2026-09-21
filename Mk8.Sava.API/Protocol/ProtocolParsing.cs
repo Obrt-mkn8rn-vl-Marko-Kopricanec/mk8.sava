@@ -297,15 +297,30 @@ internal static class ProtocolParsing
 
         if (Child(root, "DefaultServiceVersion") is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2011, 8, 18), "DefaultServiceVersion");
-        if (Child(root, "DeleteRetentionPolicy") is not null)
+        var deleteRetentionPolicy = Child(root, "DeleteRetentionPolicy");
+        if (deleteRetentionPolicy is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2017, 7, 29), "DeleteRetentionPolicy");
+        if (deleteRetentionPolicy is not null && Child(deleteRetentionPolicy, "AllowPermanentDelete") is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2020, 2, 10), "AllowPermanentDelete");
         if (Child(root, "ContainerDeleteRetentionPolicy") is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "ContainerDeleteRetentionPolicy");
         if (Child(root, "IsVersioningEnabled") is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "IsVersioningEnabled");
 
-        var deletePolicy = ReadRetentionPolicy(root, "DeleteRetentionPolicy", current.BlobSoftDeleteEnabled, current.BlobSoftDeleteRetentionDays);
-        var containerPolicy = ReadRetentionPolicy(root, "ContainerDeleteRetentionPolicy", current.ContainerSoftDeleteEnabled, current.ContainerSoftDeleteRetentionDays);
+        var deletePolicy = ReadRetentionPolicy(
+            root,
+            "DeleteRetentionPolicy",
+            current.BlobSoftDeleteEnabled,
+            current.BlobSoftDeleteRetentionDays,
+            current.BlobPermanentDeleteEnabled,
+            supportsPermanentDelete: true);
+        var containerPolicy = ReadRetentionPolicy(
+            root,
+            "ContainerDeleteRetentionPolicy",
+            current.ContainerSoftDeleteEnabled,
+            current.ContainerSoftDeleteRetentionDays,
+            currentAllowPermanentDelete: false,
+            supportsPermanentDelete: false);
         var website = Child(root, "StaticWebsite");
         var staticWebsite = current.StaticWebsite;
         if (website is not null)
@@ -347,6 +362,7 @@ internal static class ProtocolParsing
             DefaultServiceVersion = OptionalText(root, "DefaultServiceVersion") ?? current.DefaultServiceVersion,
             BlobSoftDeleteEnabled = deletePolicy.Enabled,
             BlobSoftDeleteRetentionDays = deletePolicy.Days,
+            BlobPermanentDeleteEnabled = deletePolicy.AllowPermanentDelete,
             ContainerSoftDeleteEnabled = containerPolicy.Enabled,
             ContainerSoftDeleteRetentionDays = containerPolicy.Days,
             VersioningEnabled = Child(root, "IsVersioningEnabled") is null
@@ -604,19 +620,31 @@ internal static class ProtocolParsing
                string.IsNullOrEmpty(uri.Fragment);
     }
 
-    private static (bool Enabled, int Days) ReadRetentionPolicy(XElement root, string name, bool currentEnabled, int currentDays)
+    private static (bool Enabled, int Days, bool AllowPermanentDelete) ReadRetentionPolicy(
+        XElement root,
+        string name,
+        bool currentEnabled,
+        int currentDays,
+        bool currentAllowPermanentDelete,
+        bool supportsPermanentDelete)
     {
         if (Child(root, name) is not { } policy)
-            return (currentEnabled, currentDays);
+            return (currentEnabled, currentDays, currentAllowPermanentDelete);
         ValidateUniqueChildren(policy);
-        ValidateKnownChildren(policy, "Enabled", "Days");
+        if (supportsPermanentDelete)
+            ValidateKnownChildren(policy, "Enabled", "Days", "AllowPermanentDelete");
+        else
+            ValidateKnownChildren(policy, "Enabled", "Days");
         var enabled = ParseBool(RequiredText(policy, "Enabled"), false);
         var days = OptionalText(policy, "Days") is { } text ? ParseInt(text, "Days") : currentDays;
+        var allowPermanentDelete = supportsPermanentDelete && Child(policy, "AllowPermanentDelete") is not null
+            ? ParseBool(RequiredText(policy, "AllowPermanentDelete"), false)
+            : false;
         if (enabled && Child(policy, "Days") is null)
             throw InvalidServicePropertiesXml("Retention Days is required when retention is enabled.");
         if (enabled && days is < 1 or > 365)
             throw InvalidServicePropertiesXml("Retention days must be between 1 and 365.");
-        return (enabled, days);
+        return (enabled, days, allowPermanentDelete);
     }
 
     private static void RequireServicePropertiesVersion(DateOnly version, DateOnly minimum, string feature)

@@ -600,7 +600,8 @@ public static class BlobProtocolEndpoint
                 container,
                 blob,
                 query.TryGetValue("snapshot", out var snapshot) ? NullIfEmpty(snapshot.ToString()) : null,
-                query.TryGetValue("versionid", out var version) ? NullIfEmpty(version.ToString()) : null);
+                query.TryGetValue("versionid", out var version) ? NullIfEmpty(version.ToString()) : null,
+                query.TryGetValue("deletetype", out var deleteType) ? deleteType.ToString() : null);
         }
         catch (UriFormatException)
         {
@@ -649,28 +650,49 @@ public static class BlobProtocolEndpoint
         {
             var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
             subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken);
+            var permanentDelete = resolved.DeleteType is not null;
+            if (permanentDelete)
+            {
+                if (resolved.Request.Kind != BlobBatchOperationKind.Delete)
+                    throw AzureStorageException.InvalidQuery("deletetype");
+                ValidatePermanentDeleteRequest(subrequestContext, resolved.DeleteType!);
+            }
             var blob = await service.GetBlobAsync(
                 subrequestContext.Account,
                 resolved.Container,
                 resolved.Blob,
                 resolved.VersionId,
                 resolved.Snapshot,
-                includeDeleted: false,
+                includeDeleted: permanentDelete,
                 cancellationToken);
 
             var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
             switch (resolved.Request.Kind)
             {
                 case BlobBatchOperationKind.Delete:
-                    Require(subrequestContext, 'd');
+                    Require(
+                        subrequestContext,
+                        permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
                     EvaluateWriteConditions(inner.Request, blob);
                     EnsureLease(inner.Request, blob.Lease, "blob");
-                    var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken);
-                    await service.DeleteBlobAsync(
-                        blob,
-                        ProtocolParsing.First(inner.Request.Headers, "x-ms-delete-snapshots"),
-                        cancellationToken);
-                    headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
+                    if (permanentDelete)
+                    {
+                        await service.PermanentlyDeleteBlobAsync(
+                            blob,
+                            resolved.Snapshot is not null || resolved.VersionId is not null,
+                            cancellationToken);
+                        headers["x-ms-delete-type-permanent"] = "true";
+                    }
+                    else
+                    {
+                        var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken);
+                        await service.DeleteBlobAsync(
+                            blob,
+                            ProtocolParsing.First(inner.Request.Headers, "x-ms-delete-snapshots"),
+                            cancellationToken);
+                        if (IsServiceVersionAtLeast(subrequestContext, new DateOnly(2017, 7, 29)))
+                            headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
+                    }
                     return new BlobBatchSubresponse(
                         StatusCodes.Status202Accepted,
                         headers,
@@ -798,7 +820,8 @@ public static class BlobProtocolEndpoint
         string Container,
         string Blob,
         string? Snapshot,
-        string? VersionId);
+        string? VersionId,
+        string? DeleteType);
 
     private static async Task HandleBlobAsync(
         HttpContext http,
@@ -814,6 +837,11 @@ public static class BlobProtocolEndpoint
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
         var versionId = NullIfEmpty(http.Request.Query["versionid"].ToString());
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
+        var permanentDelete = HttpMethods.IsDelete(http.Request.Method) &&
+                              string.IsNullOrEmpty(comp) &&
+                              http.Request.Query.ContainsKey("deletetype");
+        if (permanentDelete)
+            ValidatePermanentDeleteRequest(request, http.Request.Query["deletetype"].ToString());
         if (versionId is not null)
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Blob versioning");
 
@@ -1088,6 +1116,7 @@ public static class BlobProtocolEndpoint
             string.IsNullOrEmpty(comp) &&
             versionId is null &&
             snapshot is null &&
+            !permanentDelete &&
             IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)) &&
             await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken) is null)
         {
@@ -1104,7 +1133,7 @@ public static class BlobProtocolEndpoint
             blobName,
             versionId,
             snapshot,
-            includeDeleted: false,
+            includeDeleted: permanentDelete,
             cancellationToken);
 
         if (blob.IsIncrementalCopy && blob.Snapshot is null &&
@@ -1427,10 +1456,27 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
-            Require(request, 'd');
+            Require(request, permanentDelete ? 'y' : versionId is not null ? 'x' : 'd');
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
-            await service.DeleteBlobAsync(blob, ProtocolParsing.First(http.Request.Headers, "x-ms-delete-snapshots"), cancellationToken);
+            if (permanentDelete)
+            {
+                await service.PermanentlyDeleteBlobAsync(
+                    blob,
+                    snapshot is not null || versionId is not null,
+                    cancellationToken);
+                http.Response.Headers["x-ms-delete-type-permanent"] = "true";
+            }
+            else
+            {
+                var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+                await service.DeleteBlobAsync(
+                    blob,
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-delete-snapshots"),
+                    cancellationToken);
+                if (IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
+                    http.Response.Headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
+            }
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -2529,6 +2575,13 @@ public static class BlobProtocolEndpoint
             StatusCodes.Status400BadRequest,
             "FeatureVersionMismatch",
             $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
+    }
+
+    private static void ValidatePermanentDeleteRequest(StorageRequestContext request, string deleteType)
+    {
+        if (!string.Equals(deleteType, "permanent", StringComparison.Ordinal))
+            throw AzureStorageException.InvalidQuery("deletetype");
+        RequireFeatureVersion(request, new DateOnly(2020, 2, 10), "Permanent Delete Blob");
     }
 
     private static void ValidateBlobListFeatures(
