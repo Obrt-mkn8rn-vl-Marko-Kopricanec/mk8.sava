@@ -7,7 +7,7 @@ namespace Mk8.Sava.Storage;
 
 public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -62,6 +62,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     is_current INTEGER NOT NULL,
                     is_deleted INTEGER NOT NULL,
                     modified_ticks INTEGER NOT NULL,
+                    logical_length INTEGER NOT NULL,
+                    pending_copy_length INTEGER NOT NULL,
                     data TEXT NOT NULL
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_blobs_current
@@ -79,19 +81,46 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     blob_name TEXT NOT NULL,
                     block_id TEXT NOT NULL,
                     created_ticks INTEGER NOT NULL,
+                    logical_length INTEGER NOT NULL,
                     data TEXT NOT NULL,
                     PRIMARY KEY (account, container, blob_name, block_id)
                 );
                 CREATE INDEX IF NOT EXISTS ix_staged_blocks_age
                     ON staged_blocks(created_ticks);
 
+                CREATE TABLE IF NOT EXISTS blob_chunk_references (
+                    generation_id TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (generation_id, chunk_id),
+                    FOREIGN KEY (generation_id) REFERENCES blobs(generation_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS ix_blob_chunk_references_chunk
+                    ON blob_chunk_references(chunk_id);
+
+                CREATE TABLE IF NOT EXISTS staged_block_chunk_references (
+                    account TEXT NOT NULL,
+                    container TEXT NOT NULL,
+                    blob_name TEXT NOT NULL,
+                    block_id TEXT NOT NULL,
+                    chunk_id TEXT NOT NULL,
+                    PRIMARY KEY (account, container, blob_name, block_id, chunk_id),
+                    FOREIGN KEY (account, container, blob_name, block_id)
+                        REFERENCES staged_blocks(account, container, blob_name, block_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS ix_staged_block_chunk_references_chunk
+                    ON staged_block_chunk_references(chunk_id);
+
                 CREATE TABLE IF NOT EXISTS service_properties (
                     account TEXT PRIMARY KEY,
                     data TEXT NOT NULL
                 );
                 """, cancellationToken);
-            if (schemaVersion == 0)
+            if (schemaVersion == 1)
+                await MigrateVersion1ToVersion2Async(connection, cancellationToken);
+            else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
+            await VerifyForeignKeysAsync(connection, cancellationToken);
+            _ = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken);
         }
         finally
         {
@@ -685,12 +714,16 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         try
         {
             await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
             await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = """
-                INSERT INTO staged_blocks(account, container, blob_name, block_id, created_ticks, data)
-                VALUES ($account, $container, $blob, $block, $created, $data)
+                INSERT INTO staged_blocks(
+                    account, container, blob_name, block_id, created_ticks, logical_length, data)
+                VALUES ($account, $container, $blob, $block, $created, $logical, $data)
                 ON CONFLICT(account, container, blob_name, block_id) DO UPDATE SET
                     created_ticks = excluded.created_ticks,
+                    logical_length = excluded.logical_length,
                     data = excluded.data;
                 """;
             command.Parameters.AddWithValue("$account", block.Account);
@@ -698,8 +731,11 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             command.Parameters.AddWithValue("$blob", block.BlobName);
             command.Parameters.AddWithValue("$block", block.BlockId);
             command.Parameters.AddWithValue("$created", block.CreatedAt.UtcTicks);
+            command.Parameters.AddWithValue("$logical", block.Content.Length);
             command.Parameters.AddWithValue("$data", Serialize(block));
             await command.ExecuteNonQueryAsync(cancellationToken);
+            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
         }
         finally
         {
@@ -841,7 +877,7 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         try
         {
             await using var source = await OpenAsync(cancellationToken);
-            var inventory = await ReadStorageInventoryAsync(source, cancellationToken);
+            var inventory = await ReadVerifiedStorageInventoryAsync(source, cancellationToken);
             pins = acquireContentPins(inventory.ReachableChunkIds);
             var destinationConnectionString = new SqliteConnectionStringBuilder
             {
@@ -899,13 +935,96 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     throw new InvalidDataException($"The metadata database failed SQLite integrity checking: {result}");
             }
         }
+        await VerifyForeignKeysAsync(connection, cancellationToken);
 
         var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
-        var inventory = await ReadStorageInventoryAsync(connection, cancellationToken);
+        var inventory = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken);
         return new MetadataDatabaseInspection(schemaVersion, inventory);
     }
 
     private static async Task<StorageMetadataInventory> ReadStorageInventoryAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+        return schemaVersion >= 2
+            ? await ReadIndexedStorageInventoryAsync(connection, cancellationToken)
+            : await ReadManifestStorageInventoryAsync(connection, cancellationToken);
+    }
+
+    private static async Task<StorageMetadataInventory> ReadVerifiedStorageInventoryAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var authoritative = await ReadManifestStorageInventoryAsync(connection, cancellationToken);
+        if (await ReadSchemaVersionAsync(connection, cancellationToken) < 2)
+            return authoritative;
+
+        var indexed = await ReadIndexedStorageInventoryAsync(connection, cancellationToken);
+        if (authoritative.LogicalBlobBytes != indexed.LogicalBlobBytes ||
+            authoritative.LogicalStagedBlockBytes != indexed.LogicalStagedBlockBytes ||
+            authoritative.BlobRecordCount != indexed.BlobRecordCount ||
+            authoritative.StagedBlockCount != indexed.StagedBlockCount ||
+            !authoritative.ReachableChunkIds.SetEquals(indexed.ReachableChunkIds))
+        {
+            throw new InvalidDataException("The metadata chunk-reference index does not match the authoritative manifests.");
+        }
+        return authoritative;
+    }
+
+    private static async Task<StorageMetadataInventory> ReadIndexedStorageInventoryAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var reachable = new HashSet<string>(StringComparer.Ordinal);
+        await using (var chunks = connection.CreateCommand())
+        {
+            chunks.CommandText = """
+                SELECT chunk_id FROM blob_chunk_references
+                UNION
+                SELECT chunk_id FROM staged_block_chunk_references;
+                """;
+            await using var reader = await chunks.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                reachable.Add(reader.GetString(0));
+        }
+
+        long logicalBlobBytes;
+        int blobRecordCount;
+        await using (var blobs = connection.CreateCommand())
+        {
+            blobs.CommandText = """
+                SELECT COALESCE(SUM(logical_length + pending_copy_length), 0), COUNT(*)
+                FROM blobs;
+                """;
+            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new InvalidDataException("The blob inventory query returned no aggregate row.");
+            logicalBlobBytes = reader.GetInt64(0);
+            blobRecordCount = reader.GetInt32(1);
+        }
+
+        long logicalStagedBlockBytes;
+        int stagedBlockCount;
+        await using (var blocks = connection.CreateCommand())
+        {
+            blocks.CommandText = "SELECT COALESCE(SUM(logical_length), 0), COUNT(*) FROM staged_blocks;";
+            await using var reader = await blocks.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken))
+                throw new InvalidDataException("The staged-block inventory query returned no aggregate row.");
+            logicalStagedBlockBytes = reader.GetInt64(0);
+            stagedBlockCount = reader.GetInt32(1);
+        }
+
+        return new StorageMetadataInventory(
+            reachable,
+            logicalBlobBytes,
+            logicalStagedBlockBytes,
+            blobRecordCount,
+            stagedBlockCount);
+    }
+
+    private static async Task<StorageMetadataInventory> ReadManifestStorageInventoryAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
@@ -966,16 +1085,109 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
     public static string CreateVersionId(DateTimeOffset time) =>
         time.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", CultureInfo.InvariantCulture);
 
+    private static async Task MigrateVersion1ToVersion2Async(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<BlobRecord> blobs;
+        IReadOnlyList<StagedBlockRecord> blocks;
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT data FROM blobs;";
+            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+        }
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT data FROM staged_blocks;";
+            blocks = await ReadJsonRowsAsync<StagedBlockRecord>(command, cancellationToken);
+        }
+
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            "ALTER TABLE blobs ADD COLUMN logical_length INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            "ALTER TABLE blobs ADD COLUMN pending_copy_length INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            "ALTER TABLE staged_blocks ADD COLUMN logical_length INTEGER NOT NULL DEFAULT 0;",
+            cancellationToken);
+
+        foreach (var blob in blobs)
+        {
+            await using var update = connection.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE blobs
+                SET logical_length = $logical, pending_copy_length = $pending
+                WHERE generation_id = $generation;
+                """;
+            update.Parameters.AddWithValue("$logical", blob.Content.Length);
+            update.Parameters.AddWithValue("$pending", blob.PendingCopyContent?.Length ?? 0);
+            update.Parameters.AddWithValue("$generation", blob.GenerationId);
+            if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                throw new InvalidDataException("A blob changed while migrating the metadata schema.");
+            await ReplaceBlobChunkReferencesAsync(connection, transaction, blob, cancellationToken);
+        }
+
+        foreach (var block in blocks)
+        {
+            await using var update = connection.CreateCommand();
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE staged_blocks
+                SET logical_length = $logical
+                WHERE account = $account AND container = $container
+                  AND blob_name = $blob AND block_id = $block;
+                """;
+            update.Parameters.AddWithValue("$logical", block.Content.Length);
+            update.Parameters.AddWithValue("$account", block.Account);
+            update.Parameters.AddWithValue("$container", block.Container);
+            update.Parameters.AddWithValue("$blob", block.BlobName);
+            update.Parameters.AddWithValue("$block", block.BlockId);
+            if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                throw new InvalidDataException("A staged block changed while migrating the metadata schema.");
+            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken);
+        }
+
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            $"PRAGMA user_version={CurrentSchemaVersion};",
+            cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken);
+        await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken);
         return connection;
     }
 
     private static async Task ExecuteNonQueryAsync(SqliteConnection connection, string text, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
+        command.CommandText = text;
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task ExecuteNonQueryAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string text,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = text;
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
@@ -987,6 +1199,17 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         await using var command = connection.CreateCommand();
         command.CommandText = "PRAGMA user_version;";
         return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    private static async Task VerifyForeignKeysAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA foreign_key_check;";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (await reader.ReadAsync(cancellationToken))
+            throw new InvalidDataException("The metadata database contains an invalid chunk-reference relationship.");
     }
 
     private static void AddContainerParameters(SqliteCommand command, ContainerRecord container)
@@ -1116,11 +1339,17 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            INSERT INTO blobs(generation_id, account, container, name, version_id, snapshot, is_current, is_deleted, modified_ticks, data)
-            VALUES ($generation, $account, $container, $name, $version, $snapshot, $current, $deleted, $modified, $data);
+            INSERT INTO blobs(
+                generation_id, account, container, name, version_id, snapshot,
+                is_current, is_deleted, modified_ticks, logical_length,
+                pending_copy_length, data)
+            VALUES (
+                $generation, $account, $container, $name, $version, $snapshot,
+                $current, $deleted, $modified, $logical, $pending, $data);
             """;
         AddBlobParameters(command, record);
         await command.ExecuteNonQueryAsync(cancellationToken);
+        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
     }
 
     private static async Task UpdateBlobRowAsync(
@@ -1141,12 +1370,15 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 is_current = $current,
                 is_deleted = $deleted,
                 modified_ticks = $modified,
+                logical_length = $logical,
+                pending_copy_length = $pending,
                 data = $data
             WHERE generation_id = $generation;
             """;
         AddBlobParameters(command, record);
         if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
             throw new StorageConcurrencyException();
+        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
     }
 
     private static async Task DeleteBlobRowAsync(
@@ -1163,6 +1395,84 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             throw new StorageConcurrencyException();
     }
 
+    private static async Task ReplaceBlobChunkReferencesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord record,
+        CancellationToken cancellationToken)
+    {
+        await using (var clear = connection.CreateCommand())
+        {
+            clear.Transaction = transaction;
+            clear.CommandText = "DELETE FROM blob_chunk_references WHERE generation_id = $generation;";
+            clear.Parameters.AddWithValue("$generation", record.GenerationId);
+            await clear.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var chunkId in EnumerateChunkIds(record).Distinct(StringComparer.Ordinal))
+        {
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO blob_chunk_references(generation_id, chunk_id)
+                VALUES ($generation, $chunk);
+                """;
+            insert.Parameters.AddWithValue("$generation", record.GenerationId);
+            insert.Parameters.AddWithValue("$chunk", chunkId);
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static async Task ReplaceStagedBlockChunkReferencesAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        StagedBlockRecord block,
+        CancellationToken cancellationToken)
+    {
+        await using (var clear = connection.CreateCommand())
+        {
+            clear.Transaction = transaction;
+            clear.CommandText = """
+                DELETE FROM staged_block_chunk_references
+                WHERE account = $account AND container = $container
+                  AND blob_name = $blob AND block_id = $block;
+                """;
+            clear.Parameters.AddWithValue("$account", block.Account);
+            clear.Parameters.AddWithValue("$container", block.Container);
+            clear.Parameters.AddWithValue("$blob", block.BlobName);
+            clear.Parameters.AddWithValue("$block", block.BlockId);
+            await clear.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var chunkId in block.Content.Chunks.Select(chunk => chunk.Id).Distinct(StringComparer.Ordinal))
+        {
+            await using var insert = connection.CreateCommand();
+            insert.Transaction = transaction;
+            insert.CommandText = """
+                INSERT INTO staged_block_chunk_references(
+                    account, container, blob_name, block_id, chunk_id)
+                VALUES ($account, $container, $blob, $block, $chunk);
+                """;
+            insert.Parameters.AddWithValue("$account", block.Account);
+            insert.Parameters.AddWithValue("$container", block.Container);
+            insert.Parameters.AddWithValue("$blob", block.BlobName);
+            insert.Parameters.AddWithValue("$block", block.BlockId);
+            insert.Parameters.AddWithValue("$chunk", chunkId);
+            await insert.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static IEnumerable<string> EnumerateChunkIds(BlobRecord record)
+    {
+        foreach (var chunk in record.Content.Chunks)
+            yield return chunk.Id;
+        if (record.PendingCopyContent is not null)
+        {
+            foreach (var chunk in record.PendingCopyContent.Chunks)
+                yield return chunk.Id;
+        }
+    }
+
     private static void AddBlobParameters(SqliteCommand command, BlobRecord record)
     {
         command.Parameters.AddWithValue("$generation", record.GenerationId);
@@ -1174,6 +1484,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         command.Parameters.AddWithValue("$current", record.IsCurrent ? 1 : 0);
         command.Parameters.AddWithValue("$deleted", record.IsDeleted ? 1 : 0);
         command.Parameters.AddWithValue("$modified", record.LastModified.UtcTicks);
+        command.Parameters.AddWithValue("$logical", record.Content.Length);
+        command.Parameters.AddWithValue("$pending", record.PendingCopyContent?.Length ?? 0);
         command.Parameters.AddWithValue("$data", Serialize(record));
     }
 

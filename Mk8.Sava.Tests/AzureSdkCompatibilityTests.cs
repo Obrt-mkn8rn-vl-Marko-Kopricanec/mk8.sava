@@ -13,6 +13,8 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -20,6 +22,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Data.Sqlite;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
@@ -1513,6 +1516,97 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task SchemaOneMetadataMigratesAndBackfillsAuthoritativeChunkReferences()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-v1-{Guid.NewGuid():N}");
+        var backupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-v1-backup-{Guid.NewGuid():N}");
+        var legacyBackupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-legacy-backup-{Guid.NewGuid():N}");
+        var rejectedBackupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-index-mismatch-{Guid.NewGuid():N}");
+        const string containerName = "migrated-container";
+        await CreateVersionOneDatabaseAsync(dataPath, containerName);
+        await CreateVersionOneBackupAsync(dataPath, legacyBackupPath);
+        var application = new SavaWebApplicationFactory(dataPath);
+        try
+        {
+            await application.InitializeAsync();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var configuredOptions = application.Services
+                .GetRequiredService<Microsoft.Extensions.Options.IOptions<Mk8.Sava.Configuration.SavaOptions>>()
+                .Value;
+            var legacy = await StorageBackupService.ValidateBackupAsync(
+                legacyBackupPath,
+                configuredOptions,
+                CancellationToken.None);
+            Assert.Equal(1, legacy.BlobRecordCount);
+            Assert.Equal(1, legacy.StagedBlockCount);
+            var inventory = await metadata.GetStorageInventoryAsync(CancellationToken.None);
+            Assert.Equal(1, inventory.BlobRecordCount);
+            Assert.Equal(1, inventory.StagedBlockCount);
+            Assert.Equal(1024, inventory.LogicalBlobBytes);
+            Assert.Equal(512, inventory.LogicalStagedBlockBytes);
+            Assert.Equal(
+                new HashSet<string>([SavaWebApplicationFactory.AccountName + "/$zero"], StringComparer.Ordinal),
+                inventory.ReachableChunkIds);
+
+            var container = CreateClient(application).GetBlobContainerClient(containerName);
+            Assert.Equal(
+                new byte[1024],
+                (await container.GetPageBlobClient("sparse.bin").DownloadContentAsync()).Value.Content.ToArray());
+            var blocks = await container.GetBlockBlobClient("staged.bin").GetBlockListAsync(BlockListTypes.Uncommitted);
+            var staged = Assert.Single(blocks.Value.UncommittedBlocks);
+            Assert.Equal(Convert.ToBase64String("migrated-block"u8), staged.Name);
+            Assert.Equal(512, staged.SizeLong);
+
+            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
+            {
+                await connection.OpenAsync();
+                await using var version = connection.CreateCommand();
+                version.CommandText = "PRAGMA user_version;";
+                Assert.Equal(2L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                await using var references = connection.CreateCommand();
+                references.CommandText = """
+                    SELECT
+                        (SELECT COUNT(*) FROM blob_chunk_references) +
+                        (SELECT COUNT(*) FROM staged_block_chunk_references);
+                    """;
+                Assert.Equal(2L, Convert.ToInt64(await references.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            }
+
+            var backup = application.Services.GetRequiredService<StorageBackupService>();
+            var created = await backup.CreateAsync(backupPath, CancellationToken.None);
+            Assert.Equal(1, created.BlobRecordCount);
+            Assert.Equal(1, created.StagedBlockCount);
+            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
+
+            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
+            {
+                await connection.OpenAsync();
+                await using var corruptIndex = connection.CreateCommand();
+                corruptIndex.CommandText = """
+                    DELETE FROM blob_chunk_references;
+                    DELETE FROM staged_block_chunk_references;
+                    """;
+                await corruptIndex.ExecuteNonQueryAsync();
+            }
+            var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
+                backup.CreateAsync(rejectedBackupPath, CancellationToken.None));
+            Assert.Contains("chunk-reference index", mismatch.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+            if (Directory.Exists(backupPath))
+                Directory.Delete(backupPath, recursive: true);
+            if (Directory.Exists(legacyBackupPath))
+                Directory.Delete(legacyBackupPath, recursive: true);
+            if (Directory.Exists(rejectedBackupPath))
+                Directory.Delete(rejectedBackupPath, recursive: true);
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SoftDeleteRetentionSurvivesPolicyChangesAndExpiredRecordsArePurged()
     {
         var client = CreateClient(factory);
@@ -1942,6 +2036,156 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+
+    private static async Task CreateVersionOneDatabaseAsync(string dataPath, string containerName)
+    {
+        Directory.CreateDirectory(dataPath);
+        var now = DateTimeOffset.UtcNow;
+        var domain = SavaWebApplicationFactory.AccountName;
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        options.Converters.Add(new JsonStringEnumConverter());
+        var container = new ContainerRecord
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Name = containerName,
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            CreatedAt = now,
+            LastModified = now
+        };
+        var blob = new BlobRecord
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = containerName,
+            Name = "sparse.bin",
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = MetadataStore.NewRevision(),
+            IsCurrent = true,
+            Kind = BlobKind.PageBlob,
+            Content = new ContentManifest(
+                domain,
+                1024,
+                ContentManifest.SparseHash,
+                [new ChunkReference(domain + "/$zero", 0, 1024)]),
+            ETag = MetadataStore.NewETag(),
+            CreatedAt = now,
+            LastModified = now
+        };
+        var block = new StagedBlockRecord
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = containerName,
+            BlobName = "staged.bin",
+            BlockId = Convert.ToBase64String("migrated-block"u8),
+            Content = new ContentManifest(
+                domain,
+                512,
+                ContentManifest.SparseHash,
+                [new ChunkReference(domain + "/$zero", 0, 512)]),
+            CreatedAt = now
+        };
+
+        await using var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        await connection.OpenAsync();
+        await using (var schema = connection.CreateCommand())
+        {
+            schema.CommandText = """
+                CREATE TABLE containers (
+                    account TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    deleted INTEGER NOT NULL,
+                    modified_ticks INTEGER NOT NULL,
+                    data TEXT NOT NULL,
+                    PRIMARY KEY (account, name)
+                );
+                CREATE TABLE blobs (
+                    generation_id TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
+                    container TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    version_id TEXT NULL,
+                    snapshot TEXT NULL,
+                    is_current INTEGER NOT NULL,
+                    is_deleted INTEGER NOT NULL,
+                    modified_ticks INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE TABLE staged_blocks (
+                    account TEXT NOT NULL,
+                    container TEXT NOT NULL,
+                    blob_name TEXT NOT NULL,
+                    block_id TEXT NOT NULL,
+                    created_ticks INTEGER NOT NULL,
+                    data TEXT NOT NULL,
+                    PRIMARY KEY (account, container, blob_name, block_id)
+                );
+                CREATE TABLE service_properties (
+                    account TEXT PRIMARY KEY,
+                    data TEXT NOT NULL
+                );
+                PRAGMA user_version=1;
+                """;
+            await schema.ExecuteNonQueryAsync();
+        }
+        await using (var insert = connection.CreateCommand())
+        {
+            insert.CommandText = """
+                INSERT INTO containers(account, name, deleted, modified_ticks, data)
+                VALUES ($account, $name, 0, $modified, $data);
+                INSERT INTO blobs(
+                    generation_id, account, container, name, version_id, snapshot,
+                    is_current, is_deleted, modified_ticks, data)
+                VALUES ($generation, $account, $name, $blob, NULL, NULL, 1, 0, $modified, $blob_data);
+                INSERT INTO staged_blocks(account, container, blob_name, block_id, created_ticks, data)
+                VALUES ($account, $name, $staged_blob, $block, $modified, $block_data);
+                """;
+            insert.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
+            insert.Parameters.AddWithValue("$name", containerName);
+            insert.Parameters.AddWithValue("$modified", now.UtcTicks);
+            insert.Parameters.AddWithValue("$data", JsonSerializer.Serialize(container, options));
+            insert.Parameters.AddWithValue("$generation", blob.GenerationId);
+            insert.Parameters.AddWithValue("$blob", blob.Name);
+            insert.Parameters.AddWithValue("$blob_data", JsonSerializer.Serialize(blob, options));
+            insert.Parameters.AddWithValue("$staged_blob", block.BlobName);
+            insert.Parameters.AddWithValue("$block", block.BlockId);
+            insert.Parameters.AddWithValue("$block_data", JsonSerializer.Serialize(block, options));
+            await insert.ExecuteNonQueryAsync();
+        }
+    }
+
+    private static async Task CreateVersionOneBackupAsync(string dataPath, string backupPath)
+    {
+        Directory.CreateDirectory(backupPath);
+        Directory.CreateDirectory(Path.Combine(backupPath, "chunks"));
+        var source = Path.Combine(dataPath, "metadata.db");
+        var destination = Path.Combine(backupPath, "metadata.db");
+        File.Copy(source, destination);
+        var metadata = await File.ReadAllBytesAsync(destination);
+        var manifest = new
+        {
+            format = "mk8.sava.backup",
+            formatVersion = 1,
+            metadataSchemaVersion = 1,
+            createdAt = DateTimeOffset.UtcNow,
+            metadata = new
+            {
+                length = metadata.LongLength,
+                sha256 = Convert.ToHexStringLower(SHA256.HashData(metadata))
+            },
+            blobRecordCount = 1,
+            stagedBlockCount = 1,
+            logicalBlobBytes = 1024,
+            logicalStagedBlockBytes = 512,
+            keyRequirements = new Dictionary<string, string>(),
+            chunks = Array.Empty<object>()
+        };
+        await File.WriteAllBytesAsync(
+            Path.Combine(backupPath, "backup-manifest.json"),
+            JsonSerializer.SerializeToUtf8Bytes(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                WriteIndented = true
+            }));
+    }
 
     private static string ListIdentity(BlobRecord item) =>
         $"{item.Name}|{item.VersionId}|{item.Snapshot}|{(item.VersionId is null ? null : item.IsCurrent)}";
