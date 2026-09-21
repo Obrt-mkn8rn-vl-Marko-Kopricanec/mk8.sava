@@ -472,11 +472,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         var builder = new StringBuilder();
         foreach (var header in request.Headers
                      .Where(header => header.Key.StartsWith("x-ms-", StringComparison.OrdinalIgnoreCase))
-                     .OrderBy(header => header.Key, StringComparer.OrdinalIgnoreCase))
+                     .Select(header => new { Key = header.Key.ToLowerInvariant(), header.Value })
+                     .OrderBy(header => header.Key, AzureCanonicalHeaderNameComparer.Instance))
         {
-            var name = header.Key.ToLowerInvariant();
             var value = string.Join(',', header.Value.Select(CollapseWhitespace));
-            builder.Append(name).Append(':').Append(value).Append('\n');
+            builder.Append(header.Key).Append(':').Append(value).Append('\n');
         }
         return builder.ToString();
     }
