@@ -35,7 +35,7 @@ public sealed class SavaOptions : IValidatableObject
     public double ChunkPackCompactionMinimumDeadRatio { get; init; } = 0.20;
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
-    public long MaximumRequestBodyBytes { get; init; } = 4L * 1024 * 1024 * 1024;
+    public long MaximumRequestBodyBytes { get; init; } = 5_000L * 1024 * 1024;
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);

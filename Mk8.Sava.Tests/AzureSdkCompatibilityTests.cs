@@ -3090,6 +3090,267 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HistoricalWriteLimitsAndUrlOperationVersionsRejectBeforeMutation()
+    {
+        const int mebibyte = 1024 * 1024;
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"write-limits-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        var blockBlob = container.GetBlockBlobClient("blocks.bin");
+        var blockSas = blockBlob.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        var firstBlockId = Convert.ToBase64String("limit-block-0001"u8);
+        using (var boundaryBlockRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   new Uri(blockSas + "&comp=block&blockid=" + Uri.EscapeDataString(firstBlockId)))
+        {
+            Content = new ByteArrayContent(new byte[4 * mebibyte])
+        })
+        {
+            boundaryBlockRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
+            using var boundaryBlockResponse = await transport.SendAsync(boundaryBlockRequest);
+            Assert.Equal(HttpStatusCode.Created, boundaryBlockResponse.StatusCode);
+        }
+
+        var oversizedBlockId = Convert.ToBase64String("limit-block-0002"u8);
+        using (var oversizedBlockRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   new Uri(blockSas + "&comp=block&blockid=" + Uri.EscapeDataString(oversizedBlockId)))
+        {
+            Content = new DeclaredLengthContent(4L * mebibyte + 1)
+        })
+        {
+            oversizedBlockRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
+            using var oversizedBlockResponse = await transport.SendAsync(oversizedBlockRequest);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedBlockResponse.StatusCode);
+            Assert.Equal("RequestBodyTooLarge", oversizedBlockResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        var staged = await blockBlob.GetBlockListAsync(BlockListTypes.Uncommitted);
+        Assert.Equal([firstBlockId], staged.Value.UncommittedBlocks.Select(block => block.Name));
+
+        var oversizedPutBlob = container.GetBlobClient("oversized-put.bin");
+        using (var oversizedPutRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oversizedPutBlob.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new DeclaredLengthContent(64L * mebibyte + 1)
+        })
+        {
+            oversizedPutRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
+            oversizedPutRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var oversizedPutResponse = await transport.SendAsync(oversizedPutRequest);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPutResponse.StatusCode);
+        }
+        Assert.False((await oversizedPutBlob.ExistsAsync()).Value);
+
+        var appendBlob = container.GetAppendBlobClient("append.bin");
+        await appendBlob.CreateAsync();
+        var appendUri = new Uri(
+            appendBlob.GenerateSasUri(
+                BlobSasPermissions.Add | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)) + "&comp=appendblock");
+        using (var boundaryAppendRequest = new HttpRequestMessage(HttpMethod.Put, appendUri)
+        {
+            Content = new ByteArrayContent(new byte[4 * mebibyte])
+        })
+        {
+            boundaryAppendRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
+            using var boundaryAppendResponse = await transport.SendAsync(boundaryAppendRequest);
+            Assert.Equal(HttpStatusCode.Created, boundaryAppendResponse.StatusCode);
+        }
+        using (var oversizedAppendRequest = new HttpRequestMessage(HttpMethod.Put, appendUri)
+        {
+            Content = new DeclaredLengthContent(4L * mebibyte + 1)
+        })
+        {
+            oversizedAppendRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
+            using var oversizedAppendResponse = await transport.SendAsync(oversizedAppendRequest);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedAppendResponse.StatusCode);
+        }
+        Assert.Equal(4L * mebibyte, (await appendBlob.GetPropertiesAsync()).Value.ContentLength);
+
+        var pageBlob = container.GetPageBlobClient("pages.bin");
+        await pageBlob.CreateAsync(8L * mebibyte);
+        var pageUri = new Uri(
+            pageBlob.GenerateSasUri(
+                BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)) + "&comp=page");
+        using (var boundaryPageRequest = new HttpRequestMessage(HttpMethod.Put, pageUri)
+        {
+            Content = new ByteArrayContent(new byte[4 * mebibyte])
+        })
+        {
+            boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
+            boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes=0-{4 * mebibyte - 1}");
+            using var boundaryPageResponse = await transport.SendAsync(boundaryPageRequest);
+            Assert.Equal(HttpStatusCode.Created, boundaryPageResponse.StatusCode);
+        }
+        using (var oversizedPageRequest = new HttpRequestMessage(HttpMethod.Put, pageUri)
+        {
+            Content = new DeclaredLengthContent(4L * mebibyte + 512)
+        })
+        {
+            oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
+            oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes=0-{4 * mebibyte + 511}");
+            using var oversizedPageResponse = await transport.SendAsync(oversizedPageRequest);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPageResponse.StatusCode);
+        }
+        var pageRanges = await pageBlob.GetPageRangesAsync();
+        Assert.Equal([new HttpRange(0, 4L * mebibyte)], pageRanges.Value.PageRanges);
+
+        var oversizedPageBlob = container.GetPageBlobClient("oversized-page.bin");
+        using (var oversizedPageCreateRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oversizedPageBlob.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            oversizedPageCreateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            oversizedPageCreateRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "PageBlob");
+            oversizedPageCreateRequest.Headers.TryAddWithoutValidation(
+                "x-ms-blob-content-length",
+                (8L * 1024 * 1024 * 1024 * 1024 + 512).ToString(CultureInfo.InvariantCulture));
+            using var oversizedPageCreateResponse = await transport.SendAsync(oversizedPageCreateRequest);
+            Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPageCreateResponse.StatusCode);
+        }
+        Assert.False((await oversizedPageBlob.ExistsAsync()).Value);
+
+        var negativeSequenceBlob = container.GetPageBlobClient("negative-sequence.bin");
+        using (var negativeSequenceRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   negativeSequenceBlob.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "PageBlob");
+            negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
+            negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-sequence-number", "-1");
+            using var negativeSequenceResponse = await transport.SendAsync(negativeSequenceRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, negativeSequenceResponse.StatusCode);
+        }
+        Assert.False((await negativeSequenceBlob.ExistsAsync()).Value);
+
+        var oldAppendBlob = container.GetAppendBlobClient("old-append.bin");
+        using (var oldAppendCreateRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oldAppendBlob.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            oldAppendCreateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
+            oldAppendCreateRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "AppendBlob");
+            using var oldAppendCreateResponse = await transport.SendAsync(oldAppendCreateRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldAppendCreateResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldAppendCreateResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await oldAppendBlob.ExistsAsync()).Value);
+
+        const string unreachableSource = "https://source.invalid/blob";
+        var oldUrlBlock = container.GetBlockBlobClient("old-url-block.bin");
+        var oldUrlBlockId = Convert.ToBase64String("old-url-block-id"u8);
+        using (var oldBlockFromUrlRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   new Uri(
+                       oldUrlBlock.GenerateSasUri(
+                           BlobSasPermissions.Create | BlobSasPermissions.Write,
+                           DateTimeOffset.UtcNow.AddMinutes(5)) +
+                       "&comp=block&blockid=" + Uri.EscapeDataString(oldUrlBlockId))))
+        {
+            oldBlockFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
+            oldBlockFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            using var oldBlockFromUrlResponse = await transport.SendAsync(oldBlockFromUrlRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldBlockFromUrlResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldBlockFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var supportedBlockFromUrlUri = new Uri(
+            oldUrlBlock.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)) +
+            "&comp=block&blockid=" + Uri.EscapeDataString(oldUrlBlockId));
+        using (var oldSourceCrcRequest = new HttpRequestMessage(HttpMethod.Put, supportedBlockFromUrlUri))
+        {
+            oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-11-09");
+            oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-source-content-crc64", Convert.ToBase64String(new byte[8]));
+            using var oldSourceCrcResponse = await transport.SendAsync(oldSourceCrcRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldSourceCrcResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldSourceCrcResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var oldSourceAuthorizationRequest = new HttpRequestMessage(HttpMethod.Put, supportedBlockFromUrlUri))
+        {
+            oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
+            oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-copy-source-authorization", "Bearer opaque-token");
+            using var oldSourceAuthorizationResponse = await transport.SendAsync(oldSourceAuthorizationRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldSourceAuthorizationResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldSourceAuthorizationResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var oldSourceTagConditionRequest = new HttpRequestMessage(HttpMethod.Put, supportedBlockFromUrlUri))
+        {
+            oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+            oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-source-if-tags", "\"project\" = 'mk8'");
+            using var oldSourceTagConditionResponse = await transport.SendAsync(oldSourceTagConditionRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldSourceTagConditionResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldSourceTagConditionResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var oldAppendFromUrlRequest = new HttpRequestMessage(HttpMethod.Put, appendUri))
+        {
+            oldAppendFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
+            oldAppendFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            using var oldAppendFromUrlResponse = await transport.SendAsync(oldAppendFromUrlRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldAppendFromUrlResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldAppendFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var oldPageFromUrlRequest = new HttpRequestMessage(HttpMethod.Put, pageUri))
+        {
+            oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
+            oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
+            oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
+            using var oldPageFromUrlResponse = await transport.SendAsync(oldPageFromUrlRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldPageFromUrlResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldPageFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var oldPutBlobFromUrl = container.GetBlockBlobClient("old-put-blob-url.bin");
+        using (var oldPutBlobFromUrlRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oldPutBlobFromUrl.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
+            oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var oldPutBlobFromUrlResponse = await transport.SendAsync(oldPutBlobFromUrlRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, oldPutBlobFromUrlResponse.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldPutBlobFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await oldPutBlobFromUrl.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public void StorageCrc64MatchesTheAzureSdkImplementation()
     {
         var content = Enumerable.Range(0, 4_097).Select(index => (byte)(index % 233)).ToArray();
@@ -3551,6 +3812,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         public List<long> Values { get; } = [];
 
         public void Report(long value) => Values.Add(value);
+    }
+
+    private sealed class DeclaredLengthContent(long length) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            Task.CompletedTask;
+
+        protected override bool TryComputeLength(out long computedLength)
+        {
+            computedLength = length;
+            return true;
+        }
     }
 
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>
