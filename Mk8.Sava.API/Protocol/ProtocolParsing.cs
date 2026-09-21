@@ -12,6 +12,10 @@ internal sealed record UserDelegationKeyRequest(
     DateTimeOffset ExpiresAt,
     string? DelegatedUserTenantId);
 
+internal sealed record ServicePropertiesUpdate(
+    ServiceProperties Properties,
+    bool StaticWebsiteSpecified);
+
 internal static class ProtocolParsing
 {
     private const long MaximumBlockListXmlCharacters = 8L * 1024 * 1024;
@@ -207,7 +211,7 @@ internal static class ProtocolParsing
         return new UserDelegationKeyRequest(startsAt, expiresAt, NullIfEmpty(delegatedTenant));
     }
 
-    public static async Task<ServiceProperties> ReadServicePropertiesAsync(
+    public static async Task<ServicePropertiesUpdate> ReadServicePropertiesAsync(
         Stream body,
         ServiceProperties current,
         CancellationToken cancellationToken)
@@ -237,7 +241,28 @@ internal static class ProtocolParsing
         var deletePolicy = ReadRetentionPolicy(root, "DeleteRetentionPolicy", current.BlobSoftDeleteEnabled, current.BlobSoftDeleteRetentionDays);
         var containerPolicy = ReadRetentionPolicy(root, "ContainerDeleteRetentionPolicy", current.ContainerSoftDeleteEnabled, current.ContainerSoftDeleteRetentionDays);
         var website = Child(root, "StaticWebsite");
-        return current with
+        var staticWebsite = current.StaticWebsite;
+        if (website is not null)
+        {
+            var indexDocument = NullIfEmpty(OptionalText(website, "IndexDocument"));
+            var defaultIndexDocumentPath = NullIfEmpty(OptionalText(website, "DefaultIndexDocumentPath"));
+            if (indexDocument is not null && defaultIndexDocumentPath is not null)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidXmlDocument",
+                    "IndexDocument and DefaultIndexDocumentPath are mutually exclusive.");
+            }
+            staticWebsite = new StaticWebsiteProperties
+            {
+                Enabled = ParseBool(RequiredText(website, "Enabled"), false),
+                IndexDocument = indexDocument,
+                DefaultIndexDocumentPath = defaultIndexDocumentPath,
+                ErrorDocument404Path = NullIfEmpty(OptionalText(website, "ErrorDocument404Path"))
+            };
+        }
+
+        return new ServicePropertiesUpdate(current with
         {
             Cors = cors,
             DefaultServiceVersion = OptionalText(root, "DefaultServiceVersion") ?? current.DefaultServiceVersion,
@@ -246,13 +271,8 @@ internal static class ProtocolParsing
             ContainerSoftDeleteEnabled = containerPolicy.Enabled,
             ContainerSoftDeleteRetentionDays = containerPolicy.Days,
             VersioningEnabled = ParseBool(OptionalText(root, "IsVersioningEnabled"), current.VersioningEnabled),
-            StaticWebsite = website is null ? current.StaticWebsite : new StaticWebsiteProperties
-            {
-                Enabled = ParseBool(OptionalText(website, "Enabled"), false),
-                IndexDocument = OptionalText(website, "IndexDocument"),
-                ErrorDocument404Path = OptionalText(website, "ErrorDocument404Path")
-            }
-        };
+            StaticWebsite = staticWebsite
+        }, website is not null);
     }
 
     public static (long Start, long End) ParseRange(string value, long length)

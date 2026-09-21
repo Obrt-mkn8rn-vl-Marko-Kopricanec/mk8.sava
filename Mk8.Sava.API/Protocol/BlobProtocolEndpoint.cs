@@ -23,13 +23,15 @@ public static class BlobProtocolEndpoint
         var writer = http.RequestServices.GetRequiredService<AzureResponseWriter>();
         var cancellationToken = http.RequestAborted;
 
-        if (HttpMethods.IsOptions(http.Request.Method))
+        if (request.ResourceKind != StorageResourceKind.StaticWebsite &&
+            HttpMethods.IsOptions(http.Request.Method))
         {
             await HandleCorsPreflightAsync(http, service, request, cancellationToken);
             return;
         }
 
-        await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken);
+        if (request.ResourceKind != StorageResourceKind.StaticWebsite)
+            await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken);
 
         switch (request.ResourceKind)
         {
@@ -41,6 +43,9 @@ public static class BlobProtocolEndpoint
                 break;
             case StorageResourceKind.Blob:
                 await HandleBlobAsync(http, request, service, writer, cancellationToken);
+                break;
+            case StorageResourceKind.StaticWebsite:
+                await HandleStaticWebsiteAsync(http, request, service, cancellationToken);
                 break;
             default:
                 throw new ArgumentOutOfRangeException();
@@ -106,8 +111,10 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
-            var updated = await ProtocolParsing.ReadServicePropertiesAsync(http.Request.Body, current, cancellationToken);
-            await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken);
+            var update = await ProtocolParsing.ReadServicePropertiesAsync(http.Request.Body, current, cancellationToken);
+            if (update.StaticWebsiteSpecified)
+                RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Static website properties");
+            await service.PutServicePropertiesAsync(request.Account, update.Properties, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -150,6 +157,164 @@ public static class BlobProtocolEndpoint
         }
 
         throw UnsupportedOperation();
+    }
+
+    private static async Task HandleStaticWebsiteAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        CancellationToken cancellationToken)
+    {
+        if (!HttpMethods.IsGet(http.Request.Method) && !HttpMethods.IsHead(http.Request.Method))
+        {
+            http.Response.Headers.Allow = "GET, HEAD";
+            await WriteStaticWebsiteErrorAsync(
+                http,
+                StatusCodes.Status405MethodNotAllowed,
+                "The resource doesn't support the specified HTTP verb.",
+                cancellationToken);
+            return;
+        }
+
+        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+        if (!properties.StaticWebsite.Enabled)
+        {
+            await WriteStaticWebsiteErrorAsync(
+                http,
+                StatusCodes.Status404NotFound,
+                "The requested content does not exist.",
+                cancellationToken);
+            return;
+        }
+
+        var requestedPath = request.Blob ?? string.Empty;
+        var isDirectoryRequest = requestedPath.Length == 0 ||
+                                 (http.Request.Path.Value?.EndsWith("/", StringComparison.Ordinal) ?? false);
+        var indexDocument = properties.StaticWebsite.IndexDocument;
+        var primaryPath = isDirectoryRequest && !string.IsNullOrEmpty(indexDocument)
+            ? CombineWebsitePath(requestedPath, indexDocument)
+            : requestedPath;
+        var blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, primaryPath, cancellationToken);
+        var statusCode = StatusCodes.Status200OK;
+
+        if (blob is null && properties.StaticWebsite.DefaultIndexDocumentPath is { Length: > 0 } defaultDocument)
+            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, defaultDocument.TrimStart('/'), cancellationToken);
+
+        if (blob is null && properties.StaticWebsite.ErrorDocument404Path is { Length: > 0 } errorDocument)
+        {
+            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, errorDocument.TrimStart('/'), cancellationToken);
+            statusCode = StatusCodes.Status404NotFound;
+        }
+
+        if (blob is null)
+        {
+            await WriteStaticWebsiteErrorAsync(
+                http,
+                StatusCodes.Status404NotFound,
+                "The requested content does not exist.",
+                cancellationToken);
+            return;
+        }
+
+        if (statusCode == StatusCodes.Status200OK)
+            EvaluateReadConditions(http.Request, blob);
+        await WriteStaticWebsiteBlobAsync(http, service, blob, statusCode, cancellationToken);
+    }
+
+    private static string CombineWebsitePath(string directory, string document) =>
+        string.IsNullOrEmpty(directory)
+            ? document.TrimStart('/')
+            : $"{directory.TrimEnd('/')}/{document.TrimStart('/')}";
+
+    private static async Task<BlobRecord?> TryGetStaticWebsiteBlobAsync(
+        BlobService service,
+        string account,
+        string name,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(name))
+            return null;
+        try
+        {
+            return await service.GetBlobAsync(
+                account,
+                "$web",
+                name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                cancellationToken);
+        }
+        catch (AzureStorageException exception) when (exception.ErrorCode is "BlobNotFound" or "ContainerNotFound")
+        {
+            return null;
+        }
+    }
+
+    private static async Task WriteStaticWebsiteBlobAsync(
+        HttpContext http,
+        BlobService service,
+        BlobRecord blob,
+        int statusCode,
+        CancellationToken cancellationToken)
+    {
+        long start = 0;
+        long end = blob.Content.Length - 1;
+        if (statusCode == StatusCodes.Status200OK &&
+            (ProtocolParsing.First(http.Request.Headers, "Range") ??
+             ProtocolParsing.First(http.Request.Headers, "x-ms-range")) is { Length: > 0 } range)
+        {
+            (start, end) = ProtocolParsing.ParseRange(range, blob.Content.Length);
+            statusCode = StatusCodes.Status206PartialContent;
+            http.Response.Headers.ContentRange = $"bytes {start}-{end}/{blob.Content.Length}";
+        }
+
+        var length = blob.Content.Length == 0 ? 0 : end - start + 1;
+        http.Response.StatusCode = statusCode;
+        http.Response.Headers.AcceptRanges = "bytes";
+        http.Response.Headers.ETag = blob.ETag;
+        http.Response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        http.Response.ContentType = blob.Http.ContentType;
+        http.Response.ContentLength = length;
+        SetStaticWebsiteHeader(http.Response.Headers, "Content-Encoding", blob.Http.ContentEncoding);
+        SetStaticWebsiteHeader(http.Response.Headers, "Content-Language", blob.Http.ContentLanguage);
+        SetStaticWebsiteHeader(http.Response.Headers, "Cache-Control", blob.Http.CacheControl);
+        SetStaticWebsiteHeader(http.Response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
+        if (statusCode != StatusCodes.Status206PartialContent)
+            SetStaticWebsiteHeader(http.Response.Headers, "Content-MD5", blob.Http.ContentMd5);
+        if (HttpMethods.IsHead(http.Request.Method) || length == 0)
+            return;
+
+        blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+        await service.WriteContentAsync(
+            blob,
+            new BlobEncryption(blob.EncryptionScope, CustomerProvidedKeySha256: null),
+            start,
+            length,
+            http.Response.Body,
+            cancellationToken);
+    }
+
+    private static void SetStaticWebsiteHeader(IHeaderDictionary headers, string name, string? value)
+    {
+        if (value is not null)
+            headers[name] = value;
+    }
+
+    private static async Task WriteStaticWebsiteErrorAsync(
+        HttpContext http,
+        int statusCode,
+        string message,
+        CancellationToken cancellationToken)
+    {
+        var body = Encoding.UTF8.GetBytes(
+            $"<!DOCTYPE html><html><head><title>{statusCode}</title></head>" +
+            $"<body><h1>{statusCode}</h1><p>{WebUtility.HtmlEncode(message)}</p></body></html>");
+        http.Response.StatusCode = statusCode;
+        http.Response.ContentType = "text/html; charset=utf-8";
+        http.Response.ContentLength = body.Length;
+        if (!HttpMethods.IsHead(http.Request.Method))
+            await http.Response.Body.WriteAsync(body, cancellationToken);
     }
 
     private static async Task HandleContainerAsync(
@@ -222,7 +387,8 @@ public static class BlobProtocolEndpoint
 
         var container = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken);
 
-        if (HttpMethods.IsHead(http.Request.Method) && string.IsNullOrEmpty(comp))
+        if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
+            string.IsNullOrEmpty(comp))
         {
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             EvaluateContainerConditions(http.Request, container);
