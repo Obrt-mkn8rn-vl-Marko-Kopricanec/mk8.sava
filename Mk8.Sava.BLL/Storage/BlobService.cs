@@ -1305,6 +1305,103 @@ public sealed class BlobService(
             cancellationToken);
     }
 
+    public async Task<BlobRecord> CopyBlockBlobFromBlobAsync(
+        string account,
+        string container,
+        string name,
+        BlobRecord source,
+        BlobWriteOptions options,
+        string sourceUri,
+        LeaseRecord destinationLease,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        if (source.Kind != BlobKind.BlockBlob)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "InvalidSourceBlobType",
+                "The source blob type is invalid for this operation.");
+        }
+        var encryption = EncryptionOf(options);
+        if (!chunks.IsInDomain(account, encryption, source.Content))
+            throw UnsupportedEncryptionTransition();
+        using var sourcePin = chunks.Pin(source.Content);
+        return await PublishSynchronousBlockCopyAsync(
+            account,
+            container,
+            name,
+            source.Content,
+            source.CommittedBlocks,
+            options,
+            sourceUri,
+            destinationLease,
+            expectedGeneration,
+            expectedRevision,
+            cancellationToken);
+    }
+
+    public async Task<BlobRecord> CopyBlockBlobFromStreamAsync(
+        string account,
+        string container,
+        string name,
+        Stream source,
+        BlobWriteOptions options,
+        string sourceUri,
+        LeaseRecord destinationLease,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        using var content = await chunks.StorePinnedAsync(account, EncryptionOf(options), source, cancellationToken);
+        return await PublishSynchronousBlockCopyAsync(
+            account,
+            container,
+            name,
+            content.Manifest,
+            [],
+            options,
+            sourceUri,
+            destinationLease,
+            expectedGeneration,
+            expectedRevision,
+            cancellationToken);
+    }
+
+    private async Task<BlobRecord> PublishSynchronousBlockCopyAsync(
+        string account,
+        string container,
+        string name,
+        ContentManifest content,
+        IReadOnlyList<CommittedBlockRecord> committedBlocks,
+        BlobWriteOptions options,
+        string sourceUri,
+        LeaseRecord destinationLease,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var now = metadata.GetUtcNow();
+        var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
+        {
+            Lease = leases.ResetAfterBlobWrite(destinationLease),
+            CommittedBlocks = [.. committedBlocks],
+            Copy = new CopyState
+            {
+                Id = Guid.NewGuid().ToString(),
+                Source = sourceUri,
+                Status = "success",
+                BytesCopied = content.Length,
+                TotalBytes = content.Length,
+                CompletedAt = now
+            }
+        };
+        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+    }
+
     public async Task<BlobRecord> BeginIncrementalCopyAsync(
         string account,
         string container,

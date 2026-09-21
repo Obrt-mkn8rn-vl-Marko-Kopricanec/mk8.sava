@@ -14,6 +14,8 @@ internal sealed record UrlSource(
     long? ContentLength,
     BlobHttpProperties Http,
     Dictionary<string, string> Metadata,
+    Dictionary<string, string> Tags,
+    BlobKind? Kind,
     string? ETag);
 
 internal sealed record UrlTransferResult<TResult>(TResult Value, TransactionalChecksums Checksums);
@@ -43,7 +45,8 @@ internal sealed class UrlTransferClient(
         long maximumBytes,
         bool sourceLengthConflict,
         Func<UrlSource, Task<TResult>> consume,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool copySourceTags = false)
     {
         var effectiveMaximumBytes = Math.Min(maximumBytes, _options.MaximumRequestBodyBytes);
         if (effectiveMaximumBytes <= 0)
@@ -61,6 +64,10 @@ internal sealed class UrlTransferClient(
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
+
+        var sourceTags = copySourceTags
+            ? await ReadSourceTagsAsync(destinationRequest, sourceUri, cancellationToken)
+            : new Dictionary<string, string>(StringComparer.Ordinal);
 
         using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         AddSourceAuthorization(destinationRequest, sourceRequest);
@@ -133,6 +140,8 @@ internal sealed class UrlTransferClient(
                 contentLength,
                 ReadHttpProperties(response),
                 ReadMetadata(response),
+                sourceTags,
+                ReadBlobKind(response),
                 response.Headers.ETag?.ToString());
             return await ConsumeWithChecksumValidationAsync(
                 destinationRequest,
@@ -380,6 +389,62 @@ internal sealed class UrlTransferClient(
                 headers.Append(header.Key, header.Value.ToArray());
         }
         return ProtocolParsing.ReadMetadata(headers);
+    }
+
+    private async Task<Dictionary<string, string>> ReadSourceTagsAsync(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        CancellationToken cancellationToken)
+    {
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(sourceUri.Query);
+        var values = query
+            .Where(pair => !string.Equals(pair.Key, "comp", StringComparison.OrdinalIgnoreCase))
+            .SelectMany(pair => pair.Value.Select(value => new KeyValuePair<string, string?>(pair.Key, value)))
+            .Append(new KeyValuePair<string, string?>("comp", "tags"));
+        var builder = new UriBuilder(sourceUri)
+        {
+            Query = QueryString.Create(values).Value?.TrimStart('?') ?? string.Empty
+        };
+        using var request = new HttpRequestMessage(HttpMethod.Get, builder.Uri);
+        AddSourceAuthorization(destinationRequest, request);
+        request.Headers.TryAddWithoutValidation(
+            "x-ms-version",
+            StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        }
+        catch (HttpRequestException)
+        {
+            throw CannotVerifyCopySource("The source tags could not be read.");
+        }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw CannotVerifyCopySource("The source tag request did not complete before the transfer timeout.");
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken);
+            await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
+            return await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken);
+        }
+    }
+
+    private static BlobKind? ReadBlobKind(HttpResponseMessage response)
+    {
+        if (!response.Headers.TryGetValues("x-ms-blob-type", out var values))
+            return null;
+        return values.SingleOrDefault() switch
+        {
+            "BlockBlob" => BlobKind.BlockBlob,
+            "AppendBlob" => BlobKind.AppendBlob,
+            "PageBlob" => BlobKind.PageBlob,
+            _ => null
+        };
     }
 
     private static string? Join(IEnumerable<string> values)
