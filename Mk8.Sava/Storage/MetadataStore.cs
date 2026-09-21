@@ -390,6 +390,27 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
     }
 
+    internal async Task<IReadOnlyList<BlobRecord>> ListBlobFamilyAsync(
+        string account,
+        string container,
+        string name,
+        bool includeDeleted,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT data FROM blobs
+            WHERE account = $account AND container = $container AND name = $name
+                  {(includeDeleted ? string.Empty : "AND is_deleted = 0")}
+            ORDER BY is_current DESC, modified_ticks DESC, generation_id;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$name", name);
+        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+    }
+
     internal async Task<BlobListPage> ListBlobsPageAsync(
         string account,
         string container,
@@ -854,6 +875,68 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
             await UpdateBlobRowAsync(connection, transaction, record, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task ApplyBlobRecordMutationsAsync(
+        IReadOnlyList<BlobRecordMutation> mutations,
+        CancellationToken cancellationToken)
+    {
+        if (mutations.Count == 0)
+            return;
+        if (mutations.Select(item => item.GenerationId).Distinct(StringComparer.Ordinal).Count() != mutations.Count ||
+            mutations.Any(item => item.Replacement is not null &&
+                                  !string.Equals(
+                                      item.GenerationId,
+                                      item.Replacement.GenerationId,
+                                      StringComparison.Ordinal)))
+        {
+            throw new ArgumentException("Blob record mutations must target unique, stable generation identities.", nameof(mutations));
+        }
+
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            foreach (var mutation in mutations)
+            {
+                var current = await GetBlobByGenerationAsync(
+                    connection,
+                    transaction,
+                    mutation.GenerationId,
+                    cancellationToken);
+                if (current is null ||
+                    !string.Equals(current.Revision, mutation.ExpectedRevision, StringComparison.Ordinal))
+                {
+                    throw new StorageConcurrencyException();
+                }
+            }
+
+            foreach (var mutation in mutations)
+            {
+                if (mutation.Replacement is null)
+                {
+                    await DeleteBlobRowAsync(
+                        connection,
+                        transaction,
+                        mutation.GenerationId,
+                        cancellationToken);
+                }
+                else
+                {
+                    await UpdateBlobRowAsync(
+                        connection,
+                        transaction,
+                        mutation.Replacement,
+                        cancellationToken);
+                }
+            }
             await transaction.CommitAsync(cancellationToken);
         }
         finally

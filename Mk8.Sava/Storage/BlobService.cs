@@ -1057,11 +1057,10 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
-        var records = await metadata.ListBlobsAsync(
+        var records = await metadata.ListBlobFamilyAsync(
             current.Account,
             current.Container,
-            includeVersions: true,
-            includeSnapshots: true,
+            current.Name,
             includeDeleted: true,
             cancellationToken);
         var relatedSnapshots = records.Where(item => item.Name == current.Name && item.Snapshot is not null && !item.IsDeleted).ToArray();
@@ -1085,13 +1084,15 @@ public sealed class BlobService(
             EnsureBlobMutable(target);
 
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        var mutations = new List<BlobRecordMutation>(targets.Count);
         foreach (var target in targets)
         {
+            BlobRecord? replacement;
             if (target.IsCurrent &&
                 target.Snapshot is null &&
                 properties.VersioningEnabled)
             {
-                await metadata.PutBlobRecordAsync(target with
+                replacement = target with
                 {
                     IsCurrent = false,
                     IsDeleted = false,
@@ -1100,25 +1101,27 @@ public sealed class BlobService(
                     VersionId = target.VersionId ?? MetadataStore.CreateVersionId(target.LastModified),
                     Lease = LeaseRecord.Available,
                     Revision = MetadataStore.NewRevision()
-                }, target.Revision, cancellationToken);
+                };
             }
             else if (properties.BlobSoftDeleteEnabled)
             {
                 var deletedAt = metadata.GetUtcNow();
-                await metadata.PutBlobRecordAsync(target with
+                replacement = target with
                 {
                     IsDeleted = true,
                     DeletedAt = deletedAt,
                     DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
                     IsCurrent = target.IsCurrent,
                     Revision = MetadataStore.NewRevision()
-                }, target.Revision, cancellationToken);
+                };
             }
             else
             {
-                await metadata.DeleteBlobRecordAsync(target.GenerationId, target.Revision, cancellationToken);
+                replacement = null;
             }
+            mutations.Add(new BlobRecordMutation(target.GenerationId, target.Revision, replacement));
         }
+        await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken);
     }
 
     public async Task UndeleteBlobAsync(
@@ -1127,10 +1130,12 @@ public sealed class BlobService(
         string name,
         CancellationToken cancellationToken)
     {
-        var records = await metadata.ListBlobsAsync(account, container, true, true, true, cancellationToken);
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var records = await metadata.ListBlobFamilyAsync(account, container, name, includeDeleted: true, cancellationToken);
         var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
         var now = metadata.GetUtcNow();
-        var restored = false;
+        var mutations = new List<BlobRecordMutation>();
         foreach (var record in records.Where(item => item.Name == name && item.IsDeleted))
         {
             if (record.DeletedAt is null)
@@ -1139,17 +1144,17 @@ public sealed class BlobService(
                                  record.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays);
             if (retentionUntil < now)
                 continue;
-            await metadata.PutBlobRecordAsync(record with
+            mutations.Add(new BlobRecordMutation(record.GenerationId, record.Revision, record with
             {
                 IsDeleted = false,
                 DeletedAt = null,
                 DeleteRetentionUntil = null,
                 Revision = MetadataStore.NewRevision()
-            }, record.Revision, cancellationToken);
-            restored = true;
+            }));
         }
-        if (!restored)
+        if (mutations.Count == 0)
             throw AzureStorageException.BlobNotFound();
+        await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken);
     }
 
     public async Task<BlobRecord> BeginCopyFromBlobAsync(

@@ -247,6 +247,11 @@ internal sealed record BlobTagCursor(string Container, string Name, string Gener
 
 internal sealed record TaggedBlobPage(IReadOnlyList<BlobRecord> Items, bool HasMore);
 
+internal sealed record BlobRecordMutation(
+    string GenerationId,
+    string ExpectedRevision,
+    BlobRecord? Replacement);
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable
