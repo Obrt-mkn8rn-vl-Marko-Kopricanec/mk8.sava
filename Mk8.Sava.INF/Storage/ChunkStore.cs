@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
+using System.IO.Pipelines;
 using System.Text;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
@@ -57,6 +58,94 @@ public sealed class ChunkStore
         string account,
         BlobEncryption encryption,
         Stream source,
+        CancellationToken cancellationToken) =>
+        await StorePinnedCoreAsync(
+            account,
+            encryption,
+            source,
+            _options.MaximumRequestBodyBytes,
+            cancellationToken);
+
+    public async Task<StoredContent> CopyToDomainPinnedAsync(
+        string destinationAccount,
+        BlobEncryption sourceEncryption,
+        BlobEncryption destinationEncryption,
+        ContentManifest source,
+        CancellationToken cancellationToken)
+    {
+        ValidateManifest(source);
+        if (IsInDomain(destinationAccount, destinationEncryption, source))
+            return new StoredContent(source, Pin(source));
+
+        using var transferCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var pipe = new Pipe(new PipeOptions(
+            pauseWriterThreshold: checked(_options.MaximumChunkBytes * 2L),
+            resumeWriterThreshold: _options.MaximumChunkBytes,
+            useSynchronizationContext: false));
+        var producer = ProduceAsync();
+        StoredContent? copied = null;
+        try
+        {
+            await using var input = pipe.Reader.AsStream(leaveOpen: true);
+            copied = await StorePinnedCoreAsync(
+                destinationAccount,
+                destinationEncryption,
+                input,
+                long.MaxValue,
+                cancellationToken);
+            await producer;
+            return copied;
+        }
+        catch
+        {
+            copied?.Dispose();
+            transferCancellation.Cancel();
+            try
+            {
+                await producer;
+            }
+            catch
+            {
+                // Preserve the transfer/storage exception that caused cancellation.
+            }
+            throw;
+        }
+        finally
+        {
+            await pipe.Reader.CompleteAsync();
+        }
+
+        async Task ProduceAsync()
+        {
+            Exception? failure = null;
+            try
+            {
+                await using var output = pipe.Writer.AsStream(leaveOpen: true);
+                await WriteRangeAsync(
+                    source,
+                    sourceEncryption,
+                    0,
+                    source.Length,
+                    output,
+                    transferCancellation.Token);
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+                throw;
+            }
+            finally
+            {
+                await pipe.Writer.CompleteAsync(failure);
+            }
+        }
+    }
+
+    private async Task<StoredContent> StorePinnedCoreAsync(
+        string account,
+        BlobEncryption encryption,
+        Stream source,
+        long maximumBytes,
         CancellationToken cancellationToken)
     {
         var domain = ResolveDomain(account, encryption);
@@ -68,7 +157,7 @@ public sealed class ChunkStore
 
         try
         {
-            await foreach (var bytes in _chunker.ReadChunksAsync(source, _options.MaximumRequestBodyBytes, cancellationToken))
+            await foreach (var bytes in _chunker.ReadChunksAsync(source, maximumBytes, cancellationToken))
             {
                 completeHash.AppendData(bytes);
                 completeMd5.AppendData(bytes);
