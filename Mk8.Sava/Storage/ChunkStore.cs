@@ -103,6 +103,18 @@ public sealed class ChunkStore
         return new PinLease(this, ids);
     }
 
+    internal IDisposable PinChunkIds(IReadOnlySet<string> chunkIds)
+    {
+        var ids = chunkIds
+            .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        PinIds(ids);
+        return new PinLease(this, ids);
+    }
+
+    internal string GetChunkPathForBackup(string id) => GetChunkPath(id);
+
     public ContentManifest Empty(string account, BlobEncryption encryption) =>
         ContentManifest.Empty(ResolveDomain(account, encryption));
 
@@ -890,7 +902,7 @@ public sealed class ChunkStore
         }
     }
 
-    private static string GetDomainFromChunkId(string id)
+    internal static string GetDomainFromChunkId(string id)
     {
         var firstSeparator = id.IndexOf('/', StringComparison.Ordinal);
         if (firstSeparator <= 0)

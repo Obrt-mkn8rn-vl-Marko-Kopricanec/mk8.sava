@@ -7,6 +7,7 @@ using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
 var builder = WebApplication.CreateBuilder(args);
+var operatorCommand = ParseOperatorCommand(args);
 
 builder.Services.AddOptions<SavaOptions>()
     .Bind(builder.Configuration.GetSection(SavaOptions.SectionName))
@@ -46,6 +47,7 @@ builder.Services.AddSingleton<StorageTelemetry>();
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<BlobService>();
+builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<AzureResponseWriter>();
@@ -59,7 +61,44 @@ builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Tim
 
 var app = builder.Build();
 
+if (operatorCommand is { Name: "restore" })
+{
+    var options = app.Services.GetRequiredService<IOptions<SavaOptions>>().Value;
+    var environment = app.Services.GetRequiredService<IHostEnvironment>();
+    var target = StoragePaths.ResolveRoot(environment.ContentRootPath, options.DataPath);
+    var restored = await StorageBackupService.RestoreAsync(
+        operatorCommand.Value.Path,
+        target,
+        options,
+        CancellationToken.None);
+    Console.WriteLine(
+        $"Restored {restored.BlobRecordCount} blob records and {restored.ChunkCount} chunks into '{target}'.");
+    return;
+}
+
+if (operatorCommand is { Name: "validate" })
+{
+    var options = app.Services.GetRequiredService<IOptions<SavaOptions>>().Value;
+    var validated = await StorageBackupService.ValidateBackupAsync(
+        operatorCommand.Value.Path,
+        options,
+        CancellationToken.None);
+    Console.WriteLine(
+        $"Validated backup '{validated.BackupPath}' with {validated.BlobRecordCount} blob records and {validated.ChunkCount} chunks.");
+    return;
+}
+
 await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
+
+if (operatorCommand is { Name: "create" })
+{
+    var created = await app.Services.GetRequiredService<StorageBackupService>().CreateAsync(
+        operatorCommand.Value.Path,
+        CancellationToken.None);
+    Console.WriteLine(
+        $"Created backup '{created.BackupPath}' with {created.BlobRecordCount} blob records and {created.ChunkCount} chunks.");
+    return;
+}
 
 app.UseMiddleware<StorageTelemetryMiddleware>();
 app.UseMiddleware<AzureExceptionMiddleware>();
@@ -96,5 +135,27 @@ app.MapGet("/metrics", (StorageTelemetry telemetry) =>
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
 await app.RunAsync();
+
+static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
+{
+    (string Name, string Path)? command = null;
+    var names = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["--backup-create"] = "create",
+        ["--backup-validate"] = "validate",
+        ["--restore-from"] = "restore"
+    };
+    for (var index = 0; index < arguments.Length; index++)
+    {
+        if (!names.TryGetValue(arguments[index], out var name))
+            continue;
+        if (command is not null)
+            throw new ArgumentException("Specify only one backup or restore command.");
+        if (++index >= arguments.Length || string.IsNullOrWhiteSpace(arguments[index]))
+            throw new ArgumentException($"The {arguments[index - 1]} command requires a path.");
+        command = (name, arguments[index]);
+    }
+    return command;
+}
 
 public partial class Program;

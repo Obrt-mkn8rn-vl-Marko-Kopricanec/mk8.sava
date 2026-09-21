@@ -178,6 +178,19 @@ public sealed record StorageMetadataInventory(
     int BlobRecordCount,
     int StagedBlockCount);
 
+internal sealed class MetadataBackupSnapshot(
+    StorageMetadataInventory inventory,
+    IDisposable contentPins) : IDisposable
+{
+    public StorageMetadataInventory Inventory { get; } = inventory;
+
+    public void Dispose() => contentPins.Dispose();
+}
+
+internal sealed record MetadataDatabaseInspection(
+    int SchemaVersion,
+    StorageMetadataInventory Inventory);
+
 public sealed record StorageUsageSnapshot(
     long LogicalBlobBytes,
     long LogicalStagedBlockBytes,

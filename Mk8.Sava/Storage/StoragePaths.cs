@@ -7,11 +7,7 @@ public sealed class StoragePaths
 {
     public StoragePaths(IHostEnvironment environment, IOptions<SavaOptions> options)
     {
-        var configured = options.Value.DataPath;
-        Root = Path.GetFullPath(
-            Path.IsPathRooted(configured)
-                ? configured
-                : Path.Combine(environment.ContentRootPath, configured));
+        Root = ResolveRoot(environment.ContentRootPath, options.Value.DataPath);
         Chunks = Path.Combine(Root, "chunks");
         Staging = Path.Combine(Root, "staging");
         Database = Path.Combine(Root, "metadata.db");
@@ -25,5 +21,10 @@ public sealed class StoragePaths
     public string Chunks { get; }
     public string Staging { get; }
     public string Database { get; }
-}
 
+    public static string ResolveRoot(string contentRootPath, string configuredPath) =>
+        Path.GetFullPath(
+            Path.IsPathRooted(configuredPath)
+                ? configuredPath
+                : Path.Combine(contentRootPath, configuredPath));
+}

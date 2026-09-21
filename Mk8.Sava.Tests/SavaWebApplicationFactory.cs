@@ -13,7 +13,17 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string DelegatorObjectId = "c618c4f3-ec92-4df7-bf22-3a4c599cfb78";
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
-    public string DataPath { get; } = Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}");
+    public SavaWebApplicationFactory()
+        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"))
+    {
+    }
+
+    internal SavaWebApplicationFactory(string dataPath)
+    {
+        DataPath = dataPath;
+    }
+
+    public string DataPath { get; }
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {

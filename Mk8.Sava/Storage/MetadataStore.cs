@@ -7,6 +7,8 @@ namespace Mk8.Sava.Storage;
 
 public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider = null)
 {
+    public const int CurrentSchemaVersion = 1;
+
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         Converters = { new JsonStringEnumConverter() }
@@ -32,6 +34,12 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken);
             await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken);
             await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken);
+            var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+            if (schemaVersion > CurrentSchemaVersion)
+            {
+                throw new InvalidDataException(
+                    $"The metadata schema version {schemaVersion} is newer than the supported version {CurrentSchemaVersion}.");
+            }
             await ExecuteNonQueryAsync(connection, """
                 CREATE TABLE IF NOT EXISTS containers (
                     account TEXT NOT NULL,
@@ -82,6 +90,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     data TEXT NOT NULL
                 );
                 """, cancellationToken);
+            if (schemaVersion == 0)
+                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
         }
         finally
         {
@@ -817,12 +827,93 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
 
     public async Task<StorageMetadataInventory> GetStorageInventoryAsync(CancellationToken cancellationToken)
     {
+        await using var connection = await OpenAsync(cancellationToken);
+        return await ReadStorageInventoryAsync(connection, cancellationToken);
+    }
+
+    internal async Task<MetadataBackupSnapshot> CreateBackupSnapshotAsync(
+        string destinationDatabasePath,
+        Func<IReadOnlySet<string>, IDisposable> acquireContentPins,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        IDisposable? pins = null;
+        try
+        {
+            await using var source = await OpenAsync(cancellationToken);
+            var inventory = await ReadStorageInventoryAsync(source, cancellationToken);
+            pins = acquireContentPins(inventory.ReachableChunkIds);
+            var destinationConnectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = destinationDatabasePath,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                Cache = SqliteCacheMode.Private,
+                Pooling = false
+            }.ToString();
+            await using (var destination = new SqliteConnection(destinationConnectionString))
+            {
+                await destination.OpenAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                source.BackupDatabase(destination);
+                cancellationToken.ThrowIfCancellationRequested();
+                await using var journalMode = destination.CreateCommand();
+                journalMode.CommandText = "PRAGMA journal_mode=DELETE;";
+                var selectedMode = Convert.ToString(
+                    await journalMode.ExecuteScalarAsync(cancellationToken),
+                    CultureInfo.InvariantCulture);
+                if (!string.Equals(selectedMode, "delete", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("The metadata backup could not be normalized to a standalone database file.");
+            }
+            var snapshot = new MetadataBackupSnapshot(inventory, pins);
+            pins = null;
+            return snapshot;
+        }
+        finally
+        {
+            pins?.Dispose();
+            _writeGate.Release();
+        }
+    }
+
+    internal static async Task<MetadataDatabaseInspection> InspectDatabaseAsync(
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Cache = SqliteCacheMode.Private,
+            Pooling = false
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using (var integrity = connection.CreateCommand())
+        {
+            integrity.CommandText = "PRAGMA integrity_check;";
+            await using var reader = await integrity.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var result = reader.GetString(0);
+                if (!string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException($"The metadata database failed SQLite integrity checking: {result}");
+            }
+        }
+
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+        var inventory = await ReadStorageInventoryAsync(connection, cancellationToken);
+        return new MetadataDatabaseInspection(schemaVersion, inventory);
+    }
+
+    private static async Task<StorageMetadataInventory> ReadStorageInventoryAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
         var reachable = new HashSet<string>(StringComparer.Ordinal);
         long logicalBlobBytes = 0;
         long logicalStagedBlockBytes = 0;
         var blobRecordCount = 0;
         var stagedBlockCount = 0;
-        await using var connection = await OpenAsync(cancellationToken);
 
         await using (var blobs = connection.CreateCommand())
         {
@@ -887,6 +978,15 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         await using var command = connection.CreateCommand();
         command.CommandText = text;
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<int> ReadSchemaVersionAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
     }
 
     private static void AddContainerParameters(SqliteCommand command, ContainerRecord container)
