@@ -7,7 +7,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public sealed class AzureResponseWriter
+public sealed partial class AzureResponseWriter
 {
     private const string LegacyBlobMarkerPrefix = "mk8s1.";
     private const string BlobMarkerPrefix = "mk8s2.";
@@ -89,17 +89,21 @@ public sealed class AzureResponseWriter
         BlobListPage listing,
         string prefix,
         string startFrom,
+        string endBefore,
         string delimiter,
         string marker,
         int maxResults,
         IReadOnlySet<string> includes,
+        bool arrow,
         CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
-        var listingScope = CreateBlobListingScope(request, prefix, startFrom, delimiter, includes);
+        var listingScope = CreateBlobListingScope(request, prefix, startFrom, endBefore, delimiter, includes);
         var nextMarker = listing.HasMore && listing.Items.Count > 0
             ? EncodeBlobMarker(listing.Items[^1].Cursor, listingScope)
             : string.Empty;
+        if (arrow)
+            return WriteArrowBlobsAsync(context, listing, nextMarker, includes, cancellationToken);
         var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
 
         return WriteXmlAsync(context, writer =>
@@ -159,6 +163,8 @@ public sealed class AzureResponseWriter
                     IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
                 {
                     writer.WriteElementString("AccessTier", blob.AccessTier);
+                    if (blob.AccessTierInferred)
+                        writer.WriteElementString("AccessTierInferred", "true");
                     if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
                         IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
                     {
@@ -427,6 +433,8 @@ public sealed class AzureResponseWriter
             IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
         {
             response.Headers["x-ms-access-tier"] = blob.AccessTier;
+            if (blob.AccessTierInferred)
+                response.Headers["x-ms-access-tier-inferred"] = "true";
             if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
                 IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
             {
@@ -566,18 +574,23 @@ public sealed class AzureResponseWriter
         StorageRequestContext request,
         string prefix,
         string startFrom,
+        string endBefore,
         string delimiter,
         IReadOnlySet<string> includes)
     {
-        var value = string.Join(
-            '\n',
+        var scopeParts = new List<string>
+        {
             request.Account,
-            request.Container,
+            request.Container ?? string.Empty,
             request.ServiceVersion,
             prefix,
-            startFrom,
-            delimiter,
-            string.Join(',', includes.Order(StringComparer.OrdinalIgnoreCase)));
+            startFrom
+        };
+        if (!string.IsNullOrEmpty(endBefore))
+            scopeParts.Add(endBefore);
+        scopeParts.Add(delimiter);
+        scopeParts.Add(string.Join(',', includes.Order(StringComparer.OrdinalIgnoreCase)));
+        var value = string.Join('\n', scopeParts);
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)).AsSpan(0, 12));
     }
 
@@ -585,6 +598,7 @@ public sealed class AzureResponseWriter
         HttpContext context,
         string prefix,
         string startFrom,
+        string endBefore,
         string delimiter,
         IReadOnlySet<string> includes,
         string marker)
@@ -596,6 +610,7 @@ public sealed class AzureResponseWriter
             StorageRequestContext.Get(context),
             prefix,
             startFrom,
+            endBefore,
             delimiter,
             includes);
         if (marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))

@@ -236,6 +236,7 @@ public static class BlobProtocolEndpoint
             var includes = SplitCsv(http.Request.Query["include"].ToString());
             var prefix = http.Request.Query["prefix"].ToString();
             var startFrom = http.Request.Query["startfrom"].ToString();
+            var endBefore = http.Request.Query["endbefore"].ToString();
             var delimiter = http.Request.Query["delimiter"].ToString();
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
@@ -248,10 +249,31 @@ public static class BlobProtocolEndpoint
                     "FeatureVersionMismatch",
                     "The startFrom parameter requires service version 2023-05-03 or later.");
             }
+            var arrow = IsArrowListRequest(http.Request, request);
+            if (http.Request.Query.ContainsKey("endbefore"))
+            {
+                if (!IsServiceVersionAtLeast(request, new DateOnly(2026, 6, 6)))
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status400BadRequest,
+                        "FeatureVersionMismatch",
+                        "The endBefore parameter requires service version 2026-06-06 or later.");
+                }
+                if (string.IsNullOrEmpty(endBefore))
+                    throw AzureStorageException.InvalidQuery("endbefore");
+                if (!arrow)
+                    throw AzureStorageException.InvalidQuery("endbefore");
+                if (!string.IsNullOrEmpty(startFrom) &&
+                    string.CompareOrdinal(endBefore, startFrom) < 0)
+                {
+                    throw AzureStorageException.InvalidQuery("endbefore");
+                }
+            }
             var decodedMarker = AzureResponseWriter.DecodeBlobMarker(
                 http,
                 prefix,
                 startFrom,
+                endBefore,
                 delimiter,
                 includes,
                 marker);
@@ -263,6 +285,7 @@ public static class BlobProtocolEndpoint
                 includes.Contains("deleted") || includes.Contains("deletedwithversions"),
                 prefix,
                 startFrom,
+                endBefore,
                 delimiter,
                 decodedMarker,
                 maxResults,
@@ -272,10 +295,12 @@ public static class BlobProtocolEndpoint
                 blobs,
                 prefix,
                 startFrom,
+                endBefore,
                 delimiter,
                 marker,
                 maxResults,
                 includes,
+                arrow,
                 cancellationToken);
             return;
         }
@@ -2204,7 +2229,10 @@ public static class BlobProtocolEndpoint
             legalHold,
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
-            encryption.CustomerProvidedKey);
+            encryption.CustomerProvidedKey,
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
+                ? fallback?.AccessTierInferred
+                : false);
     }
 
     private static string? ReadAccessTier(HttpRequest request, string? fallback)
@@ -2264,6 +2292,31 @@ public static class BlobProtocolEndpoint
             CultureInfo.InvariantCulture,
             DateTimeStyles.None,
             out var version) && version >= minimum;
+
+    private static bool IsArrowListRequest(HttpRequest request, StorageRequestContext context)
+    {
+        const string arrowContentType = "application/vnd.apache.arrow.stream";
+        var accept = request.Headers.Accept.ToString();
+        if (string.IsNullOrWhiteSpace(accept))
+            return false;
+
+        var mediaTypes = accept.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(value => value.Split(';', 2)[0].Trim())
+            .ToArray();
+        if (mediaTypes.Contains(arrowContentType, StringComparer.OrdinalIgnoreCase))
+        {
+            RequireFeatureVersion(context, new DateOnly(2026, 6, 6), "Apache Arrow blob listings");
+            return true;
+        }
+        if (mediaTypes.All(value =>
+                value.Equals("application/xml", StringComparison.OrdinalIgnoreCase) ||
+                value.Equals("*/*", StringComparison.Ordinal)))
+        {
+            return false;
+        }
+
+        throw AzureStorageException.InvalidHeader("Accept", accept);
+    }
 
     private static void RequireFeatureVersion(
         StorageRequestContext request,
@@ -2356,7 +2409,8 @@ public static class BlobProtocolEndpoint
             legalHold,
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
-            encryption.CustomerProvidedKey);
+            encryption.CustomerProvidedKey,
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null ? null : false);
     }
 
     private static BlobWriteOptions ReadCopyWriteOptions(HttpRequest request, BlobRecord source)
@@ -2378,7 +2432,10 @@ public static class BlobProtocolEndpoint
             legalHold,
             encryption.Scope,
             encryption.CustomerProvidedKeySha256,
-            encryption.CustomerProvidedKey);
+            encryption.CustomerProvidedKey,
+            ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
+                ? source.AccessTierInferred
+                : false);
     }
 
     private static BlobEncryption ReadRequestEncryption(HttpRequest request, bool write)

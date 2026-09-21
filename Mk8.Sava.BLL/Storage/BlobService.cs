@@ -269,6 +269,7 @@ public sealed class BlobService(
         bool includeDeleted,
         string prefix,
         string startFrom,
+        string endBefore,
         string delimiter,
         BlobListingMarker marker,
         int maximum,
@@ -283,6 +284,7 @@ public sealed class BlobService(
             includeDeleted,
             prefix,
             startFrom,
+            endBefore,
             delimiter,
             marker.Cursor,
             marker.LegacyOffset,
@@ -948,6 +950,7 @@ public sealed class BlobService(
             updated = current with
             {
                 AccessTier = tier,
+                AccessTierInferred = false,
                 SmartAccessTier = tier == "Smart" ? "Hot" : null,
                 SmartTierLastAccessedAt = tier == "Smart" ? now : null,
                 ArchiveStatus = null,
@@ -1996,6 +1999,8 @@ public sealed class BlobService(
             Tags = options.Tags ?? new Dictionary<string, string>(StringComparer.Ordinal),
             Http = options.Http,
             AccessTier = options.AccessTier ?? "Hot",
+            AccessTierInferred = kind == BlobKind.BlockBlob &&
+                                 (options.AccessTierInferred ?? options.AccessTier is null),
             SmartAccessTier = options.AccessTier == "Smart" ? "Hot" : null,
             ImmutabilityUntil = options.ImmutabilityUntil,
             ImmutabilityLocked = options.ImmutabilityLocked,

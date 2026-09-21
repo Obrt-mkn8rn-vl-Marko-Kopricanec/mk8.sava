@@ -782,6 +782,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         bool includeDeleted,
         string prefix,
         string startFrom,
+        string endBefore,
         string delimiter,
         BlobListCursor? cursor,
         int legacyOffset,
@@ -809,6 +810,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             predicates.Add("snapshot IS NULL");
         if (!includeDeleted)
             predicates.Add("is_deleted = 0");
+        if (!string.IsNullOrEmpty(endBefore))
+            predicates.Add("name < $end_before");
 
         const string rankExpression = """
             CASE
@@ -900,6 +903,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$prefix", prefix);
         command.Parameters.AddWithValue("$start_from", startFrom);
+        command.Parameters.AddWithValue("$end_before", endBefore);
         command.Parameters.AddWithValue("$delimiter", delimiter);
         command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
         command.Parameters.AddWithValue("$name_complete", cursor?.NameComplete == true ? 1 : 0);
