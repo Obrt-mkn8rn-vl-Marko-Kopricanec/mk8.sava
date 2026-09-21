@@ -13,7 +13,10 @@ public sealed record BlobWriteOptions(
     string? AccessTier = null,
     DateTimeOffset? ImmutabilityUntil = null,
     bool ImmutabilityLocked = false,
-    bool HasLegalHold = false);
+    bool HasLegalHold = false,
+    string? EncryptionScope = null,
+    string? CustomerProvidedKeySha256 = null,
+    byte[]? CustomerProvidedKey = null);
 
 public sealed record PageRange(long Start, long End);
 
@@ -227,7 +230,8 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
     {
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
+        var encryption = EncryptionOf(options);
+        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content.Manifest, options, now);
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
@@ -245,7 +249,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account), options, now);
+        var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now);
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
     }
 
@@ -266,7 +270,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, length), options, now) with
+        var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with
         {
             SequenceNumber = sequenceNumber
         };
@@ -279,6 +283,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string name,
         string blockId,
         Stream source,
+        BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
@@ -287,6 +292,8 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
         if (current is not null && current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (current is not null && !chunks.IsInDomain(account, encryption, current.Content))
+            throw CustomerProvidedKeyMismatch();
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
         if (staged.Count >= 100_000 && staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The uncommitted block count exceeds the maximum permitted value.");
@@ -294,7 +301,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                          ?? current?.CommittedBlocks.FirstOrDefault()?.Id;
         if (existingId is not null && ValidateBlockId(existingId) != blockIdLength)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlobOrBlock", "All block IDs for a blob must have the same length.");
-        using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
+        if (staged.Any(item => !chunks.IsInDomain(account, encryption, item.Content)))
+            throw CustomerProvidedKeyMismatch();
+        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
         await metadata.PutStagedBlockAsync(new StagedBlockRecord
         {
             Account = account,
@@ -320,6 +329,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
+        var encryption = EncryptionOf(options);
         var stagedById = staged.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
         var committedById = current?.CommittedBlocks
@@ -348,10 +358,12 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             };
             if (resolved is null)
                 throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlockList", "The specified block list is invalid.");
+            if (!chunks.IsInDomain(account, encryption, resolved))
+                throw CustomerProvidedKeyMismatch();
             selected.Add(new CommittedBlockRecord(blockId, resolved));
         }
 
-        var content = await chunks.ComposeAsync(account, selected.Select(item => item.Content).ToArray(), cancellationToken);
+        var content = await chunks.ComposeAsync(account, encryption, selected.Select(item => item.Content).ToArray(), cancellationToken);
         using var contentPin = chunks.Pin(content);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
@@ -371,6 +383,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         Stream source,
         long? expectedPosition,
         long? expectedMaximumSize,
+        BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -384,7 +397,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         if (expectedPosition.HasValue && expectedPosition.Value != current.Content.Length)
             throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, "AppendPositionConditionNotMet", "The append position condition specified was not met.");
 
-        using var appended = await chunks.StorePinnedAsync(current.Account, source, cancellationToken);
+        if (!chunks.IsInDomain(current.Account, encryption, current.Content))
+            throw CustomerProvidedKeyMismatch();
+        using var appended = await chunks.StorePinnedAsync(current.Account, encryption, source, cancellationToken);
         if (appended.Manifest.Length > 100L * 1024 * 1024)
             throw new AzureStorageException(StatusCodes.Status413PayloadTooLarge, "RequestBodyTooLarge", "An append block cannot exceed 100 MiB.");
         if (expectedMaximumSize.HasValue && current.Content.Length + appended.Manifest.Length > expectedMaximumSize.Value)
@@ -394,7 +409,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 "MaxBlobSizeConditionNotMet",
                 "The max blob size condition specified was not met.");
         }
-        var content = await chunks.ComposeAsync(current.Account, [current.Content, appended.Manifest], cancellationToken);
+        var content = await chunks.ComposeAsync(current.Account, encryption, [current.Content, appended.Manifest], cancellationToken);
         using var contentPin = chunks.Pin(content);
         var updated = current with
         {
@@ -416,6 +431,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         long end,
         Stream? source,
         bool clear,
+        BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -427,6 +443,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
         using var content = await chunks.ReplaceRangePinnedAsync(
             current.Account,
+            encryption,
             current.Content,
             start,
             end - start + 1,
@@ -447,6 +464,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task WriteContentAsync(
         BlobRecord blob,
+        BlobEncryption encryption,
         long offset,
         long length,
         Stream destination,
@@ -460,7 +478,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                 "BlobArchived",
                 "This operation is not permitted on an archived blob.");
         }
-        await chunks.WriteRangeAsync(blob.Content, offset, length, destination, cancellationToken);
+        await chunks.WriteRangeAsync(blob.Content, encryption, offset, length, destination, cancellationToken);
     }
 
     public async Task<BlobRecord> SetBlobMetadataAsync(
@@ -530,7 +548,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
             if (current.Kind != BlobKind.PageBlob || resizeTo < 0 || resizeTo > maximumPageBlobBytes || resizeTo % 512 != 0)
                 throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", resizeTo.Value.ToString(CultureInfo.InvariantCulture));
-            resized = await chunks.ResizeSparsePinnedAsync(current.Account, current.Content, resizeTo.Value, cancellationToken);
+            resized = await chunks.ResizeSparsePinnedAsync(current.Account, EncryptionOf(current), current.Content, resizeTo.Value, cancellationToken);
             content = resized.Manifest;
         }
 
@@ -836,8 +854,9 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        if (!chunks.IsInDomain(account, source.Content))
-            throw new InvalidOperationException("Cross-account copies must pass through a verified plaintext transfer.");
+        var encryption = EncryptionOf(options);
+        if (!chunks.IsInDomain(account, encryption, source.Content))
+            throw UnsupportedEncryptionTransition();
         using var sourcePin = chunks.Pin(source.Content);
         return await BeginCopyAsync(
             account,
@@ -868,7 +887,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        using var content = await chunks.StorePinnedAsync(account, source, cancellationToken);
+        using var content = await chunks.StorePinnedAsync(account, EncryptionOf(options), source, cancellationToken);
         return await BeginCopyAsync(
             account,
             container,
@@ -906,12 +925,13 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
     {
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        if (!chunks.IsInDomain(account, sourceContent))
-            throw new InvalidOperationException("Copy source content must be staged in the destination encryption domain.");
+        var encryption = EncryptionOf(options);
+        if (!chunks.IsInDomain(account, encryption, sourceContent))
+            throw UnsupportedEncryptionTransition();
         using var sourcePin = chunks.Pin(sourceContent);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
-        var proposed = NewBlob(account, container, name, sourceKind, chunks.Empty(account), options, now) with
+        var proposed = NewBlob(account, container, name, sourceKind, chunks.Empty(account, encryption), options, now) with
         {
             SequenceNumber = sequenceNumber,
             IsSealed = isSealed,
@@ -955,7 +975,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var now = metadata.GetUtcNow();
         var updated = current with
         {
-            Content = chunks.Empty(current.Account),
+            Content = chunks.Empty(current.Account, EncryptionOf(current)),
             PendingCopyContent = null,
             CommittedBlocks = [],
             PageRanges = [],
@@ -1143,9 +1163,27 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
             AccessTier = options.AccessTier ?? "Hot",
             ImmutabilityUntil = options.ImmutabilityUntil,
             ImmutabilityLocked = options.ImmutabilityLocked,
-            HasLegalHold = options.HasLegalHold
+            HasLegalHold = options.HasLegalHold,
+            EncryptionScope = options.EncryptionScope,
+            CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256
         };
     }
+
+    private static BlobEncryption EncryptionOf(BlobWriteOptions options) =>
+        new(options.EncryptionScope, options.CustomerProvidedKeySha256, options.CustomerProvidedKey);
+
+    private static BlobEncryption EncryptionOf(BlobRecord blob) =>
+        new(blob.EncryptionScope, blob.CustomerProvidedKeySha256);
+
+    private static AzureStorageException CustomerProvidedKeyMismatch() => new(
+        StatusCodes.Status409Conflict,
+        "CustomerProvidedKeyInUse",
+        "The blob is encrypted with a customer-provided key that does not match this request.");
+
+    private static AzureStorageException UnsupportedEncryptionTransition() => new(
+        StatusCodes.Status409Conflict,
+        "BlobOperationNotSupported",
+        "The copy source and destination use different request-level encryption settings.");
 
     private static List<PageRange> UpdatePageRanges(
         IReadOnlyList<PageRange> current,

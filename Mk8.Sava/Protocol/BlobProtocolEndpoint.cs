@@ -571,10 +571,11 @@ public static class BlobProtocolEndpoint
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
+            var encryption = ReadRequestEncryption(http.Request, write: true);
             if (copySource is null)
             {
                 await WithIntegrityValidationAsync(http.Request, async body =>
-                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, cancellationToken));
+                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, encryption, cancellationToken));
             }
             else
             {
@@ -585,13 +586,14 @@ public static class BlobProtocolEndpoint
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     async source =>
                     {
-                        await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, cancellationToken);
+                        await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, encryption, cancellationToken);
                         return true;
                     },
                     cancellationToken);
             }
             http.Response.StatusCode = StatusCodes.Status201Created;
             http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+            AddEncryptionResponseHeaders(http.Response, encryption);
             EchoTransactionalChecksum(http, copySource is not null);
             return;
         }
@@ -628,12 +630,13 @@ public static class BlobProtocolEndpoint
             EnsureLease(http.Request, current.Lease, "blob");
             var expectedPosition = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-appendpos");
             var expectedMaximumSize = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-maxsize");
+            var encryption = ReadRequestEncryption(http.Request, write: true);
             BlobRecord updated = null!;
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
             if (copySource is null)
             {
                 await WithIntegrityValidationAsync(http.Request, async body =>
-                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, cancellationToken));
+                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, encryption, cancellationToken));
             }
             else
             {
@@ -647,6 +650,7 @@ public static class BlobProtocolEndpoint
                         source.Content,
                         expectedPosition,
                         expectedMaximumSize,
+                        encryption,
                         cancellationToken),
                     cancellationToken);
             }
@@ -664,6 +668,7 @@ public static class BlobProtocolEndpoint
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
+            var encryption = ReadRequestEncryption(http.Request, write: true);
             var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
                              ?? ProtocolParsing.First(http.Request.Headers, "Range")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-range");
@@ -672,7 +677,7 @@ public static class BlobProtocolEndpoint
             BlobRecord updated;
             if (operation == "clear")
             {
-                updated = await service.PutPageAsync(current, start, end, null, clear: true, cancellationToken);
+                updated = await service.PutPageAsync(current, start, end, null, clear: true, encryption, cancellationToken);
             }
             else if (operation == "update")
             {
@@ -681,7 +686,7 @@ public static class BlobProtocolEndpoint
                 if (copySource is null)
                 {
                     await WithIntegrityValidationAsync(http.Request, async body =>
-                        updated = await service.PutPageAsync(current, start, end, body, clear: false, cancellationToken));
+                        updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken));
                 }
                 else
                 {
@@ -696,6 +701,7 @@ public static class BlobProtocolEndpoint
                             end,
                             source.Content,
                             clear: false,
+                            encryption,
                             cancellationToken),
                         cancellationToken);
                 }
@@ -804,14 +810,16 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+            var encryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
             EvaluateReadConditions(http.Request, blob);
-            await WriteBlobAsync(http, service, blob, cancellationToken);
+            await WriteBlobAsync(http, service, blob, encryption, cancellationToken);
             return;
         }
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "metadata")
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+            EnsureCustomerProvidedKey(http.Request, blob, write: false);
             EvaluateReadConditions(http.Request, blob);
             AzureResponseWriter.AddBlobHeaders(http.Response, blob);
             return;
@@ -829,6 +837,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var updated = await service.SetBlobMetadataAsync(blob, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
@@ -868,12 +877,14 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "snapshot")
         {
             Require(request, 'w');
+            EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var created = await service.CreateSnapshotAsync(blob, cancellationToken);
             http.Response.Headers["x-ms-snapshot"] = created.Snapshot;
             http.Response.Headers.ETag = created.ETag;
             http.Response.Headers.LastModified = created.LastModified.ToString("R", CultureInfo.InvariantCulture);
+            AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
         }
@@ -1096,6 +1107,7 @@ public static class BlobProtocolEndpoint
         HttpContext http,
         BlobService service,
         BlobRecord blob,
+        BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
         AzureResponseWriter.AddBlobHeaders(http.Response, blob);
@@ -1122,14 +1134,14 @@ public static class BlobProtocolEndpoint
             if (rangeHeader is null || length > 4 * 1024 * 1024)
                 throw AzureStorageException.InvalidHeader("x-ms-range-get-content-md5", "true");
             using var buffer = new MemoryStream((int)length);
-            await service.WriteContentAsync(blob, start, length, buffer, cancellationToken);
+            await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken);
             var bytes = buffer.ToArray();
             http.Response.Headers.ContentMD5 = Convert.ToBase64String(MD5.HashData(bytes));
             await http.Response.Body.WriteAsync(bytes, cancellationToken);
             return;
         }
 
-        await service.WriteContentAsync(blob, start, length, http.Response.Body, cancellationToken);
+        await service.WriteContentAsync(blob, encryption, start, length, http.Response.Body, cancellationToken);
     }
 
     private static async Task<BlobRecord> ResolveCopySourceAsync(
@@ -1531,6 +1543,7 @@ public static class BlobProtocolEndpoint
         bool useStandardContentType = true)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
             ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
             ProtocolParsing.ReadMetadata(request.Headers),
@@ -1538,12 +1551,16 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? fallback?.AccessTier,
             until,
             locked,
-            legalHold);
+            legalHold,
+            encryption.Scope,
+            encryption.CustomerProvidedKeySha256,
+            encryption.CustomerProvidedKey);
     }
 
     private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
             ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
             ProtocolParsing.ReadMetadata(request.Headers),
@@ -1551,12 +1568,16 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier"),
             until,
             locked,
-            legalHold);
+            legalHold,
+            encryption.Scope,
+            encryption.CustomerProvidedKeySha256,
+            encryption.CustomerProvidedKey);
     }
 
     private static BlobWriteOptions ReadCopyWriteOptions(HttpRequest request, BlobRecord source)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var encryption = ReadRequestEncryption(request, write: true);
         var hasReplacementMetadata = request.Headers.Keys.Any(name =>
             name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
         return new BlobWriteOptions(
@@ -1568,7 +1589,154 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? source.AccessTier,
             until,
             locked,
-            legalHold);
+            legalHold,
+            encryption.Scope,
+            encryption.CustomerProvidedKeySha256,
+            encryption.CustomerProvidedKey);
+    }
+
+    private static BlobEncryption ReadRequestEncryption(HttpRequest request, bool write)
+    {
+        var scope = ProtocolParsing.First(request.Headers, "x-ms-encryption-scope");
+        var signedScope = request.Query.ContainsKey("sig")
+            ? NullIfEmpty(request.Query["ses"].ToString())
+            : null;
+        if (scope is not null && signedScope is not null && !string.Equals(scope, signedScope, StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidHeaderValue",
+                "The request encryption scope does not match the scope signed by the shared access signature.",
+                "x-ms-encryption-scope",
+                scope);
+        }
+        scope ??= signedScope;
+        if (scope is { Length: > 256 } ||
+            scope is not null && (string.IsNullOrWhiteSpace(scope) || scope.Any(char.IsControl)))
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-scope", scope);
+
+        var encodedKey = ProtocolParsing.First(request.Headers, "x-ms-encryption-key");
+        var encodedHash = ProtocolParsing.First(request.Headers, "x-ms-encryption-key-sha256");
+        var algorithm = ProtocolParsing.First(request.Headers, "x-ms-encryption-algorithm");
+        var hasCustomerKeyHeader = encodedKey is not null || encodedHash is not null || algorithm is not null;
+        if ((scope is not null || hasCustomerKeyHeader) &&
+            (!DateOnly.TryParseExact(
+                 StorageRequestContext.Get(request.HttpContext).ServiceVersion,
+                 "yyyy-MM-dd",
+                 CultureInfo.InvariantCulture,
+                 DateTimeStyles.None,
+                 out var serviceVersion) || serviceVersion < new DateOnly(2019, 2, 2)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Customer-provided keys and encryption scopes require service version 2019-02-02 or later.");
+        }
+        if (!hasCustomerKeyHeader)
+            return new BlobEncryption(scope, null);
+        if (scope is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidHeaderValue",
+                "A customer-provided key and an encryption scope cannot be specified on the same request.",
+                "x-ms-encryption-scope",
+                scope);
+        }
+        if (!request.IsHttps)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidRequest",
+                "Customer-provided encryption keys require HTTPS.");
+        }
+        if (encodedKey is null)
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-key");
+        if (write && encodedHash is null)
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256");
+        if (!string.Equals(algorithm, "AES256", StringComparison.Ordinal))
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-algorithm", algorithm);
+
+        byte[] key;
+        try
+        {
+            key = Convert.FromBase64String(encodedKey);
+        }
+        catch (FormatException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-key");
+        }
+        try
+        {
+            if (key.Length != 32)
+                throw AzureStorageException.InvalidHeader("x-ms-encryption-key");
+            var actualHash = SHA256.HashData(key);
+            if (encodedHash is not null)
+            {
+                byte[] suppliedHash;
+                try
+                {
+                    suppliedHash = Convert.FromBase64String(encodedHash);
+                }
+                catch (FormatException)
+                {
+                    throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
+                }
+                if (suppliedHash.Length != actualHash.Length ||
+                    !CryptographicOperations.FixedTimeEquals(suppliedHash, actualHash))
+                {
+                    throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
+                }
+            }
+            request.HttpContext.Response.RegisterForDispose(new SensitiveBufferLease(key));
+            return new BlobEncryption(null, Convert.ToBase64String(actualHash), key);
+        }
+        catch
+        {
+            CryptographicOperations.ZeroMemory(key);
+            throw;
+        }
+    }
+
+    private static BlobEncryption EnsureCustomerProvidedKey(HttpRequest request, BlobRecord blob, bool write)
+    {
+        var supplied = ReadRequestEncryption(request, write);
+        if (string.Equals(
+                supplied.CustomerProvidedKeySha256,
+                blob.CustomerProvidedKeySha256,
+                StringComparison.Ordinal))
+        {
+            return supplied;
+        }
+        if (supplied.CustomerProvidedKey is not null)
+            CryptographicOperations.ZeroMemory(supplied.CustomerProvidedKey);
+        throw new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "CustomerProvidedKeyInUse",
+            "The blob is encrypted with a customer-provided key that does not match this request.");
+    }
+
+    private static BlobEncryption EncryptionOf(BlobRecord blob) =>
+        new(blob.EncryptionScope, blob.CustomerProvidedKeySha256);
+
+    private static void AddEncryptionResponseHeaders(HttpResponse response, BlobEncryption encryption)
+    {
+        if (encryption.CustomerProvidedKeySha256 is not null)
+            response.Headers["x-ms-encryption-key-sha256"] = encryption.CustomerProvidedKeySha256;
+        if (encryption.Scope is not null)
+            response.Headers["x-ms-encryption-scope"] = encryption.Scope;
+    }
+
+    private sealed class SensitiveBufferLease(byte[] buffer) : IDisposable
+    {
+        private byte[]? _buffer = buffer;
+
+        public void Dispose()
+        {
+            var owned = Interlocked.Exchange(ref _buffer, null);
+            if (owned is not null)
+                CryptographicOperations.ZeroMemory(owned);
+        }
     }
 
     private static (DateTimeOffset? Until, bool Locked, bool LegalHold) ReadImmutabilityHeaders(IHeaderDictionary headers)

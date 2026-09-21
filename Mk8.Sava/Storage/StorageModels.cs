@@ -36,6 +36,11 @@ public sealed record ContentManifest(
 
 public sealed record CommittedBlockRecord(string Id, ContentManifest Content);
 
+public readonly record struct BlobEncryption(
+    string? Scope,
+    string? CustomerProvidedKeySha256,
+    byte[]? CustomerProvidedKey = null);
+
 public enum BlockListMode
 {
     Latest,
@@ -103,6 +108,8 @@ public sealed record BlobRecord
     public DateTimeOffset? ImmutabilityUntil { get; init; }
     public bool ImmutabilityLocked { get; init; }
     public bool HasLegalHold { get; init; }
+    public string? EncryptionScope { get; init; }
+    public string? CustomerProvidedKeySha256 { get; init; }
     public CopyState? Copy { get; init; }
     public ContentManifest? PendingCopyContent { get; init; }
     public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];

@@ -11,6 +11,7 @@ using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Security.Claims;
+using System.Text;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -613,6 +614,93 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task CustomerProvidedKeysAndEncryptionScopesAreEnforcedAndIsolated()
+    {
+        var normalService = CreateClient(factory);
+        var containerName = $"encryption-{Guid.NewGuid():N}";
+        await normalService.GetBlobContainerClient(containerName).CreateAsync();
+        var content = RandomNumberGenerator.GetBytes(64 * 1024);
+        var key = RandomNumberGenerator.GetBytes(32);
+        var wrongKey = RandomNumberGenerator.GetBytes(32);
+        var expectedHash = Convert.ToBase64String(SHA256.HashData(key));
+        var chunksBefore = Directory.GetFiles(Path.Combine(factory.DataPath, "chunks"), "*.chunk", SearchOption.AllDirectories).Length;
+
+        var keyedService = CreateEncryptedClient(factory, new CustomerProvidedKey(key), encryptionScope: null);
+        var keyedBlob = keyedService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin");
+        await keyedBlob.UploadAsync(BinaryData.FromBytes(content), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string> { ["private"] = "metadata" }
+        });
+        var chunksAfterKeyed = Directory.GetFiles(Path.Combine(factory.DataPath, "chunks"), "*.chunk", SearchOption.AllDirectories).Length;
+        var keyedProperties = (await keyedBlob.GetPropertiesAsync()).Value;
+        Assert.Equal(expectedHash, keyedProperties.EncryptionKeySha256);
+        Assert.Equal(content, (await keyedBlob.DownloadContentAsync()).Value.Content.ToArray());
+
+        var missingKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            normalService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").GetPropertiesAsync());
+        Assert.Equal(409, missingKey.Status);
+        Assert.Equal("CustomerProvidedKeyInUse", missingKey.ErrorCode);
+        var wrongKeyService = CreateEncryptedClient(factory, new CustomerProvidedKey(wrongKey), encryptionScope: null);
+        var mismatchedKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            wrongKeyService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").DownloadContentAsync());
+        Assert.Equal(409, mismatchedKey.Status);
+        Assert.Equal("CustomerProvidedKeyInUse", mismatchedKey.ErrorCode);
+
+        const string scope = "records-scope";
+        var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, scope);
+        var scopedBlob = scopedService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin");
+        await scopedBlob.UploadAsync(BinaryData.FromBytes(content));
+        var chunksAfterScoped = Directory.GetFiles(Path.Combine(factory.DataPath, "chunks"), "*.chunk", SearchOption.AllDirectories).Length;
+        var scopedProperties = (await scopedBlob.GetPropertiesAsync()).Value;
+        Assert.Equal(scope, scopedProperties.EncryptionScope);
+        Assert.Equal(content, (await normalService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin").DownloadContentAsync()).Value.Content.ToArray());
+
+        var listed = new List<BlobItem>();
+        await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(BlobTraits.Metadata))
+            listed.Add(item);
+        var listedKeyed = Assert.Single(listed, item => item.Name == "keyed.bin");
+        Assert.Equal(expectedHash, listedKeyed.Properties.CustomerProvidedKeySha256);
+        Assert.Empty(listedKeyed.Metadata);
+        Assert.Equal(scope, Assert.Single(listed, item => item.Name == "scoped.bin").Properties.EncryptionScope);
+        Assert.True(chunksAfterKeyed > chunksBefore);
+        Assert.True(chunksAfterScoped > chunksAfterKeyed);
+        var metadataBytes = await File.ReadAllBytesAsync(Path.Combine(factory.DataPath, "metadata.db"));
+        Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CustomerProvidedKeysFlowThroughSpecializedBlobOperations()
+    {
+        var key = RandomNumberGenerator.GetBytes(32);
+        var service = CreateEncryptedClient(factory, new CustomerProvidedKey(key), encryptionScope: null);
+        var container = service.GetBlobContainerClient($"cpk-specialized-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        var block = container.GetBlockBlobClient("blocks.bin");
+        var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes("block-0001"));
+        var blockBytes = RandomNumberGenerator.GetBytes(12 * 1024);
+        await block.StageBlockAsync(blockId, new MemoryStream(blockBytes));
+        await block.CommitBlockListAsync([blockId]);
+        await block.SetMetadataAsync(new Dictionary<string, string> { ["protected"] = "true" });
+        var snapshot = await block.CreateSnapshotAsync();
+        Assert.Equal(blockBytes, (await block.WithSnapshot(snapshot.Value.Snapshot).DownloadContentAsync()).Value.Content.ToArray());
+
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync();
+        var appendBytes = RandomNumberGenerator.GetBytes(4096);
+        await append.AppendBlockAsync(new MemoryStream(appendBytes));
+        Assert.Equal(appendBytes, (await append.DownloadContentAsync()).Value.Content.ToArray());
+
+        var page = container.GetPageBlobClient("page.bin");
+        await page.CreateAsync(1024);
+        var pageBytes = RandomNumberGenerator.GetBytes(512);
+        await page.UploadPagesAsync(new MemoryStream(pageBytes), offset: 512);
+        var downloaded = (await page.DownloadContentAsync()).Value.Content.ToArray();
+        Assert.Equal(new byte[512], downloaded[..512]);
+        Assert.Equal(pageBytes, downloaded[512..]);
+    }
+
+    [Fact]
     public async Task TransactionalCrc64IsValidatedBeforePublication()
     {
         var service = CreateClient(factory);
@@ -763,6 +851,25 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = uri }),
             Retry = { MaxRetries = 0 }
         });
+
+    private static BlobServiceClient CreateEncryptedClient(
+        SavaWebApplicationFactory app,
+        CustomerProvidedKey? customerProvidedKey,
+        string? encryptionScope)
+    {
+        var endpoint = new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost");
+        var options = new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = endpoint }),
+            CustomerProvidedKey = customerProvidedKey,
+            EncryptionScope = encryptionScope,
+            Retry = { MaxRetries = 0 }
+        };
+        return new BlobServiceClient(
+            endpoint,
+            new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+            options);
+    }
 
     private static BlobServiceClient CreateBearerClient(SavaWebApplicationFactory app, string token)
     {

@@ -159,6 +159,8 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
                 writer.WriteElementString("AccessTier", blob.AccessTier);
+                WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
+                WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
                 WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
                 WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
                 WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
@@ -186,7 +188,7 @@ public sealed class AzureResponseWriter
                 }
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
-                    WriteMetadata(writer, blob.Metadata);
+                    WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
                 if (includes.Contains("tags"))
                     WriteTags(writer, blob.Tags);
                 writer.WriteEndElement();
@@ -347,6 +349,8 @@ public sealed class AzureResponseWriter
         response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         response.Headers["x-ms-server-encrypted"] = "true";
+        SetOptional(response.Headers, "x-ms-encryption-key-sha256", blob.CustomerProvidedKeySha256);
+        SetOptional(response.Headers, "x-ms-encryption-scope", blob.EncryptionScope);
         response.Headers["x-ms-access-tier"] = blob.AccessTier;
         SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
         SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
@@ -393,11 +397,19 @@ public sealed class AzureResponseWriter
         }
     }
 
-    private static void WriteMetadata(XmlWriter writer, IReadOnlyDictionary<string, string> metadata)
+    private static void WriteMetadata(
+        XmlWriter writer,
+        IReadOnlyDictionary<string, string> metadata,
+        bool encrypted = false)
     {
         writer.WriteStartElement("Metadata");
-        foreach (var (name, value) in metadata)
-            writer.WriteElementString(XmlConvert.EncodeLocalName(name), value);
+        if (encrypted && metadata.Count > 0)
+            writer.WriteAttributeString("Encrypted", "true");
+        if (!encrypted)
+        {
+            foreach (var (name, value) in metadata)
+                writer.WriteElementString(XmlConvert.EncodeLocalName(name), value);
+        }
         writer.WriteEndElement();
     }
 

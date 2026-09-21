@@ -40,10 +40,11 @@ public sealed class ChunkStore
 
     public async Task<StoredContent> StorePinnedAsync(
         string account,
+        BlobEncryption encryption,
         Stream source,
         CancellationToken cancellationToken)
     {
-        var domain = ResolveDomain(account);
+        var domain = ResolveDomain(account, encryption);
         using var completeHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var references = new List<ChunkReference>();
         var pinnedIds = new HashSet<string>(StringComparer.Ordinal);
@@ -64,7 +65,7 @@ public sealed class ChunkStore
                 }
                 else
                 {
-                    var id = await StoreVerifiedChunkAsync(domain, bytes, cancellationToken);
+                    var id = await StoreVerifiedChunkAsync(domain, bytes, encryption.CustomerProvidedKey, cancellationToken);
                     if (pinnedIds.Add(id))
                         PinId(id);
                     references.Add(new ChunkReference(id, offset, bytes.Length));
@@ -101,13 +102,14 @@ public sealed class ChunkStore
         return new PinLease(this, ids);
     }
 
-    public ContentManifest Empty(string account) => ContentManifest.Empty(ResolveDomain(account));
+    public ContentManifest Empty(string account, BlobEncryption encryption) =>
+        ContentManifest.Empty(ResolveDomain(account, encryption));
 
-    public ContentManifest Sparse(string account, long length)
+    public ContentManifest Sparse(string account, BlobEncryption encryption, long length)
     {
         if (length < 0)
             throw new ArgumentOutOfRangeException(nameof(length));
-        var domain = ResolveDomain(account);
+        var domain = ResolveDomain(account, encryption);
         return length == 0
             ? ContentManifest.Empty(domain)
             : new ContentManifest(
@@ -117,15 +119,16 @@ public sealed class ChunkStore
                 [new ChunkReference(ZeroId(domain), 0, length)]);
     }
 
-    public bool IsInDomain(string account, ContentManifest manifest) =>
-        string.Equals(ResolveDomain(account), manifest.Domain, StringComparison.Ordinal);
+    public bool IsInDomain(string account, BlobEncryption encryption, ContentManifest manifest) =>
+        string.Equals(ResolveDomain(account, encryption), manifest.Domain, StringComparison.Ordinal);
 
     public async Task<ContentManifest> ComposeAsync(
         string account,
+        BlobEncryption encryption,
         IReadOnlyList<ContentManifest> manifests,
         CancellationToken cancellationToken)
     {
-        var domain = ResolveDomain(account);
+        var domain = ResolveDomain(account, encryption);
         if (manifests.Any(manifest => !string.Equals(manifest.Domain, domain, StringComparison.Ordinal)))
             throw new InvalidOperationException("Content from different encryption domains must be copied through verified plaintext.");
 
@@ -160,7 +163,7 @@ public sealed class ChunkStore
                     offset += chunk.Length;
                     continue;
                 }
-                var bytes = await ReadVerifiedChunkAsync(chunk.Id, domain, cancellationToken);
+                var bytes = await ReadVerifiedChunkAsync(chunk.Id, domain, encryption.CustomerProvidedKey, cancellationToken);
                 if (bytes.LongLength != chunk.Length)
                     throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
                 hash.AppendData(bytes);
@@ -174,6 +177,7 @@ public sealed class ChunkStore
 
     public async Task<StoredContent> ReplaceRangePinnedAsync(
         string account,
+        BlobEncryption encryption,
         ContentManifest current,
         long start,
         long length,
@@ -182,7 +186,7 @@ public sealed class ChunkStore
         CancellationToken cancellationToken)
     {
         ValidateManifest(current);
-        if (!IsInDomain(account, current) || start < 0 || length < 0 || start > current.Length || length > current.Length - start)
+        if (!IsInDomain(account, encryption, current) || start < 0 || length < 0 || start > current.Length || length > current.Length - start)
             throw new ArgumentOutOfRangeException(nameof(start));
         if (!clear && replacement is null)
             throw new ArgumentNullException(nameof(replacement));
@@ -191,14 +195,14 @@ public sealed class ChunkStore
         var temporaryPins = new List<IDisposable>();
         try
         {
-            await AppendSliceAsync(account, current, 0, start, references, temporaryPins, cancellationToken);
+            await AppendSliceAsync(account, encryption, current, 0, start, references, temporaryPins, cancellationToken);
             if (clear)
             {
                 AddReference(references, ZeroId(current.Domain), length, current.Domain);
             }
             else
             {
-                var stored = await StorePinnedAsync(account, replacement!, cancellationToken);
+                var stored = await StorePinnedAsync(account, encryption, replacement!, cancellationToken);
                 temporaryPins.Add(stored);
                 if (stored.Manifest.Length != length)
                     throw new EndOfStreamException("The replacement stream length did not match the requested range.");
@@ -207,6 +211,7 @@ public sealed class ChunkStore
             }
             await AppendSliceAsync(
                 account,
+                encryption,
                 current,
                 start + length,
                 current.Length - start - length,
@@ -225,12 +230,13 @@ public sealed class ChunkStore
 
     public async Task<StoredContent> ResizeSparsePinnedAsync(
         string account,
+        BlobEncryption encryption,
         ContentManifest current,
         long length,
         CancellationToken cancellationToken)
     {
         ValidateManifest(current);
-        if (!IsInDomain(account, current) || length < 0)
+        if (!IsInDomain(account, encryption, current) || length < 0)
             throw new ArgumentOutOfRangeException(nameof(length));
         if (length == current.Length)
             return new StoredContent(current, Pin(current));
@@ -240,7 +246,7 @@ public sealed class ChunkStore
         try
         {
             var retained = Math.Min(length, current.Length);
-            await AppendSliceAsync(account, current, 0, retained, references, temporaryPins, cancellationToken);
+            await AppendSliceAsync(account, encryption, current, 0, retained, references, temporaryPins, cancellationToken);
             if (length > current.Length)
                 AddReference(references, ZeroId(current.Domain), length - current.Length, current.Domain);
             return PinSparseManifest(current.Domain, references, temporaryPins);
@@ -255,12 +261,18 @@ public sealed class ChunkStore
 
     public async Task WriteRangeAsync(
         ContentManifest manifest,
+        BlobEncryption encryption,
         long offset,
         long length,
         Stream destination,
         CancellationToken cancellationToken)
     {
         ValidateManifest(manifest);
+        if (encryption.CustomerProvidedKeySha256 is not null &&
+            !string.Equals(manifest.Domain, ResolveDomain(manifest.Domain.Split('/', 2)[0], encryption), StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("The supplied customer-provided key does not match the content encryption domain.");
+        }
         if (offset < 0 || length < 0 || offset > manifest.Length || length > manifest.Length - offset)
             throw new ArgumentOutOfRangeException(nameof(offset));
         if (length == 0)
@@ -292,7 +304,7 @@ public sealed class ChunkStore
                     continue;
                 }
 
-                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, cancellationToken);
+                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken);
                 if (bytes.LongLength != chunk.Length)
                     throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
                 var slice = bytes.AsMemory(checked((int)startInChunk), checked((int)sliceLength));
@@ -313,20 +325,26 @@ public sealed class ChunkStore
         }
     }
 
-    public async Task<byte[]> ReadAllAsync(ContentManifest manifest, CancellationToken cancellationToken)
+    public async Task<byte[]> ReadAllAsync(
+        ContentManifest manifest,
+        BlobEncryption encryption,
+        CancellationToken cancellationToken)
     {
         if (manifest.Length > int.MaxValue)
             throw new InvalidOperationException("The content is too large to materialize in memory.");
         using var buffer = new MemoryStream((int)manifest.Length);
-        await WriteRangeAsync(manifest, 0, manifest.Length, buffer, cancellationToken);
+        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, buffer, cancellationToken);
         return buffer.ToArray();
     }
 
-    public async Task<string> MaterializeAsync(ContentManifest manifest, CancellationToken cancellationToken)
+    public async Task<string> MaterializeAsync(
+        ContentManifest manifest,
+        BlobEncryption encryption,
+        CancellationToken cancellationToken)
     {
         var path = Path.Combine(_paths.Staging, $"materialized-{Guid.NewGuid():N}.tmp");
         await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
-        await WriteRangeAsync(manifest, 0, manifest.Length, output, cancellationToken);
+        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, output, cancellationToken);
         await output.FlushAsync(cancellationToken);
         output.Flush(flushToDisk: true);
         return path;
@@ -352,6 +370,7 @@ public sealed class ChunkStore
 
     private async Task AppendSliceAsync(
         string account,
+        BlobEncryption encryption,
         ContentManifest manifest,
         long start,
         long length,
@@ -383,13 +402,13 @@ public sealed class ChunkStore
                 continue;
             }
 
-            var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, cancellationToken);
+            var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken);
             if (bytes.LongLength != chunk.Length)
                 throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
             var offset = checked((int)(overlapStart - chunk.Offset));
             var count = checked((int)overlapLength);
             using var slice = new MemoryStream(bytes, offset, count, writable: false);
-            var stored = await StorePinnedAsync(account, slice, cancellationToken);
+            var stored = await StorePinnedAsync(account, encryption, slice, cancellationToken);
             temporaryPins.Add(stored);
             foreach (var storedChunk in stored.Manifest.Chunks)
                 AddReference(destination, storedChunk.Id, storedChunk.Length, manifest.Domain);
@@ -473,7 +492,11 @@ public sealed class ChunkStore
         }
     }
 
-    private async Task<string> StoreVerifiedChunkAsync(string domain, byte[] bytes, CancellationToken cancellationToken)
+    private async Task<string> StoreVerifiedChunkAsync(
+        string domain,
+        byte[] bytes,
+        byte[]? customerProvidedKey,
+        CancellationToken cancellationToken)
     {
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         var baseName = $"{hash}-{bytes.Length}";
@@ -487,7 +510,7 @@ public sealed class ChunkStore
             var finalPath = GetChunkPath(id);
             if (File.Exists(finalPath))
             {
-                var existing = await ReadVerifiedChunkAsync(id, domain, cancellationToken);
+                var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
                 if (CryptographicOperations.FixedTimeEquals(existing, bytes))
                     return id;
                 continue;
@@ -496,7 +519,7 @@ public sealed class ChunkStore
             var temporaryPath = Path.Combine(_paths.Staging, $"chunk-{Guid.NewGuid():N}.tmp");
             try
             {
-                await WriteChunkFileAsync(temporaryPath, domain, bytes, cancellationToken);
+                await WriteChunkFileAsync(temporaryPath, domain, bytes, customerProvidedKey, cancellationToken);
                 try
                 {
                     File.Move(temporaryPath, finalPath, overwrite: false);
@@ -504,7 +527,7 @@ public sealed class ChunkStore
                 }
                 catch (IOException) when (File.Exists(finalPath))
                 {
-                    var existing = await ReadVerifiedChunkAsync(id, domain, cancellationToken);
+                    var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
                     if (CryptographicOperations.FixedTimeEquals(existing, bytes))
                         return id;
                 }
@@ -517,7 +540,12 @@ public sealed class ChunkStore
         }
     }
 
-    private async Task WriteChunkFileAsync(string path, string domain, byte[] bytes, CancellationToken cancellationToken)
+    private async Task WriteChunkFileAsync(
+        string path,
+        string domain,
+        byte[] bytes,
+        byte[]? customerProvidedKey,
+        CancellationToken cancellationToken)
     {
         byte codec = 0;
         byte[] encoded = bytes;
@@ -546,7 +574,7 @@ public sealed class ChunkStore
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
         RandomNumberGenerator.Fill(header.AsSpan(nonceOffset, NonceLength));
         var ciphertext = new byte[encoded.Length];
-        using (var aes = new AesGcm(DeriveEncryptionKey(domain), TagLength))
+        using (var aes = new AesGcm(DeriveEncryptionKey(domain, customerProvidedKey), TagLength))
         {
             aes.Encrypt(
                 header.AsSpan(nonceOffset, NonceLength),
@@ -563,7 +591,11 @@ public sealed class ChunkStore
         output.Flush(flushToDisk: true);
     }
 
-    private async Task<byte[]> ReadVerifiedChunkAsync(string id, string domain, CancellationToken cancellationToken)
+    private async Task<byte[]> ReadVerifiedChunkAsync(
+        string id,
+        string domain,
+        byte[]? customerProvidedKey,
+        CancellationToken cancellationToken)
     {
         if (!id.StartsWith(domain + "/", StringComparison.Ordinal))
             throw new InvalidDataException("A chunk reference escaped its encryption domain.");
@@ -589,7 +621,7 @@ public sealed class ChunkStore
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
         try
         {
-            using var aes = new AesGcm(DeriveEncryptionKey(domain), TagLength);
+            using var aes = new AesGcm(DeriveEncryptionKey(domain, customerProvidedKey), TagLength);
             aes.Decrypt(
                 header.AsSpan(nonceOffset, NonceLength),
                 ciphertext,
@@ -631,14 +663,39 @@ public sealed class ChunkStore
         return decoded;
     }
 
-    private string ResolveDomain(string account) => _options.EnableCrossAccountDeduplication ? "$global" : account;
-
-    private byte[] DeriveEncryptionKey(string domain)
+    private string ResolveDomain(string account, BlobEncryption encryption)
     {
+        if (encryption.CustomerProvidedKeySha256 is not null)
+        {
+            var hash = Convert.FromBase64String(encryption.CustomerProvidedKeySha256);
+            return $"{account}/$cpk-{Convert.ToHexStringLower(hash)}";
+        }
+        if (encryption.Scope is not null)
+        {
+            var scopeHash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(encryption.Scope)));
+            return $"{account}/$scope-{scopeHash}";
+        }
+        return _options.EnableCrossAccountDeduplication ? "$global" : account;
+    }
+
+    private byte[] DeriveEncryptionKey(string domain, byte[]? customerProvidedKey)
+    {
+        if (domain.Contains("/$cpk-", StringComparison.Ordinal))
+        {
+            if (customerProvidedKey is not { Length: 32 })
+                throw new InvalidDataException("The customer-provided key is required to decrypt this content.");
+            var expectedHash = domain[(domain.IndexOf("/$cpk-", StringComparison.Ordinal) + "/$cpk-".Length)..];
+            var actualHash = Convert.ToHexStringLower(SHA256.HashData(customerProvidedKey));
+            if (!string.Equals(expectedHash, actualHash, StringComparison.Ordinal))
+                throw new InvalidDataException("The customer-provided key does not match this content.");
+            using var customerHmac = new HMACSHA256(customerProvidedKey);
+            return customerHmac.ComputeHash(Encoding.UTF8.GetBytes($"mk8.sava/customer-chunk-encryption/v1/{domain}"));
+        }
+
         string encodedRoot;
         if (domain == "$global")
             encodedRoot = _options.CrossAccountEncryptionKey ?? throw new InvalidOperationException("The cross-account encryption key is not configured.");
-        else if (!_options.Accounts.TryGetValue(domain, out encodedRoot!))
+        else if (!_options.Accounts.TryGetValue(domain.Split('/', 2)[0], out encodedRoot!))
             throw new InvalidDataException("The chunk encryption domain is not configured.");
         using var hmac = new HMACSHA256(Convert.FromBase64String(encodedRoot));
         return hmac.ComputeHash(Encoding.UTF8.GetBytes($"mk8.sava/chunk-encryption/v1/{domain}"));

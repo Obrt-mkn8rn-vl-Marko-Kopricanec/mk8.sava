@@ -78,13 +78,14 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
         if (exception.StatusCode == StatusCodes.Status304NotModified)
             return;
 
-        context.Response.ContentType = "application/xml";
         context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
         if (exception.StatusCode == StatusCodes.Status401Unauthorized)
             context.Response.Headers.WWWAuthenticate = "Bearer resource_id=\"https://storage.azure.com/\"";
 
         if (HttpMethods.IsHead(context.Request.Method))
             return;
+
+        context.Response.ContentType = "application/xml";
 
         var builder = new StringBuilder();
         using (var writer = XmlWriter.Create(builder, new XmlWriterSettings
