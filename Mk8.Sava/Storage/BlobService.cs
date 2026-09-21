@@ -34,7 +34,9 @@ public sealed record StorageMaintenanceResult(
     int PurgedSoftDeletedContainers,
     int ExpiredUncommittedBlocks,
     int ReclaimedChunks,
-    int ReclaimedStagingFiles);
+    int ReclaimedStagingFiles,
+    int RecompressedChunks,
+    long RecompressionBytesSaved);
 
 public sealed class BlobService(
     MetadataStore metadata,
@@ -50,6 +52,7 @@ public sealed class BlobService(
     private int _integrityCustomerKey;
     private int _integrityMissing;
     private int _integrityCorrupt;
+    private string? _recompressionCursor;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
@@ -1421,6 +1424,7 @@ public sealed class BlobService(
             _options.MaximumStagingFilesPerMaintenancePass);
         var collection = await CollectGarbageWithInventoryAsync(cancellationToken);
         await ScanIntegrityAsync(collection.Inventory, cancellationToken);
+        var recompression = await RecompressColdChunksAsync(collection.Inventory, now, cancellationToken);
         var physical = chunks.MeasurePhysicalUsage();
         var usage = new StorageUsageSnapshot(
             collection.Inventory.LogicalBlobBytes,
@@ -1440,7 +1444,9 @@ public sealed class BlobService(
             purgedContainers,
             expiredBlocks,
             collection.ReclaimedChunks,
-            reclaimedStagingFiles);
+            reclaimedStagingFiles,
+            recompression.RecompressedChunks,
+            recompression.BytesSaved);
         telemetry.RecordMaintenance(result, usage);
         return result;
     }
@@ -1455,7 +1461,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         var firstReachabilitySnapshot = await metadata.GetReachableChunkIdsAsync(cancellationToken);
-        var reservations = new List<ChunkStore.ChunkReclamationReservation>();
+        var reservations = new List<ChunkStore.ChunkMutationReservation>();
         var deleted = 0;
         try
         {
@@ -1464,7 +1470,7 @@ public sealed class BlobService(
                 cancellationToken.ThrowIfCancellationRequested();
                 if (firstReachabilitySnapshot.Contains(chunk))
                     continue;
-                var reservation = chunks.TryReserveForReclamation(chunk);
+                var reservation = chunks.TryReserveForMutation(chunk);
                 if (reservation is not null)
                     reservations.Add(reservation);
             }
@@ -1559,6 +1565,44 @@ public sealed class BlobService(
         _integrityCustomerKey = 0;
         _integrityMissing = 0;
         _integrityCorrupt = 0;
+    }
+
+    private async Task<ChunkRecompressionResult> RecompressColdChunksAsync(
+        StorageMetadataInventory inventory,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var ids = inventory.ReachableChunkIds
+            .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Where(id => !ChunkStore.GetDomainFromChunkId(id).Contains("/$cpk-", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (ids.Length == 0)
+        {
+            _recompressionCursor = null;
+            return ChunkRecompressionResult.Skipped;
+        }
+
+        var start = _recompressionCursor is null
+            ? 0
+            : Array.FindIndex(ids, id => string.CompareOrdinal(id, _recompressionCursor) > 0);
+        if (start < 0)
+            start = 0;
+        var end = Math.Min(ids.Length, start + _options.BackgroundCompressionChunksPerMaintenancePass);
+        var examined = 0;
+        var recompressed = 0;
+        long bytesSaved = 0;
+        for (var index = start; index < end; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = await chunks.TryRecompressChunkAsync(ids[index], now, cancellationToken);
+            examined += result.ExaminedChunks;
+            recompressed += result.RecompressedChunks;
+            bytesSaved = checked(bytesSaved + result.BytesSaved);
+        }
+
+        _recompressionCursor = end == ids.Length ? null : ids[end - 1];
+        return new ChunkRecompressionResult(examined, recompressed, bytesSaved);
     }
 
     private async Task<BlobRecord> CompleteCopyIfDueAsync(

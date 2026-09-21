@@ -1,9 +1,11 @@
 # mk8.sava operations
 
-The service keeps its authoritative metadata in `metadata.db` and immutable,
-encrypted content extents under `chunks/`. The configured `Sava:DataPath` is a
-single storage root; do not copy a live root with a generic filesystem command
-and assume the result is consistent.
+The service keeps its authoritative metadata in `metadata.db` and encrypted,
+content-addressed extents under `chunks/`. Chunk identities are immutable, while
+their verified physical encoding may be atomically replaced by background
+recompression. The configured `Sava:DataPath` is a single storage root; do not
+copy a live root with a generic filesystem command and assume the result is
+consistent.
 
 ## Health and metrics
 
@@ -27,6 +29,18 @@ Crash-abandoned `.tmp` files are removed after
 `Sava:AbandonedStagingRetention`, up to
 `Sava:MaximumStagingFilesPerMaintenancePass` deletions per pass. A file still
 held by an active request cannot be reclaimed.
+
+Reachable chunks older than `Sava:BackgroundCompressionMinimumAge` are revisited
+in cursor order, up to `Sava:BackgroundCompressionChunksPerMaintenancePass`.
+The service authenticates and reconstructs the plaintext, writes a candidate at
+`Sava:BackgroundCompressionQuality`, verifies it byte-for-byte, and atomically
+publishes it only when it saves at least
+`Sava:BackgroundCompressionMinimumSavingsBytes`. Active readers, backups, and
+writes pin the old representation and cause that attempt to be deferred. This
+physical rewrite does not update blob ETags or last-modified values.
+Customer-provided-key chunks are excluded because the service does not retain
+their keys. Recompression totals and serialized chunk-file bytes saved are
+exported through `/metrics`.
 
 ## Create and validate a backup
 
