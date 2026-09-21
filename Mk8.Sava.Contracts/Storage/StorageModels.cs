@@ -102,6 +102,7 @@ public sealed record BlobRecord
     public long SequenceNumber { get; init; }
     public bool IsSealed { get; init; }
     public string AccessTier { get; init; } = "Hot";
+    public string? SmartAccessTier { get; init; }
     public DateTimeOffset? AccessTierChangedAt { get; init; }
     public string? ArchiveStatus { get; init; }
     public string? RehydratePriority { get; init; }

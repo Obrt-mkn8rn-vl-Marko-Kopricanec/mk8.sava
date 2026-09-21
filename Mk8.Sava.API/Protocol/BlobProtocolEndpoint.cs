@@ -234,12 +234,22 @@ public static class BlobProtocolEndpoint
             await AuthorizeContainerListAsync(request, service, container);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
             var prefix = http.Request.Query["prefix"].ToString();
+            var startFrom = http.Request.Query["startfrom"].ToString();
             var delimiter = http.Request.Query["delimiter"].ToString();
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+            if (http.Request.Query.ContainsKey("startfrom") &&
+                !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "FeatureVersionMismatch",
+                    "The startFrom parameter requires service version 2023-05-03 or later.");
+            }
             var decodedMarker = AzureResponseWriter.DecodeBlobMarker(
                 http,
                 prefix,
+                startFrom,
                 delimiter,
                 includes,
                 marker);
@@ -250,6 +260,7 @@ public static class BlobProtocolEndpoint
                 includes.Contains("snapshots"),
                 includes.Contains("deleted") || includes.Contains("deletedwithversions"),
                 prefix,
+                startFrom,
                 delimiter,
                 decodedMarker,
                 maxResults,
@@ -258,6 +269,7 @@ public static class BlobProtocolEndpoint
                 http,
                 blobs,
                 prefix,
+                startFrom,
                 delimiter,
                 marker,
                 maxResults,
@@ -474,6 +486,7 @@ public static class BlobProtocolEndpoint
                     EvaluateWriteConditions(inner.Request, blob);
                     var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
                                ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
+                    ValidateAccessTierVersion(inner.Request, tier);
                     var tierUpdate = await service.SetTierAsync(
                         blob,
                         tier,
@@ -958,6 +971,8 @@ public static class BlobProtocolEndpoint
         {
             RequireAny(request, 't', 'r');
             EvaluateReadConditions(http.Request, blob);
+            EvaluateBlobTagConditions(http.Request, request, blob, write: false);
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             await writer.WriteTagsAsync(http, blob.Tags, cancellationToken);
             return;
         }
@@ -979,7 +994,13 @@ public static class BlobProtocolEndpoint
             RequireAny(request, 't', 'w');
             EnsureMutableVersion(blob);
             EvaluateWriteConditions(http.Request, blob);
-            var tags = await ProtocolParsing.ReadTagsBodyAsync(http.Request.Body, cancellationToken);
+            EvaluateBlobTagConditions(http.Request, request, blob, write: true);
+            EnsureLease(http.Request, blob.Lease, "blob");
+            Dictionary<string, string> tags = null!;
+            await WithIntegrityValidationAsync(
+                http.Request,
+                async body => tags = await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken),
+                allowStructured: false);
             await service.SetBlobTagsAsync(blob, tags, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
@@ -1049,6 +1070,7 @@ public static class BlobProtocolEndpoint
             EvaluateWriteConditions(http.Request, blob);
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
+            ValidateAccessTierVersion(http.Request, tier);
             var updated = await service.SetTierAsync(
                 blob,
                 tier,
@@ -1262,6 +1284,9 @@ public static class BlobProtocolEndpoint
 
         var type = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type")
                    ?? throw AzureStorageException.InvalidHeader("x-ms-blob-type");
+        var explicitlyRequestedTier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier");
+        if (explicitlyRequestedTier is not null && type != "BlockBlob")
+            throw AzureStorageException.InvalidHeader("x-ms-access-tier", explicitlyRequestedTier);
         BlobRecord created;
         switch (type)
         {
@@ -1963,6 +1988,58 @@ public static class BlobProtocolEndpoint
         EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
     }
 
+    private static void EvaluateBlobTagConditions(
+        HttpRequest request,
+        StorageRequestContext context,
+        BlobRecord blob,
+        bool write)
+    {
+        const string ifMatchName = "x-ms-blob-if-match";
+        const string ifNoneMatchName = "x-ms-blob-if-none-match";
+        const string ifModifiedName = "x-ms-blob-if-modified-since";
+        const string ifUnmodifiedName = "x-ms-blob-if-unmodified-since";
+        var ifMatch = ProtocolParsing.First(request.Headers, ifMatchName);
+        var ifNoneMatch = ProtocolParsing.First(request.Headers, ifNoneMatchName);
+        var hasConditions = ifMatch is not null ||
+                            ifNoneMatch is not null ||
+                            request.Headers.ContainsKey(ifModifiedName) ||
+                            request.Headers.ContainsKey(ifUnmodifiedName);
+        if (!hasConditions)
+            return;
+        if (!IsServiceVersionAtLeast(context, new DateOnly(2025, 11, 5)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Blob tag ETag and date conditions require service version 2025-11-05 or later.");
+        }
+
+        if (!string.IsNullOrEmpty(ifMatch) && !MatchesETag(ifMatch, blob.ETag, requireMatch: true))
+            throw AzureStorageException.ConditionNotMet();
+        if (!string.IsNullOrEmpty(ifNoneMatch) && MatchesETag(ifNoneMatch, blob.ETag, requireMatch: true))
+        {
+            throw write
+                ? AzureStorageException.ConditionNotMet()
+                : new AzureStorageException(
+                    StatusCodes.Status304NotModified,
+                    "ConditionNotMet",
+                    "The condition specified using HTTP conditional header(s) is not met.");
+        }
+        var ifModified = ParseHttpDate(request.Headers, ifModifiedName);
+        if (ifModified.HasValue && blob.LastModified <= ifModified.Value.AddSeconds(1))
+        {
+            throw write
+                ? AzureStorageException.ConditionNotMet()
+                : new AzureStorageException(
+                    StatusCodes.Status304NotModified,
+                    "ConditionNotMet",
+                    "The condition specified using HTTP conditional header(s) is not met.");
+        }
+        var ifUnmodified = ParseHttpDate(request.Headers, ifUnmodifiedName);
+        if (ifUnmodified.HasValue && blob.LastModified > ifUnmodified.Value.AddSeconds(1))
+            throw AzureStorageException.ConditionNotMet();
+    }
+
     private static void EvaluatePageSequenceConditions(HttpRequest request, BlobRecord blob)
     {
         var lessThan = TryParseLongHeader(request.Headers, "x-ms-if-sequence-number-lt");
@@ -1997,6 +2074,12 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.LeaseMismatch();
         if (lease.State != LeaseState.Leased && supplied is not null)
             throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, $"LeaseNotPresentWith{CultureInfo.InvariantCulture.TextInfo.ToTitleCase(resource)}Operation", "There is currently no lease on the resource.");
+    }
+
+    private static void ValidateOptionalLease(HttpRequest request, LeaseRecord lease, string resource)
+    {
+        if (ProtocolParsing.First(request.Headers, "x-ms-lease-id") is not null)
+            EnsureLease(request, lease, resource);
     }
 
     private static LeaseRecord EffectiveLease(LeaseRecord lease)
@@ -2045,7 +2128,7 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
             ProtocolParsing.ReadMetadata(request.Headers),
             ProtocolParsing.ReadTagsHeader(request.Headers),
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? fallback?.AccessTier,
+            ReadAccessTier(request, fallback?.AccessTier),
             until,
             locked,
             legalHold,
@@ -2053,6 +2136,36 @@ public static class BlobProtocolEndpoint
             encryption.CustomerProvidedKeySha256,
             encryption.CustomerProvidedKey);
     }
+
+    private static string? ReadAccessTier(HttpRequest request, string? fallback)
+    {
+        var tier = ProtocolParsing.First(request.Headers, "x-ms-access-tier");
+        if (tier is not null)
+            ValidateAccessTierVersion(request, tier);
+        return tier ?? fallback;
+    }
+
+    private static void ValidateAccessTierVersion(HttpRequest request, string tier)
+    {
+        if (!string.Equals(tier, "Smart", StringComparison.Ordinal))
+            return;
+        var context = StorageRequestContext.Get(request.HttpContext);
+        if (!IsServiceVersionAtLeast(context, new DateOnly(2026, 2, 6)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Smart tier requires service version 2026-02-06 or later.");
+        }
+    }
+
+    private static bool IsServiceVersionAtLeast(StorageRequestContext request, DateOnly minimum) =>
+        DateOnly.TryParseExact(
+            request.ServiceVersion,
+            "yyyy-MM-dd",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out var version) && version >= minimum;
 
     private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
     {
@@ -2062,7 +2175,7 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
             ProtocolParsing.ReadMetadata(request.Headers),
             ProtocolParsing.ReadTagsHeader(request.Headers),
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier"),
+            ReadAccessTier(request, fallback: null),
             until,
             locked,
             legalHold,
@@ -2083,7 +2196,7 @@ public static class BlobProtocolEndpoint
                 ? ProtocolParsing.ReadMetadata(request.Headers)
                 : new Dictionary<string, string>(source.Metadata, StringComparer.OrdinalIgnoreCase),
             ProtocolParsing.ReadTagsHeader(request.Headers),
-            ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? source.AccessTier,
+            ReadAccessTier(request, source.AccessTier),
             until,
             locked,
             legalHold,
@@ -2352,7 +2465,10 @@ public static class BlobProtocolEndpoint
         return builder.Uri.AbsoluteUri;
     }
 
-    private static async Task WithIntegrityValidationAsync(HttpRequest request, Func<Stream, Task> action)
+    private static async Task WithIntegrityValidationAsync(
+        HttpRequest request,
+        Func<Stream, Task> action,
+        bool allowStructured = true)
     {
         var expectedMd5 = ProtocolParsing.First(request.Headers, "Content-MD5");
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
@@ -2360,6 +2476,8 @@ public static class BlobProtocolEndpoint
         var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
         if (structuredBody is not null)
         {
+            if (!allowStructured)
+                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
             if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
                 throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
             if (expectedMd5 is not null || expectedCrc64 is not null)
