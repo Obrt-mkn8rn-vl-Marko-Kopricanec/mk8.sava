@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Xml;
+using System.Xml.Linq;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
@@ -88,8 +90,15 @@ internal sealed class UrlTransferClient(
         {
             if (!response.IsSuccessStatusCode)
             {
-                throw CannotVerifyCopySource(
-                    $"The source returned HTTP status {(int)response.StatusCode} ({response.ReasonPhrase}).");
+                if (HasSourceConditions(destinationRequest) &&
+                    response.StatusCode is HttpStatusCode.NotModified or HttpStatusCode.PreconditionFailed)
+                {
+                    throw AzureStorageException.SourceConditionNotMet();
+                }
+                throw await CreateSourceFailureAsync(
+                    destinationRequest,
+                    response,
+                    cancellationToken);
             }
             if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
             {
@@ -358,8 +367,97 @@ internal sealed class UrlTransferClient(
         return string.IsNullOrEmpty(value) ? null : value;
     }
 
+    private static bool HasSourceConditions(HttpRequest request) =>
+        request.Headers.ContainsKey("x-ms-source-if-match") ||
+        request.Headers.ContainsKey("x-ms-source-if-none-match") ||
+        request.Headers.ContainsKey("x-ms-source-if-modified-since") ||
+        request.Headers.ContainsKey("x-ms-source-if-unmodified-since") ||
+        request.Headers.ContainsKey("x-ms-source-if-tags");
+
+    private static async Task<AzureStorageException> CreateSourceFailureAsync(
+        HttpRequest destinationRequest,
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        var sourceStatus = ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture);
+        var sourceErrorCode = response.Headers.TryGetValues("x-ms-error-code", out var errorCodes)
+            ? errorCodes.FirstOrDefault()
+            : null;
+        var sourceError = await ReadSourceErrorAsync(response.Content, cancellationToken);
+        sourceErrorCode ??= sourceError.Code;
+        var sourceErrorMessage = sourceError.Message;
+        var message = sourceErrorMessage ??
+                      $"Could not verify the copy source because it returned HTTP status {sourceStatus} ({response.ReasonPhrase}).";
+        if (!IsServiceVersionAtLeast(destinationRequest, new DateOnly(2024, 2, 4)))
+            return CannotVerifyCopySource(message);
+
+        var details = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["CopySourceStatusCode"] = sourceStatus
+        };
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["x-ms-copy-source-status-code"] = sourceStatus
+        };
+        if (!string.IsNullOrEmpty(sourceErrorCode))
+        {
+            details["CopySourceErrorCode"] = sourceErrorCode;
+            headers["x-ms-copy-source-error-code"] = sourceErrorCode;
+        }
+        if (!string.IsNullOrEmpty(sourceErrorMessage))
+            details["CopySourceErrorMessage"] = sourceErrorMessage;
+
+        return new AzureStorageException(
+            StatusCodes.Status500InternalServerError,
+            "CannotVerifyCopySource",
+            message,
+            responseHeaders: headers,
+            details: details);
+    }
+
+    private static async Task<(string? Code, string? Message)> ReadSourceErrorAsync(
+        HttpContent content,
+        CancellationToken cancellationToken)
+    {
+        const int maximumErrorBodyBytes = 64 * 1024;
+        try
+        {
+            await using var source = await content.ReadAsStreamAsync(cancellationToken);
+            using var buffer = new MemoryStream();
+            var bytes = new byte[4096];
+            while (buffer.Length <= maximumErrorBodyBytes)
+            {
+                var read = await source.ReadAsync(bytes, cancellationToken);
+                if (read == 0)
+                    break;
+                await buffer.WriteAsync(bytes.AsMemory(0, read), cancellationToken);
+            }
+            if (buffer.Length == 0 || buffer.Length > maximumErrorBodyBytes)
+                return (null, null);
+
+            buffer.Position = 0;
+            using var reader = XmlReader.Create(buffer, new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                MaxCharactersInDocument = maximumErrorBodyBytes
+            });
+            var document = XDocument.Load(reader, LoadOptions.None);
+            var code = document.Descendants()
+                .FirstOrDefault(element => element.Name.LocalName == "Code")
+                ?.Value;
+            var message = document.Descendants()
+                .FirstOrDefault(element => element.Name.LocalName == "Message")
+                ?.Value;
+            return (code, message);
+        }
+        catch (Exception exception) when (exception is XmlException or InvalidOperationException or IOException)
+        {
+            return (null, null);
+        }
+    }
+
     private static AzureStorageException CannotVerifyCopySource(string message) => new(
-        StatusCodes.Status400BadRequest,
+        StatusCodes.Status500InternalServerError,
         "CannotVerifyCopySource",
         message);
 

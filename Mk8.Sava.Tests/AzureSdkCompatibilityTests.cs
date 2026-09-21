@@ -2470,6 +2470,97 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UrlSourceConditionsAndFailuresKeepAzureErrorSemantics()
+    {
+        var sourceBytes = Enumerable.Range(0, 2048).Select(index => (byte)(index % 241)).ToArray();
+        await using var source = await LoopbackSource.StartAsync(sourceBytes);
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"url-errors-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var missingEtag = new ETag("\"not-the-source-etag\"");
+
+        static async Task AssertSourceConditionAsync(Func<Task> operation)
+        {
+            var failure = await Assert.ThrowsAsync<RequestFailedException>(operation);
+            Assert.Equal(StatusCodes.Status412PreconditionFailed, failure.Status);
+            Assert.Equal("SourceConditionNotMet", failure.ErrorCode);
+        }
+
+        var whole = container.GetBlockBlobClient("whole.bin");
+        await AssertSourceConditionAsync(() => whole.SyncUploadFromUriAsync(
+            source.Uri,
+            new BlobSyncUploadFromUriOptions
+            {
+                SourceConditions = new BlobRequestConditions { IfMatch = missingEtag }
+            }));
+        Assert.False((await whole.ExistsAsync()).Value);
+
+        var block = container.GetBlockBlobClient("block.bin");
+        await AssertSourceConditionAsync(() => block.StageBlockFromUriAsync(
+            source.Uri,
+            Convert.ToBase64String("conditioned-block"u8),
+            new StageBlockFromUriOptions
+            {
+                SourceConditions = new RequestConditions { IfMatch = missingEtag }
+            }));
+        Assert.False((await block.ExistsAsync()).Value);
+
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync();
+        await AssertSourceConditionAsync(() => append.AppendBlockFromUriAsync(
+            source.Uri,
+            new AppendBlobAppendBlockFromUriOptions
+            {
+                SourceConditions = new AppendBlobRequestConditions { IfMatch = missingEtag }
+            }));
+        Assert.Equal(0, (await append.GetPropertiesAsync()).Value.ContentLength);
+
+        var page = container.GetPageBlobClient("page.bin");
+        await page.CreateAsync(512);
+        await AssertSourceConditionAsync(() => page.UploadPagesFromUriAsync(
+            source.Uri,
+            new HttpRange(0, 512),
+            new HttpRange(0, 512),
+            new PageBlobUploadPagesFromUriOptions
+            {
+                SourceConditions = new PageBlobRequestConditions { IfMatch = missingEtag }
+            }));
+        Assert.Equal(new byte[512], (await page.DownloadContentAsync()).Value.Content.ToArray());
+
+        var copied = container.GetBlobClient("copied.bin");
+        await AssertSourceConditionAsync(() => copied.StartCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions
+            {
+                SourceConditions = new BlobRequestConditions { IfMatch = missingEtag }
+            }));
+        Assert.False((await copied.ExistsAsync()).Value);
+
+        var missing = container.GetBlobClient("missing-source.bin");
+        var missingUri = missing.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Put, missingUri)
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.MissingUri.ToString());
+        request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        using var response = await transport.SendAsync(request);
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+        Assert.Equal("CannotVerifyCopySource", response.Headers.GetValues("x-ms-error-code").Single());
+        Assert.Equal("404", response.Headers.GetValues("x-ms-copy-source-status-code").Single());
+        Assert.Equal("BlobNotFound", response.Headers.GetValues("x-ms-copy-source-error-code").Single());
+        var error = await response.Content.ReadAsStringAsync();
+        Assert.Contains("<CopySourceStatusCode>404</CopySourceStatusCode>", error, StringComparison.Ordinal);
+        Assert.Contains("<CopySourceErrorCode>BlobNotFound</CopySourceErrorCode>", error, StringComparison.Ordinal);
+        Assert.Contains("<CopySourceErrorMessage>The specified blob does not exist.</CopySourceErrorMessage>", error, StringComparison.Ordinal);
+        Assert.False((await missing.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task SourceCustomerKeysAreValidatedAndForwardedForEveryUrlWriteOperation()
     {
         var sourceBytes = Enumerable.Range(0, 2048).Select(index => (byte)(index % 239)).ToArray();
@@ -5959,6 +6050,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private sealed class LoopbackSource(WebApplication application, Uri uri) : IAsyncDisposable
     {
         public Uri Uri { get; } = uri;
+        public Uri MissingUri { get; } = new(uri, "/missing");
 
         public static async Task<LoopbackSource> StartAsync(byte[] content)
         {
@@ -5967,6 +6059,22 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var application = builder.Build();
             application.MapGet("/source", async context =>
             {
+                const string sourceEtag = "\"source-etag\"";
+                var ifMatch = context.Request.Headers.IfMatch.ToString();
+                if (!string.IsNullOrEmpty(ifMatch) &&
+                    !ifMatch.Split(',', StringSplitOptions.TrimEntries).Any(value => value is "*" or sourceEtag))
+                {
+                    await WriteSourceErrorAsync(context, StatusCodes.Status412PreconditionFailed, "ConditionNotMet");
+                    return;
+                }
+                var ifNoneMatch = context.Request.Headers.IfNoneMatch.ToString();
+                if (!string.IsNullOrEmpty(ifNoneMatch) &&
+                    ifNoneMatch.Split(',', StringSplitOptions.TrimEntries).Any(value => value is "*" or sourceEtag))
+                {
+                    context.Response.StatusCode = StatusCodes.Status304NotModified;
+                    return;
+                }
+
                 var start = 0;
                 var end = content.Length - 1;
                 var range = context.Request.Headers.Range.ToString();
@@ -5987,9 +6095,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 }
                 context.Response.ContentType = "application/x-url-source";
                 context.Response.ContentLength = end - start + 1;
-                context.Response.Headers.ETag = "\"source-etag\"";
+                context.Response.Headers.ETag = sourceEtag;
                 await context.Response.Body.WriteAsync(content.AsMemory(start, end - start + 1));
             });
+            application.MapGet("/missing", context =>
+                WriteSourceErrorAsync(context, StatusCodes.Status404NotFound, "BlobNotFound"));
             await application.StartAsync();
             var addresses = application.Services
                 .GetRequiredService<IServer>()
@@ -5998,6 +6108,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 ?.Addresses;
             var address = addresses?.Single() ?? throw new InvalidOperationException("The source server did not publish an address.");
             return new LoopbackSource(application, new Uri(new Uri(address), "/source"));
+        }
+
+        private static async Task WriteSourceErrorAsync(HttpContext context, int statusCode, string errorCode)
+        {
+            var message = errorCode == "BlobNotFound"
+                ? "The specified blob does not exist."
+                : "The condition specified using HTTP conditional header(s) is not met.";
+            context.Response.StatusCode = statusCode;
+            context.Response.ContentType = "application/xml";
+            context.Response.Headers["x-ms-error-code"] = errorCode;
+            await context.Response.WriteAsync(
+                $"<Error><Code>{errorCode}</Code><Message>{message}</Message></Error>");
         }
 
         public async ValueTask DisposeAsync()

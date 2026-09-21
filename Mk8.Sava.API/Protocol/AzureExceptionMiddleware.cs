@@ -75,6 +75,8 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
         context.Response.Clear();
         context.Response.StatusCode = exception.StatusCode;
         AddCommonHeaders(context);
+        foreach (var header in exception.ResponseHeaders)
+            context.Response.Headers[header.Key] = header.Value;
         if (exception.StatusCode == StatusCodes.Status304NotModified)
             return;
 
@@ -108,6 +110,8 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
                 writer.WriteElementString("HeaderName", exception.HeaderName);
             if (exception.HeaderValue is not null)
                 writer.WriteElementString("HeaderValue", exception.HeaderValue);
+            foreach (var detail in exception.Details)
+                writer.WriteElementString(detail.Key, detail.Value);
             writer.WriteEndElement();
         }
 
