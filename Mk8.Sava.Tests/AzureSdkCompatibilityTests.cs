@@ -2685,6 +2685,40 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             }
         });
         Assert.Equal(content, (await valid.DownloadContentAsync()).Value.Content.ToArray());
+        var validatedDownload = await valid.DownloadContentAsync(new BlobDownloadOptions
+        {
+            TransferValidation = new DownloadTransferValidationOptions
+            {
+                ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+            }
+        });
+        Assert.Equal(content, validatedDownload.Value.Content.ToArray());
+        var validatedRange = await valid.DownloadContentAsync(new BlobDownloadOptions
+        {
+            Range = new HttpRange(4 * 1024 * 1024 - 127, 384),
+            TransferValidation = new DownloadTransferValidationOptions
+            {
+                ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+            }
+        });
+        Assert.Equal(content.AsSpan(4 * 1024 * 1024 - 127, 384).ToArray(), validatedRange.Value.Content.ToArray());
+
+        var empty = container.GetBlobClient("empty.bin");
+        await empty.UploadAsync(new MemoryStream([]), new BlobUploadOptions
+        {
+            TransferValidation = new UploadTransferValidationOptions
+            {
+                ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+            }
+        });
+        var validatedEmptyDownload = await empty.DownloadContentAsync(new BlobDownloadOptions
+        {
+            TransferValidation = new DownloadTransferValidationOptions
+            {
+                ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+            }
+        });
+        Assert.Empty(validatedEmptyDownload.Value.Content.ToArray());
 
         var stagedContent = "structured staged block"u8.ToArray();
         var blockId = Convert.ToBase64String("block-0001"u8);
@@ -2779,6 +2813,24 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("Crc64Mismatch", transactionalResponse.Headers.GetValues("x-ms-error-code").Single());
         }
         Assert.False((await invalidTransactional.ExistsAsync()).Value);
+
+        const int rawRangeStart = 731;
+        const int rawRangeLength = 2048;
+        using var rangeRequest = new HttpRequestMessage(
+            HttpMethod.Get,
+            valid.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        rangeRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+        rangeRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes={rawRangeStart}-{rawRangeStart + rawRangeLength - 1}");
+        rangeRequest.Headers.TryAddWithoutValidation("x-ms-range-get-content-crc64", "true");
+        using var rangeResponse = await transport.SendAsync(rangeRequest);
+        Assert.Equal(HttpStatusCode.PartialContent, rangeResponse.StatusCode);
+        var rangeBytes = await rangeResponse.Content.ReadAsByteArrayAsync();
+        Assert.Equal(content.AsSpan(rawRangeStart, rawRangeLength).ToArray(), rangeBytes);
+        var rangeCrc64 = new Mk8.Sava.Protocol.StorageCrc64();
+        rangeCrc64.Append(rangeBytes);
+        Assert.Equal(
+            Convert.ToBase64String(rangeCrc64.GetHash()),
+            rangeResponse.Headers.GetValues("x-ms-content-crc64").Single());
     }
 
     [Fact]

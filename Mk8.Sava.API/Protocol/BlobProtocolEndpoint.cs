@@ -1335,19 +1335,90 @@ public static class BlobProtocolEndpoint
         }
 
         var length = blob.Content.Length == 0 ? 0 : end - start + 1;
-        http.Response.ContentLength = length;
-        if (HttpMethods.IsHead(http.Request.Method) || length == 0)
+        if (HttpMethods.IsHead(http.Request.Method))
+        {
+            http.Response.ContentLength = length;
             return;
+        }
 
         var wantMd5 = string.Equals(ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-md5"), "true", StringComparison.OrdinalIgnoreCase);
-        if (wantMd5)
+        var wantCrc64 = string.Equals(ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-crc64"), "true", StringComparison.OrdinalIgnoreCase);
+        if (wantMd5 && wantCrc64)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "BothCrc64AndMd5Specified",
+                "Both CRC64 and MD5 were requested. Specify only one checksum.");
+        }
+
+        var structuredBody = ProtocolParsing.First(http.Request.Headers, "x-ms-structured-body");
+        if (structuredBody is not null)
+        {
+            if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
+                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
+            if (wantMd5 || wantCrc64)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidHeaderValue",
+                    "A structured response cannot also request a transactional range checksum.");
+            }
+            var request = StorageRequestContext.Get(http);
+            if (!DateOnly.TryParseExact(
+                    request.ServiceVersion,
+                    "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out var serviceVersion) || serviceVersion < new DateOnly(2025, 1, 5))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "FeatureVersionMismatch",
+                    "Structured response bodies require service version 2025-01-05 or later.");
+            }
+
+            http.Response.Headers["x-ms-structured-body"] = structuredBody;
+            http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
+            http.Response.ContentLength = StructuredBodyEncoder.GetEncodedLength(length);
+            await StructuredBodyEncoder.WriteAsync(
+                length,
+                async (rangeStart, rangeLength, destination, token) =>
+                    await service.WriteContentAsync(
+                        blob,
+                        encryption,
+                        start + rangeStart,
+                        rangeLength,
+                        destination,
+                        token),
+                http.Response.Body,
+                cancellationToken);
+            return;
+        }
+
+        http.Response.ContentLength = length;
+        if (length == 0)
+            return;
+        if (wantMd5 || wantCrc64)
         {
             if (rangeHeader is null || length > 4 * 1024 * 1024)
-                throw AzureStorageException.InvalidHeader("x-ms-range-get-content-md5", "true");
+            {
+                throw AzureStorageException.InvalidHeader(
+                    wantMd5 ? "x-ms-range-get-content-md5" : "x-ms-range-get-content-crc64",
+                    "true");
+            }
             using var buffer = new MemoryStream((int)length);
             await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken);
             var bytes = buffer.ToArray();
-            http.Response.Headers.ContentMD5 = Convert.ToBase64String(MD5.HashData(bytes));
+            if (wantMd5)
+            {
+                http.Response.Headers.ContentMD5 = Convert.ToBase64String(MD5.HashData(bytes));
+            }
+            else
+            {
+                var crc64 = new StorageCrc64();
+                crc64.Append(bytes);
+                http.Response.Headers["x-ms-content-crc64"] = Convert.ToBase64String(crc64.GetHash());
+            }
             await http.Response.Body.WriteAsync(bytes, cancellationToken);
             return;
         }
