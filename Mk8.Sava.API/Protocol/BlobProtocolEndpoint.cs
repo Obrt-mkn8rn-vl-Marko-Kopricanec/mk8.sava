@@ -207,8 +207,9 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (comp == "restore" && HttpMethods.IsPut(http.Request.Method))
+        if (comp == "undelete" && HttpMethods.IsPut(http.Request.Method))
         {
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
             RequireAny(request, 'c', 'w');
             var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name") ?? containerName;
             var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
@@ -238,6 +239,7 @@ public static class BlobProtocolEndpoint
             var delimiter = http.Request.Query["delimiter"].ToString();
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+            ValidateBlobListFeatures(request, includes, delimiter);
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -618,6 +620,8 @@ public static class BlobProtocolEndpoint
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
         var versionId = NullIfEmpty(http.Request.Query["versionid"].ToString());
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
+        if (versionId is not null)
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Blob versioning");
 
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
@@ -659,7 +663,7 @@ public static class BlobProtocolEndpoint
                     cancellationToken);
             }
             http.Response.StatusCode = StatusCodes.Status201Created;
-            http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+            AddRequestServerEncryptedHeader(http.Response);
             AddEncryptionResponseHeaders(http.Response, encryption);
             EchoTransactionalChecksum(http, copySource is not null);
             return;
@@ -688,7 +692,7 @@ public static class BlobProtocolEndpoint
                 current?.Revision,
                 cancellationToken);
             AzureResponseWriter.AddBlobHeaders(http.Response, committed);
-            http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+            AddRequestServerEncryptedHeader(http.Response);
             EchoTransactionalChecksum(http);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -877,6 +881,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "undelete")
         {
+            RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Undelete Blob");
             Require(request, 'w');
             await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
             return;
@@ -910,6 +915,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "immutabilitypolicies")
         {
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Set Blob Immutability Policy");
             Require(request, 'i');
             EvaluateWriteConditions(http.Request, blob);
             var untilValue = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-until-date")
@@ -937,6 +943,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsDelete(http.Request.Method) && comp == "immutabilitypolicies")
         {
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Delete Blob Immutability Policy");
             Require(request, 'i');
             EvaluateWriteConditions(http.Request, blob);
             await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken);
@@ -945,6 +952,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "legalhold")
         {
+            RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Set Blob Legal Hold");
             Require(request, 'i');
             var value = ProtocolParsing.First(http.Request.Headers, "x-ms-legal-hold");
             if (!bool.TryParse(value, out var hasLegalHold))
@@ -991,6 +999,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "tags")
         {
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Get Blob Tags");
             RequireAny(request, 't', 'r');
             EvaluateReadConditions(http.Request, blob);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
@@ -1013,6 +1022,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "tags")
         {
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tags");
             RequireAny(request, 't', 'w');
             EnsureMutableVersion(blob);
             EvaluateWriteConditions(http.Request, blob);
@@ -1077,6 +1087,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "seal")
         {
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Append Blob Seal");
             Require(request, 'w');
             EnsureMutableVersion(blob);
             EvaluateWriteConditions(http.Request, blob);
@@ -1088,11 +1099,15 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "tier")
         {
+            RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Set Blob Tier");
+            if (snapshot is not null)
+                RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tier on a snapshot");
             Require(request, 'w');
             EvaluateWriteConditions(http.Request, blob);
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
             ValidateAccessTierVersion(http.Request, tier);
+            ValidateRehydratePriorityVersion(http.Request);
             var updated = await service.SetTierAsync(
                 blob,
                 tier,
@@ -1259,7 +1274,7 @@ public static class BlobProtocolEndpoint
                     cancellationToken);
                 AzureResponseWriter.AddBlobHeaders(http.Response, uploaded);
                 http.Response.Headers["x-ms-copy-status"] = "success";
-                http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+                AddRequestServerEncryptedHeader(http.Response);
                 EchoTransactionalChecksum(http, sourceChecksum: true);
                 http.Response.StatusCode = StatusCodes.Status201Created;
                 return;
@@ -1366,7 +1381,7 @@ public static class BlobProtocolEndpoint
 
         AzureResponseWriter.AddBlobHeaders(http.Response, created);
         EchoTransactionalChecksum(http);
-        http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+        AddRequestServerEncryptedHeader(http.Response);
         http.Response.StatusCode = StatusCodes.Status201Created;
     }
 
@@ -2166,12 +2181,13 @@ public static class BlobProtocolEndpoint
         BlobRecord? fallback,
         bool useStandardContentType = true)
     {
-        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
+        ValidateRehydratePriorityVersion(request);
         var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
             ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
             ProtocolParsing.ReadMetadata(request.Headers),
-            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ReadTagsHeader(request),
             ReadAccessTier(request, fallback?.AccessTier),
             until,
             locked,
@@ -2191,16 +2207,44 @@ public static class BlobProtocolEndpoint
 
     private static void ValidateAccessTierVersion(HttpRequest request, string tier)
     {
-        if (!string.Equals(tier, "Smart", StringComparison.Ordinal))
-            return;
+        if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
+            throw AzureStorageException.InvalidHeader("x-ms-access-tier", tier);
         var context = StorageRequestContext.Get(request.HttpContext);
-        if (!IsServiceVersionAtLeast(context, new DateOnly(2026, 2, 6)))
+        var minimum = tier switch
+        {
+            "Cold" => new DateOnly(2021, 12, 2),
+            "Smart" => new DateOnly(2026, 2, 6),
+            _ => new DateOnly(2018, 11, 9)
+        };
+        if (!IsServiceVersionAtLeast(context, minimum))
         {
             throw new AzureStorageException(
                 StatusCodes.Status400BadRequest,
                 "FeatureVersionMismatch",
-                "Smart tier requires service version 2026-02-06 or later.");
+                $"The {tier} access tier requires service version {minimum:yyyy-MM-dd} or later.");
         }
+    }
+
+    private static void ValidateRehydratePriorityVersion(HttpRequest request)
+    {
+        if (!request.Headers.ContainsKey("x-ms-rehydrate-priority"))
+            return;
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2019, 2, 2),
+            "Rehydrate priority");
+    }
+
+    private static Dictionary<string, string> ReadTagsHeader(HttpRequest request)
+    {
+        if (request.Headers.ContainsKey("x-ms-tags"))
+        {
+            RequireFeatureVersion(
+                StorageRequestContext.Get(request.HttpContext),
+                new DateOnly(2019, 12, 12),
+                "Blob index tags");
+        }
+        return ProtocolParsing.ReadTagsHeader(request.Headers);
     }
 
     private static bool IsServiceVersionAtLeast(StorageRequestContext request, DateOnly minimum) =>
@@ -2222,6 +2266,31 @@ public static class BlobProtocolEndpoint
             StatusCodes.Status400BadRequest,
             "FeatureVersionMismatch",
             $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
+    }
+
+    private static void ValidateBlobListFeatures(
+        StorageRequestContext request,
+        IReadOnlySet<string> includes,
+        string delimiter)
+    {
+        if (includes.Contains("deleted"))
+            RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Listing deleted blobs");
+        if (includes.Contains("tags"))
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Listing blob index tags");
+        if (includes.Contains("versions"))
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Listing blob versions");
+        if (includes.Contains("immutabilitypolicy"))
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Listing blob immutability policies");
+        if (includes.Contains("legalhold"))
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Listing blob legal holds");
+        if (includes.Contains("deletedwithversions"))
+            RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Listing deleted blobs with versions");
+        if (!string.IsNullOrEmpty(delimiter) &&
+            includes.Contains("snapshots") &&
+            !IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
+        {
+            throw AzureStorageException.InvalidQuery("include");
+        }
     }
 
     private static long GetMaximumPutBlobBytes(StorageRequestContext request) =>
@@ -2264,12 +2333,13 @@ public static class BlobProtocolEndpoint
 
     private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
     {
-        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
+        ValidateRehydratePriorityVersion(request);
         var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
             ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
             ProtocolParsing.ReadMetadata(request.Headers),
-            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ReadTagsHeader(request),
             ReadAccessTier(request, fallback: null),
             until,
             locked,
@@ -2281,7 +2351,8 @@ public static class BlobProtocolEndpoint
 
     private static BlobWriteOptions ReadCopyWriteOptions(HttpRequest request, BlobRecord source)
     {
-        var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
+        var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
+        ValidateRehydratePriorityVersion(request);
         var encryption = ReadRequestEncryption(request, write: true);
         var hasReplacementMetadata = request.Headers.Keys.Any(name =>
             name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
@@ -2290,7 +2361,7 @@ public static class BlobProtocolEndpoint
             hasReplacementMetadata
                 ? ProtocolParsing.ReadMetadata(request.Headers)
                 : new Dictionary<string, string>(source.Metadata, StringComparer.OrdinalIgnoreCase),
-            ProtocolParsing.ReadTagsHeader(request.Headers),
+            ReadTagsHeader(request),
             ReadAccessTier(request, source.AccessTier),
             until,
             locked,
@@ -2323,6 +2394,13 @@ public static class BlobProtocolEndpoint
         var encodedKey = ProtocolParsing.First(request.Headers, "x-ms-encryption-key");
         var encodedHash = ProtocolParsing.First(request.Headers, "x-ms-encryption-key-sha256");
         var algorithm = ProtocolParsing.First(request.Headers, "x-ms-encryption-algorithm");
+        if (scope is not null || encodedKey is not null || encodedHash is not null || algorithm is not null)
+        {
+            RequireFeatureVersion(
+                StorageRequestContext.Get(request.HttpContext),
+                new DateOnly(2019, 2, 2),
+                "Customer-provided encryption");
+        }
         var hasCustomerKeyHeader = encodedKey is not null || encodedHash is not null || algorithm is not null;
         if ((scope is not null || hasCustomerKeyHeader) &&
             (!DateOnly.TryParseExact(
@@ -2426,10 +2504,26 @@ public static class BlobProtocolEndpoint
 
     private static void AddEncryptionResponseHeaders(HttpResponse response, BlobEncryption encryption)
     {
+        if (!IsServiceVersionAtLeast(
+                StorageRequestContext.Get(response.HttpContext),
+                new DateOnly(2019, 2, 2)))
+        {
+            return;
+        }
         if (encryption.CustomerProvidedKeySha256 is not null)
             response.Headers["x-ms-encryption-key-sha256"] = encryption.CustomerProvidedKeySha256;
         if (encryption.Scope is not null)
             response.Headers["x-ms-encryption-scope"] = encryption.Scope;
+    }
+
+    private static void AddRequestServerEncryptedHeader(HttpResponse response)
+    {
+        if (IsServiceVersionAtLeast(
+                StorageRequestContext.Get(response.HttpContext),
+                new DateOnly(2015, 12, 11)))
+        {
+            response.Headers["x-ms-request-server-encrypted"] = "true";
+        }
     }
 
     private sealed class SensitiveBufferLease(byte[] buffer) : IDisposable
@@ -2444,10 +2538,19 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static (DateTimeOffset? Until, bool Locked, bool LegalHold) ReadImmutabilityHeaders(IHeaderDictionary headers)
+    private static (DateTimeOffset? Until, bool Locked, bool LegalHold) ReadImmutabilityHeaders(HttpRequest request)
     {
+        var headers = request.Headers;
         var untilValue = ProtocolParsing.First(headers, "x-ms-immutability-policy-until-date");
         var modeValue = ProtocolParsing.First(headers, "x-ms-immutability-policy-mode");
+        var legalHoldValue = ProtocolParsing.First(headers, "x-ms-legal-hold");
+        if (untilValue is not null || modeValue is not null || legalHoldValue is not null)
+        {
+            RequireFeatureVersion(
+                StorageRequestContext.Get(request.HttpContext),
+                new DateOnly(2020, 6, 12),
+                "Blob-level immutability headers");
+        }
         if (untilValue is null && modeValue is not null)
             throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date");
 
@@ -2466,7 +2569,6 @@ public static class BlobProtocolEndpoint
             };
         }
 
-        var legalHoldValue = ProtocolParsing.First(headers, "x-ms-legal-hold");
         var legalHold = legalHoldValue is not null &&
                         (bool.TryParse(legalHoldValue, out var parsedLegalHold)
                             ? parsedLegalHold

@@ -3351,6 +3351,259 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task VersionedBlobFeaturesRejectBeforeMutationAndHideNewerResponseFields()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"feature-versions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        static async Task AssertFeatureVersionMismatchAsync(HttpClient client, HttpRequestMessage request)
+        {
+            using (request)
+            using (var response = await client.SendAsync(request))
+            {
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+        }
+
+        var tagged = container.GetBlobClient("tagged.bin");
+        await tagged.UploadAsync(
+            BinaryData.FromString("tagged payload"),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string> { ["project"] = "mk8" }
+            });
+        var taggedSas = tagged.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
+
+        using (var oldTagWrite = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(taggedSas, "comp=tags"))
+        {
+            Content = new ByteArrayContent("<Tags><TagSet /></Tags>"u8.ToArray())
+        })
+        {
+            oldTagWrite.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+            await AssertFeatureVersionMismatchAsync(transport, oldTagWrite);
+        }
+        Assert.Equal("mk8", (await tagged.GetTagsAsync()).Value.Tags["project"]);
+
+        var oldTagRead = new HttpRequestMessage(HttpMethod.Get, AppendQuery(taggedSas, "comp=tags"));
+        oldTagRead.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+        await AssertFeatureVersionMismatchAsync(transport, oldTagRead);
+
+        var oldTaggedCreate = container.GetBlobClient("old-tag-header.bin");
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oldTaggedCreate.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent("must not publish"u8.ToArray())
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            request.Headers.TryAddWithoutValidation("x-ms-tags", "project=old");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        Assert.False((await oldTaggedCreate.ExistsAsync()).Value);
+
+        var oldTierCreate = container.GetBlobClient("old-tier-header.bin");
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oldTierCreate.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent("must not publish"u8.ToArray())
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cool");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        Assert.False((await oldTierCreate.ExistsAsync()).Value);
+
+        var oldImmutableCreate = container.GetBlobClient("old-immutability-header.bin");
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   oldImmutableCreate.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent("must not publish"u8.ToArray())
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-immutability-policy-until-date",
+                DateTimeOffset.UtcNow.AddDays(1).ToString("R", CultureInfo.InvariantCulture));
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        Assert.False((await oldImmutableCreate.ExistsAsync()).Value);
+
+        var tiered = container.GetBlobClient("tiered.bin");
+        await tiered.UploadAsync(BinaryData.FromString("tier payload"));
+        await tiered.SetAccessTierAsync(AccessTier.Cool);
+        var tierUri = AppendQuery(
+            tiered.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=tier");
+        using (var request = new HttpRequestMessage(HttpMethod.Put, tierUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
+            request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Hot");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Put, tierUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-10-02");
+            request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cold");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Put, tierUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2018-11-09");
+            request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Archive");
+            request.Headers.TryAddWithoutValidation("x-ms-rehydrate-priority", "High");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        Assert.Equal(AccessTier.Cool, (await tiered.GetPropertiesAsync()).Value.AccessTier);
+
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync();
+        var appendSas = append.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
+        var oldSeal = new HttpRequestMessage(HttpMethod.Put, AppendQuery(appendSas, "comp=seal"))
+        {
+            Content = new ByteArrayContent([])
+        };
+        oldSeal.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
+        await AssertFeatureVersionMismatchAsync(transport, oldSeal);
+        await append.AppendBlockAsync(BinaryData.FromString("still writable").ToStream());
+        await append.SealAsync();
+
+        using (var oldAppendProperties = new HttpRequestMessage(HttpMethod.Head, appendSas))
+        {
+            oldAppendProperties.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
+            using var response = await transport.SendAsync(oldAppendProperties);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(response.Headers.Contains("x-ms-blob-sealed"));
+        }
+
+        var mutable = container.GetBlobClient("mutable.bin");
+        await mutable.UploadAsync(BinaryData.FromString("mutable payload"));
+        var mutableSas = mutable.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(mutableSas, "comp=immutabilityPolicies"))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-immutability-policy-until-date",
+                DateTimeOffset.UtcNow.AddDays(1).ToString("R", CultureInfo.InvariantCulture));
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        using (var request = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(mutableSas, "comp=legalhold"))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            request.Headers.TryAddWithoutValidation("x-ms-legal-hold", "true");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        await mutable.SetMetadataAsync(new Dictionary<string, string> { ["state"] = "still-mutable" });
+
+        var deleted = container.GetBlobClient("deleted.bin");
+        await deleted.UploadAsync(BinaryData.FromString("deleted payload"));
+        await deleted.DeleteAsync();
+        var oldUndelete = new HttpRequestMessage(
+            HttpMethod.Put,
+            AppendQuery(
+                deleted.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "comp=undelete"))
+        {
+            Content = new ByteArrayContent([])
+        };
+        oldUndelete.Headers.TryAddWithoutValidation("x-ms-version", "2017-04-17");
+        await AssertFeatureVersionMismatchAsync(transport, oldUndelete);
+        Assert.False((await deleted.ExistsAsync()).Value);
+
+        var oldVersionRead = new HttpRequestMessage(
+            HttpMethod.Head,
+            AppendQuery(
+                taggedSas,
+                "versionid=" + Uri.EscapeDataString("2026-01-01T00:00:00.0000000Z")));
+        oldVersionRead.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+        await AssertFeatureVersionMismatchAsync(transport, oldVersionRead);
+
+        var containerSas = container.GenerateSasUri(
+            BlobContainerSasPermissions.All,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        var oldTagList = new HttpRequestMessage(
+            HttpMethod.Get,
+            AppendQuery(containerSas, "restype=container&comp=list&include=tags"));
+        oldTagList.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+        await AssertFeatureVersionMismatchAsync(transport, oldTagList);
+
+        using (var oldList = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   AppendQuery(containerSas, "restype=container&comp=list&prefix=tagged.bin")))
+        {
+            oldList.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
+            using var response = await transport.SendAsync(oldList);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var xml = await response.Content.ReadAsStringAsync();
+            Assert.DoesNotContain("Creation-Time", xml, StringComparison.Ordinal);
+            Assert.DoesNotContain("AccessTier", xml, StringComparison.Ordinal);
+            Assert.DoesNotContain("ServerEncrypted", xml, StringComparison.Ordinal);
+            Assert.DoesNotContain("TagCount", xml, StringComparison.Ordinal);
+        }
+
+        using (var currentList = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   AppendQuery(containerSas, "restype=container&comp=list&prefix=tagged.bin&include=tags")))
+        {
+            currentList.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            using var response = await transport.SendAsync(currentList);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var xml = await response.Content.ReadAsStringAsync();
+            Assert.Contains("<TagCount>1</TagCount>", xml, StringComparison.Ordinal);
+            Assert.Contains("<Key>project</Key>", xml, StringComparison.Ordinal);
+        }
+
+        await tagged.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
+        {
+            ExpiresOn = DateTimeOffset.UtcNow.AddDays(1),
+            PolicyMode = BlobImmutabilityPolicyMode.Unlocked
+        });
+        await tagged.SetLegalHoldAsync(true);
+        using (var historicalProperties = new HttpRequestMessage(HttpMethod.Head, taggedSas))
+        {
+            historicalProperties.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
+            using var response = await transport.SendAsync(historicalProperties);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.True(response.Headers.Contains("x-ms-access-tier"));
+            Assert.True(response.Headers.Contains("x-ms-creation-time"));
+            Assert.False(response.Headers.Contains("x-ms-tag-count"));
+            Assert.False(response.Headers.Contains("x-ms-version-id"));
+            Assert.False(response.Headers.Contains("x-ms-immutability-policy-until-date"));
+            Assert.False(response.Headers.Contains("x-ms-legal-hold"));
+        }
+    }
+
+    [Fact]
     public void StorageCrc64MatchesTheAzureSdkImplementation()
     {
         var content = Enumerable.Range(0, 4_097).Select(index => (byte)(index % 233)).ToArray();
