@@ -7,9 +7,17 @@ using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 using System.IdentityModel.Tokens.Jwt;
+using System.Globalization;
 using System.Net;
+using System.Security.Cryptography;
 using System.Security.Claims;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Mk8.Sava.Tests;
 
@@ -311,6 +319,116 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UrlTransfersSupportBlockAppendPageAndWholeBlobOperations()
+    {
+        var sourceBytes = Enumerable.Range(0, 16 * 1024).Select(index => (byte)(index % 251)).ToArray();
+        await using var source = await LoopbackSource.StartAsync(sourceBytes);
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"url-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        var whole = container.GetBlockBlobClient("whole.bin");
+        await whole.SyncUploadFromUriAsync(source.Uri, overwrite: true);
+        Assert.Equal(sourceBytes, (await whole.DownloadContentAsync()).Value.Content.ToArray());
+
+        const int blockOffset = 900;
+        const int blockLength = 2_300;
+        var block = container.GetBlockBlobClient("block.bin");
+        var blockId = Convert.ToBase64String("url-block-1"u8);
+        var blockSlice = sourceBytes.AsSpan(blockOffset, blockLength).ToArray();
+        await block.StageBlockFromUriAsync(source.Uri, blockId, new StageBlockFromUriOptions
+        {
+            SourceRange = new HttpRange(blockOffset, blockLength),
+            SourceContentHash = MD5.HashData(blockSlice)
+        });
+        await block.CommitBlockListAsync([blockId]);
+        Assert.Equal(blockSlice, (await block.DownloadContentAsync()).Value.Content.ToArray());
+
+        const int appendOffset = 4_000;
+        const int appendLength = 1_500;
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync();
+        var appendSlice = sourceBytes.AsSpan(appendOffset, appendLength).ToArray();
+        await append.AppendBlockFromUriAsync(source.Uri, new AppendBlobAppendBlockFromUriOptions
+        {
+            SourceRange = new HttpRange(appendOffset, appendLength),
+            SourceContentHash = MD5.HashData(appendSlice)
+        });
+        Assert.Equal(appendSlice, (await append.DownloadContentAsync()).Value.Content.ToArray());
+
+        var page = container.GetPageBlobClient("page.bin");
+        await page.CreateAsync(1024);
+        var pageSlice = sourceBytes.AsSpan(0, 512).ToArray();
+        await page.UploadPagesFromUriAsync(
+            source.Uri,
+            new HttpRange(0, 512),
+            new HttpRange(512, 512),
+            new PageBlobUploadPagesFromUriOptions { SourceContentHash = MD5.HashData(pageSlice) });
+        var expectedPage = new byte[1024];
+        pageSlice.CopyTo(expectedPage, 512);
+        Assert.Equal(expectedPage, (await page.DownloadContentAsync()).Value.Content.ToArray());
+    }
+
+    [Fact]
+    public async Task TransactionalCrc64IsValidatedBeforePublication()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"crc-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var content = Enumerable.Range(0, 64 * 1024).Select(index => (byte)(index % 239)).ToArray();
+        var valid = container.GetBlobClient("valid.bin");
+        await valid.UploadAsync(new MemoryStream(content), new BlobUploadOptions
+        {
+            TransferValidation = new UploadTransferValidationOptions
+            {
+                ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
+            }
+        });
+        Assert.Equal(content, (await valid.DownloadContentAsync()).Value.Content.ToArray());
+
+        var invalid = container.GetBlobClient("invalid.bin");
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            invalid.UploadAsync(new MemoryStream(content), new BlobUploadOptions
+            {
+                TransferValidation = new UploadTransferValidationOptions
+                {
+                    ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64,
+                    PrecalculatedChecksum = new byte[8]
+                }
+            }));
+        Assert.Equal(400, rejected.Status);
+        Assert.Equal("Crc64Mismatch", rejected.ErrorCode);
+        Assert.False((await invalid.ExistsAsync()).Value);
+    }
+
+    [Fact]
+    public void StorageCrc64MatchesTheAzureSdkImplementation()
+    {
+        var content = Enumerable.Range(0, 4_097).Select(index => (byte)(index % 233)).ToArray();
+        var implementationType = typeof(StorageSharedKeyCredential).Assembly.GetType("Azure.Storage.StorageCrc64HashAlgorithm")
+                                 ?? throw new InvalidOperationException("The Azure SDK CRC64 implementation was not found.");
+        var constructor = implementationType.GetConstructors(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .Single();
+        var arguments = constructor.GetParameters()
+            .Select(parameter => parameter.ParameterType == typeof(ulong) ? (object)0UL : throw new InvalidOperationException(parameter.ParameterType.FullName))
+            .ToArray();
+        var sdk = constructor.Invoke(arguments);
+        var methods = implementationType.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+        var append = methods.Single(method =>
+            method.Name == "Append" &&
+            method.GetParameters() is [{ ParameterType: var parameterType }] &&
+            parameterType == typeof(byte[]));
+        var getHash = methods.Single(method => method.Name == "GetHashAndReset" && method.GetParameters().Length == 0);
+        append.Invoke(sdk, [content]);
+        var expected = (byte[]?)getHash.Invoke(sdk, null)
+                       ?? throw new InvalidOperationException("The Azure SDK CRC64 implementation returned no hash.");
+        var actual = new Mk8.Sava.Protocol.StorageCrc64();
+        actual.Append(content.AsSpan(0, 1_111));
+        actual.Append(content.AsSpan(1_111));
+        Assert.Equal(expected, actual.GetHash());
+    }
+
+    [Fact]
     public async Task AccountPolicyBlocksPublicContainers()
     {
         var service = CreateClient(factory);
@@ -441,4 +559,55 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>
         Directory.EnumerateFiles(Path.Combine(dataPath, "chunks"), "*.chunk", SearchOption.AllDirectories)
             .Select(path => new FileInfo(path));
+
+    private sealed class LoopbackSource(WebApplication application, Uri uri) : IAsyncDisposable
+    {
+        public Uri Uri { get; } = uri;
+
+        public static async Task<LoopbackSource> StartAsync(byte[] content)
+        {
+            var builder = WebApplication.CreateSlimBuilder();
+            builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+            var application = builder.Build();
+            application.MapGet("/source", async context =>
+            {
+                var start = 0;
+                var end = content.Length - 1;
+                var range = context.Request.Headers.Range.ToString();
+                if (!string.IsNullOrEmpty(range))
+                {
+                    var bounds = range[6..].Split('-', 2);
+                    start = int.Parse(bounds[0], CultureInfo.InvariantCulture);
+                    end = string.IsNullOrEmpty(bounds[1])
+                        ? end
+                        : int.Parse(bounds[1], CultureInfo.InvariantCulture);
+                    if (start < 0 || end < start || end >= content.Length)
+                    {
+                        context.Response.StatusCode = StatusCodes.Status416RangeNotSatisfiable;
+                        return;
+                    }
+                    context.Response.StatusCode = StatusCodes.Status206PartialContent;
+                    context.Response.Headers.ContentRange = $"bytes {start}-{end}/{content.Length}";
+                }
+                context.Response.ContentType = "application/x-url-source";
+                context.Response.ContentLength = end - start + 1;
+                context.Response.Headers.ETag = "\"source-etag\"";
+                await context.Response.Body.WriteAsync(content.AsMemory(start, end - start + 1));
+            });
+            await application.StartAsync();
+            var addresses = application.Services
+                .GetRequiredService<IServer>()
+                .Features
+                .Get<IServerAddressesFeature>()
+                ?.Addresses;
+            var address = addresses?.Single() ?? throw new InvalidOperationException("The source server did not publish an address.");
+            return new LoopbackSource(application, new Uri(new Uri(address), "/source"));
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await application.StopAsync();
+            await application.DisposeAsync();
+        }
+    }
 }

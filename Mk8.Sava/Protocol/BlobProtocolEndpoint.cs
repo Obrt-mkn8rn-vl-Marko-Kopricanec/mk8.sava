@@ -2,6 +2,8 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Xml;
+using Microsoft.Extensions.Options;
+using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -293,10 +295,29 @@ public static class BlobProtocolEndpoint
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
-            await WithIntegrityValidationAsync(http.Request, async body =>
-                await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, cancellationToken));
+            var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
+            if (copySource is null)
+            {
+                await WithIntegrityValidationAsync(http.Request, async body =>
+                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, cancellationToken));
+            }
+            else
+            {
+                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+                await transfers.ReadAsync(
+                    http.Request,
+                    copySource,
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    async source =>
+                    {
+                        await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, cancellationToken);
+                        return true;
+                    },
+                    cancellationToken);
+            }
             http.Response.StatusCode = StatusCodes.Status201Created;
             http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+            EchoTransactionalChecksum(http, copySource is not null);
             return;
         }
 
@@ -308,7 +329,7 @@ public static class BlobProtocolEndpoint
             if (current is not null)
                 EnsureLease(http.Request, current.Lease, "blob");
             var blockIds = await ProtocolParsing.ReadBlockListAsync(http.Request.Body, cancellationToken);
-            var options = ReadWriteOptions(http.Request, current);
+            var options = ReadWriteOptions(http.Request, current, useStandardContentType: false);
             var committed = await service.CommitBlockListAsync(
                 request.Account,
                 containerName,
@@ -331,12 +352,33 @@ public static class BlobProtocolEndpoint
             EvaluateWriteConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
             var expectedPosition = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-appendpos");
+            var expectedMaximumSize = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-maxsize");
             BlobRecord updated = null!;
-            await WithIntegrityValidationAsync(http.Request, async body =>
-                updated = await service.AppendBlockAsync(current, body, expectedPosition, cancellationToken));
+            var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
+            if (copySource is null)
+            {
+                await WithIntegrityValidationAsync(http.Request, async body =>
+                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, cancellationToken));
+            }
+            else
+            {
+                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+                await transfers.ReadAsync(
+                    http.Request,
+                    copySource,
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    async source => updated = await service.AppendBlockAsync(
+                        current,
+                        source.Content,
+                        expectedPosition,
+                        expectedMaximumSize,
+                        cancellationToken),
+                    cancellationToken);
+            }
             AzureResponseWriter.AddBlobHeaders(http.Response, updated);
             http.Response.Headers["x-ms-blob-append-offset"] = current.Content.Length.ToString(CultureInfo.InvariantCulture);
             http.Response.Headers["x-ms-blob-committed-block-count"] = updated.AppendBlockCount.ToString(CultureInfo.InvariantCulture);
+            EchoTransactionalChecksum(http, copySource is not null);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
         }
@@ -352,14 +394,43 @@ public static class BlobProtocolEndpoint
                              ?? throw AzureStorageException.InvalidHeader("x-ms-range");
             var (start, end) = ProtocolParsing.ParseRange(rangeValue, current.Content.Length);
             var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToLowerInvariant();
-            var updated = await service.PutPageAsync(
-                current,
-                start,
-                end,
-                operation == "update" ? http.Request.Body : null,
-                clear: operation == "clear",
-                cancellationToken);
+            BlobRecord updated;
+            if (operation == "clear")
+            {
+                updated = await service.PutPageAsync(current, start, end, null, clear: true, cancellationToken);
+            }
+            else if (operation == "update")
+            {
+                var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
+                updated = null!;
+                if (copySource is null)
+                {
+                    await WithIntegrityValidationAsync(http.Request, async body =>
+                        updated = await service.PutPageAsync(current, start, end, body, clear: false, cancellationToken));
+                }
+                else
+                {
+                    var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+                    await transfers.ReadAsync(
+                        http.Request,
+                        copySource,
+                        ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                        async source => updated = await service.PutPageAsync(
+                            current,
+                            start,
+                            end,
+                            source.Content,
+                            clear: false,
+                            cancellationToken),
+                        cancellationToken);
+                }
+            }
+            else
+            {
+                throw AzureStorageException.InvalidHeader("x-ms-page-write", operation);
+            }
             AzureResponseWriter.AddBlobHeaders(http.Response, updated);
+            EchoTransactionalChecksum(http, ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source") is not null);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
         }
@@ -547,6 +618,37 @@ public static class BlobProtocolEndpoint
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
         {
+            var requestedType = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type");
+            if (requestedType == "BlockBlob" || string.Equals(
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-requires-sync"),
+                    "true",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                if (requestedType is not null && requestedType != "BlockBlob")
+                    throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
+                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+                var uploaded = await transfers.ReadAsync(
+                    http.Request,
+                    copySource,
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
+                    async source => await service.PutBlockBlobAsync(
+                        request.Account,
+                        containerName,
+                        blobName,
+                        source.Content,
+                        ReadUrlWriteOptions(http.Request, source),
+                        current?.GenerationId,
+                        current?.Revision,
+                        cancellationToken),
+                    cancellationToken);
+                AzureResponseWriter.AddBlobHeaders(http.Response, uploaded);
+                http.Response.Headers["x-ms-copy-status"] = "success";
+                http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+                EchoTransactionalChecksum(http, sourceChecksum: true);
+                http.Response.StatusCode = StatusCodes.Status201Created;
+                return;
+            }
+
             var source = await ResolveCopySourceAsync(request, service, copySource, cancellationToken);
             var copied = await service.CopyFromAsync(
                 request.Account,
@@ -612,7 +714,7 @@ public static class BlobProtocolEndpoint
         }
 
         AzureResponseWriter.AddBlobHeaders(http.Response, created);
-        http.Response.Headers["x-ms-content-crc64"] = ProtocolParsing.First(http.Request.Headers, "x-ms-content-crc64");
+        EchoTransactionalChecksum(http);
         http.Response.Headers["x-ms-request-server-encrypted"] = "true";
         http.Response.StatusCode = StatusCodes.Status201Created;
     }
@@ -1068,35 +1170,116 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static BlobWriteOptions ReadWriteOptions(HttpRequest request, BlobRecord? fallback) => new(
-        ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http),
+    private static BlobWriteOptions ReadWriteOptions(
+        HttpRequest request,
+        BlobRecord? fallback,
+        bool useStandardContentType = true) => new(
+        ProtocolParsing.ReadHttpProperties(request.Headers, fallback?.Http, useStandardContentType),
         ProtocolParsing.ReadMetadata(request.Headers),
         ProtocolParsing.ReadTagsHeader(request.Headers),
         ProtocolParsing.First(request.Headers, "x-ms-access-tier") ?? fallback?.AccessTier);
 
+    private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source) => new(
+        ProtocolParsing.ReadHttpProperties(request.Headers, source.Http),
+        ProtocolParsing.ReadMetadata(request.Headers),
+        ProtocolParsing.ReadTagsHeader(request.Headers),
+        ProtocolParsing.First(request.Headers, "x-ms-access-tier"));
+
     private static async Task WithIntegrityValidationAsync(HttpRequest request, Func<Stream, Task> action)
     {
         var expectedMd5 = ProtocolParsing.First(request.Headers, "Content-MD5");
-        if (expectedMd5 is null)
+        var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
+        if (expectedMd5 is not null && expectedCrc64 is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "BothCrc64AndMd5Specified",
+                "Both CRC64 and MD5 were specified for the request. Specify only one checksum.");
+        }
+        if (expectedMd5 is null && expectedCrc64 is null)
         {
             await action(request.Body);
             return;
         }
-        byte[] expected;
+
+        var expected = DecodeChecksum(
+            expectedMd5 ?? expectedCrc64!,
+            expectedMd5 is null ? 8 : 16,
+            expectedMd5 is null ? "x-ms-content-crc64" : "Content-MD5");
+        var paths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
+        var options = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+        var temporaryPath = Path.Combine(paths.Staging, $"validated-{Guid.NewGuid():N}.tmp");
         try
         {
-            expected = Convert.FromBase64String(expectedMd5);
+            await using var temporary = new FileStream(
+                temporaryPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                128 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var md5 = expectedMd5 is null ? null : IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+            var crc64 = expectedCrc64 is null ? null : new StorageCrc64();
+            var buffer = new byte[128 * 1024];
+            long length = 0;
+            while (true)
+            {
+                var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted);
+                if (read == 0)
+                    break;
+                length = checked(length + read);
+                if (length > options.MaximumRequestBodyBytes)
+                    throw new RequestBodyTooLargeException(options.MaximumRequestBodyBytes);
+                md5?.AppendData(buffer, 0, read);
+                crc64?.Append(buffer.AsSpan(0, read));
+                await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted);
+            }
+
+            var actual = md5?.GetHashAndReset() ?? crc64!.GetHash();
+            if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    expectedMd5 is null ? "Crc64Mismatch" : "Md5Mismatch",
+                    "The checksum specified in the request did not match the value calculated by the server.");
+            }
+
+            temporary.Position = 0;
+            await action(temporary);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+        }
+    }
+
+    private static byte[] DecodeChecksum(string value, int requiredLength, string headerName)
+    {
+        try
+        {
+            var bytes = Convert.FromBase64String(value);
+            if (bytes.Length == requiredLength)
+                return bytes;
         }
         catch (FormatException)
         {
-            throw AzureStorageException.InvalidHeader("Content-MD5", expectedMd5);
         }
-        if (expected.Length != 16)
-            throw AzureStorageException.InvalidHeader("Content-MD5", expectedMd5);
-        using var hashing = new Md5ReadStream(request.Body);
-        await action(hashing);
-        if (!CryptographicOperations.FixedTimeEquals(expected, hashing.GetHash()))
-            throw new AzureStorageException(StatusCodes.Status400BadRequest, "Md5Mismatch", "The MD5 value specified in the request did not match the value calculated by the server.");
+        throw AzureStorageException.InvalidHeader(headerName, value);
+    }
+
+    private static void EchoTransactionalChecksum(HttpContext http, bool sourceChecksum = false)
+    {
+        var md5 = ProtocolParsing.First(
+            http.Request.Headers,
+            sourceChecksum ? "x-ms-source-content-md5" : "Content-MD5");
+        var crc64 = ProtocolParsing.First(
+            http.Request.Headers,
+            sourceChecksum ? "x-ms-source-content-crc64" : "x-ms-content-crc64");
+        if (md5 is not null)
+            http.Response.Headers.ContentMD5 = md5;
+        if (crc64 is not null)
+            http.Response.Headers["x-ms-content-crc64"] = crc64;
     }
 
     private static DateTimeOffset? ParseExpiry(IHeaderDictionary headers, DateTimeOffset metadataNow)
@@ -1172,50 +1355,4 @@ public static class BlobProtocolEndpoint
         "InvalidQueryParameterValue",
         "The requested operation is not valid for this resource.");
 
-    private sealed class Md5ReadStream(Stream inner) : Stream
-    {
-        private readonly IncrementalHash _hash = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-        private bool _finalized;
-        private byte[]? _result;
-
-        public byte[] GetHash()
-        {
-            if (!_finalized)
-            {
-                _result = _hash.GetHashAndReset();
-                _finalized = true;
-            }
-            return _result!;
-        }
-
-        public override int Read(byte[] buffer, int offset, int count)
-        {
-            var read = inner.Read(buffer, offset, count);
-            if (read > 0) _hash.AppendData(buffer, offset, read);
-            return read;
-        }
-
-        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        {
-            var read = await inner.ReadAsync(buffer, cancellationToken);
-            if (read > 0) _hash.AppendData(buffer.Span[..read]);
-            return read;
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing) _hash.Dispose();
-            base.Dispose(disposing);
-        }
-
-        public override bool CanRead => inner.CanRead;
-        public override bool CanSeek => false;
-        public override bool CanWrite => false;
-        public override long Length => throw new NotSupportedException();
-        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
-        public override void Flush() { }
-        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-        public override void SetLength(long value) => throw new NotSupportedException();
-        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
-    }
 }

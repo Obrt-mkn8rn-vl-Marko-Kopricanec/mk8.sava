@@ -371,6 +371,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         BlobRecord current,
         Stream source,
         long? expectedPosition,
+        long? expectedMaximumSize,
         CancellationToken cancellationToken)
     {
         if (current.Kind != BlobKind.AppendBlob)
@@ -385,6 +386,13 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         using var appended = await chunks.StorePinnedAsync(current.Account, source, cancellationToken);
         if (appended.Manifest.Length > 100L * 1024 * 1024)
             throw new AzureStorageException(StatusCodes.Status413PayloadTooLarge, "RequestBodyTooLarge", "An append block cannot exceed 100 MiB.");
+        if (expectedMaximumSize.HasValue && current.Content.Length + appended.Manifest.Length > expectedMaximumSize.Value)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status412PreconditionFailed,
+                "MaxBlobSizeConditionNotMet",
+                "The max blob size condition specified was not met.");
+        }
         var content = await chunks.ComposeAsync(current.Account, [current.Content, appended.Manifest], cancellationToken);
         using var contentPin = chunks.Pin(content);
         var updated = current with
@@ -474,6 +482,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var updated = current with
         {
             Metadata = userMetadata,
+            Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };

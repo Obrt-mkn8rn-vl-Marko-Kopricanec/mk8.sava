@@ -32,12 +32,17 @@ internal static class ProtocolParsing
         return metadata;
     }
 
-    public static BlobHttpProperties ReadHttpProperties(IHeaderDictionary headers, BlobHttpProperties? fallback = null)
+    public static BlobHttpProperties ReadHttpProperties(
+        IHeaderDictionary headers,
+        BlobHttpProperties? fallback = null,
+        bool useStandardContentType = true)
     {
         fallback ??= new BlobHttpProperties();
         return new BlobHttpProperties
         {
-            ContentType = First(headers, "x-ms-blob-content-type") ?? First(headers, "Content-Type") ?? fallback.ContentType,
+            ContentType = First(headers, "x-ms-blob-content-type")
+                          ?? (useStandardContentType ? First(headers, "Content-Type") : null)
+                          ?? fallback.ContentType,
             ContentEncoding = First(headers, "x-ms-blob-content-encoding") ?? fallback.ContentEncoding,
             ContentLanguage = First(headers, "x-ms-blob-content-language") ?? fallback.ContentLanguage,
             CacheControl = First(headers, "x-ms-blob-cache-control") ?? fallback.CacheControl,

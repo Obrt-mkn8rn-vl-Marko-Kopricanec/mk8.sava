@@ -1,3 +1,4 @@
+using System.Net;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -46,6 +47,13 @@ builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<BlobService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<AzureResponseWriter>();
+builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        AllowAutoRedirect = true,
+        MaxAutomaticRedirections = 5,
+        AutomaticDecompression = DecompressionMethods.None
+    });
 
 var app = builder.Build();
 
