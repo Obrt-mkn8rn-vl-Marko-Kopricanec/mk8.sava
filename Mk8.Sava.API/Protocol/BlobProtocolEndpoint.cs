@@ -627,8 +627,8 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "block")
         {
-            RequireAny(request, 'w', 'c');
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            RequireBlockWrite(request, current is null);
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
@@ -662,12 +662,16 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "blocklist")
         {
-            RequireAny(request, 'w', 'c');
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            RequireBlockWrite(request, current is null);
             EvaluateWriteConditions(http.Request, current);
             if (current is not null)
                 EnsureLease(http.Request, current.Lease, "blob");
-            var blockIds = await ProtocolParsing.ReadBlockListAsync(http.Request.Body, cancellationToken);
+            IReadOnlyList<BlockListEntry> blockIds = [];
+            await WithIntegrityValidationAsync(
+                http.Request,
+                async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken),
+                allowStructured: false);
             var options = ReadWriteOptions(http.Request, current, useStandardContentType: false);
             var committed = await service.CommitBlockListAsync(
                 request.Account,
@@ -680,6 +684,7 @@ public static class BlobProtocolEndpoint
                 cancellationToken);
             AzureResponseWriter.AddBlobHeaders(http.Response, committed);
             http.Response.Headers["x-ms-request-server-encrypted"] = "true";
+            EchoTransactionalChecksum(http);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
         }
@@ -1954,6 +1959,19 @@ public static class BlobProtocolEndpoint
                 : AzureStorageException.AuthorizationFailure();
     }
 
+    private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
+    {
+        if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
+            createsBlob &&
+            IsServiceVersionAtLeast(request, new DateOnly(2026, 4, 6)))
+        {
+            RequireAny(request, 'c', 'w');
+            return;
+        }
+
+        Require(request, 'w');
+    }
+
     private static void EvaluateReadConditions(HttpRequest request, BlobRecord blob)
     {
         var ifMatch = ProtocolParsing.First(request.Headers, "If-Match");
@@ -2474,6 +2492,23 @@ public static class BlobProtocolEndpoint
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
         var structuredBody = ProtocolParsing.First(request.Headers, "x-ms-structured-body");
         var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
+        var requestContext = StorageRequestContext.Get(request.HttpContext);
+        if (expectedCrc64 is not null &&
+            !IsServiceVersionAtLeast(requestContext, new DateOnly(2019, 2, 2)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Transactional CRC64 checksums require service version 2019-02-02 or later.");
+        }
+        if ((structuredBody is not null || structuredContentLength is not null) &&
+            !IsServiceVersionAtLeast(requestContext, new DateOnly(2025, 1, 5)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Structured request bodies require service version 2025-01-05 or later.");
+        }
         if (structuredBody is not null)
         {
             if (!allowStructured)
