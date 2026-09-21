@@ -7,6 +7,7 @@ using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 using System.IdentityModel.Tokens.Jwt;
+using System.Net;
 using System.Security.Claims;
 using Microsoft.IdentityModel.Tokens;
 
@@ -175,12 +176,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Resource = "b",
             StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
             ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-            Protocol = SasProtocol.HttpsAndHttp
+            Protocol = SasProtocol.HttpsAndHttp,
+            ContentType = "text/x-sas-override"
         };
         serviceBuilder.SetPermissions(BlobSasPermissions.Read);
         var serviceSas = serviceBuilder.ToSasQueryParameters(credential);
         var sasBlob = CreateBlobClient(factory, new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{serviceSas}"));
-        Assert.Equal("sas payload", (await sasBlob.DownloadContentAsync()).Value.Content.ToString());
+        var sasDownload = await sasBlob.DownloadContentAsync();
+        Assert.Equal("sas payload", sasDownload.Value.Content.ToString());
+        Assert.Equal("text/x-sas-override", sasDownload.Value.Details.ContentType);
         var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => sasBlob.DeleteAsync());
         Assert.Equal(403, deniedDelete.Status);
 
@@ -265,6 +269,113 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(401, rejected.Status);
     }
 
+    [Fact]
+    public async Task BearerDelegationKeysProduceScopedUserDelegationSasTokens()
+    {
+        var owner = CreateClient(factory);
+        var containerName = $"delegation-{Guid.NewGuid():N}";
+        var blobName = "delegated.txt";
+        var container = owner.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString("delegated payload"));
+
+        var token = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var delegator = CreateBearerClient(factory, token);
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddHours(1);
+        var key = await delegator.GetUserDelegationKeyAsync(startsOn, expiresOn);
+        Assert.Equal(SavaWebApplicationFactory.DelegatorObjectId, key.Value.SignedObjectId);
+        Assert.Equal(SavaWebApplicationFactory.TenantId, key.Value.SignedTenantId);
+
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.Delete);
+        var sas = builder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
+        var delegatedBlob = CreateBlobClient(
+            factory,
+            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
+
+        Assert.Equal("delegated payload", (await delegatedBlob.DownloadContentAsync()).Value.Content.ToString());
+        var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => delegatedBlob.DeleteAsync());
+        Assert.Equal(403, deniedDelete.Status);
+    }
+
+    [Fact]
+    public async Task AccountPolicyBlocksPublicContainers()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"private-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.SetAccessPolicyAsync(PublicAccessType.Blob));
+        Assert.Equal("PublicAccessNotPermitted", denied.ErrorCode);
+        Assert.Equal(409, denied.Status);
+    }
+
+    [Fact]
+    public async Task CorsAndConditionalResponsesMatchHttpSemantics()
+    {
+        var service = CreateClient(factory);
+        var properties = (await service.GetPropertiesAsync()).Value;
+        properties.Cors.Clear();
+        properties.Cors.Add(new BlobCorsRule
+        {
+            AllowedOrigins = "https://client.example",
+            AllowedMethods = "GET,HEAD",
+            AllowedHeaders = "*",
+            ExposedHeaders = "ETag,x-ms-request-id",
+            MaxAgeInSeconds = 120
+        });
+        await service.SetPropertiesAsync(properties);
+
+        var containerName = $"cors-{Guid.NewGuid():N}";
+        var blobName = "conditional.txt";
+        var container = service.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        var blob = container.GetBlobClient(blobName);
+        await blob.UploadAsync(BinaryData.FromString("conditional payload"));
+        var etag = (await blob.GetPropertiesAsync()).Value.ETag;
+
+        var sasBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        sasBuilder.SetPermissions(BlobSasPermissions.Read);
+        var credential = new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        var sas = sasBuilder.ToSasQueryParameters(credential);
+        var uri = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}");
+        using var client = new HttpClient(factory.Server.CreateHandler());
+
+        using var corsRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        corsRequest.Headers.Add("Origin", "https://client.example");
+        using var corsResponse = await client.SendAsync(corsRequest);
+        Assert.Equal(HttpStatusCode.OK, corsResponse.StatusCode);
+        Assert.Equal("https://client.example", corsResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
+        Assert.Contains("ETag", corsResponse.Headers.GetValues("Access-Control-Expose-Headers").Single());
+
+        using var conditionalRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        conditionalRequest.Headers.IfNoneMatch.Add(new System.Net.Http.Headers.EntityTagHeaderValue(etag.ToString()));
+        using var conditionalResponse = await client.SendAsync(conditionalRequest);
+        Assert.Equal(HttpStatusCode.NotModified, conditionalResponse.StatusCode);
+        Assert.False(conditionalResponse.Headers.Contains("x-ms-error-code"));
+        Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync());
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
@@ -302,13 +413,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         });
     }
 
-    private static string CreateJwt(string base64Key, string objectId)
+    private static string CreateJwt(string base64Key, string objectId, string? tenantId = null)
     {
         var key = new SymmetricSecurityKey(Convert.FromBase64String(base64Key)) { KeyId = "test-key" };
+        var claims = new List<Claim> { new("oid", objectId) };
+        if (tenantId is not null)
+            claims.Add(new Claim("tid", tenantId));
         var token = new JwtSecurityToken(
             issuer: "https://issuer.mk8.test",
             audience: "https://storage.azure.com/",
-            claims: [new Claim("oid", objectId)],
+            claims: claims,
             notBefore: DateTime.UtcNow.AddMinutes(-1),
             expires: DateTime.UtcNow.AddMinutes(10),
             signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256));

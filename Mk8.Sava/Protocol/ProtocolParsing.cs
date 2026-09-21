@@ -7,6 +7,11 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
+internal sealed record UserDelegationKeyRequest(
+    DateTimeOffset StartsAt,
+    DateTimeOffset ExpiresAt,
+    string? DelegatedUserTenantId);
+
 internal static class ProtocolParsing
 {
     public static Dictionary<string, string> ReadMetadata(IHeaderDictionary headers)
@@ -133,21 +138,37 @@ internal static class ProtocolParsing
         return policies;
     }
 
+    public static async Task<UserDelegationKeyRequest> ReadUserDelegationKeyRequestAsync(
+        Stream body,
+        CancellationToken cancellationToken)
+    {
+        using var reader = CreateXmlReader(body);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+        if (document.Root?.Name.LocalName != "KeyInfo")
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
+
+        var startsAt = ParseRequiredDate(ChildValue(document.Root, "Start"), "Start");
+        var expiresAt = ParseRequiredDate(ChildValue(document.Root, "Expiry"), "Expiry");
+        var delegatedTenant = ChildValue(document.Root, "DelegatedUserTid");
+        if (!string.IsNullOrEmpty(delegatedTenant) && !Guid.TryParse(delegatedTenant, out _))
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The DelegatedUserTid value is invalid.");
+        return new UserDelegationKeyRequest(startsAt, expiresAt, NullIfEmpty(delegatedTenant));
+    }
+
     public static async Task<ServiceProperties> ReadServicePropertiesAsync(
         Stream body,
         ServiceProperties current,
         CancellationToken cancellationToken)
     {
-        var document = new XmlDocument { XmlResolver = null };
         using var reader = CreateXmlReader(body);
-        document.Load(reader);
-        cancellationToken.ThrowIfCancellationRequested();
-        var root = document.DocumentElement;
-        if (root?.LocalName != "StorageServiceProperties")
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+        var root = document.Root;
+        if (root?.Name.LocalName != "StorageServiceProperties")
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
         var cors = new List<CorsRule>();
-        foreach (XmlElement rule in root.SelectNodes("*[local-name()='Cors']/*[local-name()='CorsRule']") ?? EmptyNodes.Instance)
+        var corsElement = Child(root, "Cors");
+        foreach (var rule in corsElement?.Elements().Where(element => element.Name.LocalName == "CorsRule") ?? [])
         {
             cors.Add(new CorsRule
             {
@@ -158,10 +179,12 @@ internal static class ProtocolParsing
                 MaxAgeInSeconds = ParseInt(RequiredText(rule, "MaxAgeInSeconds"), "MaxAgeInSeconds")
             });
         }
+        if (cors.Count > 5)
+            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "A maximum of five CORS rules is supported.");
 
         var deletePolicy = ReadRetentionPolicy(root, "DeleteRetentionPolicy", current.BlobSoftDeleteEnabled, current.BlobSoftDeleteRetentionDays);
         var containerPolicy = ReadRetentionPolicy(root, "ContainerDeleteRetentionPolicy", current.ContainerSoftDeleteEnabled, current.ContainerSoftDeleteRetentionDays);
-        var website = root.SelectSingleNode("*[local-name()='StaticWebsite']") as XmlElement;
+        var website = Child(root, "StaticWebsite");
         return current with
         {
             Cors = cors,
@@ -252,9 +275,14 @@ internal static class ProtocolParsing
                 ? parsed
                 : throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {field} value is invalid.");
 
-    private static (bool Enabled, int Days) ReadRetentionPolicy(XmlElement root, string name, bool currentEnabled, int currentDays)
+    private static DateTimeOffset ParseRequiredDate(string? value, string field) =>
+        !string.IsNullOrEmpty(value) && DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed)
+            ? parsed.ToUniversalTime()
+            : throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {field} value is invalid.");
+
+    private static (bool Enabled, int Days) ReadRetentionPolicy(XElement root, string name, bool currentEnabled, int currentDays)
     {
-        if (root.SelectSingleNode($"*[local-name()='{name}']") is not XmlElement policy)
+        if (Child(root, name) is not { } policy)
             return (currentEnabled, currentDays);
         var enabled = ParseBool(OptionalText(policy, "Enabled"), false);
         var days = OptionalText(policy, "Days") is { } text ? ParseInt(text, "Days") : currentDays;
@@ -276,11 +304,15 @@ internal static class ProtocolParsing
             ? parsed
             : throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {field} value is invalid.");
 
-    private static string RequiredText(XmlElement parent, string name) =>
+    private static string RequiredText(XElement parent, string name) =>
         OptionalText(parent, name) ?? throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {name} element is required.");
 
-    private static string? OptionalText(XmlElement parent, string name) =>
-        (parent.SelectSingleNode($"*[local-name()='{name}']") as XmlElement)?.InnerText;
+    private static string? OptionalText(XElement parent, string name) => Child(parent, name)?.Value;
+
+    private static XElement? Child(XElement parent, string name) =>
+        parent.Elements().FirstOrDefault(element => element.Name.LocalName == name);
+
+    private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
     private static string? ChildValue(XElement parent, string name) =>
         parent.Elements().FirstOrDefault(element => element.Name.LocalName == name)?.Value;
@@ -290,11 +322,4 @@ internal static class ProtocolParsing
         "InvalidRange",
         "The range specified is invalid for the current size of the resource.");
 
-    private sealed class EmptyNodes : XmlNodeList
-    {
-        public static EmptyNodes Instance { get; } = new();
-        public override XmlNode? Item(int index) => null;
-        public override System.Collections.IEnumerator GetEnumerator() => Array.Empty<XmlNode>().GetEnumerator();
-        public override int Count => 0;
-    }
 }

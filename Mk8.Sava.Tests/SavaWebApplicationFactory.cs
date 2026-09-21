@@ -10,6 +10,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
     public const string SecondAccountName = "devstoreaccount2";
     public const string SecondAccountKey = "mQ9zP2jx0fSgXK7cZ4aNH3kv1VYw+eR8sL6dB5uC0iFqW7oT2rA9gE4hJ1nM8pUxZcK5bQ3sD6vF0yL7wN2tGA==";
+    public const string DelegatorObjectId = "c618c4f3-ec92-4df7-bf22-3a4c599cfb78";
+    public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public string DataPath { get; } = Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}");
 
@@ -29,6 +31,9 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:BearerAuthentication:SymmetricSigningKeys:test-key"] = AccountKey,
                 ["Sava:BearerAuthentication:Principals:reader-1:Permissions"] = "rl",
                 ["Sava:BearerAuthentication:Principals:reader-1:Accounts:0"] = AccountName,
+                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Permissions"] = "r",
+                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Accounts:0"] = AccountName,
+                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
                 ["Sava:MinimumChunkBytes"] = "4096",
                 ["Sava:TargetChunkBytes"] = "8192",
                 ["Sava:MaximumChunkBytes"] = "16384",

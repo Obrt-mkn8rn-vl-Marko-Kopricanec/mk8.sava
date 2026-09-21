@@ -23,13 +23,25 @@ public sealed record StorageAuthorization(
     DateTimeOffset? ExpiresAt = null,
     string? Identifier = null,
     bool IsAccountSas = false,
-    string? SignedResource = null)
+    string? SignedResource = null,
+    string? TenantId = null,
+    bool CanGenerateUserDelegationKey = false)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
 
     public bool Allows(char permission) => Kind == StorageAuthorizationKind.SharedKey || Permissions.Contains(permission, StringComparison.Ordinal);
 }
+
+public sealed record UserDelegationKey(
+    string SignedObjectId,
+    string SignedTenantId,
+    string SignedStart,
+    string SignedExpiry,
+    string SignedService,
+    string SignedVersion,
+    string? SignedDelegatedUserTenantId,
+    string Value);
 
 public sealed class StorageAuthenticator(IOptions<SavaOptions> options, MetadataStore metadata)
 {
@@ -49,10 +61,75 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (authorization.StartsWith("SharedKeyLite ", StringComparison.Ordinal))
             return AuthenticateSharedKey(context.Request, request, authorization, lite: true);
         if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            return await AuthenticateBearerAsync(context, request);
+        {
+            var bearer = await AuthenticateBearerAsync(context, request);
+            return context.Request.Query.ContainsKey("sig")
+                ? await AuthenticateSasAsync(context, request, cancellationToken, bearer)
+                : bearer;
+        }
         if (context.Request.Query.ContainsKey("sig"))
-            return await AuthenticateSasAsync(context, request, cancellationToken);
+            return await AuthenticateSasAsync(context, request, cancellationToken, null);
         return StorageAuthorization.Anonymous;
+    }
+
+    internal UserDelegationKey IssueUserDelegationKey(
+        StorageRequestContext request,
+        UserDelegationKeyRequest keyRequest)
+    {
+        if (request.Authorization.Kind != StorageAuthorizationKind.Bearer ||
+            !request.Authorization.CanGenerateUserDelegationKey)
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+
+        if (!Guid.TryParse(request.Authorization.Identifier, out _) ||
+            !Guid.TryParse(request.Authorization.TenantId, out _))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+
+        if (!DateOnly.TryParseExact(request.ServiceVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var version) ||
+            version < new DateOnly(2018, 11, 9))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "The requested operation requires service version 2018-11-09 or later.");
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (keyRequest.StartsAt >= keyRequest.ExpiresAt ||
+            keyRequest.StartsAt < now.AddMinutes(-15) ||
+            keyRequest.StartsAt > now.AddDays(7) ||
+            keyRequest.ExpiresAt > now.AddDays(7) ||
+            keyRequest.ExpiresAt - keyRequest.StartsAt > TimeSpan.FromDays(7))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidInput",
+                "The user delegation key start and expiry must define a valid period of no more than seven days.");
+        }
+
+        var signedStart = FormatSasTime(keyRequest.StartsAt);
+        var signedExpiry = FormatSasTime(keyRequest.ExpiresAt);
+        var key = DeriveUserDelegationKey(
+            request.Account,
+            request.Authorization.Identifier!,
+            request.Authorization.TenantId!,
+            signedStart,
+            signedExpiry,
+            "b",
+            request.ServiceVersion,
+            keyRequest.DelegatedUserTenantId);
+        return new UserDelegationKey(
+            request.Authorization.Identifier!,
+            request.Authorization.TenantId!,
+            signedStart,
+            signedExpiry,
+            "b",
+            request.ServiceVersion,
+            keyRequest.DelegatedUserTenantId,
+            key);
     }
 
     private async Task<StorageAuthorization> AuthenticateBearerAsync(
@@ -75,11 +152,13 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             throw AzureStorageException.AuthorizationFailure();
 
         var granted = new HashSet<char>();
+        var mappedAccessApplies = false;
         if (configuration.Principals.TryGetValue(subject, out var access) &&
             Covers(access.Accounts, request.Account) &&
             (request.Container is null || Covers(access.Containers, request.Container)))
         {
             granted.UnionWith(access.Permissions);
+            mappedAccessApplies = true;
         }
 
         foreach (var role in principal.FindAll("roles").Select(claim => claim.Value))
@@ -91,7 +170,12 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (granted.Count == 0)
             throw AzureStorageException.AuthorizationFailure();
         var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
-        return new StorageAuthorization(StorageAuthorizationKind.Bearer, permissions, Identifier: subject);
+        return new StorageAuthorization(
+            StorageAuthorizationKind.Bearer,
+            permissions,
+            Identifier: subject,
+            TenantId: principal.FindFirst("tid")?.Value,
+            CanGenerateUserDelegationKey: mappedAccessApplies && access!.CanGenerateUserDelegationKey);
     }
 
     private StorageAuthorization AuthenticateSharedKey(
@@ -124,7 +208,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
     private async Task<StorageAuthorization> AuthenticateSasAsync(
         HttpContext context,
         StorageRequestContext request,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        StorageAuthorization? bearer)
     {
         var query = context.Request.Query;
         var version = query["sv"].ToString();
@@ -149,7 +234,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         var expiresAt = ParseSasTime(query["se"].ToString());
         string stringToSign;
         var isAccountSas = query.ContainsKey("ss");
+        var isUserDelegationSas = query.ContainsKey("skoid");
+        if (isAccountSas && isUserDelegationSas)
+            throw AzureStorageException.AuthenticationFailed();
         var signedResource = string.Empty;
+        var signingKey = encodedKey;
         if (isAccountSas)
         {
             var services = query["ss"].ToString();
@@ -171,6 +260,123 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             if (signedVersion >= new DateOnly(2020, 12, 6))
                 fields.Add(query["ses"].ToString());
             stringToSign = string.Join('\n', fields) + "\n";
+        }
+        else if (isUserDelegationSas)
+        {
+            if (signedVersion < new DateOnly(2018, 11, 9) || !string.IsNullOrEmpty(query["si"]))
+                throw AzureStorageException.AuthenticationFailed();
+
+            var resourceType = query["sr"].ToString();
+            signedResource = resourceType;
+            if (!ServiceSasCoversRequest(resourceType, request))
+                throw AzureStorageException.AuthorizationFailure();
+
+            var objectId = query["skoid"].ToString();
+            var tenantId = query["sktid"].ToString();
+            var keyStartText = query["skt"].ToString();
+            var keyExpiryText = query["ske"].ToString();
+            var keyService = query["sks"].ToString();
+            var keyVersion = query["skv"].ToString();
+            if (!Guid.TryParse(objectId, out _) ||
+                !Guid.TryParse(tenantId, out _) ||
+                keyService != "b" ||
+                !DateOnly.TryParseExact(keyVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedKeyVersion) ||
+                parsedKeyVersion < new DateOnly(2018, 11, 9))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+
+            var keyStartsAt = ParseSasTime(keyStartText);
+            var keyExpiresAt = ParseSasTime(keyExpiryText);
+            if (keyStartsAt is null || keyExpiresAt is null ||
+                keyStartsAt >= keyExpiresAt ||
+                keyExpiresAt.Value - keyStartsAt.Value > TimeSpan.FromDays(7))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+
+            if (!_options.BearerAuthentication.Principals.TryGetValue(objectId, out var delegatedPrincipal) ||
+                !Covers(delegatedPrincipal.Accounts, request.Account) ||
+                request.Container is not null && !Covers(delegatedPrincipal.Containers, request.Container))
+            {
+                throw AzureStorageException.AuthorizationFailure();
+            }
+            permissions = IntersectPermissions(permissions, delegatedPrincipal.Permissions);
+            startsAt = Latest(startsAt, keyStartsAt);
+            expiresAt = Earliest(expiresAt, keyExpiresAt);
+
+            var authorizedObjectId = query["saoid"].ToString();
+            var unauthorizedObjectId = query["suoid"].ToString();
+            if (!string.IsNullOrEmpty(authorizedObjectId) || !string.IsNullOrEmpty(unauthorizedObjectId))
+                throw AzureStorageException.AuthorizationFailure();
+
+            var delegatedUserTenantId = query["skdutid"].ToString();
+            var delegatedUserObjectId = query["sduoid"].ToString();
+            if (!string.IsNullOrEmpty(delegatedUserObjectId))
+            {
+                if (signedVersion < new DateOnly(2025, 7, 5) ||
+                    bearer is null ||
+                    !string.Equals(bearer.Identifier, delegatedUserObjectId, StringComparison.Ordinal) ||
+                    !string.IsNullOrEmpty(delegatedUserTenantId) && !string.Equals(bearer.TenantId, delegatedUserTenantId, StringComparison.Ordinal))
+                {
+                    throw AzureStorageException.AuthorizationFailure();
+                }
+            }
+            else if (!string.IsNullOrEmpty(delegatedUserTenantId))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+
+            signingKey = DeriveUserDelegationKey(
+                request.Account,
+                objectId,
+                tenantId,
+                FormatSasTime(keyStartsAt.Value),
+                FormatSasTime(keyExpiresAt.Value),
+                keyService,
+                keyVersion,
+                NullIfEmpty(delegatedUserTenantId));
+
+            var fields = new List<string>
+            {
+                query["sp"].ToString(),
+                query["st"].ToString(),
+                query["se"].ToString(),
+                BuildSasCanonicalResource(request, resourceType),
+                objectId,
+                tenantId,
+                keyStartText,
+                keyExpiryText,
+                keyService,
+                keyVersion,
+                authorizedObjectId,
+                unauthorizedObjectId,
+                query["scid"].ToString()
+            };
+            if (signedVersion >= new DateOnly(2025, 7, 5))
+            {
+                fields.Add(delegatedUserTenantId);
+                fields.Add(delegatedUserObjectId);
+            }
+            fields.Add(signedIp);
+            fields.Add(protocol);
+            fields.Add(version);
+            fields.Add(resourceType);
+            if (signedVersion >= new DateOnly(2020, 2, 10))
+                fields.Add(query["snapshot"].ToString());
+            if (signedVersion >= new DateOnly(2020, 12, 6))
+                fields.Add(query["ses"].ToString());
+            if (signedVersion >= new DateOnly(2026, 4, 6))
+            {
+                fields.Add(BuildSignedRequestHeaders(context.Request, query["srh"].ToString()));
+                fields.Add(BuildSignedRequestQuery(context.Request, query["srq"].ToString()));
+            }
+            fields.Add(query["rscc"].ToString());
+            fields.Add(query["rscd"].ToString());
+            fields.Add(query["rsce"].ToString());
+            fields.Add(query["rscl"].ToString());
+            fields.Add(query["rsct"].ToString());
+            stringToSign = string.Join('\n', fields);
         }
         else
         {
@@ -218,7 +424,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             }
         }
 
-        var expected = Sign(encodedKey, stringToSign);
+        var expected = Sign(signingKey, stringToSign);
         if (!FixedTimeEquals(expected, suppliedSignature))
             throw AzureStorageException.AuthenticationFailed();
 
@@ -235,7 +441,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             expiresAt,
             query["si"].ToString(),
             isAccountSas,
-            signedResource);
+            signedResource,
+            TenantId: isUserDelegationSas ? query["sktid"].ToString() : null);
     }
 
     private static string BuildSharedKeyString(HttpRequest request, StorageRequestContext context)
@@ -301,6 +508,34 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         using var hmac = new HMACSHA256(Convert.FromBase64String(encodedKey));
         return Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(value)));
     }
+
+    private string DeriveUserDelegationKey(
+        string account,
+        string objectId,
+        string tenantId,
+        string signedStart,
+        string signedExpiry,
+        string signedService,
+        string signedVersion,
+        string? delegatedUserTenantId)
+    {
+        if (!_options.Accounts.TryGetValue(account, out var encodedAccountKey))
+            throw AzureStorageException.AuthenticationFailed();
+        var derivationContext = string.Join('\n',
+            "mk8.sava:user-delegation-key:v1",
+            account,
+            objectId,
+            tenantId,
+            signedStart,
+            signedExpiry,
+            signedService,
+            signedVersion,
+            delegatedUserTenantId ?? string.Empty);
+        return Sign(encodedAccountKey, derivationContext);
+    }
+
+    private static string FormatSasTime(DateTimeOffset value) =>
+        value.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
 
     private static bool FixedTimeEquals(string expected, string supplied)
     {
@@ -370,11 +605,59 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         return new string(token.Where(policy.Contains).ToArray());
     }
 
+    private static string BuildSignedRequestHeaders(HttpRequest request, string names)
+    {
+        if (string.IsNullOrEmpty(names))
+            return string.Empty;
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var builder = new StringBuilder();
+        foreach (var item in names.Split(','))
+        {
+            var name = item.Trim().ToLowerInvariant();
+            if (string.IsNullOrEmpty(name) || name.Contains('\n', StringComparison.Ordinal) || !seen.Add(name) ||
+                !request.Headers.TryGetValue(name, out var values))
+            {
+                throw AzureStorageException.AuthenticationFailed("A signed request header is missing or invalid.");
+            }
+            var value = values.ToString();
+            if (value.Contains('\n', StringComparison.Ordinal) || value.Contains('\r', StringComparison.Ordinal))
+                throw AzureStorageException.AuthenticationFailed("A signed request header is invalid.");
+            builder.Append(name).Append(':').Append(value).Append('\n');
+        }
+        return builder.ToString();
+    }
+
+    private static string BuildSignedRequestQuery(HttpRequest request, string names)
+    {
+        if (string.IsNullOrEmpty(names))
+            return string.Empty;
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var builder = new StringBuilder();
+        foreach (var item in names.Split(','))
+        {
+            var name = item.Trim();
+            if (string.IsNullOrEmpty(name) || name.Contains('\n', StringComparison.Ordinal) || !seen.Add(name) ||
+                !request.Query.TryGetValue(name, out var values))
+            {
+                throw AzureStorageException.AuthenticationFailed("A signed request query parameter is missing or invalid.");
+            }
+            var value = values.ToString();
+            if (value.Contains('\n', StringComparison.Ordinal) || value.Contains('\r', StringComparison.Ordinal))
+                throw AzureStorageException.AuthenticationFailed("A signed request query parameter is invalid.");
+            builder.Append('\n').Append(name).Append('=').Append(value);
+        }
+        return builder.ToString();
+    }
+
     private static DateTimeOffset? Latest(DateTimeOffset? left, DateTimeOffset? right) =>
         left.HasValue && right.HasValue ? (left > right ? left : right) : left ?? right;
 
     private static DateTimeOffset? Earliest(DateTimeOffset? left, DateTimeOffset? right) =>
         left.HasValue && right.HasValue ? (left < right ? left : right) : left ?? right;
+
+    private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;
 
     private static bool Covers(IReadOnlyCollection<string> configuredValues, string value) =>
         configuredValues.Count == 0 || configuredValues.Contains("*", StringComparer.Ordinal) || configuredValues.Contains(value, StringComparer.Ordinal);

@@ -1,5 +1,7 @@
 using System.Globalization;
 using System.Text;
+using Microsoft.Extensions.Options;
+using Mk8.Sava.Configuration;
 using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
@@ -12,8 +14,12 @@ public sealed record BlobWriteOptions(
 
 public sealed record PageRange(long Start, long End);
 
-public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
+public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOptions<SavaOptions> configuredOptions)
 {
+    private readonly SavaOptions _options = configuredOptions.Value;
+
+    public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
+
     public Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
@@ -30,6 +36,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
         ValidateContainerName(name);
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
+        EnsurePublicAccessAllowed(publicAccess);
 
         var now = metadata.GetUtcNow();
         var container = new ContainerRecord
@@ -90,6 +97,7 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
     {
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
+        EnsurePublicAccessAllowed(publicAccess);
         var updated = current with
         {
             PublicAccess = publicAccess,
@@ -810,6 +818,17 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks)
     {
         if (string.IsNullOrEmpty(name) || Encoding.UTF8.GetByteCount(name) > 1024 || name.Any(char.IsControl))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidResourceName", "The specified resource name contains invalid characters.");
+    }
+
+    private void EnsurePublicAccessAllowed(string? publicAccess)
+    {
+        if (publicAccess is not null && !_options.AllowAnonymousPublicAccess)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "PublicAccessNotPermitted",
+                "Public access is not permitted on this storage account.");
+        }
     }
 
     private static int ValidateBlockId(string blockId)

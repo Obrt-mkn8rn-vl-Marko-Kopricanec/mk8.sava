@@ -33,7 +33,14 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
         {
             context.Abort();
         }
-        catch (Exception exception) when (exception is IOException or InvalidDataException or SqliteException)
+        catch (XmlException)
+        {
+            await WriteErrorAsync(context, new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidXmlDocument",
+                "The specified XML is not syntactically valid."));
+        }
+        catch (Exception exception)
         {
             logger.LogError(exception, "Storage operation failed for request {RequestId}.", GetRequestId(context));
             await WriteErrorAsync(context, new AzureStorageException(
@@ -53,11 +60,17 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
 
         context.Response.Clear();
         context.Response.StatusCode = exception.StatusCode;
+        AddCommonHeaders(context);
+        if (exception.StatusCode == StatusCodes.Status304NotModified)
+            return;
+
         context.Response.ContentType = "application/xml";
         context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
         if (exception.StatusCode == StatusCodes.Status401Unauthorized)
             context.Response.Headers.WWWAuthenticate = "Bearer resource_id=\"https://storage.azure.com/\"";
-        AddCommonHeaders(context);
+
+        if (HttpMethods.IsHead(context.Request.Method))
+            return;
 
         var builder = new StringBuilder();
         using (var writer = XmlWriter.Create(builder, new XmlWriterSettings

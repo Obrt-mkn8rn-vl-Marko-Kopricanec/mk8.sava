@@ -287,6 +287,24 @@ public sealed class AzureResponseWriter
             writer.WriteEndElement();
         }, cancellationToken);
 
+    public Task WriteUserDelegationKeyAsync(
+        HttpContext context,
+        UserDelegationKey key,
+        CancellationToken cancellationToken) =>
+        WriteXmlAsync(context, writer =>
+        {
+            writer.WriteStartElement("UserDelegationKey");
+            writer.WriteElementString("SignedOid", key.SignedObjectId);
+            writer.WriteElementString("SignedTid", key.SignedTenantId);
+            writer.WriteElementString("SignedStart", key.SignedStart);
+            writer.WriteElementString("SignedExpiry", key.SignedExpiry);
+            writer.WriteElementString("SignedService", key.SignedService);
+            writer.WriteElementString("SignedVersion", key.SignedVersion);
+            WriteOptional(writer, "SignedDelegatedUserTid", key.SignedDelegatedUserTenantId);
+            writer.WriteElementString("Value", key.Value);
+            writer.WriteEndElement();
+        }, cancellationToken);
+
     public static void AddContainerHeaders(HttpResponse response, ContainerRecord container)
     {
         response.Headers.ETag = container.ETag;

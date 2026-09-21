@@ -21,6 +21,8 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken);
+
         switch (request.ResourceKind)
         {
             case StorageResourceKind.Service:
@@ -45,6 +47,17 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (comp == "userdelegationkey" && HttpMethods.IsPost(http.Request.Method))
+        {
+            if (request.Authorization.Kind != StorageAuthorizationKind.Bearer)
+                throw AzureStorageException.AuthorizationFailure();
+            var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(http.Request.Body, cancellationToken);
+            var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
+            var key = authenticator.IssueUserDelegationKey(request, keyRequest);
+            await writer.WriteUserDelegationKeyAsync(http, key, cancellationToken);
+            return;
+        }
+
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas && !request.Authorization.IsAccountSas)
             throw AzureStorageException.AuthorizationFailure();
         if (HttpMethods.IsGet(http.Request.Method) && comp == "list")
@@ -96,16 +109,10 @@ public static class BlobProtocolEndpoint
         if (comp == "stats" && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'r');
-            await writer.WriteXmlAsync(http, xml =>
-            {
-                xml.WriteStartElement("StorageServiceStats");
-                xml.WriteStartElement("GeoReplication");
-                xml.WriteElementString("Status", "live");
-                xml.WriteElementString("LastSyncTime", DateTimeOffset.UtcNow.ToString("R", CultureInfo.InvariantCulture));
-                xml.WriteEndElement();
-                xml.WriteEndElement();
-            }, cancellationToken);
-            return;
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidQueryParameterValue",
+                "Service statistics are unavailable because this account has no geo-replicated secondary endpoint.");
         }
 
         if (comp == "blobs" && HttpMethods.IsGet(http.Request.Method))
@@ -167,7 +174,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsHead(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
-            await AuthorizeContainerReadAsync(request, container, allowContainerPublic: true);
+            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             EvaluateContainerConditions(http.Request, container);
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
@@ -175,7 +182,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "list")
         {
-            await AuthorizeContainerListAsync(request, container);
+            await AuthorizeContainerListAsync(request, service, container);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
             var blobs = await service.ListBlobsAsync(
                 request.Account,
@@ -198,7 +205,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "metadata")
         {
-            await AuthorizeContainerReadAsync(request, container, allowContainerPublic: true);
+            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             EvaluateContainerConditions(http.Request, container);
             AzureResponseWriter.AddContainerHeaders(http.Response, container);
             return;
@@ -227,7 +234,9 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             EvaluateContainerConditions(http.Request, container);
             EnsureLease(http.Request, container.Lease, "container");
-            var policies = await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken);
+            var policies = http.Request.ContentLength is null or 0
+                ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
+                : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken);
             var updated = await service.SetContainerAclAsync(
                 container,
                 ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access"),
@@ -615,6 +624,7 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+        ApplySasResponseOverrides(http);
         long start = 0;
         long end = blob.Content.Length - 1;
         var rangeHeader = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
@@ -869,6 +879,51 @@ public static class BlobProtocolEndpoint
         http.Response.Headers.AccessControlMaxAge = rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture);
     }
 
+    private static async Task ApplyCorsResponseHeadersAsync(
+        HttpContext http,
+        BlobService service,
+        StorageRequestContext request,
+        CancellationToken cancellationToken)
+    {
+        var origin = ProtocolParsing.First(http.Request.Headers, "Origin");
+        if (origin is null)
+            return;
+
+        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+        var rule = properties.Cors.FirstOrDefault(candidate =>
+            MatchesCsv(candidate.AllowedOrigins, origin) &&
+            MatchesCsv(candidate.AllowedMethods, http.Request.Method));
+        if (rule is null)
+            return;
+
+        http.Response.Headers.AccessControlAllowOrigin = rule.AllowedOrigins.Contains('*') ? "*" : origin;
+        http.Response.Headers.AccessControlExposeHeaders = rule.ExposedHeaders;
+        http.Response.Headers.Append("Vary", "Origin");
+    }
+
+    private static void ApplySasResponseOverrides(HttpContext http)
+    {
+        if (StorageRequestContext.Get(http).Authorization.Kind != StorageAuthorizationKind.Sas)
+            return;
+
+        ApplyOverride("rscc", "Cache-Control");
+        ApplyOverride("rscd", "Content-Disposition");
+        ApplyOverride("rsce", "Content-Encoding");
+        ApplyOverride("rscl", "Content-Language");
+        ApplyOverride("rsct", "Content-Type");
+        return;
+
+        void ApplyOverride(string queryName, string headerName)
+        {
+            if (!http.Request.Query.TryGetValue(queryName, out var values) || values.Count == 0)
+                return;
+            var value = values[0] ?? string.Empty;
+            if (value.Contains('\r', StringComparison.Ordinal) || value.Contains('\n', StringComparison.Ordinal))
+                throw AzureStorageException.InvalidQuery(queryName);
+            http.Response.Headers[headerName] = value;
+        }
+    }
+
     private static async Task AuthorizeBlobReadAsync(
         StorageRequestContext request,
         BlobService service,
@@ -881,24 +936,31 @@ public static class BlobProtocolEndpoint
             return;
         }
         var container = await service.GetContainerAsync(blob.Account, blob.Container, false, cancellationToken);
-        if (container.PublicAccess is not ("blob" or "container"))
+        if (!service.AllowsAnonymousPublicAccess || container.PublicAccess is not ("blob" or "container"))
             throw AzureStorageException.AuthorizationFailure();
     }
 
-    private static Task AuthorizeContainerReadAsync(StorageRequestContext request, ContainerRecord container, bool allowContainerPublic)
+    private static Task AuthorizeContainerReadAsync(
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        bool allowContainerPublic)
     {
         if (request.Authorization.Kind != StorageAuthorizationKind.Anonymous)
             Require(request, 'r');
-        else if (!allowContainerPublic || container.PublicAccess != "container")
+        else if (!service.AllowsAnonymousPublicAccess || !allowContainerPublic || container.PublicAccess != "container")
             throw AzureStorageException.AuthorizationFailure();
         return Task.CompletedTask;
     }
 
-    private static Task AuthorizeContainerListAsync(StorageRequestContext request, ContainerRecord container)
+    private static Task AuthorizeContainerListAsync(
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container)
     {
         if (request.Authorization.Kind != StorageAuthorizationKind.Anonymous)
             Require(request, 'l');
-        else if (container.PublicAccess != "container")
+        else if (!service.AllowsAnonymousPublicAccess || container.PublicAccess != "container")
             throw AzureStorageException.AuthorizationFailure();
         return Task.CompletedTask;
     }
