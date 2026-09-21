@@ -50,6 +50,7 @@ builder.Services.AddSingleton<IStorageTelemetry>(services => services.GetRequire
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
+builder.Services.AddSingleton<LeaseService>();
 builder.Services.AddSingleton<BlobService>();
 builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddHostedService<StorageMaintenanceService>();

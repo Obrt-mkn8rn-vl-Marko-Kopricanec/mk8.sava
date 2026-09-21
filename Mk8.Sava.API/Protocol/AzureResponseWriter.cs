@@ -452,7 +452,8 @@ public sealed partial class AzureResponseWriter
         {
             response.Headers["x-ms-lease-status"] = LeaseStatus(container.Lease);
             response.Headers["x-ms-lease-state"] = LeaseStateValue(container.Lease);
-            response.Headers["x-ms-lease-duration"] = container.Lease.DurationSeconds == -1 ? "infinite" : "fixed";
+            if (container.Lease.State == Storage.LeaseState.Leased)
+                response.Headers["x-ms-lease-duration"] = container.Lease.DurationSeconds == -1 ? "infinite" : "fixed";
         }
         foreach (var (name, value) in container.Metadata)
             response.Headers[$"x-ms-meta-{name}"] = value;
@@ -775,7 +776,8 @@ public sealed partial class AzureResponseWriter
         _ => throw new ArgumentOutOfRangeException(nameof(kind))
     };
 
-    private static string LeaseStatus(LeaseRecord lease) => lease.State == Storage.LeaseState.Leased ? "locked" : "unlocked";
+    private static string LeaseStatus(LeaseRecord lease) =>
+        lease.State is Storage.LeaseState.Leased or Storage.LeaseState.Breaking ? "locked" : "unlocked";
 
     private static string LeaseStateValue(LeaseRecord lease) => lease.State.ToString().ToLowerInvariant();
 

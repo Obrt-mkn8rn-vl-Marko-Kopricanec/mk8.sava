@@ -9,6 +9,7 @@ namespace Mk8.Sava.Storage;
 public sealed class BlobService(
     MetadataStore metadata,
     ChunkStore chunks,
+    LeaseService leases,
     IStorageTelemetry telemetry,
     IOptions<SavaOptions> configuredOptions)
 {
@@ -35,14 +36,14 @@ public sealed class BlobService(
     {
         var containers = await metadata.ListContainersAsync(account, includeDeleted, cancellationToken);
         if (!includeDeleted || !containers.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
-            return containers;
+            return containers.Select(EffectiveContainer).ToArray();
         var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
         return containers.Select(container => container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
-            ? container with
+            ? EffectiveContainer(container with
             {
                 DeleteRetentionUntil = container.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays)
-            }
-            : container).ToArray();
+            })
+            : EffectiveContainer(container)).ToArray();
     }
 
     internal async Task<ContainerListPage> ListContainersPageAsync(
@@ -60,23 +61,21 @@ public sealed class BlobService(
             marker,
             maximum,
             cancellationToken);
-        if (!includeDeleted || !page.Items.Any(item =>
-                item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
-        {
-            return page;
-        }
-
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        var needsRetention = includeDeleted && page.Items.Any(item =>
+            item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue);
+        var properties = needsRetention
+            ? await metadata.GetServicePropertiesAsync(account, cancellationToken)
+            : null;
         return page with
         {
             Items = page.Items.Select(container =>
-                    container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
-                        ? container with
+                    properties is not null && container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
+                        ? EffectiveContainer(container with
                         {
                             DeleteRetentionUntil = container.DeletedAt.Value.AddDays(
                                 properties.ContainerSoftDeleteRetentionDays)
-                        }
-                        : container)
+                        })
+                        : EffectiveContainer(container))
                 .ToArray()
         };
     }
@@ -124,9 +123,12 @@ public sealed class BlobService(
         string account,
         string name,
         bool includeDeleted,
-        CancellationToken cancellationToken) =>
-        await metadata.GetContainerAsync(account, name, includeDeleted, cancellationToken)
-        ?? throw AzureStorageException.ContainerNotFound();
+        CancellationToken cancellationToken)
+    {
+        var container = await metadata.GetContainerAsync(account, name, includeDeleted, cancellationToken)
+                        ?? throw AzureStorageException.ContainerNotFound();
+        return EffectiveContainer(container);
+    }
 
     public async Task<ContainerRecord> SetContainerMetadataAsync(
         ContainerRecord current,
@@ -252,11 +254,11 @@ public sealed class BlobService(
             var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
             var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
             effective.Add(properties is not null && rehydrated.DeletedAt.HasValue && !rehydrated.DeleteRetentionUntil.HasValue
-                ? rehydrated with
+                ? EffectiveBlob(rehydrated with
                 {
                     DeleteRetentionUntil = rehydrated.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays)
-                }
-                : rehydrated);
+                })
+                : EffectiveBlob(rehydrated));
         }
         return effective;
     }
@@ -312,12 +314,12 @@ public sealed class BlobService(
             var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
             var blob = properties is not null && rehydrated.DeletedAt.HasValue &&
                        !rehydrated.DeleteRetentionUntil.HasValue
-                ? rehydrated with
+                ? EffectiveBlob(rehydrated with
                 {
                     DeleteRetentionUntil = rehydrated.DeletedAt.Value.AddDays(
                         properties.BlobSoftDeleteRetentionDays)
-                }
-                : rehydrated;
+                })
+                : EffectiveBlob(rehydrated);
             effective.Add(new BlobListEntry(blob, null));
         }
         return new BlobListPage(effective, page.HasMore);
@@ -340,7 +342,7 @@ public sealed class BlobService(
         foreach (var blob in page.Items)
         {
             var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
-            effective.Add(await CompleteRehydrationIfDueAsync(copy, cancellationToken));
+            effective.Add(EffectiveBlob(await CompleteRehydrationIfDueAsync(copy, cancellationToken)));
         }
         return new TaggedBlobPage(effective, page.HasMore);
     }
@@ -359,7 +361,7 @@ public sealed class BlobService(
         var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
                    ?? throw AzureStorageException.BlobNotFound();
         blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
-        return await CompleteRehydrationIfDueAsync(blob, cancellationToken);
+        return EffectiveBlob(await CompleteRehydrationIfDueAsync(blob, cancellationToken));
     }
 
     public async Task<BlobRecord> RecordSmartTierAccessAsync(
@@ -405,6 +407,7 @@ public sealed class BlobService(
         string name,
         Stream source,
         BlobWriteOptions options,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -414,7 +417,10 @@ public sealed class BlobService(
         var encryption = EncryptionOf(options);
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
         var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content.Manifest, options, now);
+        var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content.Manifest, options, now) with
+        {
+            Lease = leases.ResetAfterBlobWrite(destinationLease)
+        };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
     }
 
@@ -423,6 +429,7 @@ public sealed class BlobService(
         string container,
         string name,
         BlobWriteOptions options,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -430,7 +437,10 @@ public sealed class BlobService(
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now);
+        var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now) with
+        {
+            Lease = leases.ResetAfterBlobWrite(destinationLease)
+        };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
     }
 
@@ -441,6 +451,7 @@ public sealed class BlobService(
         long length,
         BlobWriteOptions options,
         long sequenceNumber,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -457,6 +468,7 @@ public sealed class BlobService(
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with
         {
+            Lease = leases.ResetAfterBlobWrite(destinationLease),
             SequenceNumber = sequenceNumber
         };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
@@ -499,6 +511,24 @@ public sealed class BlobService(
             Content = content.Manifest,
             CreatedAt = metadata.GetUtcNow()
         }, cancellationToken);
+        if (current is not null)
+        {
+            var written = PrepareBlobWrite(current);
+            if (written.Lease != current.Lease)
+            {
+                try
+                {
+                    await metadata.PutBlobRecordAsync(
+                        written with { Revision = MetadataStore.NewRevision() },
+                        current.Revision,
+                        cancellationToken);
+                }
+                catch (StorageConcurrencyException)
+                {
+                    // A concurrent mutation owns the newer lease state.
+                }
+            }
+        }
     }
 
     public async Task<BlobRecord> CommitBlockListAsync(
@@ -554,6 +584,7 @@ public sealed class BlobService(
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
         {
+            Lease = current is null ? LeaseRecord.Available : leases.ResetAfterBlobWrite(current.Lease),
             CommittedBlocks = selected
         };
         return await metadata.PublishBlockListAsync(
@@ -574,6 +605,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.IsSealed)
@@ -622,6 +654,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
@@ -767,6 +800,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         var updated = current with
         {
             Metadata = userMetadata,
@@ -800,6 +834,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         if (tags.Count > 10)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
         var updated = current with { Tags = tags, Copy = null, Revision = MetadataStore.NewRevision() };
@@ -818,6 +853,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         var nextSequence = current.SequenceNumber;
         if (sequenceNumber.HasValue || sequenceAction is not null)
         {
@@ -877,6 +913,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         var updated = current with
@@ -898,6 +935,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
@@ -972,6 +1010,7 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        current = PrepareBlobWrite(current);
         if (expiresAt <= metadata.GetUtcNow())
             throw AzureStorageException.InvalidHeader("x-ms-expiry-time", expiresAt.Value.ToString("R", CultureInfo.InvariantCulture));
         var updated = current with
@@ -993,6 +1032,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        current = PrepareBlobWrite(current);
         if (expiresOn <= metadata.GetUtcNow())
             throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", expiresOn.ToString("R", CultureInfo.InvariantCulture));
         if (current.ImmutabilityLocked)
@@ -1017,6 +1057,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        current = PrepareBlobWrite(current);
         if (current.ImmutabilityLocked)
             throw BlobImmutableDueToPolicy();
         var updated = current with
@@ -1036,6 +1077,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        current = PrepareBlobWrite(current);
         var updated = current with
         {
             HasLegalHold = hasLegalHold,
@@ -1138,6 +1180,7 @@ public sealed class BlobService(
                     DeletedAt = deletedAt,
                     DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
                     IsCurrent = target.IsCurrent,
+                    Lease = LeaseRecord.Available,
                     Revision = MetadataStore.NewRevision()
                 };
             }
@@ -1227,6 +1270,7 @@ public sealed class BlobService(
         BlobRecord source,
         BlobWriteOptions options,
         string sourceUri,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -1248,6 +1292,7 @@ public sealed class BlobService(
             source.PageRanges,
             options,
             sourceUri,
+            destinationLease,
             expectedGeneration,
             expectedRevision,
             cancellationToken);
@@ -1280,6 +1325,7 @@ public sealed class BlobService(
         if (current is not null)
         {
             EnsureNoPendingCopy(current);
+            current = PrepareBlobWrite(current);
             if (!current.IsIncrementalCopy || current.Kind != BlobKind.PageBlob ||
                 !string.Equals(current.IncrementalCopySource, sourceIdentity, StringComparison.Ordinal) ||
                 current.IncrementalCopySourceCreatedAt != source.CreatedAt)
@@ -1353,6 +1399,7 @@ public sealed class BlobService(
         Stream source,
         BlobWriteOptions options,
         string sourceUri,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -1371,6 +1418,7 @@ public sealed class BlobService(
             pageRanges: [],
             options,
             sourceUri,
+            destinationLease,
             expectedGeneration,
             expectedRevision,
             cancellationToken);
@@ -1389,6 +1437,7 @@ public sealed class BlobService(
         IReadOnlyList<PageRange> pageRanges,
         BlobWriteOptions options,
         string sourceUri,
+        LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
         CancellationToken cancellationToken)
@@ -1403,6 +1452,7 @@ public sealed class BlobService(
         var copyId = Guid.NewGuid().ToString();
         var proposed = NewBlob(account, container, name, sourceKind, chunks.Empty(account, encryption), options, now) with
         {
+            Lease = leases.ResetAfterBlobWrite(destinationLease),
             SequenceNumber = sequenceNumber,
             IsSealed = isSealed,
             AppendBlockCount = appendBlockCount,
@@ -1427,6 +1477,7 @@ public sealed class BlobService(
         string copyId,
         CancellationToken cancellationToken)
     {
+        current = PrepareBlobWrite(current);
         if (current.Copy is null || current.Copy.Status != "pending" || current.PendingCopyContent is null)
         {
             throw new AzureStorageException(
@@ -1922,6 +1973,7 @@ public sealed class BlobService(
         var updated = blob with
         {
             Content = blob.PendingCopyContent,
+            Lease = leases.ResetAfterBlobWrite(blob.Lease),
             PendingCopyContent = null,
             PageRanges = blob.PendingCopyPageRanges ?? blob.PageRanges,
             PendingCopyPageRanges = null,
@@ -2204,6 +2256,15 @@ public sealed class BlobService(
         }
         ranges.Add(new PageRange(start, end));
     }
+
+    private ContainerRecord EffectiveContainer(ContainerRecord container) =>
+        container with { Lease = leases.GetEffective(container.Lease) };
+
+    private BlobRecord EffectiveBlob(BlobRecord blob) =>
+        blob with { Lease = leases.GetEffective(blob.Lease) };
+
+    private BlobRecord PrepareBlobWrite(BlobRecord blob) =>
+        blob with { Lease = leases.ResetAfterBlobWrite(blob.Lease) };
 
     private static void ValidateContainerName(string name)
     {

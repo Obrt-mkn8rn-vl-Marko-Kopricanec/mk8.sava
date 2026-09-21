@@ -36,6 +36,12 @@ public sealed class AzureStorageException : Exception
         header,
         value);
 
+    public static AzureStorageException MissingHeader(string header) => new(
+        (int)HttpStatusCode.BadRequest,
+        "MissingRequiredHeader",
+        "An HTTP header that's mandatory for this request isn't specified.",
+        header);
+
     public static AzureStorageException AuthenticationFailed(string detail = "Server failed to authenticate the request.") => new(
         (int)HttpStatusCode.Forbidden,
         "AuthenticationFailed",
@@ -71,8 +77,28 @@ public sealed class AzureStorageException : Exception
         "ConditionNotMet",
         "The condition specified using HTTP conditional header(s) is not met.");
 
-    public static AzureStorageException LeaseMismatch() => new(
+    public static AzureStorageException LeaseIdMissing(string resource) => new(
         (int)HttpStatusCode.PreconditionFailed,
-        "LeaseIdMismatchWithBlobOperation",
-        "The lease ID specified did not match the lease ID for the blob.");
+        "LeaseIdMissing",
+        $"There is currently a lease on the {resource} and no lease ID was specified in the request.");
+
+    public static AzureStorageException LeaseOperationMismatch(string resource) => new(
+        (int)HttpStatusCode.PreconditionFailed,
+        resource == "container" ? "LeaseIdMismatchWithContainerOperation" : "LeaseIdMismatchWithBlobOperation",
+        $"The lease ID specified did not match the lease ID for the {resource}.");
+
+    public static AzureStorageException LeaseNotPresentForOperation(string resource) => new(
+        (int)HttpStatusCode.PreconditionFailed,
+        resource == "container" ? "LeaseNotPresentWithContainerOperation" : "LeaseNotPresentWithBlobOperation",
+        $"A lease ID was specified, but there is currently no active lease on the {resource}.");
+
+    public static AzureStorageException LeaseIdMismatchWithLeaseOperation() => new(
+        (int)HttpStatusCode.Conflict,
+        "LeaseIdMismatchWithLeaseOperation",
+        "The lease ID specified did not match the lease ID for the container or blob.");
+
+    public static AzureStorageException LeaseNotPresentWithLeaseOperation() => new(
+        (int)HttpStatusCode.Conflict,
+        "LeaseNotPresentWithLeaseOperation",
+        "There is currently no lease on the container or blob.");
 }
