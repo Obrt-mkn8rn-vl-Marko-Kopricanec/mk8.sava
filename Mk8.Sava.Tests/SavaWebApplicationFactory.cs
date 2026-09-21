@@ -90,6 +90,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:MaintenanceScanInterval"] = "00:00:00.050",
                 ["Sava:AbandonedStagingRetention"] = "1.00:00:00",
                 ["Sava:MaximumStagingFilesPerMaintenancePass"] = "1000",
+                ["Sava:GarbageCollectionChunksPerMaintenancePass"] = "100000",
                 ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
             });
             if (_configurationOverrides is not null)

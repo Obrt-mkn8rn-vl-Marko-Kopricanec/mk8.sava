@@ -36,6 +36,7 @@ public sealed class SavaOptions : IValidatableObject
     public TimeSpan UncommittedBlockRetention { get; init; } = TimeSpan.FromDays(7);
     public TimeSpan AbandonedStagingRetention { get; init; } = TimeSpan.FromDays(1);
     public int MaximumStagingFilesPerMaintenancePass { get; init; } = 256;
+    public int GarbageCollectionChunksPerMaintenancePass { get; init; } = 256;
     public int IntegrityScanChunksPerMaintenancePass { get; init; } = 256;
     public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
 
@@ -135,6 +136,11 @@ public sealed class SavaOptions : IValidatableObject
             yield return new ValidationResult(
                 "MaximumStagingFilesPerMaintenancePass must be positive.",
                 [nameof(MaximumStagingFilesPerMaintenancePass)]);
+
+        if (GarbageCollectionChunksPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "GarbageCollectionChunksPerMaintenancePass must be positive.",
+                [nameof(GarbageCollectionChunksPerMaintenancePass)]);
 
         if (IntegrityScanChunksPerMaintenancePass <= 0)
             yield return new ValidationResult(

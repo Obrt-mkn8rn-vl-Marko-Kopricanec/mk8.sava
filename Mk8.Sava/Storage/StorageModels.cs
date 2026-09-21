@@ -178,6 +178,17 @@ public sealed record StorageMetadataInventory(
     int BlobRecordCount,
     int StagedBlockCount);
 
+public sealed record StorageInventorySummary(
+    long LogicalBlobBytes,
+    long LogicalStagedBlockBytes,
+    int BlobRecordCount,
+    int StagedBlockCount,
+    int ReachableChunkCount);
+
+internal sealed record ChunkIdPage(IReadOnlyList<string> Items, bool HasMore);
+
+internal sealed record PhysicalChunkPage(IReadOnlyList<string> Items, bool HasMore);
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable

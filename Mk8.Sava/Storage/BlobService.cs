@@ -52,6 +52,7 @@ public sealed class BlobService(
     private int _integrityCustomerKey;
     private int _integrityMissing;
     private int _integrityCorrupt;
+    private string? _garbageCollectionCursor;
     private string? _recompressionCursor;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
@@ -1422,20 +1423,21 @@ public sealed class BlobService(
         var reclaimedStagingFiles = chunks.DeleteAbandonedStagingFiles(
             now.Subtract(_options.AbandonedStagingRetention),
             _options.MaximumStagingFilesPerMaintenancePass);
-        var collection = await CollectGarbageWithInventoryAsync(cancellationToken);
-        await ScanIntegrityAsync(collection.Inventory, cancellationToken);
-        var recompression = await RecompressColdChunksAsync(collection.Inventory, now, cancellationToken);
+        var reclaimedChunks = await CollectGarbageBatchAsync(cancellationToken);
+        var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken);
+        await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken);
+        var recompression = await RecompressColdChunksAsync(now, cancellationToken);
         var physical = chunks.MeasurePhysicalUsage();
         var usage = new StorageUsageSnapshot(
-            collection.Inventory.LogicalBlobBytes,
-            collection.Inventory.LogicalStagedBlockBytes,
+            summary.LogicalBlobBytes,
+            summary.LogicalStagedBlockBytes,
             physical.ChunkBytes,
             physical.StagingBytes,
             physical.MetadataBytes,
-            collection.Inventory.BlobRecordCount,
-            collection.Inventory.StagedBlockCount,
+            summary.BlobRecordCount,
+            summary.StagedBlockCount,
             physical.ChunkCount,
-            collection.Inventory.ReachableChunkIds.Count(id => !id.EndsWith("/$zero", StringComparison.Ordinal)));
+            summary.ReachableChunkCount);
         var result = new StorageMaintenanceResult(
             completedCopies,
             completedRehydrations,
@@ -1443,7 +1445,7 @@ public sealed class BlobService(
             purgedBlobs,
             purgedContainers,
             expiredBlocks,
-            collection.ReclaimedChunks,
+            reclaimedChunks,
             reclaimedStagingFiles,
             recompression.RecompressedChunks,
             recompression.BytesSaved);
@@ -1453,19 +1455,35 @@ public sealed class BlobService(
 
     public async Task<int> CollectGarbageAsync(CancellationToken cancellationToken)
     {
-        var result = await CollectGarbageWithInventoryAsync(cancellationToken);
-        return result.ReclaimedChunks;
+        await _maintenanceGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await CollectGarbageBatchAsync(cancellationToken);
+        }
+        finally
+        {
+            _maintenanceGate.Release();
+        }
     }
 
-    private async Task<(int ReclaimedChunks, StorageMetadataInventory Inventory)> CollectGarbageWithInventoryAsync(
+    private async Task<int> CollectGarbageBatchAsync(
         CancellationToken cancellationToken)
     {
-        var firstReachabilitySnapshot = await metadata.GetReachableChunkIdsAsync(cancellationToken);
+        var page = chunks.EnumerateChunkIdsPage(
+            _garbageCollectionCursor,
+            _options.GarbageCollectionChunksPerMaintenancePass);
+        if (page.Items.Count == 0)
+        {
+            _garbageCollectionCursor = null;
+            return 0;
+        }
+
+        var firstReachabilitySnapshot = await metadata.FindReachableChunkIdsAsync(page.Items, cancellationToken);
         var reservations = new List<ChunkStore.ChunkMutationReservation>();
         var deleted = 0;
         try
         {
-            foreach (var chunk in chunks.EnumerateChunkIds())
+            foreach (var chunk in page.Items)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (firstReachabilitySnapshot.Contains(chunk))
@@ -1475,14 +1493,17 @@ public sealed class BlobService(
                     reservations.Add(reservation);
             }
 
-            var confirmedInventory = await metadata.GetStorageInventoryAsync(cancellationToken);
+            var confirmedReachability = await metadata.FindReachableChunkIdsAsync(
+                reservations.Select(reservation => reservation.Id).ToArray(),
+                cancellationToken);
             foreach (var reservation in reservations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!confirmedInventory.ReachableChunkIds.Contains(reservation.Id) && reservation.TryDelete())
+                if (!confirmedReachability.Contains(reservation.Id) && reservation.TryDelete())
                     deleted++;
             }
-            return (deleted, confirmedInventory);
+            _garbageCollectionCursor = page.HasMore ? page.Items[^1] : null;
+            return deleted;
         }
         finally
         {
@@ -1492,36 +1513,35 @@ public sealed class BlobService(
     }
 
     private async Task ScanIntegrityAsync(
-        StorageMetadataInventory inventory,
+        int reachableChunkCount,
         CancellationToken cancellationToken)
     {
-        var ids = inventory.ReachableChunkIds
-            .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-        if (ids.Length == 0)
-        {
+        if (_integrityCursor is null)
             ResetIntegrityCycle();
+        var page = await metadata.ListReachableChunkIdsAsync(
+            _integrityCursor,
+            _options.IntegrityScanChunksPerMaintenancePass,
+            excludeCustomerProvidedKeyDomains: false,
+            cancellationToken);
+        if (page.Items.Count == 0)
+        {
             telemetry.RecordIntegrity(new StorageIntegritySnapshot(
-                0, 0, 0, 0, 0, 0, true, metadata.GetUtcNow()));
+                reachableChunkCount,
+                _integrityChecked,
+                _integrityVerified,
+                _integrityCustomerKey,
+                _integrityMissing,
+                _integrityCorrupt,
+                true,
+                metadata.GetUtcNow()));
+            _integrityCursor = null;
             return;
         }
 
-        if (_integrityCursor is null)
-            ResetIntegrityCycle();
-        var start = _integrityCursor is null
-            ? 0
-            : Array.FindIndex(ids, id => string.CompareOrdinal(id, _integrityCursor) > 0);
-        if (start < 0)
-        {
-            ResetIntegrityCycle();
-            start = 0;
-        }
-        var end = Math.Min(ids.Length, start + _options.IntegrityScanChunksPerMaintenancePass);
-        for (var index = start; index < end; index++)
+        foreach (var id in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var status = await chunks.VerifyChunkAsync(ids[index], cancellationToken);
+            var status = await chunks.VerifyChunkAsync(id, cancellationToken);
             _integrityChecked++;
             switch (status)
             {
@@ -1542,9 +1562,9 @@ public sealed class BlobService(
             }
         }
 
-        var complete = end == ids.Length;
+        var complete = !page.HasMore;
         var snapshot = new StorageIntegritySnapshot(
-            ids.Length,
+            reachableChunkCount,
             _integrityChecked,
             _integrityVerified,
             _integrityCustomerKey,
@@ -1554,7 +1574,7 @@ public sealed class BlobService(
             metadata.GetUtcNow());
         if (complete || !snapshot.Healthy || telemetry.Integrity.Healthy)
             telemetry.RecordIntegrity(snapshot);
-        _integrityCursor = complete ? null : ids[end - 1];
+        _integrityCursor = complete ? null : page.Items[^1];
     }
 
     private void ResetIntegrityCycle()
@@ -1568,40 +1588,33 @@ public sealed class BlobService(
     }
 
     private async Task<ChunkRecompressionResult> RecompressColdChunksAsync(
-        StorageMetadataInventory inventory,
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        var ids = inventory.ReachableChunkIds
-            .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
-            .Where(id => !ChunkStore.GetDomainFromChunkId(id).Contains("/$cpk-", StringComparison.Ordinal))
-            .Order(StringComparer.Ordinal)
-            .ToArray();
-        if (ids.Length == 0)
+        var page = await metadata.ListReachableChunkIdsAsync(
+            _recompressionCursor,
+            _options.BackgroundCompressionChunksPerMaintenancePass,
+            excludeCustomerProvidedKeyDomains: true,
+            cancellationToken);
+        if (page.Items.Count == 0)
         {
             _recompressionCursor = null;
             return ChunkRecompressionResult.Skipped;
         }
 
-        var start = _recompressionCursor is null
-            ? 0
-            : Array.FindIndex(ids, id => string.CompareOrdinal(id, _recompressionCursor) > 0);
-        if (start < 0)
-            start = 0;
-        var end = Math.Min(ids.Length, start + _options.BackgroundCompressionChunksPerMaintenancePass);
         var examined = 0;
         var recompressed = 0;
         long bytesSaved = 0;
-        for (var index = start; index < end; index++)
+        foreach (var id in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = await chunks.TryRecompressChunkAsync(ids[index], now, cancellationToken);
+            var result = await chunks.TryRecompressChunkAsync(id, now, cancellationToken);
             examined += result.ExaminedChunks;
             recompressed += result.RecompressedChunks;
             bytesSaved = checked(bytesSaved + result.BytesSaved);
         }
 
-        _recompressionCursor = end == ids.Length ? null : ids[end - 1];
+        _recompressionCursor = page.HasMore ? page.Items[^1] : null;
         return new ChunkRecompressionResult(examined, recompressed, bytesSaved);
     }
 
