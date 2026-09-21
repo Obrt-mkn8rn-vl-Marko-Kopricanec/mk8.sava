@@ -111,10 +111,12 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
-            var update = await ProtocolParsing.ReadServicePropertiesAsync(http.Request.Body, current, cancellationToken);
-            if (update.StaticWebsiteSpecified)
-                RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Static website properties");
-            await service.PutServicePropertiesAsync(request.Account, update.Properties, cancellationToken);
+            var updated = await ProtocolParsing.ReadServicePropertiesAsync(
+                http.Request.Body,
+                current,
+                request.ServiceVersion,
+                cancellationToken);
+            await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }

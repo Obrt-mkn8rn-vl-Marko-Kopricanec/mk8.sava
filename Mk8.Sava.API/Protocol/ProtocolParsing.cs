@@ -12,10 +12,6 @@ internal sealed record UserDelegationKeyRequest(
     DateTimeOffset ExpiresAt,
     string? DelegatedUserTenantId);
 
-internal sealed record ServicePropertiesUpdate(
-    ServiceProperties Properties,
-    bool StaticWebsiteSpecified);
-
 internal static class ProtocolParsing
 {
     private const long MaximumBlockListXmlCharacters = 8L * 1024 * 1024;
@@ -211,9 +207,10 @@ internal static class ProtocolParsing
         return new UserDelegationKeyRequest(startsAt, expiresAt, NullIfEmpty(delegatedTenant));
     }
 
-    public static async Task<ServicePropertiesUpdate> ReadServicePropertiesAsync(
+    public static async Task<ServiceProperties> ReadServicePropertiesAsync(
         Stream body,
         ServiceProperties current,
+        string serviceVersion,
         CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
@@ -222,21 +219,88 @@ internal static class ProtocolParsing
         if (root?.Name.LocalName != "StorageServiceProperties")
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
-        var cors = new List<CorsRule>();
-        var corsElement = Child(root, "Cors");
-        foreach (var rule in corsElement?.Elements().Where(element => element.Name.LocalName == "CorsRule") ?? [])
+        if (!DateOnly.TryParseExact(
+                serviceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var version))
         {
-            cors.Add(new CorsRule
+            throw AzureStorageException.InvalidHeader("x-ms-version", serviceVersion);
+        }
+
+        ValidateUniqueChildren(root);
+        ValidateKnownChildren(
+            root,
+            "Logging",
+            "Metrics",
+            "HourMetrics",
+            "MinuteMetrics",
+            "Cors",
+            "DefaultServiceVersion",
+            "DeleteRetentionPolicy",
+            "ContainerDeleteRetentionPolicy",
+            "IsVersioningEnabled",
+            "StaticWebsite");
+
+        var modernAnalytics = version >= new DateOnly(2013, 8, 15);
+        var loggingElement = Child(root, "Logging");
+        var legacyMetricsElement = Child(root, "Metrics");
+        var hourMetricsElement = Child(root, "HourMetrics");
+        var minuteMetricsElement = Child(root, "MinuteMetrics");
+        if (modernAnalytics && legacyMetricsElement is not null ||
+            !modernAnalytics && (hourMetricsElement is not null || minuteMetricsElement is not null))
+        {
+            throw InvalidServicePropertiesXml("The metrics element is not valid for the requested service version.");
+        }
+        if (!modernAnalytics && (loggingElement is null || legacyMetricsElement is null))
+            throw InvalidServicePropertiesXml("Logging and Metrics are required for this service version.");
+
+        var logging = loggingElement is null ? current.Logging : ReadAnalyticsLogging(loggingElement);
+        var hourMetrics = modernAnalytics
+            ? hourMetricsElement is null ? current.HourMetrics : ReadAnalyticsMetrics(hourMetricsElement)
+            : ReadAnalyticsMetrics(legacyMetricsElement!);
+        var minuteMetrics = minuteMetricsElement is null
+            ? current.MinuteMetrics
+            : ReadAnalyticsMetrics(minuteMetricsElement);
+
+        var corsElement = Child(root, "Cors");
+        var cors = corsElement is null ? current.Cors : [];
+        if (corsElement is not null)
+        {
+            RequireServicePropertiesVersion(version, new DateOnly(2013, 8, 15), "Cors");
+            ValidateKnownChildren(corsElement, "CorsRule");
+            foreach (var rule in corsElement.Elements())
             {
-                AllowedOrigins = RequiredText(rule, "AllowedOrigins"),
-                AllowedMethods = RequiredText(rule, "AllowedMethods"),
-                AllowedHeaders = RequiredText(rule, "AllowedHeaders"),
-                ExposedHeaders = RequiredText(rule, "ExposedHeaders"),
-                MaxAgeInSeconds = ParseInt(RequiredText(rule, "MaxAgeInSeconds"), "MaxAgeInSeconds")
-            });
+                ValidateUniqueChildren(rule);
+                ValidateKnownChildren(
+                    rule,
+                    "AllowedOrigins",
+                    "AllowedMethods",
+                    "AllowedHeaders",
+                    "ExposedHeaders",
+                    "MaxAgeInSeconds");
+                cors.Add(new CorsRule
+                {
+                    AllowedOrigins = RequiredText(rule, "AllowedOrigins"),
+                    AllowedMethods = RequiredText(rule, "AllowedMethods"),
+                    AllowedHeaders = RequiredText(rule, "AllowedHeaders"),
+                    ExposedHeaders = RequiredText(rule, "ExposedHeaders"),
+                    MaxAgeInSeconds = ParseInt(RequiredText(rule, "MaxAgeInSeconds"), "MaxAgeInSeconds")
+                });
+            }
         }
         if (cors.Count > 5)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "A maximum of five CORS rules is supported.");
+
+        if (Child(root, "DefaultServiceVersion") is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2011, 8, 18), "DefaultServiceVersion");
+        if (Child(root, "DeleteRetentionPolicy") is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2017, 7, 29), "DeleteRetentionPolicy");
+        if (Child(root, "ContainerDeleteRetentionPolicy") is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "ContainerDeleteRetentionPolicy");
+        if (Child(root, "IsVersioningEnabled") is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "IsVersioningEnabled");
 
         var deletePolicy = ReadRetentionPolicy(root, "DeleteRetentionPolicy", current.BlobSoftDeleteEnabled, current.BlobSoftDeleteRetentionDays);
         var containerPolicy = ReadRetentionPolicy(root, "ContainerDeleteRetentionPolicy", current.ContainerSoftDeleteEnabled, current.ContainerSoftDeleteRetentionDays);
@@ -244,8 +308,18 @@ internal static class ProtocolParsing
         var staticWebsite = current.StaticWebsite;
         if (website is not null)
         {
+            RequireServicePropertiesVersion(version, new DateOnly(2018, 3, 28), "StaticWebsite");
+            ValidateUniqueChildren(website);
+            ValidateKnownChildren(
+                website,
+                "Enabled",
+                "IndexDocument",
+                "DefaultIndexDocumentPath",
+                "ErrorDocument404Path");
             var indexDocument = NullIfEmpty(OptionalText(website, "IndexDocument"));
             var defaultIndexDocumentPath = NullIfEmpty(OptionalText(website, "DefaultIndexDocumentPath"));
+            if (defaultIndexDocumentPath is not null)
+                RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "DefaultIndexDocumentPath");
             if (indexDocument is not null && defaultIndexDocumentPath is not null)
             {
                 throw new AzureStorageException(
@@ -262,17 +336,22 @@ internal static class ProtocolParsing
             };
         }
 
-        return new ServicePropertiesUpdate(current with
+        return current with
         {
+            Logging = logging,
+            HourMetrics = hourMetrics,
+            MinuteMetrics = minuteMetrics,
             Cors = cors,
             DefaultServiceVersion = OptionalText(root, "DefaultServiceVersion") ?? current.DefaultServiceVersion,
             BlobSoftDeleteEnabled = deletePolicy.Enabled,
             BlobSoftDeleteRetentionDays = deletePolicy.Days,
             ContainerSoftDeleteEnabled = containerPolicy.Enabled,
             ContainerSoftDeleteRetentionDays = containerPolicy.Days,
-            VersioningEnabled = ParseBool(OptionalText(root, "IsVersioningEnabled"), current.VersioningEnabled),
+            VersioningEnabled = Child(root, "IsVersioningEnabled") is null
+                ? current.VersioningEnabled
+                : ParseBool(RequiredText(root, "IsVersioningEnabled"), current.VersioningEnabled),
             StaticWebsite = staticWebsite
-        }, website is not null);
+        };
     }
 
     public static (long Start, long End) ParseRange(string value, long length)
@@ -383,16 +462,99 @@ internal static class ProtocolParsing
             ? parsed.ToUniversalTime()
             : throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {field} value is invalid.");
 
+    private static StorageAnalyticsLogging ReadAnalyticsLogging(XElement element)
+    {
+        ValidateUniqueChildren(element);
+        ValidateKnownChildren(element, "Version", "Delete", "Read", "Write", "RetentionPolicy");
+        var version = RequiredText(element, "Version");
+        if (version != "1.0")
+            throw InvalidServicePropertiesXml("The Storage Analytics version is invalid.");
+        return new StorageAnalyticsLogging
+        {
+            Version = version,
+            Delete = ParseBool(RequiredText(element, "Delete"), false),
+            Read = ParseBool(RequiredText(element, "Read"), false),
+            Write = ParseBool(RequiredText(element, "Write"), false),
+            RetentionPolicy = ReadAnalyticsRetentionPolicy(element)
+        };
+    }
+
+    private static StorageAnalyticsMetrics ReadAnalyticsMetrics(XElement element)
+    {
+        ValidateUniqueChildren(element);
+        ValidateKnownChildren(element, "Version", "Enabled", "IncludeAPIs", "RetentionPolicy");
+        var version = RequiredText(element, "Version");
+        if (version != "1.0")
+            throw InvalidServicePropertiesXml("The Storage Analytics version is invalid.");
+        var enabled = ParseBool(RequiredText(element, "Enabled"), false);
+        var includeApisValue = OptionalText(element, "IncludeAPIs");
+        if (enabled && includeApisValue is null)
+            throw InvalidServicePropertiesXml("The IncludeAPIs element is required when metrics are enabled.");
+        return new StorageAnalyticsMetrics
+        {
+            Version = version,
+            Enabled = enabled,
+            IncludeApis = includeApisValue is null ? null : ParseBool(includeApisValue, false),
+            RetentionPolicy = ReadAnalyticsRetentionPolicy(element)
+        };
+    }
+
+    private static StorageAnalyticsRetentionPolicy ReadAnalyticsRetentionPolicy(XElement parent)
+    {
+        var policy = Child(parent, "RetentionPolicy")
+                     ?? throw InvalidServicePropertiesXml("The RetentionPolicy element is required.");
+        ValidateUniqueChildren(policy);
+        ValidateKnownChildren(policy, "Enabled", "Days");
+        var enabled = ParseBool(RequiredText(policy, "Enabled"), false);
+        var days = OptionalText(policy, "Days") is { } value ? ParseInt(value, "Days") : (int?)null;
+        if (enabled && days is null)
+            throw InvalidServicePropertiesXml("Retention Days is required when retention is enabled.");
+        if (days is not null and (< 1 or > 365))
+            throw InvalidServicePropertiesXml("Retention days must be between 1 and 365.");
+        return new StorageAnalyticsRetentionPolicy { Enabled = enabled, Days = days };
+    }
+
     private static (bool Enabled, int Days) ReadRetentionPolicy(XElement root, string name, bool currentEnabled, int currentDays)
     {
         if (Child(root, name) is not { } policy)
             return (currentEnabled, currentDays);
-        var enabled = ParseBool(OptionalText(policy, "Enabled"), false);
+        ValidateUniqueChildren(policy);
+        ValidateKnownChildren(policy, "Enabled", "Days");
+        var enabled = ParseBool(RequiredText(policy, "Enabled"), false);
         var days = OptionalText(policy, "Days") is { } text ? ParseInt(text, "Days") : currentDays;
+        if (enabled && Child(policy, "Days") is null)
+            throw InvalidServicePropertiesXml("Retention Days is required when retention is enabled.");
         if (enabled && days is < 1 or > 365)
-            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "Retention days must be between 1 and 365.");
+            throw InvalidServicePropertiesXml("Retention days must be between 1 and 365.");
         return (enabled, days);
     }
+
+    private static void RequireServicePropertiesVersion(DateOnly version, DateOnly minimum, string feature)
+    {
+        if (version < minimum)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
+        }
+    }
+
+    private static void ValidateUniqueChildren(XElement element)
+    {
+        if (element.Elements().GroupBy(child => child.Name.LocalName, StringComparer.Ordinal).Any(group => group.Skip(1).Any()))
+            throw InvalidServicePropertiesXml("The specified XML contains duplicate elements.");
+    }
+
+    private static void ValidateKnownChildren(XElement element, params string[] names)
+    {
+        var known = names.ToHashSet(StringComparer.Ordinal);
+        if (element.Elements().Any(child => !known.Contains(child.Name.LocalName)))
+            throw InvalidServicePropertiesXml("The specified XML contains an unsupported element.");
+    }
+
+    private static AzureStorageException InvalidServicePropertiesXml(string message) =>
+        new(StatusCodes.Status400BadRequest, "InvalidXmlDocument", message);
 
     private static bool ParseBool(string? value, bool defaultValue) => value?.ToLowerInvariant() switch
     {

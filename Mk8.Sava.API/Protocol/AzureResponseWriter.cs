@@ -362,36 +362,57 @@ public sealed partial class AzureResponseWriter
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WriteServicePropertiesAsync(HttpContext context, ServiceProperties properties, CancellationToken cancellationToken) =>
-        WriteXmlAsync(context, writer =>
+    public Task WriteServicePropertiesAsync(HttpContext context, ServiceProperties properties, CancellationToken cancellationToken)
+    {
+        var request = StorageRequestContext.Get(context);
+        return WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("StorageServiceProperties");
-            writer.WriteStartElement("Cors");
-            foreach (var rule in properties.Cors)
+            WriteAnalyticsLogging(writer, properties.Logging);
+            if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
             {
-                writer.WriteStartElement("CorsRule");
-                writer.WriteElementString("AllowedOrigins", rule.AllowedOrigins);
-                writer.WriteElementString("AllowedMethods", rule.AllowedMethods);
-                writer.WriteElementString("AllowedHeaders", rule.AllowedHeaders);
-                writer.WriteElementString("ExposedHeaders", rule.ExposedHeaders);
-                writer.WriteElementString("MaxAgeInSeconds", rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture));
+                WriteAnalyticsMetrics(writer, "HourMetrics", properties.HourMetrics);
+                WriteAnalyticsMetrics(writer, "MinuteMetrics", properties.MinuteMetrics);
+                writer.WriteStartElement("Cors");
+                foreach (var rule in properties.Cors)
+                {
+                    writer.WriteStartElement("CorsRule");
+                    writer.WriteElementString("AllowedOrigins", rule.AllowedOrigins);
+                    writer.WriteElementString("AllowedMethods", rule.AllowedMethods);
+                    writer.WriteElementString("AllowedHeaders", rule.AllowedHeaders);
+                    writer.WriteElementString("ExposedHeaders", rule.ExposedHeaders);
+                    writer.WriteElementString("MaxAgeInSeconds", rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture));
+                    writer.WriteEndElement();
+                }
                 writer.WriteEndElement();
             }
-            writer.WriteEndElement();
+            else
+            {
+                WriteAnalyticsMetrics(writer, "Metrics", properties.HourMetrics);
+            }
             writer.WriteStartElement("DefaultServiceVersion");
             writer.WriteString(properties.DefaultServiceVersion ?? string.Empty);
             writer.WriteEndElement();
-            WriteRetentionPolicy(writer, "DeleteRetentionPolicy", properties.BlobSoftDeleteEnabled, properties.BlobSoftDeleteRetentionDays);
-            WriteRetentionPolicy(writer, "ContainerDeleteRetentionPolicy", properties.ContainerSoftDeleteEnabled, properties.ContainerSoftDeleteRetentionDays);
-            writer.WriteElementString("IsVersioningEnabled", properties.VersioningEnabled ? "true" : "false");
-            writer.WriteStartElement("StaticWebsite");
-            writer.WriteElementString("Enabled", properties.StaticWebsite.Enabled ? "true" : "false");
-            WriteOptional(writer, "IndexDocument", properties.StaticWebsite.IndexDocument);
-            WriteOptional(writer, "DefaultIndexDocumentPath", properties.StaticWebsite.DefaultIndexDocumentPath);
-            WriteOptional(writer, "ErrorDocument404Path", properties.StaticWebsite.ErrorDocument404Path);
-            writer.WriteEndElement();
+            if (IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
+                WriteRetentionPolicy(writer, "DeleteRetentionPolicy", properties.BlobSoftDeleteEnabled, properties.BlobSoftDeleteRetentionDays);
+            if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+            {
+                WriteRetentionPolicy(writer, "ContainerDeleteRetentionPolicy", properties.ContainerSoftDeleteEnabled, properties.ContainerSoftDeleteRetentionDays);
+                writer.WriteElementString("IsVersioningEnabled", properties.VersioningEnabled ? "true" : "false");
+            }
+            if (IsServiceVersionAtLeast(request, new DateOnly(2018, 3, 28)))
+            {
+                writer.WriteStartElement("StaticWebsite");
+                writer.WriteElementString("Enabled", properties.StaticWebsite.Enabled ? "true" : "false");
+                WriteOptional(writer, "IndexDocument", properties.StaticWebsite.IndexDocument);
+                if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+                    WriteOptional(writer, "DefaultIndexDocumentPath", properties.StaticWebsite.DefaultIndexDocumentPath);
+                WriteOptional(writer, "ErrorDocument404Path", properties.StaticWebsite.ErrorDocument404Path);
+                writer.WriteEndElement();
+            }
             writer.WriteEndElement();
         }, cancellationToken);
+    }
 
     public Task WriteUserDelegationKeyAsync(
         HttpContext context,
@@ -548,6 +569,39 @@ public sealed partial class AzureResponseWriter
             writer.WriteElementString("Value", value);
             writer.WriteEndElement();
         }
+        writer.WriteEndElement();
+    }
+
+    private static void WriteAnalyticsLogging(XmlWriter writer, StorageAnalyticsLogging logging)
+    {
+        writer.WriteStartElement("Logging");
+        writer.WriteElementString("Version", logging.Version);
+        writer.WriteElementString("Delete", logging.Delete ? "true" : "false");
+        writer.WriteElementString("Read", logging.Read ? "true" : "false");
+        writer.WriteElementString("Write", logging.Write ? "true" : "false");
+        WriteAnalyticsRetentionPolicy(writer, logging.RetentionPolicy);
+        writer.WriteEndElement();
+    }
+
+    private static void WriteAnalyticsMetrics(XmlWriter writer, string name, StorageAnalyticsMetrics metrics)
+    {
+        writer.WriteStartElement(name);
+        writer.WriteElementString("Version", metrics.Version);
+        writer.WriteElementString("Enabled", metrics.Enabled ? "true" : "false");
+        if (metrics.IncludeApis.HasValue)
+            writer.WriteElementString("IncludeAPIs", metrics.IncludeApis.Value ? "true" : "false");
+        WriteAnalyticsRetentionPolicy(writer, metrics.RetentionPolicy);
+        writer.WriteEndElement();
+    }
+
+    private static void WriteAnalyticsRetentionPolicy(
+        XmlWriter writer,
+        StorageAnalyticsRetentionPolicy retentionPolicy)
+    {
+        writer.WriteStartElement("RetentionPolicy");
+        writer.WriteElementString("Enabled", retentionPolicy.Enabled ? "true" : "false");
+        if (retentionPolicy.Days.HasValue)
+            writer.WriteElementString("Days", retentionPolicy.Days.Value.ToString(CultureInfo.InvariantCulture));
         writer.WriteEndElement();
     }
 

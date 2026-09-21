@@ -359,6 +359,9 @@ public sealed record StorageIntegritySnapshot(
 
 public sealed record ServiceProperties
 {
+    public StorageAnalyticsLogging Logging { get; init; } = new();
+    public StorageAnalyticsMetrics HourMetrics { get; init; } = new();
+    public StorageAnalyticsMetrics MinuteMetrics { get; init; } = new();
     public bool VersioningEnabled { get; init; }
     public bool ContainerSoftDeleteEnabled { get; init; }
     public int ContainerSoftDeleteRetentionDays { get; init; } = 7;
@@ -367,6 +370,29 @@ public sealed record ServiceProperties
     public string? DefaultServiceVersion { get; init; }
     public List<CorsRule> Cors { get; init; } = [];
     public StaticWebsiteProperties StaticWebsite { get; init; } = new();
+}
+
+public sealed record StorageAnalyticsLogging
+{
+    public string Version { get; init; } = "1.0";
+    public bool Delete { get; init; }
+    public bool Read { get; init; }
+    public bool Write { get; init; }
+    public StorageAnalyticsRetentionPolicy RetentionPolicy { get; init; } = new();
+}
+
+public sealed record StorageAnalyticsMetrics
+{
+    public string Version { get; init; } = "1.0";
+    public bool Enabled { get; init; }
+    public bool? IncludeApis { get; init; }
+    public StorageAnalyticsRetentionPolicy RetentionPolicy { get; init; } = new();
+}
+
+public sealed record StorageAnalyticsRetentionPolicy
+{
+    public bool Enabled { get; init; }
+    public int? Days { get; init; }
 }
 
 public sealed record CorsRule
