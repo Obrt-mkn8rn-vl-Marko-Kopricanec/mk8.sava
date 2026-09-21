@@ -2106,17 +2106,18 @@ public static class BlobProtocolEndpoint
         var requestedHeaders = ProtocolParsing.First(http.Request.Headers, "Access-Control-Request-Headers") ?? string.Empty;
         var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
         var rule = properties.Cors.FirstOrDefault(candidate =>
-            MatchesCsv(candidate.AllowedOrigins, origin) &&
+            MatchesCorsOrigin(candidate.AllowedOrigins, origin) &&
             MatchesCsv(candidate.AllowedMethods, requestedMethod) &&
             requestedHeaders.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .All(header => MatchesHeader(candidate.AllowedHeaders, header)));
         if (rule is null)
             throw new AzureStorageException(StatusCodes.Status403Forbidden, "CorsPreflightFailure", "CORS not enabled or no matching rule found for this request.");
-        http.Response.Headers.AccessControlAllowOrigin = rule.AllowedOrigins.Contains('*') ? "*" : origin;
+        http.Response.Headers.AccessControlAllowOrigin = AllowsAllCorsOrigins(rule.AllowedOrigins) ? "*" : origin;
         http.Response.Headers.AccessControlAllowMethods = requestedMethod;
         http.Response.Headers.AccessControlAllowHeaders = requestedHeaders;
         http.Response.Headers.AccessControlExposeHeaders = rule.ExposedHeaders;
         http.Response.Headers.AccessControlMaxAge = rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture);
+        http.Response.Headers.AccessControlAllowCredentials = "true";
     }
 
     private static async Task ApplyCorsResponseHeadersAsync(
@@ -2126,19 +2127,32 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var origin = ProtocolParsing.First(http.Request.Headers, "Origin");
-        if (origin is null)
-            return;
-
         var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
-        var rule = properties.Cors.FirstOrDefault(candidate =>
-            MatchesCsv(candidate.AllowedOrigins, origin) &&
-            MatchesCsv(candidate.AllowedMethods, http.Request.Method));
+        var rule = origin is null
+            ? properties.Cors.FirstOrDefault(candidate =>
+                AllowsAllCorsOrigins(candidate.AllowedOrigins) &&
+                MatchesCsv(candidate.AllowedMethods, http.Request.Method))
+            : properties.Cors.FirstOrDefault(candidate =>
+                MatchesCorsOrigin(candidate.AllowedOrigins, origin) &&
+                MatchesCsv(candidate.AllowedMethods, http.Request.Method));
         if (rule is null)
+        {
+            if (properties.Cors.Count > 0 &&
+                (HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)))
+            {
+                http.Response.Headers.Append("Vary", "Origin");
+            }
             return;
+        }
 
-        http.Response.Headers.AccessControlAllowOrigin = rule.AllowedOrigins.Contains('*') ? "*" : origin;
+        var allowsAllOrigins = AllowsAllCorsOrigins(rule.AllowedOrigins);
+        http.Response.Headers.AccessControlAllowOrigin = allowsAllOrigins ? "*" : origin;
         http.Response.Headers.AccessControlExposeHeaders = rule.ExposedHeaders;
-        http.Response.Headers.Append("Vary", "Origin");
+        if (!allowsAllOrigins &&
+            (HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)))
+        {
+            http.Response.Headers.Append("Vary", "Origin");
+        }
     }
 
     private static void ApplySasResponseOverrides(HttpContext http)
@@ -3206,6 +3220,31 @@ public static class BlobProtocolEndpoint
     }
 
     private static bool MatchesCsv(string csv, string value) => csv.Split(',', StringSplitOptions.TrimEntries).Any(item => item == "*" || string.Equals(item, value, StringComparison.OrdinalIgnoreCase));
+
+    private static bool MatchesCorsOrigin(string csv, string origin) =>
+        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate =>
+            candidate == "*" ||
+            string.Equals(candidate, origin, StringComparison.Ordinal) ||
+            MatchesCorsSubdomain(candidate, origin));
+
+    private static bool MatchesCorsSubdomain(string candidate, string origin)
+    {
+        var wildcard = candidate.IndexOf("*.", StringComparison.Ordinal);
+        if (wildcard < 0 || candidate.IndexOf('*', wildcard + 1) >= 0)
+            return false;
+        var prefix = candidate[..wildcard];
+        var suffix = candidate[(wildcard + 1)..];
+        if (!origin.StartsWith(prefix, StringComparison.Ordinal) ||
+            !origin.EndsWith(suffix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+        var subdomain = origin[prefix.Length..^suffix.Length];
+        return subdomain.Length > 0;
+    }
+
+    private static bool AllowsAllCorsOrigins(string csv) =>
+        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate => candidate == "*");
 
     private static bool MatchesHeader(string csv, string header) => csv.Split(',', StringSplitOptions.TrimEntries).Any(item => item == "*" || (item.EndsWith('*') ? header.StartsWith(item[..^1], StringComparison.OrdinalIgnoreCase) : string.Equals(item, header, StringComparison.OrdinalIgnoreCase)));
 
