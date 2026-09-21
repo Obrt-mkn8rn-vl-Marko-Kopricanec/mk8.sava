@@ -1027,6 +1027,60 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync());
     }
 
+    [Fact]
+    public async Task QueryBlobContentsStreamsSdkCompatibleAvroForCsvAndJsonResults()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.csv");
+        await blob.UploadAsync(
+            new MemoryStream("100,200,300,400\n300,400,500,600\n"u8.ToArray()),
+            new BlobUploadOptions { Tags = new Dictionary<string, string> { ["kind"] = "query" } });
+        var properties = await blob.GetPropertiesAsync();
+
+        var progress = new CaptureProgress();
+        var csvResponse = await blob.QueryAsync(
+            "SELECT _2 FROM BlobStorage WHERE _1 > 250;",
+            new BlobQueryOptions
+            {
+                Conditions = new BlobRequestConditions
+                {
+                    IfMatch = properties.Value.ETag,
+                    TagConditions = "\"kind\" = 'query'"
+                },
+                ProgressHandler = progress
+            });
+        using (var reader = new StreamReader(csvResponse.Value.Content))
+            Assert.Equal("400\n", await reader.ReadToEndAsync());
+        Assert.Equal(200, csvResponse.GetRawResponse().Status);
+        Assert.Equal(properties.Value.ETag, csvResponse.Value.Details.ETag);
+        Assert.Equal([32L, 32L], progress.Values);
+
+        var jsonResponse = await blob.QueryAsync(
+            "SELECT _2 FROM BlobStorage WHERE _1 >= 300;",
+            new BlobQueryOptions
+            {
+                InputTextConfiguration = new BlobQueryCsvTextOptions
+                {
+                    ColumnSeparator = ",",
+                    QuotationCharacter = '"',
+                    EscapeCharacter = '\\',
+                    RecordSeparator = "\n"
+                },
+                OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+            });
+        using var jsonReader = new StreamReader(jsonResponse.Value.Content);
+        Assert.Equal("{\"_1\":\"400\"}\n", await jsonReader.ReadToEndAsync());
+
+        var append = container.GetAppendBlobClient("not-queryable");
+        await append.CreateAsync();
+        var invalidType = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlockBlobClient("not-queryable").QueryAsync("SELECT * FROM BlobStorage"));
+        Assert.Equal(409, invalidType.Status);
+        Assert.Equal("InvalidBlobType", invalidType.ErrorCode);
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
@@ -1106,6 +1160,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken) =>
             ValueTask.FromResult(GetToken(requestContext, cancellationToken));
+    }
+
+    private sealed class CaptureProgress : IProgress<long>
+    {
+        public List<long> Values { get; } = [];
+
+        public void Report(long value) => Values.Add(value);
     }
 
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>

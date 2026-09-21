@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO.Pipelines;
 using System.Net;
 using System.Text;
 using System.Xml;
@@ -744,6 +745,12 @@ public static class BlobProtocolEndpoint
             includeDeleted: false,
             cancellationToken);
 
+        if (HttpMethods.IsPost(http.Request.Method) && comp == "query")
+        {
+            await HandleQueryAsync(http, request, service, blob, cancellationToken);
+            return;
+        }
+
         if (HttpMethods.IsPut(http.Request.Method) && comp == "immutabilitypolicies")
         {
             Require(request, 'i');
@@ -1146,6 +1153,121 @@ public static class BlobProtocolEndpoint
         }
 
         await service.WriteContentAsync(blob, encryption, start, length, http.Response.Body, cancellationToken);
+    }
+
+    private static async Task HandleQueryAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        BlobRecord blob,
+        CancellationToken cancellationToken)
+    {
+        if (!DateOnly.TryParseExact(
+                request.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var version) || version < new DateOnly(2019, 12, 12))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Query Blob Contents requires service version 2019-12-12 or later.");
+        }
+
+        await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+        if (blob.Kind != BlobKind.BlockBlob)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "InvalidBlobType",
+                "Query Blob Contents is supported only for block blobs.");
+        }
+        if (blob.CustomerProvidedKeySha256 is not null ||
+            ProtocolParsing.First(http.Request.Headers, "x-ms-encryption-key") is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOperationNotSupported",
+                "Query Blob Contents is not supported for blobs encrypted with customer-provided keys.");
+        }
+
+        EvaluateReadConditions(http.Request, blob);
+        var tagCondition = ProtocolParsing.First(http.Request.Headers, "x-ms-if-tags");
+        if (tagCondition is not null && !MatchesTagCondition(tagCondition, blob.Tags, "x-ms-if-tags"))
+            throw AzureStorageException.ConditionNotMet();
+        if (ProtocolParsing.First(http.Request.Headers, "x-ms-lease-id") is not null)
+            EnsureLease(http.Request, blob.Lease, "blob");
+
+        var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken);
+        AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+        http.Response.ContentType = "avro/binary";
+        http.Response.StatusCode = StatusCodes.Status200OK;
+
+        var pipe = new Pipe(new PipeOptions(
+            pauseWriterThreshold: 1024 * 1024,
+            resumeWriterThreshold: 512 * 1024,
+            useSynchronizationContext: false));
+        using var producerCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var producer = ProduceQueryInputAsync(
+            service,
+            blob,
+            new BlobEncryption(blob.EncryptionScope, null),
+            pipe.Writer,
+            producerCancellation.Token);
+
+        await using var content = pipe.Reader.AsStream(leaveOpen: true);
+        try
+        {
+            await BlobQueryProtocol.ExecuteAsync(
+                query,
+                content,
+                http.Response.Body,
+                blob.Content.Length,
+                cancellationToken);
+        }
+        finally
+        {
+            producerCancellation.Cancel();
+            await pipe.Reader.CompleteAsync();
+            try
+            {
+                await producer;
+            }
+            catch (OperationCanceledException) when (producerCancellation.IsCancellationRequested)
+            {
+            }
+        }
+    }
+
+    private static async Task ProduceQueryInputAsync(
+        BlobService service,
+        BlobRecord blob,
+        BlobEncryption encryption,
+        PipeWriter writer,
+        CancellationToken cancellationToken)
+    {
+        Exception? failure = null;
+        try
+        {
+            await using var destination = writer.AsStream(leaveOpen: true);
+            await service.WriteContentAsync(
+                blob,
+                encryption,
+                0,
+                blob.Content.Length,
+                destination,
+                cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+            throw;
+        }
+        finally
+        {
+            await writer.CompleteAsync(failure);
+        }
     }
 
     private static async Task<BlobRecord> ResolveCopySourceAsync(
@@ -1798,18 +1920,21 @@ public static class BlobProtocolEndpoint
         if (ifUnmodified.HasValue && source.LastModified > ifUnmodified.Value.AddSeconds(1))
             throw SourceConditionNotMet();
         var tagCondition = ProtocolParsing.First(request.Headers, "x-ms-source-if-tags");
-        if (tagCondition is not null && !MatchesTagCondition(tagCondition, source.Tags))
+        if (tagCondition is not null && !MatchesTagCondition(tagCondition, source.Tags, "x-ms-source-if-tags"))
             throw SourceConditionNotMet();
     }
 
-    private static bool MatchesTagCondition(string expression, IReadOnlyDictionary<string, string> tags)
+    private static bool MatchesTagCondition(
+        string expression,
+        IReadOnlyDictionary<string, string> tags,
+        string headerName)
     {
         var match = System.Text.RegularExpressions.Regex.Match(
             expression,
             "^\\s*\"(?<key>[^\"]+)\"\\s*=\\s*'(?<value>[^']*)'\\s*$",
             System.Text.RegularExpressions.RegexOptions.CultureInvariant);
         if (!match.Success)
-            throw AzureStorageException.InvalidHeader("x-ms-source-if-tags", expression);
+            throw AzureStorageException.InvalidHeader(headerName, expression);
         return tags.TryGetValue(match.Groups["key"].Value, out var value) &&
                string.Equals(value, match.Groups["value"].Value, StringComparison.Ordinal);
     }
