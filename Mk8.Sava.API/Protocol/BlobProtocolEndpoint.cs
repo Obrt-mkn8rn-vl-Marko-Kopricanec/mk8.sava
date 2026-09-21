@@ -636,16 +636,21 @@ public static class BlobProtocolEndpoint
             if (copySource is null)
             {
                 await WithIntegrityValidationAsync(http.Request, async body =>
-                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, encryption, cancellationToken));
+                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, encryption, cancellationToken),
+                    maximumBodyBytes: GetMaximumPutBlockBytes(request));
             }
             else
             {
+                RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Put Block From URL");
+                RequireZeroContentLength(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 await transfers.ReadAsync(
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     allowSourceCustomerProvidedKey: true,
+                    GetMaximumPutBlockFromUrlBytes(request),
+                    sourceLengthConflict: false,
                     async source =>
                     {
                         await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, encryption, cancellationToken);
@@ -703,16 +708,21 @@ public static class BlobProtocolEndpoint
             if (copySource is null)
             {
                 await WithIntegrityValidationAsync(http.Request, async body =>
-                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, encryption, cancellationToken));
+                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, encryption, cancellationToken),
+                    maximumBodyBytes: GetMaximumAppendBlockBytes(request));
             }
             else
             {
+                RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Append Block From URL");
+                RequireZeroContentLength(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 await transfers.ReadAsync(
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     allowSourceCustomerProvidedKey: true,
+                    GetMaximumAppendBlockBytes(request),
+                    sourceLengthConflict: false,
                     async source => updated = await service.AppendBlockAsync(
                         current,
                         source.Content,
@@ -751,12 +761,14 @@ public static class BlobProtocolEndpoint
             BlobRecord updated;
             if (operation == "clear")
             {
-                if (http.Request.ContentLength is > 0)
-                    throw AzureStorageException.InvalidHeader("Content-Length", http.Request.ContentLength.Value.ToString(CultureInfo.InvariantCulture));
+                RequireZeroContentLength(http.Request);
                 updated = await service.PutPageAsync(current, start, end, null, clear: true, encryption, cancellationToken);
             }
             else if (operation == "update")
             {
+                const long maximumPageWriteBytes = 4L * 1024 * 1024;
+                if (rangeLength > maximumPageWriteBytes)
+                    throw new RequestBodyTooLargeException(maximumPageWriteBytes);
                 var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
                 updated = null!;
                 if (copySource is null)
@@ -769,16 +781,21 @@ public static class BlobProtocolEndpoint
                             suppliedLength.ToString(CultureInfo.InvariantCulture));
                     }
                     await WithIntegrityValidationAsync(http.Request, async body =>
-                        updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken));
+                        updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken),
+                        maximumBodyBytes: maximumPageWriteBytes);
                 }
                 else
                 {
+                    RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Put Page From URL");
+                    RequireZeroContentLength(http.Request);
                     var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                     await transfers.ReadAsync(
                         http.Request,
                         copySource,
                         ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                         allowSourceCustomerProvidedKey: true,
+                        maximumPageWriteBytes,
+                        sourceLengthConflict: false,
                         async source => updated = await service.PutPageAsync(
                             current,
                             start,
@@ -1220,12 +1237,16 @@ public static class BlobProtocolEndpoint
             {
                 if (requestedType is not null && requestedType != "BlockBlob")
                     throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
+                RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Put Blob From URL");
+                RequireZeroContentLength(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 var uploaded = await transfers.ReadAsync(
                     http.Request,
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     allowSourceCustomerProvidedKey: requestedType == "BlockBlob",
+                    5_000L * 1024 * 1024,
+                    sourceLengthConflict: true,
                     async source => await service.PutBlockBlobAsync(
                         request.Account,
                         containerName,
@@ -1264,12 +1285,15 @@ public static class BlobProtocolEndpoint
             }
             else
             {
+                RequireZeroContentLength(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 copied = await transfers.ReadAsync(
                     http.Request,
                     copySource,
                     sourceRange: null,
                     allowSourceCustomerProvidedKey: false,
+                    long.MaxValue,
+                    sourceLengthConflict: false,
                     async source => await service.BeginCopyFromStreamAsync(
                         request.Account,
                         containerName,
@@ -1306,11 +1330,12 @@ public static class BlobProtocolEndpoint
                         ReadWriteOptions(http.Request, current),
                         current?.GenerationId,
                         current?.Revision,
-                        cancellationToken));
+                        cancellationToken),
+                    maximumBodyBytes: GetMaximumPutBlobBytes(request));
                 break;
             case "AppendBlob":
-                if (http.Request.ContentLength is > 0)
-                    throw AzureStorageException.InvalidHeader("Content-Length", http.Request.ContentLength.Value.ToString(CultureInfo.InvariantCulture));
+                RequireFeatureVersion(request, new DateOnly(2015, 2, 21), "Append Blob");
+                RequireZeroContentLength(http.Request);
                 created = await service.CreateAppendBlobAsync(
                     request.Account,
                     containerName,
@@ -1321,6 +1346,7 @@ public static class BlobProtocolEndpoint
                     cancellationToken);
                 break;
             case "PageBlob":
+                RequireZeroContentLength(http.Request);
                 var length = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-content-length", required: true);
                 var sequence = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number", defaultValue: 0);
                 created = await service.CreatePageBlobAsync(
@@ -2185,6 +2211,57 @@ public static class BlobProtocolEndpoint
             DateTimeStyles.None,
             out var version) && version >= minimum;
 
+    private static void RequireFeatureVersion(
+        StorageRequestContext request,
+        DateOnly minimum,
+        string feature)
+    {
+        if (IsServiceVersionAtLeast(request, minimum))
+            return;
+        throw new AzureStorageException(
+            StatusCodes.Status400BadRequest,
+            "FeatureVersionMismatch",
+            $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
+    }
+
+    private static long GetMaximumPutBlobBytes(StorageRequestContext request) =>
+        IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12))
+            ? 5_000L * 1024 * 1024
+            : IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31))
+                ? 256L * 1024 * 1024
+                : 64L * 1024 * 1024;
+
+    private static long GetMaximumPutBlockBytes(StorageRequestContext request) =>
+        IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12))
+            ? 4_000L * 1024 * 1024
+            : IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31))
+                ? 100L * 1024 * 1024
+                : 4L * 1024 * 1024;
+
+    private static long GetMaximumPutBlockFromUrlBytes(StorageRequestContext request) =>
+        IsServiceVersionAtLeast(request, new DateOnly(2020, 4, 8))
+            ? 4_000L * 1024 * 1024
+            : 100L * 1024 * 1024;
+
+    private static long GetMaximumAppendBlockBytes(StorageRequestContext request) =>
+        IsServiceVersionAtLeast(request, new DateOnly(2022, 11, 2))
+            ? 100L * 1024 * 1024
+            : 4L * 1024 * 1024;
+
+    private static void RequireZeroContentLength(HttpRequest request)
+    {
+        if (request.ContentLength is > 0)
+        {
+            throw AzureStorageException.InvalidHeader(
+                "Content-Length",
+                request.ContentLength?.ToString(CultureInfo.InvariantCulture));
+        }
+        if (ProtocolParsing.First(request.Headers, "x-ms-structured-body") is { } structuredBody)
+            throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
+        if (ProtocolParsing.First(request.Headers, "x-ms-structured-content-length") is { } structuredLength)
+            throw AzureStorageException.InvalidHeader("x-ms-structured-content-length", structuredLength);
+    }
+
     private static BlobWriteOptions ReadUrlWriteOptions(HttpRequest request, UrlSource source)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request.Headers);
@@ -2486,13 +2563,21 @@ public static class BlobProtocolEndpoint
     private static async Task WithIntegrityValidationAsync(
         HttpRequest request,
         Func<Stream, Task> action,
-        bool allowStructured = true)
+        bool allowStructured = true,
+        long maximumBodyBytes = long.MaxValue)
     {
         var expectedMd5 = ProtocolParsing.First(request.Headers, "Content-MD5");
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
         var structuredBody = ProtocolParsing.First(request.Headers, "x-ms-structured-body");
         var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
         var requestContext = StorageRequestContext.Get(request.HttpContext);
+        var options = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+        var effectiveMaximumBodyBytes = Math.Min(maximumBodyBytes, options.MaximumRequestBodyBytes);
+        var (logicalContentLength, logicalLengthHeader) = GetLogicalRequestContentLength(request);
+        if (!logicalContentLength.HasValue)
+            throw AzureStorageException.InvalidHeader(logicalLengthHeader);
+        if (logicalContentLength.Value > effectiveMaximumBodyBytes)
+            throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
         if (expectedCrc64 is not null &&
             !IsServiceVersionAtLeast(requestContext, new DateOnly(2019, 2, 2)))
         {
@@ -2536,7 +2621,6 @@ public static class BlobProtocolEndpoint
             var encodedLength = request.ContentLength
                                 ?? throw AzureStorageException.InvalidHeader("Content-Length");
             var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
-            var structuredOptions = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
             var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
             try
             {
@@ -2552,7 +2636,7 @@ public static class BlobProtocolEndpoint
                     temporary,
                     encodedLength,
                     decodedLength,
-                    structuredOptions.MaximumRequestBodyBytes,
+                    effectiveMaximumBodyBytes,
                     request.HttpContext.RequestAborted);
                 temporary.Position = 0;
                 await action(temporary);
@@ -2589,7 +2673,6 @@ public static class BlobProtocolEndpoint
             expectedMd5 is null ? 8 : 16,
             expectedMd5 is null ? "x-ms-content-crc64" : "Content-MD5");
         var paths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
-        var options = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
         var temporaryPath = Path.Combine(paths.Staging, $"validated-{Guid.NewGuid():N}.tmp");
         try
         {
@@ -2610,8 +2693,8 @@ public static class BlobProtocolEndpoint
                 if (read == 0)
                     break;
                 length = checked(length + read);
-                if (length > options.MaximumRequestBodyBytes)
-                    throw new RequestBodyTooLargeException(options.MaximumRequestBodyBytes);
+                if (length > effectiveMaximumBodyBytes)
+                    throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
                 md5?.AppendData(buffer, 0, read);
                 crc64?.Append(buffer.AsSpan(0, read));
                 await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted);

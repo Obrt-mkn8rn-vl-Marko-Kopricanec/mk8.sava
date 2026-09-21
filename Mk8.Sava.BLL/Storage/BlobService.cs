@@ -406,8 +406,12 @@ public sealed class BlobService(
     {
         ValidateBlobName(name);
         const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
-        if (length < 0 || length > maximumPageBlobBytes || length % 512 != 0)
+        if (length > maximumPageBlobBytes)
+            throw new RequestBodyTooLargeException(maximumPageBlobBytes);
+        if (length < 0 || length % 512 != 0)
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
+        if (sequenceNumber < 0)
+            throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.ToString(CultureInfo.InvariantCulture));
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with

@@ -35,9 +35,22 @@ internal sealed class UrlTransferClient(
         string sourceValue,
         string? sourceRange,
         bool allowSourceCustomerProvidedKey,
+        long maximumBytes,
+        bool sourceLengthConflict,
         Func<UrlSource, Task<TResult>> consume,
         CancellationToken cancellationToken)
     {
+        var effectiveMaximumBytes = Math.Min(maximumBytes, _options.MaximumRequestBodyBytes);
+        if (effectiveMaximumBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        if (ProtocolParsing.First(destinationRequest.Headers, "x-ms-source-content-crc64") is not null &&
+            !IsServiceVersionAtLeast(destinationRequest, new DateOnly(2019, 2, 2)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Source transactional CRC64 checksums require service version 2019-02-02 or later.");
+        }
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
             sourceUri.Scheme is not ("http" or "https"))
         {
@@ -84,14 +97,34 @@ internal sealed class UrlTransferClient(
             }
 
             await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var contentLength = response.Content.Headers.ContentLength;
+            if (!contentLength.HasValue &&
+                response.Content.Headers.ContentRange is { From: { } from, To: { } to })
+            {
+                contentLength = checked(to - from + 1);
+            }
+            if (!contentLength.HasValue)
+                throw CannotVerifyCopySource("The source did not return a valid Content-Length value.");
+            if (contentLength.Value > effectiveMaximumBytes)
+            {
+                if (sourceLengthConflict)
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status409Conflict,
+                        "CannotVerifyCopySource",
+                        $"The source exceeds the maximum permitted length of {effectiveMaximumBytes} bytes.");
+                }
+                throw new RequestBodyTooLargeException(effectiveMaximumBytes);
+            }
             var sourceInfo = new UrlSource(
-                source,
-                response.Content.Headers.ContentRange?.Length ?? response.Content.Headers.ContentLength,
+                new LengthLimitedReadStream(source, effectiveMaximumBytes),
+                contentLength,
                 ReadHttpProperties(response),
                 response.Headers.ETag?.ToString());
             return await ConsumeWithChecksumValidationAsync(
                 destinationRequest,
                 sourceInfo,
+                effectiveMaximumBytes,
                 consume,
                 cancellationToken);
         }
@@ -100,6 +133,7 @@ internal sealed class UrlTransferClient(
     private async Task<TResult> ConsumeWithChecksumValidationAsync<TResult>(
         HttpRequest request,
         UrlSource source,
+        long maximumBytes,
         Func<UrlSource, Task<TResult>> consume,
         CancellationToken cancellationToken)
     {
@@ -137,8 +171,8 @@ internal sealed class UrlTransferClient(
                 if (read == 0)
                     break;
                 length = checked(length + read);
-                if (length > _options.MaximumRequestBodyBytes)
-                    throw new RequestBodyTooLargeException(_options.MaximumRequestBodyBytes);
+                if (length > maximumBytes)
+                    throw new RequestBodyTooLargeException(maximumBytes);
                 md5?.AppendData(buffer, 0, read);
                 crc64?.Append(buffer.AsSpan(0, read));
                 await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
@@ -168,6 +202,13 @@ internal sealed class UrlTransferClient(
         var value = ProtocolParsing.First(destination.Headers, "x-ms-copy-source-authorization");
         if (value is null)
             return;
+        if (!IsServiceVersionAtLeast(destination, new DateOnly(2020, 10, 2)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Copy source authorization requires service version 2020-10-02 or later.");
+        }
         if (!AuthenticationHeaderValue.TryParse(value, out var authorization) ||
             !string.Equals(authorization.Scheme, "Bearer", StringComparison.OrdinalIgnoreCase))
         {
@@ -182,6 +223,14 @@ internal sealed class UrlTransferClient(
         Copy("x-ms-source-if-none-match", "If-None-Match");
         Copy("x-ms-source-if-modified-since", "If-Modified-Since");
         Copy("x-ms-source-if-unmodified-since", "If-Unmodified-Since");
+        if (destination.Headers.ContainsKey("x-ms-source-if-tags") &&
+            !IsServiceVersionAtLeast(destination, new DateOnly(2019, 12, 12)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "FeatureVersionMismatch",
+                "Source tag conditions require service version 2019-12-12 or later.");
+        }
         Copy("x-ms-source-if-tags", "x-ms-if-tags");
         return;
 
@@ -313,6 +362,108 @@ internal sealed class UrlTransferClient(
         StatusCodes.Status400BadRequest,
         "CannotVerifyCopySource",
         message);
+
+    private static bool IsServiceVersionAtLeast(HttpRequest request, DateOnly minimum) =>
+        DateOnly.TryParseExact(
+            StorageRequestContext.Get(request.HttpContext).ServiceVersion,
+            "yyyy-MM-dd",
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.None,
+            out var version) && version >= minimum;
+
+    private sealed class LengthLimitedReadStream(Stream inner, long maximumBytes) : Stream
+    {
+        private long _read;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (buffer.IsEmpty)
+                return 0;
+            var read = inner.Read(Limit(buffer));
+            Record(read);
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (buffer.IsEmpty)
+                return 0;
+            var read = await inner.ReadAsync(Limit(buffer), cancellationToken);
+            Record(read);
+            return read;
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The owning response controls the source stream lifetime.
+            base.Dispose(disposing);
+        }
+
+        private Span<byte> Limit(Span<byte> buffer)
+        {
+            var remaining = maximumBytes - _read;
+            if (remaining <= 0)
+            {
+                var probe = inner.ReadByte();
+                if (probe >= 0)
+                    throw new RequestBodyTooLargeException(maximumBytes);
+                return Span<byte>.Empty;
+            }
+            return buffer[..(int)Math.Min(buffer.Length, remaining)];
+        }
+
+        private Memory<byte> Limit(Memory<byte> buffer)
+        {
+            var remaining = maximumBytes - _read;
+            if (remaining <= 0)
+                return ProbeAsync(buffer);
+            return buffer[..(int)Math.Min(buffer.Length, remaining)];
+        }
+
+        private Memory<byte> ProbeAsync(Memory<byte> buffer)
+        {
+            // Read one byte asynchronously on the next call so a source that lies
+            // about Content-Length cannot publish more than the operation limit.
+            return buffer[..1];
+        }
+
+        private void Record(int read)
+        {
+            if (read == 0)
+                return;
+            _read = checked(_read + read);
+            if (_read > maximumBytes)
+                throw new RequestBodyTooLargeException(maximumBytes);
+        }
+    }
 
     private static byte[] DecodeChecksum(string value, int requiredLength, string headerName)
     {
