@@ -178,7 +178,7 @@ public sealed class StorageBackupService(
         {
             throw new InvalidDataException("The backup format or version is unsupported.");
         }
-        if (manifest.MetadataSchemaVersion != MetadataStore.CurrentSchemaVersion)
+        if (manifest.MetadataSchemaVersion is < 1 or > MetadataStore.CurrentSchemaVersion)
         {
             throw new InvalidDataException(
                 $"The backup metadata schema version {manifest.MetadataSchemaVersion} is not supported by this service.");
