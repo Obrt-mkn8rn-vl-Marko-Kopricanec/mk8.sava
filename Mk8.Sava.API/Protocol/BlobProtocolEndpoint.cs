@@ -743,8 +743,13 @@ public static class BlobProtocolEndpoint
                 updated = null!;
                 if (copySource is null)
                 {
-                    if (http.Request.ContentLength is { } contentLength && contentLength != rangeLength)
-                        throw AzureStorageException.InvalidHeader("Content-Length", contentLength.ToString(CultureInfo.InvariantCulture));
+                    var (contentLength, contentLengthHeader) = GetLogicalRequestContentLength(http.Request);
+                    if (contentLength is { } suppliedLength && suppliedLength != rangeLength)
+                    {
+                        throw AzureStorageException.InvalidHeader(
+                            contentLengthHeader,
+                            suppliedLength.ToString(CultureInfo.InvariantCulture));
+                    }
                     await WithIntegrityValidationAsync(http.Request, async body =>
                         updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken));
                 }
@@ -2280,6 +2285,68 @@ public static class BlobProtocolEndpoint
     {
         var expectedMd5 = ProtocolParsing.First(request.Headers, "Content-MD5");
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
+        var structuredBody = ProtocolParsing.First(request.Headers, "x-ms-structured-body");
+        var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
+        if (structuredBody is not null)
+        {
+            if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
+                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
+            if (expectedMd5 is not null || expectedCrc64 is not null)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidHeaderValue",
+                    "A structured request body cannot also specify a transactional checksum header.");
+            }
+            if (!long.TryParse(
+                    structuredContentLength,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var decodedLength))
+            {
+                throw AzureStorageException.InvalidHeader(
+                    "x-ms-structured-content-length",
+                    structuredContentLength);
+            }
+
+            var encodedLength = request.ContentLength
+                                ?? throw AzureStorageException.InvalidHeader("Content-Length");
+            var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
+            var structuredOptions = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+            var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
+            try
+            {
+                await using var temporary = new FileStream(
+                    structuredTemporaryPath,
+                    FileMode.CreateNew,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    128 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan);
+                await StructuredBodyDecoder.DecodeAsync(
+                    request.Body,
+                    temporary,
+                    encodedLength,
+                    decodedLength,
+                    structuredOptions.MaximumRequestBodyBytes,
+                    request.HttpContext.RequestAborted);
+                temporary.Position = 0;
+                await action(temporary);
+                request.HttpContext.Response.Headers["x-ms-structured-body"] = structuredBody;
+            }
+            finally
+            {
+                if (File.Exists(structuredTemporaryPath))
+                    File.Delete(structuredTemporaryPath);
+            }
+            return;
+        }
+        if (structuredContentLength is not null)
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-structured-content-length",
+                structuredContentLength);
+        }
         if (expectedMd5 is not null && expectedCrc64 is not null)
         {
             throw new AzureStorageException(
@@ -2343,6 +2410,24 @@ public static class BlobProtocolEndpoint
             if (File.Exists(temporaryPath))
                 File.Delete(temporaryPath);
         }
+    }
+
+    private static (long? Length, string HeaderName) GetLogicalRequestContentLength(HttpRequest request)
+    {
+        var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
+        if (structuredContentLength is null)
+            return (request.ContentLength, "Content-Length");
+        if (!long.TryParse(
+                structuredContentLength,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var length))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-structured-content-length",
+                structuredContentLength);
+        }
+        return (length, "x-ms-structured-content-length");
     }
 
     private static byte[] DecodeChecksum(string value, int requiredLength, string headerName)
