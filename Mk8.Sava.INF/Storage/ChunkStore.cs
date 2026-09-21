@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
 using System.Text;
@@ -22,17 +23,25 @@ public sealed class ChunkStore
     private const int TagLength = 16;
     private const int AuthenticatedHeaderLength = sizeof(ulong) + sizeof(byte) + sizeof(byte) + sizeof(int) + 32 + NonceLength;
     private const int HeaderLength = AuthenticatedHeaderLength + TagLength;
+    private const ulong PackRecordMagic = 0x314B4341503853UL; // S8PACK1
+    private const ulong PackRecordFooterMagic = 0x31444E454B503853UL; // S8PKEND1
+    private const int PackRecordHeaderLength = sizeof(ulong) + sizeof(ushort) + sizeof(int) + 32;
+    private const int PackRecordFooterLength = sizeof(ulong);
 
     private readonly StoragePaths _paths;
+    private readonly MetadataStore _metadata;
     private readonly SavaOptions _options;
     private readonly ContentDefinedChunker _chunker;
     private readonly object _pinGate = new();
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
+    private string? _orphanPackCursor;
 
-    public ChunkStore(StoragePaths paths, IOptions<SavaOptions> options)
+    public ChunkStore(StoragePaths paths, MetadataStore metadata, IOptions<SavaOptions> options)
     {
         _paths = paths;
+        _metadata = metadata;
         _options = options.Value;
         _chunker = new ContentDefinedChunker(
             _options.MinimumChunkBytes,
@@ -113,7 +122,23 @@ public sealed class ChunkStore
         return new PinLease(this, ids);
     }
 
-    internal string GetChunkPathForBackup(string id) => GetChunkPath(id);
+    internal async Task CopyChunkFileForBackupAsync(
+        string id,
+        string destination,
+        CancellationToken cancellationToken)
+    {
+        var bytes = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        await using var output = new FileStream(
+            destination,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            128 * 1024,
+            FileOptions.Asynchronous);
+        await output.WriteAsync(bytes, cancellationToken);
+        await output.FlushAsync(cancellationToken);
+        output.Flush(flushToDisk: true);
+    }
 
     public ContentManifest Empty(string account, BlobEncryption encryption) =>
         ContentManifest.Empty(ResolveDomain(account, encryption));
@@ -363,23 +388,248 @@ public sealed class ChunkStore
         return path;
     }
 
-    internal PhysicalChunkPage EnumerateChunkIdsPage(string? after, int maximum)
+    internal async Task<PhysicalChunkPage> EnumerateChunkIdsPageAsync(
+        string? after,
+        int maximum,
+        CancellationToken cancellationToken)
     {
         if (maximum <= 0)
             throw new ArgumentOutOfRangeException(nameof(maximum));
-        var items = EnumerateChunkIdsOrdered(_paths.Chunks, relativeDirectory: string.Empty, after)
+        var standalone = EnumerateStorageIdsOrdered(_paths.Chunks, relativeDirectory: string.Empty, after, ".chunk")
             .Take(checked(maximum + 1))
             .ToList();
-        var hasMore = items.Count > maximum;
+        var packed = await _metadata.ListPackedChunkIdsAsync(after, maximum, cancellationToken);
+        var items = standalone
+            .Concat(packed.Items)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Take(checked(maximum + 1))
+            .ToList();
+        var hasMore = items.Count > maximum || standalone.Count > maximum || packed.HasMore;
         if (hasMore)
-            items.RemoveAt(items.Count - 1);
+        {
+            while (items.Count > maximum)
+                items.RemoveAt(items.Count - 1);
+        }
         return new PhysicalChunkPage(items, hasMore);
     }
 
-    private static IEnumerable<string> EnumerateChunkIdsOrdered(
+    internal async Task<PackCompactionResult> TryCompactPackAsync(
+        ChunkPackRecord pack,
+        CancellationToken cancellationToken)
+    {
+        if (!pack.Sealed)
+            return PackCompactionResult.Skipped;
+        var gate = _packGates.GetOrAdd(pack.Domain, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            var oldPath = GetPackPath(pack.PackId);
+            var locations = await _metadata.ListPackedChunkLocationsAsync(pack.PackId, cancellationToken);
+            long oldLength;
+            try
+            {
+                oldLength = new FileInfo(oldPath).Length;
+            }
+            catch (FileNotFoundException)
+            {
+                if (locations.Count == 0)
+                {
+                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken);
+                    return new PackCompactionResult(1, 1, 0, 0);
+                }
+                throw new InvalidDataException($"Chunk pack '{pack.PackId}' is missing.");
+            }
+
+            var liveBytes = locations.Sum(location => (long)location.RecordLength);
+            if (liveBytes < 0 || liveBytes > oldLength)
+                throw new InvalidDataException($"Chunk pack '{pack.PackId}' has inconsistent live locations.");
+            var deadBytes = oldLength - liveBytes;
+            if (locations.Count > 0 &&
+                (deadBytes < _options.ChunkPackCompactionMinimumSavingsBytes ||
+                 (double)deadBytes / oldLength < _options.ChunkPackCompactionMinimumDeadRatio))
+            {
+                return new PackCompactionResult(1, 0, 0, 0);
+            }
+
+            var reservations = new List<ChunkMutationReservation>(locations.Count);
+            try
+            {
+                foreach (var location in locations)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var reservation = TryReserveForMutation(location.ChunkId);
+                    if (reservation is null)
+                        return new PackCompactionResult(1, 0, 0, 0);
+                    reservations.Add(reservation);
+                }
+
+                if (locations.Count == 0)
+                {
+                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken);
+                    File.Delete(oldPath);
+                    return new PackCompactionResult(1, 1, 0, oldLength);
+                }
+
+                var replacement = new ChunkPackRecord(
+                    CreatePackId(pack.Domain),
+                    pack.Domain,
+                    _metadata.GetUtcNow(),
+                    Sealed: true);
+                var replacementPath = GetPackPath(replacement.PackId);
+                var temporaryPath = Path.Combine(_paths.Staging, $"pack-compact-{Guid.NewGuid():N}.tmp");
+                var replacements = new List<PackedChunkLocation>(locations.Count);
+                try
+                {
+                    await using (var source = new FileStream(
+                                     oldPath,
+                                     FileMode.Open,
+                                     FileAccess.Read,
+                                     FileShare.Read,
+                                     128 * 1024,
+                                     FileOptions.Asynchronous | FileOptions.RandomAccess))
+                    await using (var destination = new FileStream(
+                                     temporaryPath,
+                                     FileMode.CreateNew,
+                                     FileAccess.Write,
+                                     FileShare.None,
+                                     128 * 1024,
+                                     FileOptions.Asynchronous))
+                    {
+                        foreach (var location in locations)
+                        {
+                            _ = await ReadPackedChunkPayloadAsync(location, cancellationToken);
+                            var newOffset = destination.Position;
+                            source.Position = location.RecordOffset;
+                            await CopyExactlyAsync(source, destination, location.RecordLength, cancellationToken);
+                            replacements.Add(location with
+                            {
+                                PackId = replacement.PackId,
+                                RecordOffset = newOffset,
+                                PayloadOffset = checked(newOffset + location.PayloadOffset - location.RecordOffset)
+                            });
+                        }
+                        await destination.FlushAsync(cancellationToken);
+                        destination.Flush(flushToDisk: true);
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(replacementPath)!);
+                    File.Move(temporaryPath, replacementPath, overwrite: false);
+                    try
+                    {
+                        await _metadata.ReplaceChunkPackAsync(
+                            pack,
+                            replacement,
+                            locations,
+                            replacements,
+                            cancellationToken);
+                    }
+                    catch
+                    {
+                        File.Delete(replacementPath);
+                        throw;
+                    }
+                    File.Delete(oldPath);
+                    var newLength = new FileInfo(replacementPath).Length;
+                    return new PackCompactionResult(1, 1, 0, oldLength - newLength);
+                }
+                finally
+                {
+                    if (File.Exists(temporaryPath))
+                        File.Delete(temporaryPath);
+                }
+            }
+            finally
+            {
+                foreach (var reservation in reservations)
+                    reservation.Dispose();
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    internal async Task<(int ReclaimedPacks, long BytesSaved)> ReclaimOrphanedPacksAsync(
+        DateTimeOffset olderThan,
+        int maximumPacks,
+        CancellationToken cancellationToken)
+    {
+        if (maximumPacks <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumPacks));
+
+        var page = EnumerateStorageIdsOrdered(_paths.Packs, string.Empty, _orphanPackCursor, ".pack")
+            .Take(checked(maximumPacks + 1))
+            .ToList();
+        var hasMore = page.Count > maximumPacks;
+        if (hasMore)
+            page.RemoveAt(page.Count - 1);
+
+        var reclaimed = 0;
+        long bytesSaved = 0;
+        foreach (var packId in page)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var separator = packId.LastIndexOf('/');
+            if (separator <= 0)
+                continue;
+            var domain = packId[..separator];
+            var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                var path = GetPackPath(packId);
+                FileInfo file;
+                try
+                {
+                    file = new FileInfo(path);
+                    if (!file.Exists || file.LastWriteTimeUtc > olderThan.UtcDateTime)
+                        continue;
+                }
+                catch (IOException)
+                {
+                    continue;
+                }
+
+                if (_metadata.ChunkPackExists(packId))
+                    continue;
+
+                var length = file.Length;
+                try
+                {
+                    File.Delete(path);
+                    reclaimed++;
+                    bytesSaved = checked(bytesSaved + length);
+                }
+                catch (FileNotFoundException)
+                {
+                    // Another recovery pass removed the unregistered pack first.
+                }
+                catch (IOException)
+                {
+                    // A writer still owns the file; reconsider it on the next cycle.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Surface the bytes through physical usage and retry later.
+                }
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        _orphanPackCursor = hasMore && page.Count > 0 ? page[^1] : null;
+        return (reclaimed, bytesSaved);
+    }
+
+    private static IEnumerable<string> EnumerateStorageIdsOrdered(
         string root,
         string relativeDirectory,
-        string? after)
+        string? after,
+        string extension)
     {
         var directory = relativeDirectory.Length == 0
             ? root
@@ -423,14 +673,14 @@ public sealed class ChunkStore
                     after.StartsWith(prefix, StringComparison.Ordinal) ||
                     string.CompareOrdinal(prefix, after) > 0)
                 {
-                    foreach (var nestedId in EnumerateChunkIdsOrdered(root, relative, after))
+                    foreach (var nestedId in EnumerateStorageIdsOrdered(root, relative, after, extension))
                         yield return nestedId;
                 }
                 continue;
             }
-            if (!name.EndsWith(".chunk", StringComparison.Ordinal))
+            if (!name.EndsWith(extension, StringComparison.Ordinal))
                 continue;
-            var id = relative[..^".chunk".Length];
+            var id = relative[..^extension.Length];
             if (after is null || string.CompareOrdinal(id, after) > 0)
                 yield return id;
         }
@@ -452,6 +702,18 @@ public sealed class ChunkStore
                 // A concurrent reclamation removed the file after enumeration.
             }
         }
+        foreach (var path in Directory.EnumerateFiles(_paths.Packs, "*.pack", SearchOption.AllDirectories))
+        {
+            try
+            {
+                chunkBytes = checked(chunkBytes + new FileInfo(path).Length);
+            }
+            catch (FileNotFoundException)
+            {
+                // A concurrent compaction removed the pack after enumeration.
+            }
+        }
+        chunkCount = checked(chunkCount + _metadata.CountPackedChunks());
 
         long stagingBytes = 0;
         foreach (var path in Directory.EnumerateFiles(_paths.Staging, "*", SearchOption.TopDirectoryOnly))
@@ -584,6 +846,8 @@ public sealed class ChunkStore
 
         var path = GetChunkPath(id);
         var eligibleBefore = now.Subtract(_options.BackgroundCompressionMinimumAge).UtcDateTime;
+        if (!File.Exists(path))
+            return ChunkRecompressionResult.Skipped;
         try
         {
             if (File.GetLastWriteTimeUtc(path) > eligibleBefore)
@@ -598,6 +862,8 @@ public sealed class ChunkStore
         if (reservation is null)
             return ChunkRecompressionResult.Skipped;
 
+        if (!File.Exists(path))
+            return ChunkRecompressionResult.Skipped;
         try
         {
             if (File.GetLastWriteTimeUtc(path) > eligibleBefore)
@@ -672,7 +938,7 @@ public sealed class ChunkStore
             var path = GetChunkPath(id);
             if (_pins.ContainsKey(id) ||
                 _mutationReservations.ContainsKey(id) ||
-                !File.Exists(path))
+                !File.Exists(path) && !_metadata.PackedChunkExists(id))
             {
                 return null;
             }
@@ -796,6 +1062,22 @@ public sealed class ChunkStore
         }
     }
 
+    private static async Task CopyExactlyAsync(
+        Stream source,
+        Stream destination,
+        long length,
+        CancellationToken cancellationToken)
+    {
+        var buffer = new byte[128 * 1024];
+        while (length > 0)
+        {
+            var count = (int)Math.Min(buffer.Length, length);
+            await source.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken);
+            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+            length -= count;
+        }
+    }
+
     private static void AppendZeroesToHash(IncrementalHash hash, long length)
     {
         var buffer = new byte[128 * 1024];
@@ -856,6 +1138,38 @@ public sealed class ChunkStore
                         _options.CompressionQuality,
                         _options.CompressionMinimumSavingsBytes,
                         cancellationToken);
+                    if (_options.EnableSmallChunkPacking &&
+                        bytes.Length <= _options.SmallChunkPackingThresholdBytes)
+                    {
+                        var published = await TryStorePackedChunkFileAsync(
+                            id,
+                            domain,
+                            temporaryPath,
+                            cancellationToken);
+                        if (published && await TryPinIdAsync(id, cancellationToken))
+                        {
+                            var keepPin = false;
+                            try
+                            {
+                                var stored = await ReadVerifiedChunkAsync(
+                                    id,
+                                    domain,
+                                    customerProvidedKey,
+                                    cancellationToken);
+                                if (!CryptographicOperations.FixedTimeEquals(stored, bytes))
+                                    throw new InvalidDataException($"Packed chunk '{id}' changed while it was published.");
+                                keepPin = true;
+                                return id;
+                            }
+                            finally
+                            {
+                                if (!keepPin)
+                                    UnpinId(id);
+                            }
+                        }
+                        continue;
+                    }
+
                     Task? reservationCompletion = null;
                     var created = false;
                     lock (_pinGate)
@@ -884,6 +1198,111 @@ public sealed class ChunkStore
                 }
             }
         }
+    }
+
+    private async Task<bool> TryStorePackedChunkFileAsync(
+        string id,
+        string domain,
+        string chunkFilePath,
+        CancellationToken cancellationToken)
+    {
+        var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            var payloadLength = checked((int)new FileInfo(chunkFilePath).Length);
+            var idLength = Encoding.UTF8.GetByteCount(id);
+            var recordLength = checked(PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
+            var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken);
+            if (pack is not null)
+            {
+                var path = GetPackPath(pack.PackId);
+                if (!File.Exists(path))
+                {
+                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken);
+                    if (records != 0)
+                        throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is missing.");
+                    await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+                    pack = null;
+                }
+                else
+                {
+                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken);
+                    if (records >= _options.ChunkPackMaximumRecords ||
+                        new FileInfo(path).Length + recordLength > _options.ChunkPackTargetBytes)
+                    {
+                        await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+                        pack = null;
+                    }
+                }
+            }
+
+            pack ??= new ChunkPackRecord(
+                CreatePackId(domain),
+                domain,
+                _metadata.GetUtcNow(),
+                Sealed: false);
+            var location = await AppendPackRecordAsync(pack, id, chunkFilePath, cancellationToken);
+            var inserted = await _metadata.TryRegisterPackedChunkAsync(pack, location, cancellationToken);
+            if (inserted &&
+                (new FileInfo(GetPackPath(pack.PackId)).Length >= _options.ChunkPackTargetBytes ||
+                 await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken) >=
+                 _options.ChunkPackMaximumRecords))
+            {
+                await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+            }
+            return inserted;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<PackedChunkLocation> AppendPackRecordAsync(
+        ChunkPackRecord pack,
+        string id,
+        string chunkFilePath,
+        CancellationToken cancellationToken)
+    {
+        var idBytes = Encoding.UTF8.GetBytes(id);
+        if (idBytes.Length == 0 || idBytes.Length > ushort.MaxValue)
+            throw new InvalidDataException("A chunk identifier is too long to pack.");
+        var payload = await File.ReadAllBytesAsync(chunkFilePath, cancellationToken);
+        var header = new byte[PackRecordHeaderLength];
+        BinaryPrimitives.WriteUInt64LittleEndian(header, PackRecordMagic);
+        BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(sizeof(ulong)), checked((ushort)idBytes.Length));
+        BinaryPrimitives.WriteInt32LittleEndian(
+            header.AsSpan(sizeof(ulong) + sizeof(ushort)),
+            payload.Length);
+        SHA256.HashData(payload, header.AsSpan(sizeof(ulong) + sizeof(ushort) + sizeof(int), 32));
+        var footer = new byte[PackRecordFooterLength];
+        BinaryPrimitives.WriteUInt64LittleEndian(footer, PackRecordFooterMagic);
+
+        var path = GetPackPath(pack.PackId);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await using var output = new FileStream(
+            path,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.Read,
+            128 * 1024,
+            FileOptions.Asynchronous);
+        var recordOffset = output.Seek(0, SeekOrigin.End);
+        await output.WriteAsync(header, cancellationToken);
+        await output.WriteAsync(idBytes, cancellationToken);
+        var payloadOffset = output.Position;
+        await output.WriteAsync(payload, cancellationToken);
+        await output.WriteAsync(footer, cancellationToken);
+        await output.FlushAsync(cancellationToken);
+        output.Flush(flushToDisk: true);
+        return new PackedChunkLocation(
+            id,
+            pack.PackId,
+            recordOffset,
+            checked((int)(output.Position - recordOffset)),
+            payloadOffset,
+            payload.Length);
     }
 
     private async Task WriteChunkFileAsync(
@@ -949,13 +1368,12 @@ public sealed class ChunkStore
         string id,
         string domain,
         byte[]? customerProvidedKey,
-        CancellationToken cancellationToken) =>
-        await ReadVerifiedChunkFileAsync(
-            GetChunkPath(id),
-            id,
-            domain,
-            customerProvidedKey,
-            cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        using var input = new MemoryStream(stored, writable: false);
+        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken);
+    }
 
     private async Task<byte[]> ReadVerifiedChunkFileAsync(
         string path,
@@ -964,9 +1382,25 @@ public sealed class ChunkStore
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
+        await using var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            128 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken);
+    }
+
+    private async Task<byte[]> ReadVerifiedChunkStreamAsync(
+        Stream input,
+        string id,
+        string domain,
+        byte[]? customerProvidedKey,
+        CancellationToken cancellationToken)
+    {
         if (!id.StartsWith(domain + "/", StringComparison.Ordinal))
             throw new InvalidDataException("A chunk reference escaped its encryption domain.");
-        await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
         var header = new byte[HeaderLength];
         await input.ReadExactlyAsync(header, cancellationToken);
         if (BinaryPrimitives.ReadUInt64LittleEndian(header) != Magic)
@@ -1040,14 +1474,8 @@ public sealed class ChunkStore
 
     private async Task VerifyCustomerKeyChunkStructureAsync(string id, CancellationToken cancellationToken)
     {
-        var path = GetChunkPath(id);
-        await using var input = new FileStream(
-            path,
-            FileMode.Open,
-            FileAccess.Read,
-            FileShare.Read,
-            128 * 1024,
-            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        using var input = new MemoryStream(stored, writable: false);
         var header = new byte[HeaderLength];
         await input.ReadExactlyAsync(header, cancellationToken);
         if (BinaryPrimitives.ReadUInt64LittleEndian(header) != Magic)
@@ -1153,6 +1581,95 @@ public sealed class ChunkStore
         return hmac.ComputeHash(Encoding.UTF8.GetBytes($"mk8.sava/chunk-encryption/v1/{domain}"));
     }
 
+    private async Task<byte[]> ReadStoredChunkFileBytesAsync(
+        string id,
+        CancellationToken cancellationToken)
+    {
+        var standalone = GetChunkPath(id);
+        try
+        {
+            var length = new FileInfo(standalone).Length;
+            if (length < HeaderLength || length > _options.MaximumChunkBytes + HeaderLength)
+                throw new InvalidDataException($"Chunk '{id}' has an invalid stored length.");
+            return await File.ReadAllBytesAsync(standalone, cancellationToken);
+        }
+        catch (FileNotFoundException)
+        {
+            // Packed storage is consulted below.
+        }
+        catch (DirectoryNotFoundException)
+        {
+            // Packed storage is consulted below.
+        }
+
+        var location = await _metadata.GetPackedChunkLocationAsync(id, cancellationToken)
+                       ?? throw new FileNotFoundException($"Chunk '{id}' is missing.");
+        return await ReadPackedChunkPayloadAsync(location, cancellationToken);
+    }
+
+    private async Task<byte[]> ReadPackedChunkPayloadAsync(
+        PackedChunkLocation location,
+        CancellationToken cancellationToken)
+    {
+        if (location.RecordOffset < 0 ||
+            location.RecordLength <= PackRecordHeaderLength + PackRecordFooterLength ||
+            location.PayloadOffset < location.RecordOffset + PackRecordHeaderLength ||
+            location.PayloadLength < HeaderLength ||
+            location.PayloadLength > _options.MaximumChunkBytes + HeaderLength)
+        {
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has an invalid location.");
+        }
+
+        var path = GetPackPath(location.PackId);
+        await using var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite,
+            128 * 1024,
+            FileOptions.Asynchronous | FileOptions.RandomAccess);
+        if (location.RecordOffset > input.Length || location.RecordLength > input.Length - location.RecordOffset)
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' extends beyond its pack file.");
+        input.Position = location.RecordOffset;
+        var header = new byte[PackRecordHeaderLength];
+        await input.ReadExactlyAsync(header, cancellationToken);
+        if (BinaryPrimitives.ReadUInt64LittleEndian(header) != PackRecordMagic)
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has an invalid record marker.");
+        var idLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(sizeof(ulong)));
+        var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(
+            header.AsSpan(sizeof(ulong) + sizeof(ushort)));
+        var expectedRecordLength = checked(
+            PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
+        var expectedPayloadOffset = checked(location.RecordOffset + PackRecordHeaderLength + idLength);
+        if (idLength == 0 ||
+            payloadLength != location.PayloadLength ||
+            expectedRecordLength != location.RecordLength ||
+            expectedPayloadOffset != location.PayloadOffset)
+        {
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has inconsistent framing.");
+        }
+
+        var idBytes = new byte[idLength];
+        await input.ReadExactlyAsync(idBytes, cancellationToken);
+        if (!string.Equals(Encoding.UTF8.GetString(idBytes), location.ChunkId, StringComparison.Ordinal))
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has a mismatched record identity.");
+        var payload = new byte[payloadLength];
+        await input.ReadExactlyAsync(payload, cancellationToken);
+        var actualHash = SHA256.HashData(payload);
+        var expectedHashOffset = sizeof(ulong) + sizeof(ushort) + sizeof(int);
+        if (!CryptographicOperations.FixedTimeEquals(
+                actualHash,
+                header.AsSpan(expectedHashOffset, actualHash.Length)))
+        {
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' failed its record integrity check.");
+        }
+        var footer = new byte[PackRecordFooterLength];
+        await input.ReadExactlyAsync(footer, cancellationToken);
+        if (BinaryPrimitives.ReadUInt64LittleEndian(footer) != PackRecordFooterMagic)
+            throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has an invalid record footer.");
+        return payload;
+    }
+
     private string GetChunkPath(string id)
     {
         if (string.IsNullOrWhiteSpace(id) || Path.IsPathRooted(id) || id.Contains("..", StringComparison.Ordinal))
@@ -1164,6 +1681,24 @@ public sealed class ChunkStore
             throw new InvalidDataException("A chunk identifier escaped the content root.");
         return path;
     }
+
+    private string GetPackPath(string packId)
+    {
+        if (string.IsNullOrWhiteSpace(packId) ||
+            Path.IsPathRooted(packId) ||
+            packId.Contains("..", StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("A chunk pack identifier is invalid.");
+        }
+        var relative = packId.Replace('/', Path.DirectorySeparatorChar) + ".pack";
+        var path = Path.GetFullPath(Path.Combine(_paths.Packs, relative));
+        var root = Path.GetFullPath(_paths.Packs) + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(root, StringComparison.Ordinal))
+            throw new InvalidDataException("A chunk pack identifier escaped the pack root.");
+        return path;
+    }
+
+    private static string CreatePackId(string domain) => $"{domain}/{Guid.NewGuid():N}";
 
     private static void ValidateManifest(ContentManifest manifest)
     {
@@ -1210,7 +1745,7 @@ public sealed class ChunkStore
                 {
                     foreach (var id in ids)
                     {
-                        if (!File.Exists(GetChunkPath(id)))
+                        if (!File.Exists(GetChunkPath(id)) && !_metadata.PackedChunkExists(id))
                             throw new InvalidDataException($"Chunk '{id}' is missing.");
                     }
                     foreach (var id in ids)
@@ -1236,7 +1771,7 @@ public sealed class ChunkStore
                 }
                 else
                 {
-                    if (!File.Exists(GetChunkPath(id)))
+                    if (!File.Exists(GetChunkPath(id)) && !_metadata.PackedChunkExists(id))
                         return false;
                     _pins[id] = _pins.GetValueOrDefault(id) + 1;
                     return true;
@@ -1292,17 +1827,17 @@ public sealed class ChunkStore
 
         public string Id { get; }
 
-        public bool TryDelete()
+        public async Task<bool> TryDeleteAsync(CancellationToken cancellationToken)
         {
             if (Interlocked.CompareExchange(ref _completed, 1, 0) != 0)
                 return false;
             try
             {
-                return _owner.CompleteMutation(this, delete: true);
+                return await _owner.CompleteMutationAsync(this, cancellationToken);
             }
             catch
             {
-                _owner.CompleteMutation(this, delete: false);
+                _owner.ReleaseMutation(this);
                 throw;
             }
         }
@@ -1310,11 +1845,13 @@ public sealed class ChunkStore
         public void Dispose()
         {
             if (Interlocked.CompareExchange(ref _completed, 1, 0) == 0)
-                _owner.CompleteMutation(this, delete: false);
+                _owner.ReleaseMutation(this);
         }
     }
 
-    private bool CompleteMutation(ChunkMutationReservation reservation, bool delete)
+    private async Task<bool> CompleteMutationAsync(
+        ChunkMutationReservation reservation,
+        CancellationToken cancellationToken)
     {
         var deleted = false;
         lock (_pinGate)
@@ -1324,20 +1861,40 @@ public sealed class ChunkStore
             {
                 return false;
             }
-            if (delete && _pins.ContainsKey(reservation.Id))
+            if (_pins.ContainsKey(reservation.Id))
                 throw new InvalidOperationException("A reserved chunk became pinned during an exclusive mutation.");
-            if (delete)
+        }
+
+        try
+        {
+            var path = GetChunkPath(reservation.Id);
+            if (File.Exists(path))
             {
-                var path = GetChunkPath(reservation.Id);
-                if (File.Exists(path))
-                {
-                    File.Delete(path);
-                    deleted = true;
-                }
+                File.Delete(path);
+                deleted = true;
+            }
+            deleted = await _metadata.DeletePackedChunkLocationAsync(
+                reservation.Id,
+                cancellationToken) || deleted;
+            return deleted;
+        }
+        finally
+        {
+            ReleaseMutation(reservation);
+        }
+    }
+
+    private void ReleaseMutation(ChunkMutationReservation reservation)
+    {
+        lock (_pinGate)
+        {
+            if (!_mutationReservations.TryGetValue(reservation.Id, out var current) ||
+                !ReferenceEquals(current, reservation))
+            {
+                return;
             }
             _mutationReservations.Remove(reservation.Id);
         }
         reservation.CompletionSource.TrySetResult(true);
-        return deleted;
     }
 }

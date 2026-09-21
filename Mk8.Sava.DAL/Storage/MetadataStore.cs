@@ -5,10 +5,11 @@ using Microsoft.Data.Sqlite;
 
 namespace Mk8.Sava.Storage;
 
-public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider = null)
+public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 3;
+    public const int CurrentSchemaVersion = 4;
     private const int ChunkIndexSchemaVersion = 2;
+    private const int TagIndexSchemaVersion = 3;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -129,6 +130,27 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     account TEXT PRIMARY KEY,
                     data TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS chunk_packs (
+                    pack_id TEXT PRIMARY KEY,
+                    domain TEXT NOT NULL,
+                    created_ticks INTEGER NOT NULL,
+                    sealed INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_chunk_packs_domain_state
+                    ON chunk_packs(domain, sealed, created_ticks, pack_id);
+
+                CREATE TABLE IF NOT EXISTS packed_chunks (
+                    chunk_id TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    record_offset INTEGER NOT NULL,
+                    record_length INTEGER NOT NULL,
+                    payload_offset INTEGER NOT NULL,
+                    payload_length INTEGER NOT NULL,
+                    FOREIGN KEY (pack_id) REFERENCES chunk_packs(pack_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS ix_packed_chunks_pack
+                    ON packed_chunks(pack_id, record_offset, chunk_id);
                 """, cancellationToken);
             if (schemaVersion == 1)
             {
@@ -136,7 +158,12 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 schemaVersion = ChunkIndexSchemaVersion;
             }
             if (schemaVersion == ChunkIndexSchemaVersion)
+            {
                 await MigrateVersion2ToVersion3Async(connection, cancellationToken);
+                schemaVersion = TagIndexSchemaVersion;
+            }
+            if (schemaVersion == TagIndexSchemaVersion)
+                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             await VerifyForeignKeysAsync(connection, cancellationToken);
@@ -409,6 +436,342 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
         return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+    }
+
+    internal bool PackedChunkExists(string chunkId)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM packed_chunks WHERE chunk_id = $chunk LIMIT 1;";
+        command.Parameters.AddWithValue("$chunk", chunkId);
+        return command.ExecuteScalar() is not null;
+    }
+
+    internal bool ChunkPackExists(string packId)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM chunk_packs WHERE pack_id = $pack LIMIT 1;";
+        command.Parameters.AddWithValue("$pack", packId);
+        return command.ExecuteScalar() is not null;
+    }
+
+    internal int CountPackedChunks()
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM packed_chunks;";
+        return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
+    }
+
+    internal async Task<PackedChunkLocation?> GetPackedChunkLocationAsync(
+        string chunkId,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
+            FROM packed_chunks
+            WHERE chunk_id = $chunk;
+            """;
+        command.Parameters.AddWithValue("$chunk", chunkId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadPackedChunkLocation(reader) : null;
+    }
+
+    internal async Task<ChunkPackRecord?> GetActiveChunkPackAsync(
+        string domain,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT pack_id, domain, created_ticks, sealed
+            FROM chunk_packs
+            WHERE domain = $domain AND sealed = 0
+            ORDER BY created_ticks DESC, pack_id DESC
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$domain", domain);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadChunkPack(reader) : null;
+    }
+
+    internal async Task<int> CountPackedChunksAsync(
+        string packId,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM packed_chunks WHERE pack_id = $pack;";
+        command.Parameters.AddWithValue("$pack", packId);
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
+    internal async Task<bool> TryRegisterPackedChunkAsync(
+        ChunkPackRecord pack,
+        PackedChunkLocation location,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(pack.PackId, location.PackId, StringComparison.Ordinal))
+            throw new ArgumentException("The packed chunk location does not belong to the supplied pack.", nameof(location));
+
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            await using (var addPack = connection.CreateCommand())
+            {
+                addPack.Transaction = transaction;
+                addPack.CommandText = """
+                    INSERT INTO chunk_packs(pack_id, domain, created_ticks, sealed)
+                    VALUES ($pack, $domain, $created, $sealed)
+                    ON CONFLICT(pack_id) DO NOTHING;
+                    """;
+                addPack.Parameters.AddWithValue("$pack", pack.PackId);
+                addPack.Parameters.AddWithValue("$domain", pack.Domain);
+                addPack.Parameters.AddWithValue("$created", pack.CreatedAt.UtcTicks);
+                addPack.Parameters.AddWithValue("$sealed", pack.Sealed ? 1 : 0);
+                await addPack.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await using var addLocation = connection.CreateCommand();
+            addLocation.Transaction = transaction;
+            addLocation.CommandText = """
+                INSERT INTO packed_chunks(
+                    chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length)
+                VALUES ($chunk, $pack, $record_offset, $record_length, $payload_offset, $payload_length)
+                ON CONFLICT(chunk_id) DO NOTHING;
+                """;
+            AddPackedChunkLocationParameters(addLocation, location);
+            var inserted = await addLocation.ExecuteNonQueryAsync(cancellationToken) == 1;
+            await transaction.CommitAsync(cancellationToken);
+            return inserted;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task SealChunkPackAsync(string packId, CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE chunk_packs SET sealed = 1 WHERE pack_id = $pack;";
+            command.Parameters.AddWithValue("$pack", packId);
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<int> SealChunkPacksOlderThanAsync(
+        DateTimeOffset olderThan,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = """
+                UPDATE chunk_packs SET sealed = 1
+                WHERE pack_id IN (
+                    SELECT pack_id FROM chunk_packs
+                    WHERE sealed = 0 AND created_ticks <= $older
+                    ORDER BY created_ticks, pack_id
+                    LIMIT $limit
+                );
+                """;
+            command.Parameters.AddWithValue("$older", olderThan.UtcTicks);
+            command.Parameters.AddWithValue("$limit", maximum);
+            return await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> DeletePackedChunkLocationAsync(
+        string chunkId,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM packed_chunks WHERE chunk_id = $chunk;";
+            command.Parameters.AddWithValue("$chunk", chunkId);
+            return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<ChunkIdPage> ListPackedChunkIdsAsync(
+        string? after,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT chunk_id FROM packed_chunks
+            WHERE $has_after = 0 OR chunk_id > $after
+            ORDER BY chunk_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$has_after", after is null ? 0 : 1);
+        command.Parameters.AddWithValue("$after", after ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var ids = new List<string>(maximum + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            ids.Add(reader.GetString(0));
+        var hasMore = ids.Count > maximum;
+        if (hasMore)
+            ids.RemoveAt(ids.Count - 1);
+        return new ChunkIdPage(ids, hasMore);
+    }
+
+    internal async Task<ChunkPackPage> ListSealedChunkPacksAsync(
+        string? after,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT pack_id, domain, created_ticks, sealed
+            FROM chunk_packs
+            WHERE sealed = 1 AND ($has_after = 0 OR pack_id > $after)
+            ORDER BY pack_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$has_after", after is null ? 0 : 1);
+        command.Parameters.AddWithValue("$after", after ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var packs = new List<ChunkPackRecord>(maximum + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            packs.Add(ReadChunkPack(reader));
+        var hasMore = packs.Count > maximum;
+        if (hasMore)
+            packs.RemoveAt(packs.Count - 1);
+        return new ChunkPackPage(packs, hasMore);
+    }
+
+    internal async Task<IReadOnlyList<PackedChunkLocation>> ListPackedChunkLocationsAsync(
+        string packId,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
+            FROM packed_chunks
+            WHERE pack_id = $pack
+            ORDER BY record_offset, chunk_id;
+            """;
+        command.Parameters.AddWithValue("$pack", packId);
+        var locations = new List<PackedChunkLocation>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            locations.Add(ReadPackedChunkLocation(reader));
+        return locations;
+    }
+
+    internal async Task ReplaceChunkPackAsync(
+        ChunkPackRecord oldPack,
+        ChunkPackRecord? replacementPack,
+        IReadOnlyList<PackedChunkLocation> oldLocations,
+        IReadOnlyList<PackedChunkLocation> replacementLocations,
+        CancellationToken cancellationToken)
+    {
+        if (replacementPack is null && replacementLocations.Count != 0 ||
+            replacementPack is not null && replacementLocations.Any(location =>
+                !string.Equals(location.PackId, replacementPack.PackId, StringComparison.Ordinal)) ||
+            oldLocations.Count != replacementLocations.Count)
+        {
+            throw new ArgumentException("The replacement pack and chunk locations are inconsistent.", nameof(replacementLocations));
+        }
+
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var actual = await ListPackedChunkLocationsAsync(connection, transaction, oldPack.PackId, cancellationToken);
+            if (!EquivalentPackedLocations(actual, oldLocations))
+                throw new StorageConcurrencyException();
+
+            if (replacementPack is not null)
+            {
+                await using var addPack = connection.CreateCommand();
+                addPack.Transaction = transaction;
+                addPack.CommandText = """
+                    INSERT INTO chunk_packs(pack_id, domain, created_ticks, sealed)
+                    VALUES ($pack, $domain, $created, 1);
+                    """;
+                addPack.Parameters.AddWithValue("$pack", replacementPack.PackId);
+                addPack.Parameters.AddWithValue("$domain", replacementPack.Domain);
+                addPack.Parameters.AddWithValue("$created", replacementPack.CreatedAt.UtcTicks);
+                await addPack.ExecuteNonQueryAsync(cancellationToken);
+
+                foreach (var location in replacementLocations)
+                {
+                    await using var update = connection.CreateCommand();
+                    update.Transaction = transaction;
+                    update.CommandText = """
+                        UPDATE packed_chunks SET
+                            pack_id = $pack,
+                            record_offset = $record_offset,
+                            record_length = $record_length,
+                            payload_offset = $payload_offset,
+                            payload_length = $payload_length
+                        WHERE chunk_id = $chunk AND pack_id = $old_pack;
+                        """;
+                    AddPackedChunkLocationParameters(update, location);
+                    update.Parameters.AddWithValue("$old_pack", oldPack.PackId);
+                    if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                }
+            }
+
+            await using var removeOld = connection.CreateCommand();
+            removeOld.Transaction = transaction;
+            removeOld.CommandText = "DELETE FROM chunk_packs WHERE pack_id = $pack;";
+            removeOld.Parameters.AddWithValue("$pack", oldPack.PackId);
+            if (await removeOld.ExecuteNonQueryAsync(cancellationToken) != 1)
+                throw new StorageConcurrencyException();
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
     }
 
     internal async Task<BlobListPage> ListBlobsPageAsync(
@@ -1462,6 +1825,28 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         return new MetadataDatabaseInspection(schemaVersion, inventory);
     }
 
+    internal static async Task NormalizePackedLocationsForStandaloneBackupAsync(
+        string databasePath,
+        CancellationToken cancellationToken)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Cache = SqliteCacheMode.Private,
+            Pooling = false
+        }.ToString();
+        await using var connection = new SqliteConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using (var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken))
+        {
+            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM packed_chunks;", cancellationToken);
+            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM chunk_packs;", cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        await ExecuteNonQueryAsync(connection, "VACUUM;", cancellationToken);
+    }
+
     private static async Task<StorageMetadataInventory> ReadStorageInventoryAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
@@ -1743,7 +2128,7 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         await ExecuteNonQueryAsync(
             connection,
             transaction,
-            $"PRAGMA user_version={CurrentSchemaVersion};",
+            $"PRAGMA user_version={TagIndexSchemaVersion};",
             cancellationToken);
         await transaction.CommitAsync(cancellationToken);
     }
@@ -2036,6 +2421,59 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             insert.Parameters.AddWithValue("$value", value);
             await insert.ExecuteNonQueryAsync(cancellationToken);
         }
+    }
+
+    private static async Task<IReadOnlyList<PackedChunkLocation>> ListPackedChunkLocationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string packId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
+            FROM packed_chunks
+            WHERE pack_id = $pack
+            ORDER BY record_offset, chunk_id;
+            """;
+        command.Parameters.AddWithValue("$pack", packId);
+        var locations = new List<PackedChunkLocation>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            locations.Add(ReadPackedChunkLocation(reader));
+        return locations;
+    }
+
+    private static bool EquivalentPackedLocations(
+        IReadOnlyList<PackedChunkLocation> left,
+        IReadOnlyList<PackedChunkLocation> right) =>
+        left.Count == right.Count && left.Zip(right).All(pair => pair.First == pair.Second);
+
+    private static ChunkPackRecord ReadChunkPack(SqliteDataReader reader) => new(
+        reader.GetString(0),
+        reader.GetString(1),
+        new DateTimeOffset(reader.GetInt64(2), TimeSpan.Zero),
+        reader.GetInt64(3) != 0);
+
+    private static PackedChunkLocation ReadPackedChunkLocation(SqliteDataReader reader) => new(
+        reader.GetString(0),
+        reader.GetString(1),
+        reader.GetInt64(2),
+        reader.GetInt32(3),
+        reader.GetInt64(4),
+        reader.GetInt32(5));
+
+    private static void AddPackedChunkLocationParameters(
+        SqliteCommand command,
+        PackedChunkLocation location)
+    {
+        command.Parameters.AddWithValue("$chunk", location.ChunkId);
+        command.Parameters.AddWithValue("$pack", location.PackId);
+        command.Parameters.AddWithValue("$record_offset", location.RecordOffset);
+        command.Parameters.AddWithValue("$record_length", location.RecordLength);
+        command.Parameters.AddWithValue("$payload_offset", location.PayloadOffset);
+        command.Parameters.AddWithValue("$payload_length", location.PayloadLength);
     }
 
     private static async Task ReplaceStagedBlockChunkReferencesAsync(

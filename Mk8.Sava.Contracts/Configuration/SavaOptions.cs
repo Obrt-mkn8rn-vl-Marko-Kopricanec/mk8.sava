@@ -25,6 +25,14 @@ public sealed class SavaOptions : IValidatableObject
     public int BackgroundCompressionMinimumSavingsBytes { get; init; } = 128;
     public TimeSpan BackgroundCompressionMinimumAge { get; init; } = TimeSpan.FromHours(1);
     public int BackgroundCompressionChunksPerMaintenancePass { get; init; } = 8;
+    public bool EnableSmallChunkPacking { get; init; } = true;
+    public int SmallChunkPackingThresholdBytes { get; init; } = 48 * 1024;
+    public long ChunkPackTargetBytes { get; init; } = 16L * 1024 * 1024;
+    public int ChunkPackMaximumRecords { get; init; } = 2048;
+    public TimeSpan ChunkPackSealAge { get; init; } = TimeSpan.FromHours(1);
+    public int ChunkPacksPerMaintenancePass { get; init; } = 2;
+    public long ChunkPackCompactionMinimumSavingsBytes { get; init; } = 64 * 1024;
+    public double ChunkPackCompactionMinimumDeadRatio { get; init; } = 0.20;
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 4L * 1024 * 1024 * 1024;
@@ -112,6 +120,44 @@ public sealed class SavaOptions : IValidatableObject
             yield return new ValidationResult(
                 "BackgroundCompressionChunksPerMaintenancePass must be positive.",
                 [nameof(BackgroundCompressionChunksPerMaintenancePass)]);
+        }
+
+        if (SmallChunkPackingThresholdBytes <= 0 ||
+            SmallChunkPackingThresholdBytes > MaximumChunkBytes)
+        {
+            yield return new ValidationResult(
+                "SmallChunkPackingThresholdBytes must be positive and no larger than MaximumChunkBytes.",
+                [nameof(SmallChunkPackingThresholdBytes)]);
+        }
+
+        if (ChunkPackTargetBytes < 2L * SmallChunkPackingThresholdBytes)
+        {
+            yield return new ValidationResult(
+                "ChunkPackTargetBytes must hold at least two maximum-size packed chunks.",
+                [nameof(ChunkPackTargetBytes)]);
+        }
+
+        if (ChunkPackMaximumRecords <= 0)
+            yield return new ValidationResult("ChunkPackMaximumRecords must be positive.", [nameof(ChunkPackMaximumRecords)]);
+
+        if (ChunkPackSealAge < TimeSpan.Zero)
+            yield return new ValidationResult("ChunkPackSealAge cannot be negative.", [nameof(ChunkPackSealAge)]);
+
+        if (ChunkPacksPerMaintenancePass <= 0)
+            yield return new ValidationResult("ChunkPacksPerMaintenancePass must be positive.", [nameof(ChunkPacksPerMaintenancePass)]);
+
+        if (ChunkPackCompactionMinimumSavingsBytes < 0)
+        {
+            yield return new ValidationResult(
+                "ChunkPackCompactionMinimumSavingsBytes cannot be negative.",
+                [nameof(ChunkPackCompactionMinimumSavingsBytes)]);
+        }
+
+        if (ChunkPackCompactionMinimumDeadRatio is < 0 or > 1)
+        {
+            yield return new ValidationResult(
+                "ChunkPackCompactionMinimumDeadRatio must be between zero and one.",
+                [nameof(ChunkPackCompactionMinimumDeadRatio)]);
         }
 
         if (MaximumRequestBodyBytes <= 0)

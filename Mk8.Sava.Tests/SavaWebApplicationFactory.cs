@@ -10,6 +10,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 {
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
     private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
+    private readonly bool _deleteDataPath;
 
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
@@ -19,12 +20,25 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public SavaWebApplicationFactory()
-        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null)
+        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null, true)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath)
-        : this(dataPath, null, null)
+        : this(dataPath, null, null, true)
+    {
+    }
+
+    internal SavaWebApplicationFactory(string dataPath, bool deleteDataPath)
+        : this(dataPath, null, null, deleteDataPath)
+    {
+    }
+
+    internal SavaWebApplicationFactory(
+        string dataPath,
+        IReadOnlyDictionary<string, string?> configurationOverrides,
+        bool deleteDataPath)
+        : this(dataPath, null, configurationOverrides, deleteDataPath)
     {
     }
 
@@ -32,7 +46,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         : this(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
             urlTransferHandlerFactory,
-            null)
+            null,
+            true)
     {
     }
 
@@ -40,18 +55,21 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         : this(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
             null,
-            configurationOverrides)
+            configurationOverrides,
+            true)
     {
     }
 
     private SavaWebApplicationFactory(
         string dataPath,
         Func<HttpMessageHandler>? urlTransferHandlerFactory,
-        IReadOnlyDictionary<string, string?>? configurationOverrides)
+        IReadOnlyDictionary<string, string?>? configurationOverrides,
+        bool deleteDataPath)
     {
         DataPath = dataPath;
         _urlTransferHandlerFactory = urlTransferHandlerFactory;
         _configurationOverrides = configurationOverrides;
+        _deleteDataPath = deleteDataPath;
     }
 
     public string DataPath { get; }
@@ -84,6 +102,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:BackgroundCompressionMinimumSavingsBytes"] = "32",
                 ["Sava:BackgroundCompressionMinimumAge"] = "01:00:00",
                 ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "8",
+                ["Sava:SmallChunkPackingThresholdBytes"] = "2048",
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
                 ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
@@ -116,7 +135,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public new async Task DisposeAsync()
     {
         await base.DisposeAsync();
-        if (Directory.Exists(DataPath))
+        if (_deleteDataPath && Directory.Exists(DataPath))
             Directory.Delete(DataPath, recursive: true);
     }
 }

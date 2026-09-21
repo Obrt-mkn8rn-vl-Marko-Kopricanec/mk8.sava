@@ -1,4 +1,8 @@
 <Solution>
+  <Project Path="Mk8.Sava.API/Mk8.Sava.API.csproj" />
+  <Project Path="Mk8.Sava.BLL/Mk8.Sava.BLL.csproj" />
+  <Project Path="Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
+  <Project Path="Mk8.Sava.DAL/Mk8.Sava.DAL.csproj" />
+  <Project Path="Mk8.Sava.INF/Mk8.Sava.INF.csproj" />
   <Project Path="Mk8.Sava.Tests/Mk8.Sava.Tests.csproj" />
-  <Project Path="Mk8.Sava/Mk8.Sava.csproj" />
 </Solution>

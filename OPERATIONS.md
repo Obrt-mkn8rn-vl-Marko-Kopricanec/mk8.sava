@@ -1,11 +1,11 @@
 # mk8.sava operations
 
 The service keeps its authoritative metadata in `metadata.db` and encrypted,
-content-addressed extents under `chunks/`. Chunk identities are immutable, while
-their verified physical encoding may be atomically replaced by background
-recompression. The configured `Sava:DataPath` is a single storage root; do not
-copy a live root with a generic filesystem command and assume the result is
-consistent.
+content-addressed extents under `chunks/` or append-only small-object packs under
+`packs/`. Chunk identities are immutable, while their verified physical encoding
+may be atomically replaced by background recompression or pack compaction. The
+configured `Sava:DataPath` is a single storage root; do not copy a live root with
+a generic filesystem command and assume the result is consistent.
 
 ## Health and metrics
 
@@ -58,6 +58,18 @@ Customer-provided-key chunks are excluded because the service does not retain
 their keys. Recompression totals and serialized chunk-file bytes saved are
 exported through `/metrics`.
 
+Chunks no larger than `Sava:SmallChunkPackingThresholdBytes` are placed in
+authenticated append-only packs when `Sava:EnableSmallChunkPacking` is enabled.
+`Sava:ChunkPackTargetBytes` and `Sava:ChunkPackMaximumRecords` bound each pack.
+Metadata publishes a chunk locator only after its complete framed record has
+been flushed durably, and reads verify the frame identity and digest before the
+normal AES-GCM, decompression, plaintext digest, and length checks. Packs older
+than `Sava:ChunkPackSealAge` are sealed; maintenance considers at most
+`Sava:ChunkPacksPerMaintenancePass` sealed packs and rewrites one only when its
+unreachable bytes meet both `Sava:ChunkPackCompactionMinimumSavingsBytes` and
+`Sava:ChunkPackCompactionMinimumDeadRatio`. Locator replacement is atomic, and
+the old pack is deleted only after that transaction commits.
+
 ## Create and validate a backup
 
 The backup command runs without starting the HTTP listener. It takes a
@@ -67,8 +79,8 @@ copies exactly that root set, and publishes the backup directory only after a
 versioned manifest and all file hashes are durable.
 
 ```bash
-dotnet Mk8.Sava.dll --backup-create /srv/backups/mk8-sava-2026-09-21
-dotnet Mk8.Sava.dll --backup-validate /srv/backups/mk8-sava-2026-09-21
+dotnet Mk8.Sava.API.dll --backup-create /srv/backups/mk8-sava-2026-09-21
+dotnet Mk8.Sava.API.dll --backup-validate /srv/backups/mk8-sava-2026-09-21
 ```
 
 The destination must not already exist and must be outside `Sava:DataPath`.
@@ -94,7 +106,7 @@ new nonexistent data path, configure the same required account keys, then run:
 
 ```bash
 Sava__DataPath=/srv/mk8-sava-restored \
-  dotnet Mk8.Sava.dll --restore-from /srv/backups/mk8-sava-2026-09-21
+  dotnet Mk8.Sava.API.dll --restore-from /srv/backups/mk8-sava-2026-09-21
 ```
 
 The command fully validates the source, copies into a private sibling staging
@@ -111,13 +123,17 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 3 and the backup container format is version 1. Schema 2 adds
+version 4 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
-schema 3 adds a transactional blob-tag search index. The JSON blob/block
-manifests remain authoritative and startup and backup validation check both
-indexes against them. The service migrates schema 1 or 2 on startup and can
-validate or restore backups using either older schema. It refuses metadata newer
-than it understands and a restore refuses unsupported backup or schema versions.
+schema 3 adds a transactional blob-tag search index; schema 4 adds authoritative
+pack and packed-chunk locator tables. The JSON blob/block manifests remain
+authoritative and startup and backup validation check the derived indexes against
+them. The service migrates schema 1, 2, or 3 on startup and can validate or
+restore backups using an older supported schema. Backups materialize packed
+records as canonical standalone chunk files and remove pack locators from the
+copied database, so the existing backup format remains self-contained. The
+service refuses metadata newer than it understands, and restore refuses
+unsupported backup or schema versions.
 
 Before deploying a build that changes either format:
 

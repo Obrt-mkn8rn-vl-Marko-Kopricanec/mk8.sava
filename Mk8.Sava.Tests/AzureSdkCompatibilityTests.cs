@@ -1817,7 +1817,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:GarbageCollectionChunksPerMaintenancePass"] = "1",
             ["Sava:IntegrityScanChunksPerMaintenancePass"] = "1",
-            ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "1"
+            ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "1",
+            ["Sava:EnableSmallChunkPacking"] = "false"
         });
         try
         {
@@ -1867,6 +1868,146 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         finally
         {
             await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task SmallChunksArePackedDeduplicatedCompactedAndBackupSafeAcrossRestart()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-packed-{Guid.NewGuid():N}");
+        var backupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-packed-backup-{Guid.NewGuid():N}");
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
+            ["Sava:ChunkPackTargetBytes"] = "8192",
+            ["Sava:ChunkPackMaximumRecords"] = "2",
+            ["Sava:ChunkPackSealAge"] = "00:00:00",
+            ["Sava:ChunkPacksPerMaintenancePass"] = "16",
+            ["Sava:ChunkPackCompactionMinimumSavingsBytes"] = "1",
+            ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
+        };
+        var initial = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+        SavaWebApplicationFactory? restarted = null;
+        var initialDisposed = false;
+        try
+        {
+            await initial.InitializeAsync();
+            var service = CreateClient(initial);
+            var containerName = $"packed-{Guid.NewGuid():N}";
+            var container = service.GetBlobContainerClient(containerName);
+            await container.CreateAsync();
+            var firstBytes = RandomNumberGenerator.GetBytes(1024);
+            var secondBytes = RandomNumberGenerator.GetBytes(1536);
+            var first = container.GetBlobClient("first.bin");
+            var duplicate = container.GetBlobClient("duplicate.bin");
+            var second = container.GetBlobClient("second.bin");
+            await first.UploadAsync(BinaryData.FromBytes(firstBytes));
+            await duplicate.UploadAsync(BinaryData.FromBytes(firstBytes));
+            await second.UploadAsync(BinaryData.FromBytes(secondBytes));
+
+            var metadata = initial.Services.GetRequiredService<MetadataStore>();
+            Assert.Equal(2, metadata.CountPackedChunks());
+            Assert.Empty(EnumerateChunkFiles(dataPath));
+            Assert.Single(EnumeratePackFiles(dataPath));
+            Assert.Equal(firstBytes, (await duplicate.DownloadContentAsync()).Value.Content.ToArray());
+            var range = await second.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Range = new HttpRange(123, 456)
+            });
+            Assert.Equal(secondBytes.AsSpan(123, 456).ToArray(), range.Value.Content.ToArray());
+
+            await initial.DisposeAsync();
+            initialDisposed = true;
+
+            restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+            await restarted.InitializeAsync();
+            var restartedContainer = CreateClient(restarted).GetBlobContainerClient(containerName);
+            first = restartedContainer.GetBlobClient(first.Name);
+            duplicate = restartedContainer.GetBlobClient(duplicate.Name);
+            second = restartedContainer.GetBlobClient(second.Name);
+            Assert.Equal(secondBytes, (await second.DownloadContentAsync()).Value.Content.ToArray());
+
+            await first.DeleteAsync();
+            await duplicate.DeleteAsync();
+            var blobs = restarted.Services.GetRequiredService<BlobService>();
+            var maintenance = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(1, maintenance.ReclaimedChunks);
+            Assert.Equal(1, maintenance.CompactedChunkPacks);
+            Assert.True(maintenance.PackCompactionBytesSaved > 0);
+            metadata = restarted.Services.GetRequiredService<MetadataStore>();
+            Assert.Equal(1, metadata.CountPackedChunks());
+            Assert.Empty(EnumerateChunkFiles(dataPath));
+            Assert.Single(EnumeratePackFiles(dataPath));
+            Assert.Equal(secondBytes, (await second.DownloadContentAsync()).Value.Content.ToArray());
+
+            var orphanPath = Path.Combine(
+                dataPath,
+                "packs",
+                SavaWebApplicationFactory.AccountName,
+                $"orphan-{Guid.NewGuid():N}.pack");
+            await File.WriteAllBytesAsync(orphanPath, RandomNumberGenerator.GetBytes(257));
+            File.SetLastWriteTimeUtc(orphanPath, DateTime.UtcNow.AddMinutes(-1));
+            var recovery = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(1, recovery.CompactedChunkPacks);
+            Assert.True(recovery.PackCompactionBytesSaved >= 257);
+            Assert.False(File.Exists(orphanPath));
+
+            var backup = restarted.Services.GetRequiredService<StorageBackupService>();
+            var created = await backup.CreateAsync(backupPath, CancellationToken.None);
+            Assert.Equal(1, created.ChunkCount);
+            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
+            Assert.Single(EnumerateChunkFiles(backupPath));
+            Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
+            await using (var connection = new SqliteConnection(
+                             $"Data Source={Path.Combine(backupPath, "metadata.db")}"))
+            {
+                await connection.OpenAsync();
+                await using var command = connection.CreateCommand();
+                command.CommandText =
+                    "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
+                Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            }
+
+            var packPath = Assert.Single(EnumeratePackFiles(dataPath)).FullName;
+            await using (var corrupt = new FileStream(
+                             packPath,
+                             FileMode.Open,
+                             FileAccess.ReadWrite,
+                             FileShare.None,
+                             4096,
+                             FileOptions.Asynchronous))
+            {
+                var value = corrupt.ReadByte();
+                Assert.NotEqual(-1, value);
+                corrupt.Position = 0;
+                corrupt.WriteByte((byte)(value ^ 0xff));
+                corrupt.Flush(flushToDisk: true);
+            }
+            var record = await blobs.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                containerName,
+                second.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                CancellationToken.None);
+            var chunkId = Assert.Single(record.Content.Chunks).Id;
+            Assert.Equal(
+                ChunkIntegrityStatus.Corrupt,
+                await restarted.Services.GetRequiredService<ChunkStore>()
+                    .VerifyChunkAsync(chunkId, CancellationToken.None));
+        }
+        finally
+        {
+            if (restarted is not null)
+                await restarted.DisposeAsync();
+            if (!initialDisposed)
+                await initial.DisposeAsync();
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+            if (Directory.Exists(backupPath))
+                Directory.Delete(backupPath, recursive: true);
         }
     }
 
@@ -2203,7 +2344,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 await connection.OpenAsync();
                 await using var version = connection.CreateCommand();
                 version.CommandText = "PRAGMA user_version;";
-                Assert.Equal(3L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                Assert.Equal(4L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
                 await using var references = connection.CreateCommand();
                 references.CommandText = """
                     SELECT
@@ -2975,6 +3116,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>
         Directory.EnumerateFiles(Path.Combine(dataPath, "chunks"), "*.chunk", SearchOption.AllDirectories)
+            .Select(path => new FileInfo(path));
+
+    private static IEnumerable<FileInfo> EnumeratePackFiles(string dataPath) =>
+        Directory.EnumerateFiles(Path.Combine(dataPath, "packs"), "*.pack", SearchOption.AllDirectories)
             .Select(path => new FileInfo(path));
 
     private static string ChunkPath(string dataPath, string chunkId) =>
