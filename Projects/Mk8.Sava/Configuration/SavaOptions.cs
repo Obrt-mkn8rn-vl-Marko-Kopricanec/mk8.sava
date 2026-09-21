@@ -25,6 +25,7 @@ public sealed class SavaOptions : IValidatableObject
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 4L * 1024 * 1024 * 1024;
     public int SoftDeleteRetentionDays { get; init; } = 7;
+    public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
     {
@@ -70,6 +71,28 @@ public sealed class SavaOptions : IValidatableObject
 
         if (MaximumRequestBodyBytes <= 0)
             yield return new ValidationResult("MaximumRequestBodyBytes must be positive.", [nameof(MaximumRequestBodyBytes)]);
+
+        if (BearerAuthentication.Enabled)
+        {
+            if (BearerAuthentication.ValidAudiences.Count == 0)
+                yield return new ValidationResult("At least one bearer-token audience is required.", [nameof(BearerAuthentication)]);
+            if (BearerAuthentication.ValidIssuers.Count == 0)
+                yield return new ValidationResult("At least one bearer-token issuer is required.", [nameof(BearerAuthentication)]);
+            if (string.IsNullOrWhiteSpace(BearerAuthentication.Authority) &&
+                string.IsNullOrWhiteSpace(BearerAuthentication.MetadataAddress) &&
+                BearerAuthentication.SymmetricSigningKeys.Count == 0)
+            {
+                yield return new ValidationResult(
+                    "Bearer authentication requires an authority, metadata address, or an explicitly configured signing key.",
+                    [nameof(BearerAuthentication)]);
+            }
+
+            foreach (var (keyId, signingKey) in BearerAuthentication.SymmetricSigningKeys)
+            {
+                if (string.IsNullOrWhiteSpace(keyId) || !TryDecodeKey(signingKey, out var keyBytes) || keyBytes.Length < 32)
+                    yield return new ValidationResult("Bearer symmetric signing keys must be named base64 values of at least 256 bits.", [nameof(BearerAuthentication)]);
+            }
+        }
     }
 
     private static bool TryDecodeKey(string value, out byte[] bytes)
@@ -85,4 +108,24 @@ public sealed class SavaOptions : IValidatableObject
             return false;
         }
     }
+}
+
+public sealed class BearerAuthenticationOptions
+{
+    public bool Enabled { get; init; }
+    public string? Authority { get; init; }
+    public string? MetadataAddress { get; init; }
+    public bool RequireHttpsMetadata { get; init; } = true;
+    public List<string> ValidAudiences { get; init; } = ["https://storage.azure.com/"];
+    public List<string> ValidIssuers { get; init; } = [];
+    public Dictionary<string, string> SymmetricSigningKeys { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, BearerPrincipalAccess> Principals { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string> RolePermissions { get; init; } = new(StringComparer.Ordinal);
+}
+
+public sealed class BearerPrincipalAccess
+{
+    public string Permissions { get; init; } = string.Empty;
+    public List<string> Accounts { get; init; } = [];
+    public List<string> Containers { get; init; } = [];
 }

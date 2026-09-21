@@ -44,6 +44,11 @@ public sealed class AzureStorageException : Exception
         "AuthorizationFailure",
         "This request is not authorized to perform this operation.");
 
+    public static AzureStorageException BearerAuthenticationRequired() => new(
+        StatusCodes.Status401Unauthorized,
+        "AuthenticationFailed",
+        "Authentication failed for the supplied bearer token.");
+
     public static AzureStorageException ContainerNotFound() => new(
         StatusCodes.Status404NotFound,
         "ContainerNotFound",
@@ -64,4 +69,3 @@ public sealed class AzureStorageException : Exception
         "LeaseIdMismatchWithBlobOperation",
         "The lease ID specified did not match the lease ID for the blob.");
 }
-

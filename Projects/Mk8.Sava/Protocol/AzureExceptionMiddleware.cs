@@ -55,6 +55,8 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
         context.Response.StatusCode = exception.StatusCode;
         context.Response.ContentType = "application/xml";
         context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
+        if (exception.StatusCode == StatusCodes.Status401Unauthorized)
+            context.Response.Headers.WWWAuthenticate = "Bearer resource_id=\"https://storage.azure.com/\"";
         AddCommonHeaders(context);
 
         var builder = new StringBuilder();

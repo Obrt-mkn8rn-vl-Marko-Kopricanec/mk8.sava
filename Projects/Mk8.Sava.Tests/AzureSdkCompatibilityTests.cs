@@ -1,10 +1,14 @@
 using Azure;
+using Azure.Core;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.IdentityModel.Tokens;
 
 namespace Mk8.Sava.Tests;
 
@@ -234,6 +238,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(403, revoked.Status);
     }
 
+    [Fact]
+    public async Task BearerTokensRequireTrustedSignatureIssuerAudiencePrincipalAndPermission()
+    {
+        var owner = CreateClient(factory);
+        var containerName = $"bearer-{Guid.NewGuid():N}";
+        var container = owner.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        await container.GetBlobClient("readable.txt").UploadAsync(BinaryData.FromString("bearer payload"));
+
+        var token = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
+        var reader = CreateBearerClient(factory, token);
+        Assert.Equal("bearer payload", (await reader.GetBlobContainerClient(containerName).GetBlobClient("readable.txt").DownloadContentAsync()).Value.Content.ToString());
+        var names = new List<string>();
+        await foreach (var item in reader.GetBlobContainerClient(containerName).GetBlobsAsync())
+            names.Add(item.Name);
+        Assert.Contains("readable.txt", names);
+        var deniedWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            reader.GetBlobContainerClient(containerName).GetBlobClient("denied.txt").UploadAsync(BinaryData.FromString("no")));
+        Assert.Equal(403, deniedWrite.Status);
+
+        var invalidToken = CreateJwt(SavaWebApplicationFactory.SecondAccountKey, "reader-1");
+        var invalid = CreateBearerClient(factory, invalidToken);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            invalid.GetBlobContainerClient(containerName).GetBlobClient("readable.txt").DownloadContentAsync());
+        Assert.Equal(401, rejected.Status);
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
@@ -260,6 +291,38 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = uri }),
             Retry = { MaxRetries = 0 }
         });
+
+    private static BlobServiceClient CreateBearerClient(SavaWebApplicationFactory app, string token)
+    {
+        var endpoint = new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost");
+        return new BlobServiceClient(endpoint, new StaticTokenCredential(token), new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = endpoint }),
+            Retry = { MaxRetries = 0 }
+        });
+    }
+
+    private static string CreateJwt(string base64Key, string objectId)
+    {
+        var key = new SymmetricSecurityKey(Convert.FromBase64String(base64Key)) { KeyId = "test-key" };
+        var token = new JwtSecurityToken(
+            issuer: "https://issuer.mk8.test",
+            audience: "https://storage.azure.com/",
+            claims: [new Claim("oid", objectId)],
+            notBefore: DateTime.UtcNow.AddMinutes(-1),
+            expires: DateTime.UtcNow.AddMinutes(10),
+            signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256));
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
+    private sealed class StaticTokenCredential(string token) : TokenCredential
+    {
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken) =>
+            new(token, DateTimeOffset.UtcNow.AddMinutes(10));
+
+        public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(GetToken(requestContext, cancellationToken));
+    }
 
     private static IEnumerable<FileInfo> EnumerateChunkFiles(string dataPath) =>
         Directory.EnumerateFiles(Path.Combine(dataPath, "chunks"), "*.chunk", SearchOption.AllDirectories)

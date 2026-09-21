@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Text;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
@@ -32,6 +33,8 @@ public sealed record StorageAuthorization(
 
 public sealed class StorageAuthenticator(IOptions<SavaOptions> options, MetadataStore metadata)
 {
+    public const string BearerScheme = "StorageBearer";
+
     private readonly SavaOptions _options = options.Value;
 
     public async Task<StorageAuthorization> AuthenticateAsync(
@@ -46,10 +49,49 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (authorization.StartsWith("SharedKeyLite ", StringComparison.Ordinal))
             return AuthenticateSharedKey(context.Request, request, authorization, lite: true);
         if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-            throw AzureStorageException.AuthenticationFailed("Bearer authentication is not configured for this deployment.");
+            return await AuthenticateBearerAsync(context, request);
         if (context.Request.Query.ContainsKey("sig"))
             return await AuthenticateSasAsync(context, request, cancellationToken);
         return StorageAuthorization.Anonymous;
+    }
+
+    private async Task<StorageAuthorization> AuthenticateBearerAsync(
+        HttpContext context,
+        StorageRequestContext request)
+    {
+        var configuration = _options.BearerAuthentication;
+        if (!configuration.Enabled)
+            throw AzureStorageException.BearerAuthenticationRequired();
+
+        var result = await context.AuthenticateAsync(BearerScheme);
+        if (!result.Succeeded || result.Principal?.Identity?.IsAuthenticated != true)
+            throw AzureStorageException.BearerAuthenticationRequired();
+
+        var principal = result.Principal;
+        var subject = principal.FindFirst("oid")?.Value
+                      ?? principal.FindFirst("sub")?.Value
+                      ?? principal.FindFirst("appid")?.Value;
+        if (string.IsNullOrEmpty(subject))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var granted = new HashSet<char>();
+        if (configuration.Principals.TryGetValue(subject, out var access) &&
+            Covers(access.Accounts, request.Account) &&
+            (request.Container is null || Covers(access.Containers, request.Container)))
+        {
+            granted.UnionWith(access.Permissions);
+        }
+
+        foreach (var role in principal.FindAll("roles").Select(claim => claim.Value))
+        {
+            if (configuration.RolePermissions.TryGetValue(role, out var rolePermissions))
+                granted.UnionWith(rolePermissions);
+        }
+
+        if (granted.Count == 0)
+            throw AzureStorageException.AuthorizationFailure();
+        var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
+        return new StorageAuthorization(StorageAuthorizationKind.Bearer, permissions, Identifier: subject);
     }
 
     private StorageAuthorization AuthenticateSharedKey(
@@ -333,6 +375,9 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
     private static DateTimeOffset? Earliest(DateTimeOffset? left, DateTimeOffset? right) =>
         left.HasValue && right.HasValue ? (left < right ? left : right) : left ?? right;
+
+    private static bool Covers(IReadOnlyCollection<string> configuredValues, string value) =>
+        configuredValues.Count == 0 || configuredValues.Contains("*", StringComparer.Ordinal) || configuredValues.Contains(value, StringComparer.Ordinal);
 
     private static bool MatchesIpRange(IPAddress? address, string range)
     {
