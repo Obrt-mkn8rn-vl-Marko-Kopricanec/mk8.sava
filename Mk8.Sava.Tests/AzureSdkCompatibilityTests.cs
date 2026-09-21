@@ -74,6 +74,98 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task PagedFlatVersionSnapshotAndHierarchyListingsNeverSkipOrRepeatEntries()
+    {
+        var application = new SavaWebApplicationFactory();
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var containerName = $"pages-{Guid.NewGuid():N}";
+            var container = service.GetBlobContainerClient(containerName);
+            await container.CreateAsync();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var properties = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                properties with { VersioningEnabled = true },
+                CancellationToken.None);
+
+            var versioned = container.GetBlobClient("paged/same-name.txt");
+            await versioned.UploadAsync(BinaryData.FromString("one"), overwrite: true);
+            await versioned.UploadAsync(BinaryData.FromString("two"), overwrite: true);
+            await versioned.UploadAsync(BinaryData.FromString("three"), overwrite: true);
+            await versioned.CreateSnapshotAsync();
+            await versioned.CreateSnapshotAsync();
+
+            var expectedRecords = (await metadata.ListBlobsAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    containerName,
+                    includeVersions: true,
+                    includeSnapshots: true,
+                    includeDeleted: false,
+                    CancellationToken.None))
+                .Where(item => item.Name == versioned.Name)
+                .ToArray();
+            var listed = new List<BlobItem>();
+            var flatTokens = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var page in container
+                               .GetBlobsAsync(
+                                   BlobTraits.None,
+                                   BlobStates.Version | BlobStates.Snapshots,
+                                   prefix: versioned.Name)
+                               .AsPages(pageSizeHint: 1))
+            {
+                Assert.Single(page.Values);
+                listed.Add(page.Values[0]);
+                if (page.ContinuationToken is not null)
+                    Assert.True(flatTokens.Add(page.ContinuationToken));
+            }
+            Assert.Equal(expectedRecords.Length, listed.Count);
+            Assert.Equal(
+                expectedRecords.Select(ListIdentity).Order(StringComparer.Ordinal),
+                listed.Select(ListIdentity).Order(StringComparer.Ordinal));
+            Assert.NotEmpty(flatTokens);
+            var reboundMarkerUri = AppendQuery(
+                container.GenerateSasUri(
+                    BlobContainerSasPermissions.List,
+                    DateTimeOffset.UtcNow.AddMinutes(5)),
+                "restype=container&comp=list&include=versions%2Csnapshots&prefix=other" +
+                $"&maxresults=1&marker={Uri.EscapeDataString(flatTokens.First())}");
+            using (var transport = new HttpClient(application.Server.CreateHandler()))
+            using (var response = await transport.GetAsync(reboundMarkerUri))
+            {
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidQueryParameterValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            await container.GetBlobClient("folders/a/one").UploadAsync(BinaryData.FromString("a1"));
+            await container.GetBlobClient("folders/a/two").UploadAsync(BinaryData.FromString("a2"));
+            await container.GetBlobClient("folders/b/one").UploadAsync(BinaryData.FromString("b1"));
+            await container.GetBlobClient("folders/root").UploadAsync(BinaryData.FromString("root"));
+            var hierarchy = new List<string>();
+            var hierarchyTokens = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var page in container
+                               .GetBlobsByHierarchyAsync(delimiter: "/", prefix: "folders/")
+                               .AsPages(pageSizeHint: 1))
+            {
+                Assert.Single(page.Values);
+                var item = page.Values[0];
+                hierarchy.Add(item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}");
+                if (page.ContinuationToken is not null)
+                    Assert.True(hierarchyTokens.Add(page.ContinuationToken));
+            }
+            Assert.Equal(["P:folders/a/", "P:folders/b/", "B:folders/root"], hierarchy);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task IdenticalContentIsCompressedAndPhysicallyDeduplicated()
     {
         var service = CreateClient(factory);
@@ -1850,6 +1942,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+
+    private static string ListIdentity(BlobRecord item) =>
+        $"{item.Name}|{item.VersionId}|{item.Snapshot}|{(item.VersionId is null ? null : item.IsCurrent)}";
+
+    private static string ListIdentity(BlobItem item) =>
+        $"{item.Name}|{item.VersionId}|{item.Snapshot}|{item.IsLatestVersion}";
 
     private static HttpRequestMessage CreateSourceKeyRequest(
         Uri destination,

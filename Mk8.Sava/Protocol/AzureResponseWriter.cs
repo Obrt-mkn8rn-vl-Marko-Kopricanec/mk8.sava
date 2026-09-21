@@ -7,6 +7,8 @@ namespace Mk8.Sava.Protocol;
 
 public sealed class AzureResponseWriter
 {
+    private const string BlobMarkerPrefix = "mk8s1.";
+
     public async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
     {
         var builder = new StringBuilder();
@@ -47,9 +49,12 @@ public sealed class AzureResponseWriter
         {
             writer.WriteStartElement("EnumerationResults");
             writer.WriteAttributeString("ServiceEndpoint", endpoint);
-            writer.WriteElementString("Prefix", prefix);
-            writer.WriteElementString("Marker", marker);
-            writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
+            if (context.Request.Query.ContainsKey("prefix"))
+                writer.WriteElementString("Prefix", prefix);
+            if (context.Request.Query.ContainsKey("marker"))
+                writer.WriteElementString("Marker", marker);
+            if (context.Request.Query.ContainsKey("maxresults"))
+                writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
             writer.WriteStartElement("Containers");
             foreach (var container in page)
             {
@@ -92,11 +97,14 @@ public sealed class AzureResponseWriter
         IReadOnlySet<string> includes,
         CancellationToken cancellationToken)
     {
-        var entries = new List<(BlobRecord? Blob, string? Prefix)>();
+        var request = StorageRequestContext.Get(context);
+        var listingScope = CreateBlobListingScope(request, prefix, delimiter, includes);
+        var offset = DecodeBlobMarker(marker, listingScope, out var rawMarker);
+        var entries = new List<BlobListEntry>();
         var seenPrefixes = new HashSet<string>(StringComparer.Ordinal);
         foreach (var blob in blobs.Where(item => item.Name.StartsWith(prefix, StringComparison.Ordinal)))
         {
-            if (!string.IsNullOrEmpty(marker) && string.CompareOrdinal(blob.Name, marker) <= 0)
+            if (!string.IsNullOrEmpty(rawMarker) && string.CompareOrdinal(blob.Name, rawMarker) <= 0)
                 continue;
             if (!string.IsNullOrEmpty(delimiter))
             {
@@ -106,18 +114,21 @@ public sealed class AzureResponseWriter
                 {
                     var commonPrefix = prefix + remainder[..(delimiterIndex + delimiter.Length)];
                     if (seenPrefixes.Add(commonPrefix))
-                        entries.Add((null, commonPrefix));
+                        entries.Add(new BlobListEntry(null, commonPrefix));
                     continue;
                 }
             }
-            entries.Add((blob, null));
+            entries.Add(new BlobListEntry(blob, null));
         }
 
-        entries.Sort((left, right) => string.CompareOrdinal(left.Blob?.Name ?? left.Prefix, right.Blob?.Name ?? right.Prefix));
-        var selected = entries.Take(maxResults + 1).ToArray();
+        entries.Sort(CompareBlobListEntries);
+        if (offset > entries.Count)
+            throw AzureStorageException.InvalidQuery("marker");
+        var selected = entries.Skip(offset).Take(maxResults + 1).ToArray();
         var page = selected.Take(maxResults).ToArray();
-        var nextMarker = selected.Length > maxResults ? page[^1].Blob?.Name ?? page[^1].Prefix ?? string.Empty : string.Empty;
-        var request = StorageRequestContext.Get(context);
+        var nextMarker = selected.Length > maxResults
+            ? EncodeBlobMarker(checked(offset + page.Length), listingScope)
+            : string.Empty;
         var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
 
         return WriteXmlAsync(context, writer =>
@@ -125,11 +136,14 @@ public sealed class AzureResponseWriter
             writer.WriteStartElement("EnumerationResults");
             writer.WriteAttributeString("ServiceEndpoint", endpoint);
             writer.WriteAttributeString("ContainerName", request.Container);
-            writer.WriteElementString("Prefix", prefix);
-            writer.WriteElementString("Marker", marker);
-            if (!string.IsNullOrEmpty(delimiter))
+            if (context.Request.Query.ContainsKey("prefix"))
+                writer.WriteElementString("Prefix", prefix);
+            if (context.Request.Query.ContainsKey("marker"))
+                writer.WriteElementString("Marker", marker);
+            if (context.Request.Query.ContainsKey("delimiter"))
                 writer.WriteElementString("Delimiter", delimiter);
-            writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
+            if (context.Request.Query.ContainsKey("maxresults"))
+                writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
             writer.WriteStartElement("Blobs");
             foreach (var entry in page)
             {
@@ -151,7 +165,7 @@ public sealed class AzureResponseWriter
                     writer.WriteElementString("VersionId", blob.VersionId);
                     writer.WriteElementString("IsCurrentVersion", blob.IsCurrent ? "true" : "false");
                 }
-                if (includes.Contains("deleted"))
+                if (includes.Contains("deleted") || includes.Contains("deletedwithversions"))
                     writer.WriteElementString("Deleted", blob.IsDeleted ? "true" : "false");
                 writer.WriteStartElement("Properties");
                 writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
@@ -166,6 +180,7 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
                 writer.WriteElementString("AccessTier", blob.AccessTier);
+                writer.WriteElementString("ServerEncrypted", "true");
                 WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
                 WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
                 WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
@@ -182,11 +197,30 @@ public sealed class AzureResponseWriter
                             RemainingRetentionDays(blob.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
                     }
                 }
-                writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
-                writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
+                if (blob.Snapshot is null && !blob.IsDeleted)
+                {
+                    writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
+                    writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
+                    if (blob.Lease.State == Storage.LeaseState.Leased)
+                    {
+                        writer.WriteElementString(
+                            "LeaseDuration",
+                            blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+                    }
+                }
+                if (blob.Kind == Storage.BlobKind.PageBlob)
+                {
+                    writer.WriteElementString(
+                        "x-ms-blob-sequence-number",
+                        blob.SequenceNumber.ToString(CultureInfo.InvariantCulture));
+                }
                 if (blob.Kind == Storage.BlobKind.AppendBlob)
+                {
                     writer.WriteElementString("CommittedBlockCount", blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture));
-                if (includes.Contains("tags"))
+                    if (blob.IsSealed)
+                        writer.WriteElementString("Sealed", "true");
+                }
+                if (blob.Tags.Count > 0)
                     writer.WriteElementString("TagCount", blob.Tags.Count.ToString(CultureInfo.InvariantCulture));
                 if (includes.Contains("immutabilitypolicy") && blob.ImmutabilityUntil.HasValue)
                 {
@@ -195,7 +229,7 @@ public sealed class AzureResponseWriter
                 }
                 if (includes.Contains("legalhold"))
                     writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
-                if (blob.Copy is not null)
+                if (includes.Contains("copy") && blob.Copy is not null)
                 {
                     writer.WriteElementString("CopyId", blob.Copy.Id);
                     writer.WriteElementString("CopySource", blob.Copy.Source);
@@ -498,6 +532,84 @@ public sealed class AzureResponseWriter
     private static int RemainingRetentionDays(DateTimeOffset retentionUntil) =>
         Math.Max(0, (int)Math.Ceiling((retentionUntil - DateTimeOffset.UtcNow).TotalDays));
 
+    private static string CreateBlobListingScope(
+        StorageRequestContext request,
+        string prefix,
+        string delimiter,
+        IReadOnlySet<string> includes)
+    {
+        var value = string.Join(
+            '\n',
+            request.Account,
+            request.Container,
+            request.ServiceVersion,
+            prefix,
+            delimiter,
+            string.Join(',', includes.Order(StringComparer.OrdinalIgnoreCase)));
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)).AsSpan(0, 12));
+    }
+
+    private static int DecodeBlobMarker(string marker, string expectedScope, out string rawMarker)
+    {
+        rawMarker = marker;
+        if (!marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))
+            return 0;
+
+        rawMarker = string.Empty;
+        var separator = marker.IndexOf('.', BlobMarkerPrefix.Length);
+        if (separator < 0 ||
+            !int.TryParse(
+                marker.AsSpan(BlobMarkerPrefix.Length, separator - BlobMarkerPrefix.Length),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var offset) ||
+            offset < 0 ||
+            !string.Equals(marker[(separator + 1)..], expectedScope, StringComparison.Ordinal))
+        {
+            throw AzureStorageException.InvalidQuery("marker");
+        }
+        return offset;
+    }
+
+    private static string EncodeBlobMarker(int offset, string scope) =>
+        $"{BlobMarkerPrefix}{offset.ToString(CultureInfo.InvariantCulture)}.{scope}";
+
+    private static int CompareBlobListEntries(BlobListEntry left, BlobListEntry right)
+    {
+        var nameComparison = string.CompareOrdinal(left.Name, right.Name);
+        if (nameComparison != 0)
+            return nameComparison;
+        if (left.Prefix is not null || right.Prefix is not null)
+            return left.Prefix is not null ? right.Prefix is not null ? 0 : -1 : 1;
+
+        var leftBlob = left.Blob!;
+        var rightBlob = right.Blob!;
+        var rankComparison = BlobListRank(leftBlob).CompareTo(BlobListRank(rightBlob));
+        if (rankComparison != 0)
+            return rankComparison;
+        if (leftBlob.Snapshot is not null || rightBlob.Snapshot is not null)
+        {
+            var snapshotComparison = string.CompareOrdinal(leftBlob.Snapshot, rightBlob.Snapshot);
+            if (snapshotComparison != 0)
+                return snapshotComparison;
+        }
+        if (leftBlob.VersionId is not null || rightBlob.VersionId is not null)
+        {
+            var versionComparison = string.CompareOrdinal(rightBlob.VersionId, leftBlob.VersionId);
+            if (versionComparison != 0)
+                return versionComparison;
+        }
+        return string.CompareOrdinal(leftBlob.GenerationId, rightBlob.GenerationId);
+    }
+
+    private static int BlobListRank(BlobRecord blob) => blob switch
+    {
+        { IsCurrent: true } => 0,
+        { VersionId: not null } => 1,
+        { Snapshot: null } => 2,
+        _ => 3
+    };
+
     private static string BlobType(Storage.BlobKind kind) => kind switch
     {
         Storage.BlobKind.BlockBlob => "BlockBlob",
@@ -509,4 +621,9 @@ public sealed class AzureResponseWriter
     private static string LeaseStatus(LeaseRecord lease) => lease.State == Storage.LeaseState.Leased ? "locked" : "unlocked";
 
     private static string LeaseStateValue(LeaseRecord lease) => lease.State.ToString().ToLowerInvariant();
+
+    private sealed record BlobListEntry(BlobRecord? Blob, string? Prefix)
+    {
+        public string Name => Blob?.Name ?? Prefix!;
+    }
 }
