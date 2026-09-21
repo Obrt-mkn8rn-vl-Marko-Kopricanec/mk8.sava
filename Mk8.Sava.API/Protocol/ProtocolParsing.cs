@@ -64,20 +64,101 @@ internal static class ProtocolParsing
     public static BlobHttpProperties ReadHttpProperties(
         IHeaderDictionary headers,
         BlobHttpProperties? fallback = null,
-        bool useStandardContentType = true)
+        bool useStandardProperties = true)
     {
         fallback ??= new BlobHttpProperties();
+        const string customContentMd5Header = "x-ms-blob-content-md5";
+        const string standardContentMd5Header = "Content-MD5";
+        var contentMd5 = ReadHttpProperty(
+            headers,
+            customContentMd5Header,
+            standardContentMd5Header,
+            useStandardProperties,
+            fallback.ContentMd5);
+        if (contentMd5 is not null)
+        {
+            var contentMd5Header = headers.ContainsKey(customContentMd5Header)
+                ? customContentMd5Header
+                : useStandardProperties && headers.ContainsKey(standardContentMd5Header)
+                    ? standardContentMd5Header
+                    : customContentMd5Header;
+            ValidateContentMd5(contentMd5, contentMd5Header);
+        }
+
         return new BlobHttpProperties
         {
-            ContentType = First(headers, "x-ms-blob-content-type")
-                          ?? (useStandardContentType ? First(headers, "Content-Type") : null)
-                          ?? fallback.ContentType,
-            ContentEncoding = First(headers, "x-ms-blob-content-encoding") ?? fallback.ContentEncoding,
-            ContentLanguage = First(headers, "x-ms-blob-content-language") ?? fallback.ContentLanguage,
-            CacheControl = First(headers, "x-ms-blob-cache-control") ?? fallback.CacheControl,
-            ContentDisposition = First(headers, "x-ms-blob-content-disposition") ?? fallback.ContentDisposition,
-            ContentMd5 = First(headers, "x-ms-blob-content-md5") ?? fallback.ContentMd5
+            ContentType = ReadHttpProperty(
+                              headers,
+                              "x-ms-blob-content-type",
+                              "Content-Type",
+                              useStandardProperties,
+                              fallback.ContentType)
+                          ?? "application/octet-stream",
+            ContentEncoding = ReadHttpProperty(
+                headers,
+                "x-ms-blob-content-encoding",
+                "Content-Encoding",
+                useStandardProperties,
+                fallback.ContentEncoding),
+            ContentLanguage = ReadHttpProperty(
+                headers,
+                "x-ms-blob-content-language",
+                "Content-Language",
+                useStandardProperties,
+                fallback.ContentLanguage),
+            CacheControl = ReadHttpProperty(
+                headers,
+                "x-ms-blob-cache-control",
+                "Cache-Control",
+                useStandardProperties,
+                fallback.CacheControl),
+            ContentDisposition = ReadHttpProperty(
+                headers,
+                "x-ms-blob-content-disposition",
+                standardName: null,
+                useStandardProperties,
+                fallback.ContentDisposition),
+            ContentMd5 = contentMd5
         };
+    }
+
+    public static bool HasBlobHttpPropertyHeaders(IHeaderDictionary headers) =>
+        headers.ContainsKey("x-ms-blob-cache-control") ||
+        headers.ContainsKey("x-ms-blob-content-type") ||
+        headers.ContainsKey("x-ms-blob-content-md5") ||
+        headers.ContainsKey("x-ms-blob-content-encoding") ||
+        headers.ContainsKey("x-ms-blob-content-language") ||
+        headers.ContainsKey("x-ms-blob-content-disposition");
+
+    private static string? ReadHttpProperty(
+        IHeaderDictionary headers,
+        string customName,
+        string? standardName,
+        bool useStandardProperties,
+        string? fallback)
+    {
+        if (headers.TryGetValue(customName, out var customValues))
+            return NullIfEmpty(customValues.ToString());
+        if (useStandardProperties &&
+            standardName is not null &&
+            headers.TryGetValue(standardName, out var standardValues))
+        {
+            return NullIfEmpty(standardValues.ToString());
+        }
+        return fallback;
+    }
+
+    private static void ValidateContentMd5(string value, string headerName)
+    {
+        try
+        {
+            if (Convert.FromBase64String(value).Length == 16)
+                return;
+        }
+        catch (FormatException)
+        {
+        }
+        throw AzureStorageException.InvalidHeader(headerName, value);
     }
 
     public static Dictionary<string, string> ReadTagsHeader(IHeaderDictionary headers)

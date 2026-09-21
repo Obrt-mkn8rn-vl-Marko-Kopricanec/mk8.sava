@@ -8,9 +8,13 @@ using Mk8.Sava.Configuration;
 
 namespace Mk8.Sava.Storage;
 
-public sealed class StoredContent(ContentManifest manifest, IDisposable pin) : IDisposable
+public sealed class StoredContent(
+    ContentManifest manifest,
+    IDisposable pin,
+    string? contentMd5 = null) : IDisposable
 {
     public ContentManifest Manifest { get; } = manifest;
+    public string? ContentMd5 { get; } = contentMd5;
 
     public void Dispose() => pin.Dispose();
 }
@@ -57,6 +61,7 @@ public sealed class ChunkStore
     {
         var domain = ResolveDomain(account, encryption);
         using var completeHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var completeMd5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
         var references = new List<ChunkReference>();
         var pinnedIds = new HashSet<string>(StringComparer.Ordinal);
         long offset = 0;
@@ -66,6 +71,7 @@ public sealed class ChunkStore
             await foreach (var bytes in _chunker.ReadChunksAsync(source, _options.MaximumRequestBodyBytes, cancellationToken))
             {
                 completeHash.AppendData(bytes);
+                completeMd5.AppendData(bytes);
                 if (bytes.AsSpan().IndexOfAnyExcept((byte)0) < 0)
                 {
                     var zeroId = ZeroId(domain);
@@ -90,7 +96,10 @@ public sealed class ChunkStore
                 Convert.ToHexStringLower(completeHash.GetHashAndReset()),
                 references);
             ValidateManifest(manifest);
-            return new StoredContent(manifest, new PinLease(this, pinnedIds));
+            return new StoredContent(
+                manifest,
+                new PinLease(this, pinnedIds),
+                Convert.ToBase64String(completeMd5.GetHashAndReset()));
         }
         catch
         {
