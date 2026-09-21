@@ -292,6 +292,8 @@ internal static class ProtocolParsing
         }
         if (cors.Count > 5)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "A maximum of five CORS rules is supported.");
+        if (corsElement is not null)
+            ValidateCorsRules(cors);
 
         if (Child(root, "DefaultServiceVersion") is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2011, 8, 18), "DefaultServiceVersion");
@@ -512,6 +514,94 @@ internal static class ProtocolParsing
         if (days is not null and (< 1 or > 365))
             throw InvalidServicePropertiesXml("Retention days must be between 1 and 365.");
         return new StorageAnalyticsRetentionPolicy { Enabled = enabled, Days = days };
+    }
+
+    private static void ValidateCorsRules(IReadOnlyList<CorsRule> rules)
+    {
+        const int maximumSettingsBytes = 2 * 1024;
+        var settingsBytes = 0;
+        var originCount = 0;
+        var literalHeaderCount = 0;
+        var prefixedHeaderCount = 0;
+        var allowedMethods = new HashSet<string>(
+            ["DELETE", "GET", "HEAD", "MERGE", "PATCH", "POST", "OPTIONS", "PUT"],
+            StringComparer.Ordinal);
+
+        foreach (var rule in rules)
+        {
+            settingsBytes += Encoding.UTF8.GetByteCount(rule.AllowedOrigins);
+            settingsBytes += Encoding.UTF8.GetByteCount(rule.AllowedMethods);
+            settingsBytes += Encoding.UTF8.GetByteCount(rule.AllowedHeaders);
+            settingsBytes += Encoding.UTF8.GetByteCount(rule.ExposedHeaders);
+            settingsBytes += Encoding.UTF8.GetByteCount(rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture));
+            if (settingsBytes > maximumSettingsBytes)
+                throw InvalidServicePropertiesXml("CORS rule settings cannot exceed 2 KiB.");
+            if (rule.MaxAgeInSeconds < 0)
+                throw InvalidServicePropertiesXml("CORS MaxAgeInSeconds cannot be negative.");
+
+            var origins = SplitRequiredCorsList(rule.AllowedOrigins, "AllowedOrigins");
+            originCount += origins.Length;
+            if (originCount > 64 || origins.Any(origin => origin.Length > 256 || !IsValidCorsOrigin(origin)))
+                throw InvalidServicePropertiesXml("The CORS allowed origins are invalid.");
+
+            var methods = SplitRequiredCorsList(rule.AllowedMethods, "AllowedMethods");
+            if (methods.Distinct(StringComparer.Ordinal).Count() != methods.Length ||
+                methods.Any(method => !allowedMethods.Contains(method)))
+            {
+                throw InvalidServicePropertiesXml("The CORS allowed methods are invalid.");
+            }
+
+            CountCorsHeaders(rule.AllowedHeaders, ref literalHeaderCount, ref prefixedHeaderCount);
+            CountCorsHeaders(rule.ExposedHeaders, ref literalHeaderCount, ref prefixedHeaderCount);
+            if (literalHeaderCount > 64 || prefixedHeaderCount > 2)
+                throw InvalidServicePropertiesXml("The CORS header limits were exceeded.");
+        }
+    }
+
+    private static string[] SplitRequiredCorsList(string value, string field)
+    {
+        var values = value.Split(',', StringSplitOptions.TrimEntries);
+        if (values.Length == 0 || values.Any(string.IsNullOrEmpty))
+            throw InvalidServicePropertiesXml($"The CORS {field} value is invalid.");
+        return values;
+    }
+
+    private static void CountCorsHeaders(string value, ref int literalCount, ref int prefixedCount)
+    {
+        if (value.Length == 0)
+            return;
+        foreach (var header in value.Split(',', StringSplitOptions.TrimEntries))
+        {
+            if (header.Length == 0 || header.Length > 256 || header.Count(character => character == '*') > 1 ||
+                header.Contains('*') && !header.EndsWith('*'))
+            {
+                throw InvalidServicePropertiesXml("A CORS header value is invalid.");
+            }
+            if (header.EndsWith('*'))
+                prefixedCount++;
+            else
+                literalCount++;
+        }
+    }
+
+    private static bool IsValidCorsOrigin(string origin)
+    {
+        if (origin == "*")
+            return true;
+        var wildcardCount = origin.Count(character => character == '*');
+        if (wildcardCount > 1)
+            return false;
+        var normalized = wildcardCount == 0
+            ? origin
+            : origin.Replace("://*.", "://cors-wildcard.", StringComparison.Ordinal);
+        if (wildcardCount == 1 && normalized == origin)
+            return false;
+        return Uri.TryCreate(normalized, UriKind.Absolute, out var uri) &&
+               uri.Scheme is "http" or "https" &&
+               string.IsNullOrEmpty(uri.UserInfo) &&
+               uri.AbsolutePath == "/" &&
+               string.IsNullOrEmpty(uri.Query) &&
+               string.IsNullOrEmpty(uri.Fragment);
     }
 
     private static (bool Enabled, int Days) ReadRetentionPolicy(XElement root, string name, bool currentEnabled, int currentDays)

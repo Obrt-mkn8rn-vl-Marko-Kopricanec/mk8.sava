@@ -4304,7 +4304,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         properties.Cors.Clear();
         properties.Cors.Add(new BlobCorsRule
         {
-            AllowedOrigins = "https://client.example",
+            AllowedOrigins = "https://client.example,https://*.trusted.example",
             AllowedMethods = "GET,HEAD",
             AllowedHeaders = "*",
             ExposedHeaders = "ETag,x-ms-request-id",
@@ -4340,6 +4340,35 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(HttpStatusCode.OK, corsResponse.StatusCode);
         Assert.Equal("https://client.example", corsResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
         Assert.Contains("ETag", corsResponse.Headers.GetValues("Access-Control-Expose-Headers").Single());
+        Assert.Contains("Origin", corsResponse.Headers.Vary);
+
+        using var wildcardRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        wildcardRequest.Headers.Add("Origin", "https://nested.app.trusted.example");
+        using var wildcardResponse = await client.SendAsync(wildcardRequest);
+        Assert.Equal(HttpStatusCode.OK, wildcardResponse.StatusCode);
+        Assert.Equal(
+            "https://nested.app.trusted.example",
+            wildcardResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
+        Assert.Contains("Origin", wildcardResponse.Headers.Vary);
+
+        using var caseMismatchRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        caseMismatchRequest.Headers.Add("Origin", "https://CLIENT.example");
+        using var caseMismatchResponse = await client.SendAsync(caseMismatchRequest);
+        Assert.Equal(HttpStatusCode.OK, caseMismatchResponse.StatusCode);
+        Assert.False(caseMismatchResponse.Headers.Contains("Access-Control-Allow-Origin"));
+        Assert.Contains("Origin", caseMismatchResponse.Headers.Vary);
+
+        using var preflightRequest = new HttpRequestMessage(HttpMethod.Options, uri);
+        preflightRequest.Headers.Add("Origin", "https://app.trusted.example");
+        preflightRequest.Headers.Add("Access-Control-Request-Method", "HEAD");
+        preflightRequest.Headers.Add("Access-Control-Request-Headers", "x-client-header");
+        using var preflightResponse = await client.SendAsync(preflightRequest);
+        Assert.Equal(HttpStatusCode.OK, preflightResponse.StatusCode);
+        Assert.Equal(
+            "https://app.trusted.example",
+            preflightResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
+        Assert.Equal("true", preflightResponse.Headers.GetValues("Access-Control-Allow-Credentials").Single());
+        Assert.Equal("HEAD", preflightResponse.Headers.GetValues("Access-Control-Allow-Methods").Single());
 
         using var conditionalRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         conditionalRequest.Headers.IfNoneMatch.Add(new System.Net.Http.Headers.EntityTagHeaderValue(etag.ToString()));
@@ -4347,6 +4376,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(HttpStatusCode.NotModified, conditionalResponse.StatusCode);
         Assert.False(conditionalResponse.Headers.Contains("x-ms-error-code"));
         Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync());
+
+        var invalid = (await service.GetPropertiesAsync()).Value;
+        invalid.Cors.Clear();
+        invalid.Cors.Add(new BlobCorsRule
+        {
+            AllowedOrigins = "https://client.example",
+            AllowedMethods = "GET,TRACE",
+            AllowedHeaders = "*",
+            ExposedHeaders = string.Empty,
+            MaxAgeInSeconds = 1
+        });
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => service.SetPropertiesAsync(invalid));
+        Assert.Equal(HttpStatusCode.BadRequest, (HttpStatusCode)rejected.Status);
+        Assert.Equal("InvalidXmlDocument", rejected.ErrorCode);
+        Assert.Equal(
+            "https://client.example,https://*.trusted.example",
+            Assert.Single((await service.GetPropertiesAsync()).Value.Cors).AllowedOrigins);
     }
 
     [Fact]
