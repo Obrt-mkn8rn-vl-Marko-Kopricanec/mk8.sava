@@ -811,7 +811,17 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
 
     public async Task<IReadOnlySet<string>> GetReachableChunkIdsAsync(CancellationToken cancellationToken)
     {
+        var inventory = await GetStorageInventoryAsync(cancellationToken);
+        return inventory.ReachableChunkIds;
+    }
+
+    public async Task<StorageMetadataInventory> GetStorageInventoryAsync(CancellationToken cancellationToken)
+    {
         var reachable = new HashSet<string>(StringComparer.Ordinal);
+        long logicalBlobBytes = 0;
+        long logicalStagedBlockBytes = 0;
+        var blobRecordCount = 0;
+        var stagedBlockCount = 0;
         await using var connection = await OpenAsync(cancellationToken);
 
         await using (var blobs = connection.CreateCommand())
@@ -821,10 +831,13 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             while (await reader.ReadAsync(cancellationToken))
             {
                 var blob = Deserialize<BlobRecord>(reader.GetString(0));
+                blobRecordCount++;
+                logicalBlobBytes = checked(logicalBlobBytes + blob.Content.Length);
                 foreach (var chunk in blob.Content.Chunks)
                     reachable.Add(chunk.Id);
                 if (blob.PendingCopyContent is not null)
                 {
+                    logicalBlobBytes = checked(logicalBlobBytes + blob.PendingCopyContent.Length);
                     foreach (var chunk in blob.PendingCopyContent.Chunks)
                         reachable.Add(chunk.Id);
                 }
@@ -838,12 +851,19 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             while (await reader.ReadAsync(cancellationToken))
             {
                 var block = Deserialize<StagedBlockRecord>(reader.GetString(0));
+                stagedBlockCount++;
+                logicalStagedBlockBytes = checked(logicalStagedBlockBytes + block.Content.Length);
                 foreach (var chunk in block.Content.Chunks)
                     reachable.Add(chunk.Id);
             }
         }
 
-        return reachable;
+        return new StorageMetadataInventory(
+            reachable,
+            logicalBlobBytes,
+            logicalStagedBlockBytes,
+            blobRecordCount,
+            stagedBlockCount);
     }
 
     public DateTimeOffset GetUtcNow() => _timeProvider.GetUtcNow();

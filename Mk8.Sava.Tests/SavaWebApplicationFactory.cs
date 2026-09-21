@@ -42,7 +42,10 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
                 ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
-                ["Sava:MaintenanceScanInterval"] = "00:00:00.050"
+                ["Sava:MaintenanceScanInterval"] = "00:00:00.050",
+                ["Sava:AbandonedStagingRetention"] = "1.00:00:00",
+                ["Sava:MaximumStagingFilesPerMaintenancePass"] = "1000",
+                ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
             });
         });
     }

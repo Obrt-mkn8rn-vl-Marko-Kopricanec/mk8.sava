@@ -171,6 +171,57 @@ public sealed record StagedBlockRecord
     public required DateTimeOffset CreatedAt { get; init; }
 }
 
+public sealed record StorageMetadataInventory(
+    IReadOnlySet<string> ReachableChunkIds,
+    long LogicalBlobBytes,
+    long LogicalStagedBlockBytes,
+    int BlobRecordCount,
+    int StagedBlockCount);
+
+public sealed record StorageUsageSnapshot(
+    long LogicalBlobBytes,
+    long LogicalStagedBlockBytes,
+    long PhysicalChunkBytes,
+    long StagingBytes,
+    long MetadataBytes,
+    int BlobRecordCount,
+    int StagedBlockCount,
+    int UniqueChunkCount,
+    int ReachableChunkCount)
+{
+    public static StorageUsageSnapshot Empty { get; } = new(0, 0, 0, 0, 0, 0, 0, 0, 0);
+}
+
+public sealed record StoragePhysicalUsage(
+    long ChunkBytes,
+    long StagingBytes,
+    long MetadataBytes,
+    int ChunkCount);
+
+public enum ChunkIntegrityStatus
+{
+    Verified,
+    RequiresCustomerKey,
+    Missing,
+    Corrupt
+}
+
+public sealed record StorageIntegritySnapshot(
+    int ReachableChunks,
+    int CheckedChunks,
+    int VerifiedChunks,
+    int CustomerKeyChunks,
+    int MissingChunks,
+    int CorruptChunks,
+    bool Complete,
+    DateTimeOffset CheckedAt)
+{
+    public static StorageIntegritySnapshot Pending { get; } =
+        new(0, 0, 0, 0, 0, 0, false, DateTimeOffset.MinValue);
+
+    public bool Healthy => MissingChunks == 0 && CorruptChunks == 0;
+}
+
 public sealed record ServiceProperties
 {
     public bool VersioningEnabled { get; init; }

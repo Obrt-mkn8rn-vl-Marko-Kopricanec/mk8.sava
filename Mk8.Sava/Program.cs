@@ -42,6 +42,7 @@ builder.Services.AddOptions<JwtBearerOptions>(StorageAuthenticator.BearerScheme)
         jwt.MapInboundClaims = false;
     });
 builder.Services.AddSingleton<StoragePaths>();
+builder.Services.AddSingleton<StorageTelemetry>();
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<BlobService>();
@@ -60,13 +61,38 @@ var app = builder.Build();
 
 await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
 
+app.UseMiddleware<StorageTelemetryMiddleware>();
 app.UseMiddleware<AzureExceptionMiddleware>();
 app.UseMiddleware<RequestContextMiddleware>();
 app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
-app.MapGet("/health/ready", async (MetadataStore store, CancellationToken cancellationToken) =>
-    await store.IsReadyAsync(cancellationToken)
-        ? Results.Ok(new { status = "ready" })
-        : Results.StatusCode(StatusCodes.Status503ServiceUnavailable));
+app.MapGet("/health/ready", async (
+    MetadataStore store,
+    StorageTelemetry telemetry,
+    CancellationToken cancellationToken) =>
+{
+    var metadataReady = await store.IsReadyAsync(cancellationToken);
+    var integrity = telemetry.Integrity;
+    var ready = metadataReady && integrity.Healthy;
+    return Results.Json(
+        new
+        {
+            status = ready ? "ready" : "unavailable",
+            metadata = metadataReady ? "ready" : "unavailable",
+            integrity = new
+            {
+                status = integrity.Healthy ? "healthy" : "corrupt",
+                integrity.Complete,
+                integrity.CheckedChunks,
+                integrity.MissingChunks,
+                integrity.CorruptChunks,
+                integrity.CustomerKeyChunks,
+                checkedAt = integrity.CheckedAt == DateTimeOffset.MinValue ? null : integrity.CheckedAt.ToString("O")
+            }
+        },
+        statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
+});
+app.MapGet("/metrics", (StorageTelemetry telemetry) =>
+    Results.Text(telemetry.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
 await app.RunAsync();

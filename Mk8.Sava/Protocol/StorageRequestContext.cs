@@ -45,7 +45,8 @@ public sealed class RequestContextMiddleware(
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (context.Request.Path.StartsWithSegments("/health"))
+        if (context.Request.Path.StartsWithSegments("/health") ||
+            context.Request.Path.StartsWithSegments("/metrics"))
         {
             await next(context);
             return;

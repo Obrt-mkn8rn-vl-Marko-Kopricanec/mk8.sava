@@ -30,6 +30,9 @@ public sealed class SavaOptions : IValidatableObject
     public TimeSpan AsyncCopyCompletionDelay { get; init; } = TimeSpan.FromSeconds(1);
     public TimeSpan MaintenanceScanInterval { get; init; } = TimeSpan.FromSeconds(1);
     public TimeSpan UncommittedBlockRetention { get; init; } = TimeSpan.FromDays(7);
+    public TimeSpan AbandonedStagingRetention { get; init; } = TimeSpan.FromDays(1);
+    public int MaximumStagingFilesPerMaintenancePass { get; init; } = 256;
+    public int IntegrityScanChunksPerMaintenancePass { get; init; } = 256;
     public BearerAuthenticationOptions BearerAuthentication { get; init; } = new();
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
@@ -91,6 +94,19 @@ public sealed class SavaOptions : IValidatableObject
 
         if (UncommittedBlockRetention <= TimeSpan.Zero)
             yield return new ValidationResult("UncommittedBlockRetention must be positive.", [nameof(UncommittedBlockRetention)]);
+
+        if (AbandonedStagingRetention <= TimeSpan.Zero)
+            yield return new ValidationResult("AbandonedStagingRetention must be positive.", [nameof(AbandonedStagingRetention)]);
+
+        if (MaximumStagingFilesPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "MaximumStagingFilesPerMaintenancePass must be positive.",
+                [nameof(MaximumStagingFilesPerMaintenancePass)]);
+
+        if (IntegrityScanChunksPerMaintenancePass <= 0)
+            yield return new ValidationResult(
+                "IntegrityScanChunksPerMaintenancePass must be positive.",
+                [nameof(IntegrityScanChunksPerMaintenancePass)]);
 
         if (BearerAuthentication.Enabled)
         {

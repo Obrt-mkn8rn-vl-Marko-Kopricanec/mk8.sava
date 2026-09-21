@@ -33,11 +33,23 @@ public sealed record StorageMaintenanceResult(
     int PurgedSoftDeletedBlobs,
     int PurgedSoftDeletedContainers,
     int ExpiredUncommittedBlocks,
-    int ReclaimedChunks);
+    int ReclaimedChunks,
+    int ReclaimedStagingFiles);
 
-public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOptions<SavaOptions> configuredOptions)
+public sealed class BlobService(
+    MetadataStore metadata,
+    ChunkStore chunks,
+    StorageTelemetry telemetry,
+    IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
+    private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
+    private string? _integrityCursor;
+    private int _integrityChecked;
+    private int _integrityVerified;
+    private int _integrityCustomerKey;
+    private int _integrityMissing;
+    private int _integrityCorrupt;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
@@ -1296,6 +1308,19 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
 
     public async Task<StorageMaintenanceResult> RunMaintenanceAsync(CancellationToken cancellationToken)
     {
+        await _maintenanceGate.WaitAsync(cancellationToken);
+        try
+        {
+            return await RunMaintenanceCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _maintenanceGate.Release();
+        }
+    }
+
+    private async Task<StorageMaintenanceResult> RunMaintenanceCoreAsync(CancellationToken cancellationToken)
+    {
         var completedCopies = await CompletePendingCopiesAsync(cancellationToken);
         var completedRehydrations = 0;
         var expiredBlobs = 0;
@@ -1391,18 +1416,43 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
         var expiredBlocks = await metadata.DeleteStagedBlocksOlderThanAsync(
             now.Subtract(_options.UncommittedBlockRetention),
             cancellationToken);
-        var reclaimedChunks = await CollectGarbageAsync(cancellationToken);
-        return new StorageMaintenanceResult(
+        var reclaimedStagingFiles = chunks.DeleteAbandonedStagingFiles(
+            now.Subtract(_options.AbandonedStagingRetention),
+            _options.MaximumStagingFilesPerMaintenancePass);
+        var collection = await CollectGarbageWithInventoryAsync(cancellationToken);
+        await ScanIntegrityAsync(collection.Inventory, cancellationToken);
+        var physical = chunks.MeasurePhysicalUsage();
+        var usage = new StorageUsageSnapshot(
+            collection.Inventory.LogicalBlobBytes,
+            collection.Inventory.LogicalStagedBlockBytes,
+            physical.ChunkBytes,
+            physical.StagingBytes,
+            physical.MetadataBytes,
+            collection.Inventory.BlobRecordCount,
+            collection.Inventory.StagedBlockCount,
+            physical.ChunkCount,
+            collection.Inventory.ReachableChunkIds.Count(id => !id.EndsWith("/$zero", StringComparison.Ordinal)));
+        var result = new StorageMaintenanceResult(
             completedCopies,
             completedRehydrations,
             expiredBlobs,
             purgedBlobs,
             purgedContainers,
             expiredBlocks,
-            reclaimedChunks);
+            collection.ReclaimedChunks,
+            reclaimedStagingFiles);
+        telemetry.RecordMaintenance(result, usage);
+        return result;
     }
 
     public async Task<int> CollectGarbageAsync(CancellationToken cancellationToken)
+    {
+        var result = await CollectGarbageWithInventoryAsync(cancellationToken);
+        return result.ReclaimedChunks;
+    }
+
+    private async Task<(int ReclaimedChunks, StorageMetadataInventory Inventory)> CollectGarbageWithInventoryAsync(
+        CancellationToken cancellationToken)
     {
         var firstReachabilitySnapshot = await metadata.GetReachableChunkIdsAsync(cancellationToken);
         var reservations = new List<ChunkStore.ChunkReclamationReservation>();
@@ -1419,20 +1469,96 @@ public sealed class BlobService(MetadataStore metadata, ChunkStore chunks, IOpti
                     reservations.Add(reservation);
             }
 
-            var confirmedReachable = await metadata.GetReachableChunkIdsAsync(cancellationToken);
+            var confirmedInventory = await metadata.GetStorageInventoryAsync(cancellationToken);
             foreach (var reservation in reservations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!confirmedReachable.Contains(reservation.Id) && reservation.TryDelete())
+                if (!confirmedInventory.ReachableChunkIds.Contains(reservation.Id) && reservation.TryDelete())
                     deleted++;
             }
+            return (deleted, confirmedInventory);
         }
         finally
         {
             foreach (var reservation in reservations)
                 reservation.Dispose();
         }
-        return deleted;
+    }
+
+    private async Task ScanIntegrityAsync(
+        StorageMetadataInventory inventory,
+        CancellationToken cancellationToken)
+    {
+        var ids = inventory.ReachableChunkIds
+            .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (ids.Length == 0)
+        {
+            ResetIntegrityCycle();
+            telemetry.RecordIntegrity(new StorageIntegritySnapshot(
+                0, 0, 0, 0, 0, 0, true, metadata.GetUtcNow()));
+            return;
+        }
+
+        if (_integrityCursor is null)
+            ResetIntegrityCycle();
+        var start = _integrityCursor is null
+            ? 0
+            : Array.FindIndex(ids, id => string.CompareOrdinal(id, _integrityCursor) > 0);
+        if (start < 0)
+        {
+            ResetIntegrityCycle();
+            start = 0;
+        }
+        var end = Math.Min(ids.Length, start + _options.IntegrityScanChunksPerMaintenancePass);
+        for (var index = start; index < end; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var status = await chunks.VerifyChunkAsync(ids[index], cancellationToken);
+            _integrityChecked++;
+            switch (status)
+            {
+                case ChunkIntegrityStatus.Verified:
+                    _integrityVerified++;
+                    break;
+                case ChunkIntegrityStatus.RequiresCustomerKey:
+                    _integrityCustomerKey++;
+                    break;
+                case ChunkIntegrityStatus.Missing:
+                    _integrityMissing++;
+                    break;
+                case ChunkIntegrityStatus.Corrupt:
+                    _integrityCorrupt++;
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(status));
+            }
+        }
+
+        var complete = end == ids.Length;
+        var snapshot = new StorageIntegritySnapshot(
+            ids.Length,
+            _integrityChecked,
+            _integrityVerified,
+            _integrityCustomerKey,
+            _integrityMissing,
+            _integrityCorrupt,
+            complete,
+            metadata.GetUtcNow());
+        if (complete || !snapshot.Healthy || telemetry.Integrity.Healthy)
+            telemetry.RecordIntegrity(snapshot);
+        _integrityCursor = complete ? null : ids[end - 1];
+    }
+
+    private void ResetIntegrityCycle()
+    {
+        _integrityCursor = null;
+        _integrityChecked = 0;
+        _integrityVerified = 0;
+        _integrityCustomerKey = 0;
+        _integrityMissing = 0;
+        _integrityCorrupt = 0;
     }
 
     private async Task<BlobRecord> CompleteCopyIfDueAsync(

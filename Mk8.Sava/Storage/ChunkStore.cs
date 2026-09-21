@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.IO.Compression;
 using System.Text;
 using Microsoft.Extensions.Options;
@@ -354,6 +355,140 @@ public sealed class ChunkStore
         Directory.EnumerateFiles(_paths.Chunks, "*.chunk", SearchOption.AllDirectories)
             .Select(path => Path.GetRelativePath(_paths.Chunks, path)[..^".chunk".Length].Replace(Path.DirectorySeparatorChar, '/'));
 
+    public StoragePhysicalUsage MeasurePhysicalUsage()
+    {
+        long chunkBytes = 0;
+        var chunkCount = 0;
+        foreach (var path in Directory.EnumerateFiles(_paths.Chunks, "*.chunk", SearchOption.AllDirectories))
+        {
+            try
+            {
+                chunkBytes = checked(chunkBytes + new FileInfo(path).Length);
+                chunkCount++;
+            }
+            catch (FileNotFoundException)
+            {
+                // A concurrent reclamation removed the file after enumeration.
+            }
+        }
+
+        long stagingBytes = 0;
+        foreach (var path in Directory.EnumerateFiles(_paths.Staging, "*", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                stagingBytes = checked(stagingBytes + new FileInfo(path).Length);
+            }
+            catch (FileNotFoundException)
+            {
+                // A request completed and removed its staging file after enumeration.
+            }
+        }
+
+        long metadataBytes = 0;
+        foreach (var path in new[] { _paths.Database, _paths.Database + "-wal", _paths.Database + "-shm" })
+        {
+            try
+            {
+                metadataBytes = checked(metadataBytes + new FileInfo(path).Length);
+            }
+            catch (FileNotFoundException)
+            {
+            }
+        }
+
+        return new StoragePhysicalUsage(chunkBytes, stagingBytes, metadataBytes, chunkCount);
+    }
+
+    public int DeleteAbandonedStagingFiles(DateTimeOffset olderThan, int maximumFiles)
+    {
+        if (maximumFiles <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumFiles));
+
+        var deleted = 0;
+        foreach (var path in Directory.EnumerateFiles(_paths.Staging, "*.tmp", SearchOption.TopDirectoryOnly))
+        {
+            if (deleted >= maximumFiles)
+                break;
+            try
+            {
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 ||
+                    File.GetLastWriteTimeUtc(path) > olderThan.UtcDateTime)
+                {
+                    continue;
+                }
+
+                using var abandoned = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.DeleteOnClose);
+                deleted++;
+            }
+            catch (FileNotFoundException)
+            {
+                // The owning request completed after enumeration.
+            }
+            catch (IOException)
+            {
+                // An active request still owns the file, or another pass won the race.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Leave a file that cannot be opened safely and report it through staging bytes.
+            }
+        }
+        return deleted;
+    }
+
+    public async Task<ChunkIntegrityStatus> VerifyChunkAsync(string id, CancellationToken cancellationToken)
+    {
+        if (id.EndsWith("/$zero", StringComparison.Ordinal))
+            return ChunkIntegrityStatus.Verified;
+
+        string domain;
+        try
+        {
+            domain = GetDomainFromChunkId(id);
+            if (!await TryPinIdAsync(id, cancellationToken))
+                return ChunkIntegrityStatus.Missing;
+        }
+        catch (FileNotFoundException)
+        {
+            return ChunkIntegrityStatus.Missing;
+        }
+        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return ChunkIntegrityStatus.Corrupt;
+        }
+
+        try
+        {
+            if (domain.Contains("/$cpk-", StringComparison.Ordinal))
+            {
+                await VerifyCustomerKeyChunkStructureAsync(id, cancellationToken);
+                return ChunkIntegrityStatus.RequiresCustomerKey;
+            }
+
+            _ = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken);
+            return ChunkIntegrityStatus.Verified;
+        }
+        catch (FileNotFoundException)
+        {
+            return ChunkIntegrityStatus.Missing;
+        }
+        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+        {
+            return ChunkIntegrityStatus.Corrupt;
+        }
+        finally
+        {
+            UnpinId(id);
+        }
+    }
+
     internal ChunkReclamationReservation? TryReserveForReclamation(string id)
     {
         lock (_pinGate)
@@ -688,7 +823,85 @@ public sealed class ChunkStore
         var actualHash = SHA256.HashData(decoded);
         if (!CryptographicOperations.FixedTimeEquals(actualHash, header.AsSpan(expectedHashOffset, 32)))
             throw new InvalidDataException($"Chunk '{id}' failed its plaintext integrity check.");
+        ValidateChunkIdentity(id, decoded.Length, actualHash);
         return decoded;
+    }
+
+    private async Task VerifyCustomerKeyChunkStructureAsync(string id, CancellationToken cancellationToken)
+    {
+        var path = GetChunkPath(id);
+        await using var input = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            128 * 1024,
+            FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var header = new byte[HeaderLength];
+        await input.ReadExactlyAsync(header, cancellationToken);
+        if (BinaryPrimitives.ReadUInt64LittleEndian(header) != Magic)
+            throw new InvalidDataException($"Chunk '{id}' has an invalid format marker.");
+        if (header[sizeof(ulong) + sizeof(byte)] != EncryptionVersion)
+            throw new InvalidDataException($"Chunk '{id}' uses an unsupported encryption format.");
+        if (header[sizeof(ulong)] is not (0 or 1))
+            throw new InvalidDataException($"Chunk '{id}' uses an unsupported codec.");
+
+        var decodedLength = BinaryPrimitives.ReadInt32LittleEndian(header.AsSpan(sizeof(ulong) + 2 * sizeof(byte)));
+        if (decodedLength < 0 || decodedLength > _options.MaximumChunkBytes)
+            throw new InvalidDataException($"Chunk '{id}' has an invalid decoded length.");
+        var ciphertextLength = input.Length - HeaderLength;
+        if (ciphertextLength < 0 || ciphertextLength > _options.MaximumChunkBytes)
+            throw new InvalidDataException($"Chunk '{id}' has an invalid encoded length.");
+
+        var expectedHashOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int);
+        ValidateChunkIdentity(id, decodedLength, header.AsSpan(expectedHashOffset, 32));
+    }
+
+    private static void ValidateChunkIdentity(string id, int decodedLength, ReadOnlySpan<byte> actualHash)
+    {
+        var nameOffset = id.LastIndexOf('/') + 1;
+        var name = id[nameOffset..];
+        if (name.Length < 66 || name[64] != '-')
+            throw new InvalidDataException($"Chunk '{id}' has an invalid content identity.");
+        var collisionOffset = name.IndexOf('-', 65);
+        var lengthCharacterCount = collisionOffset >= 0 ? collisionOffset - 65 : name.Length - 65;
+        if (!int.TryParse(
+                name.AsSpan(65, lengthCharacterCount),
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var recordedLength) ||
+            recordedLength != decodedLength)
+        {
+            throw new InvalidDataException($"Chunk '{id}' has an invalid content identity.");
+        }
+
+        byte[] recordedHash;
+        try
+        {
+            recordedHash = Convert.FromHexString(name[..64]);
+        }
+        catch (FormatException exception)
+        {
+            throw new InvalidDataException($"Chunk '{id}' has an invalid content identity.", exception);
+        }
+        if (!CryptographicOperations.FixedTimeEquals(recordedHash, actualHash))
+        {
+            throw new InvalidDataException($"Chunk '{id}' does not match its content identity.");
+        }
+    }
+
+    private static string GetDomainFromChunkId(string id)
+    {
+        var firstSeparator = id.IndexOf('/', StringComparison.Ordinal);
+        if (firstSeparator <= 0)
+            throw new InvalidDataException("A chunk identifier is invalid.");
+        if (id[0] == '$')
+            return id[..firstSeparator];
+
+        var secondSeparator = id.IndexOf('/', firstSeparator + 1);
+        if (secondSeparator > firstSeparator + 1 && id[firstSeparator + 1] == '$')
+            return id[..secondSeparator];
+        return id[..firstSeparator];
     }
 
     private string ResolveDomain(string account, BlobEncryption encryption)
