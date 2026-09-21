@@ -4,6 +4,7 @@
     <RootNamespace>Mk8.Sava</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="22.1.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12" />
   </ItemGroup>
   <ItemGroup>

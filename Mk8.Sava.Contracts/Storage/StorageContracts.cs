@@ -10,7 +10,8 @@ public sealed record BlobWriteOptions(
     bool HasLegalHold = false,
     string? EncryptionScope = null,
     string? CustomerProvidedKeySha256 = null,
-    byte[]? CustomerProvidedKey = null);
+    byte[]? CustomerProvidedKey = null,
+    bool? AccessTierInferred = null);
 
 public sealed record PageRange(long Start, long End);
 

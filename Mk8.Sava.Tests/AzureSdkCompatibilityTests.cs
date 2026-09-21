@@ -545,6 +545,152 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ApacheArrowListingsHonorSchemaRangesHierarchyAndScopedPaging()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"arrow-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("a.txt").UploadAsync(BinaryData.FromString("a"));
+        await container.GetBlobClient("b.txt").UploadAsync(
+            BinaryData.FromString("b"),
+            new BlobUploadOptions
+            {
+                HttpHeaders = new BlobHttpHeaders { ContentType = "text/x-arrow-fixture" },
+                Metadata = new Dictionary<string, string> { ["owner"] = "arrow" },
+                Tags = new Dictionary<string, string> { ["kind"] = "boundary" },
+                AccessTier = AccessTier.Cool
+            });
+        await container.GetBlobClient("c/one.txt").UploadAsync(BinaryData.FromString("c1"));
+        await container.GetBlobClient("c/two.txt").UploadAsync(BinaryData.FromString("c2"));
+        await container.GetBlobClient("d.txt").UploadAsync(BinaryData.FromString("d"));
+
+        var listed = new List<BlobItem>();
+        var continuationTokens = new List<string>();
+        await foreach (var page in container
+                           .GetBlobsAsync(new GetBlobsOptions
+                           {
+                               ResponseFormat = StorageResponseFormat.Arrow,
+                               Traits = BlobTraits.Metadata | BlobTraits.Tags,
+                               StartFrom = "b.txt",
+                               EndBefore = "d.txt"
+                           })
+                           .AsPages(pageSizeHint: 1))
+        {
+            Assert.Single(page.Values);
+            listed.Add(page.Values[0]);
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                continuationTokens.Add(page.ContinuationToken);
+        }
+        Assert.Equal(["b.txt", "c/one.txt", "c/two.txt"], listed.Select(item => item.Name));
+        Assert.Equal("arrow", listed[0].Metadata["owner"]);
+        Assert.Equal("boundary", listed[0].Tags["kind"]);
+        Assert.Equal("text/x-arrow-fixture", listed[0].Properties.ContentType);
+        Assert.Equal(AccessTier.Cool, listed[0].Properties.AccessTier);
+        Assert.False(listed[0].Properties.AccessTierInferred);
+        Assert.True((await container.GetBlobClient("a.txt").GetPropertiesAsync()).Value.AccessTierInferred);
+        Assert.Equal(2, continuationTokens.Count);
+        Assert.Equal(2, continuationTokens.Distinct(StringComparer.Ordinal).Count());
+
+        var hierarchy = new List<string>();
+        await foreach (var item in container.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+        {
+            Delimiter = "/",
+            ResponseFormat = StorageResponseFormat.Arrow,
+            StartFrom = "b.txt",
+            EndBefore = "d.txt"
+        }))
+        {
+            hierarchy.Add(item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}");
+        }
+        Assert.Equal(["P:c/", "B:b.txt"], hierarchy);
+
+        var empty = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            ResponseFormat = StorageResponseFormat.Arrow,
+            StartFrom = "d.txt",
+            EndBefore = "d.txt"
+        }))
+        {
+            empty.Add(item);
+        }
+        Assert.Empty(empty);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        var listSas = container.GenerateSasUri(
+            BlobContainerSasPermissions.List,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        var arrowUri = AppendQuery(
+            listSas,
+            "restype=container&comp=list&include=metadata%2Ctags&startfrom=b.txt&endbefore=d.txt&maxresults=2");
+        using (var arrowRequest = new HttpRequestMessage(HttpMethod.Get, arrowUri))
+        {
+            arrowRequest.Headers.Add("x-ms-version", "2026-06-06");
+            arrowRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(AzureResponseWriter.ArrowStreamContentType));
+            using var arrowResponse = await transport.SendAsync(
+                arrowRequest,
+                HttpCompletionOption.ResponseHeadersRead);
+            Assert.Equal(HttpStatusCode.OK, arrowResponse.StatusCode);
+            Assert.Equal(AzureResponseWriter.ArrowStreamContentType, arrowResponse.Content.Headers.ContentType?.MediaType);
+            await using var responseStream = await arrowResponse.Content.ReadAsStreamAsync();
+            using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(responseStream);
+            Assert.Equal("2", reader.Schema.Metadata["NumberOfRecords"]);
+            Assert.False(string.IsNullOrEmpty(reader.Schema.Metadata["NextMarker"]));
+            Assert.False(reader.Schema["Name"].IsNullable);
+            Assert.False(reader.Schema["ResourceType"].IsNullable);
+            Assert.Equal(
+                Apache.Arrow.Types.TimeUnit.Second,
+                Assert.IsType<Apache.Arrow.Types.TimestampType>(reader.Schema["Creation-Time"].DataType).Unit);
+            using var batch = await reader.ReadNextRecordBatchAsync();
+            Assert.NotNull(batch);
+            Assert.Equal(2, batch.Length);
+            var names = Assert.IsType<Apache.Arrow.StringArray>(batch.Column("Name"));
+            Assert.Equal("b.txt", names.GetString(0));
+            Assert.Equal("c/one.txt", names.GetString(1));
+            var inferred = Assert.IsType<Apache.Arrow.BooleanArray>(batch.Column("AccessTierInferred"));
+            Assert.True(inferred.IsNull(0));
+            Assert.True(inferred.GetValue(1));
+            Assert.NotNull(batch.Column("Metadata"));
+            Assert.NotNull(batch.Column("Tags"));
+            Assert.Null(await reader.ReadNextRecordBatchAsync());
+        }
+
+        var reboundUri = AppendQuery(
+            listSas,
+            "restype=container&comp=list&startfrom=b.txt&endbefore=c%2Ftwo.txt&maxresults=1" +
+            $"&marker={Uri.EscapeDataString(continuationTokens[0])}");
+        using (var reboundRequest = new HttpRequestMessage(HttpMethod.Get, reboundUri))
+        {
+            reboundRequest.Headers.Add("x-ms-version", "2026-06-06");
+            reboundRequest.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(AzureResponseWriter.ArrowStreamContentType));
+            using var reboundResponse = await transport.SendAsync(reboundRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, reboundResponse.StatusCode);
+            Assert.Equal("InvalidQueryParameterValue", reboundResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        async Task AssertRejectedAsync(Uri uri, string version, bool arrow)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.Add("x-ms-version", version);
+            if (arrow)
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(AzureResponseWriter.ArrowStreamContentType));
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("application/xml", response.Content.Headers.ContentType?.MediaType);
+        }
+
+        await AssertRejectedAsync(arrowUri, "2026-04-06", arrow: true);
+        await AssertRejectedAsync(
+            AppendQuery(listSas, "restype=container&comp=list&endbefore=d.txt"),
+            "2026-06-06",
+            arrow: false);
+        await AssertRejectedAsync(
+            AppendQuery(listSas, "restype=container&comp=list&startfrom=d.txt&endbefore=b.txt"),
+            "2026-06-06",
+            arrow: true);
+    }
+
+    [Fact]
     public async Task BlobFamilyMutationsAreIndexedAndAtomic()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
