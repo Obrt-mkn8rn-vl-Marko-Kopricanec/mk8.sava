@@ -1,10 +1,12 @@
-<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <AssemblyName>Mk8.Sava</AssemblyName>
+    <AssemblyName>Mk8.Sava.DAL</AssemblyName>
     <RootNamespace>Mk8.Sava</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
   </ItemGroup>
 </Project>

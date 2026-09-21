@@ -252,6 +252,31 @@ internal sealed record BlobRecordMutation(
     string ExpectedRevision,
     BlobRecord? Replacement);
 
+internal sealed record ChunkPackRecord(
+    string PackId,
+    string Domain,
+    DateTimeOffset CreatedAt,
+    bool Sealed);
+
+internal sealed record PackedChunkLocation(
+    string ChunkId,
+    string PackId,
+    long RecordOffset,
+    int RecordLength,
+    long PayloadOffset,
+    int PayloadLength);
+
+internal sealed record ChunkPackPage(IReadOnlyList<ChunkPackRecord> Items, bool HasMore);
+
+internal sealed record PackCompactionResult(
+    int ExaminedPacks,
+    int CompactedPacks,
+    int ReclaimedRecords,
+    long BytesSaved)
+{
+    public static PackCompactionResult Skipped { get; } = new(0, 0, 0, 0);
+}
+
 internal sealed class MetadataBackupSnapshot(
     StorageMetadataInventory inventory,
     IDisposable contentPins) : IDisposable

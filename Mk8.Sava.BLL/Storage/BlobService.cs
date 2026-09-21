@@ -6,42 +6,10 @@ using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
 
-public sealed record BlobWriteOptions(
-    BlobHttpProperties Http,
-    Dictionary<string, string> Metadata,
-    Dictionary<string, string>? Tags = null,
-    string? AccessTier = null,
-    DateTimeOffset? ImmutabilityUntil = null,
-    bool ImmutabilityLocked = false,
-    bool HasLegalHold = false,
-    string? EncryptionScope = null,
-    string? CustomerProvidedKeySha256 = null,
-    byte[]? CustomerProvidedKey = null);
-
-public sealed record PageRange(long Start, long End);
-
-public sealed record PageRangeDiff(
-    IReadOnlyList<PageRange> PageRanges,
-    IReadOnlyList<PageRange> ClearRanges);
-
-public sealed record BlobTierUpdate(BlobRecord Blob, bool Pending);
-
-public sealed record StorageMaintenanceResult(
-    int CompletedCopies,
-    int CompletedRehydrations,
-    int ExpiredBlobs,
-    int PurgedSoftDeletedBlobs,
-    int PurgedSoftDeletedContainers,
-    int ExpiredUncommittedBlocks,
-    int ReclaimedChunks,
-    int ReclaimedStagingFiles,
-    int RecompressedChunks,
-    long RecompressionBytesSaved);
-
 public sealed class BlobService(
     MetadataStore metadata,
     ChunkStore chunks,
-    StorageTelemetry telemetry,
+    IStorageTelemetry telemetry,
     IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
@@ -56,6 +24,7 @@ public sealed class BlobService(
     private ContainerKey? _containerMaintenanceCursor;
     private string? _garbageCollectionCursor;
     private string? _recompressionCursor;
+    private string? _packCompactionCursor;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
@@ -1555,6 +1524,15 @@ public sealed class BlobService(
             now.Subtract(_options.AbandonedStagingRetention),
             _options.MaximumStagingFilesPerMaintenancePass);
         var reclaimedChunks = await CollectGarbageBatchAsync(cancellationToken);
+        _ = await metadata.SealChunkPacksOlderThanAsync(
+            now.Subtract(_options.ChunkPackSealAge),
+            _options.ChunkPacksPerMaintenancePass,
+            cancellationToken);
+        var orphanedPacks = await chunks.ReclaimOrphanedPacksAsync(
+            now.Subtract(_options.ChunkPackSealAge),
+            _options.ChunkPacksPerMaintenancePass,
+            cancellationToken);
+        var packCompaction = await CompactChunkPacksAsync(cancellationToken);
         var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken);
         await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken);
         var recompression = await RecompressColdChunksAsync(now, cancellationToken);
@@ -1579,7 +1557,9 @@ public sealed class BlobService(
             reclaimedChunks,
             reclaimedStagingFiles,
             recompression.RecompressedChunks,
-            recompression.BytesSaved);
+            recompression.BytesSaved,
+            checked(packCompaction.CompactedPacks + orphanedPacks.ReclaimedPacks),
+            checked(packCompaction.BytesSaved + orphanedPacks.BytesSaved));
         telemetry.RecordMaintenance(result, usage);
         return result;
     }
@@ -1600,9 +1580,10 @@ public sealed class BlobService(
     private async Task<int> CollectGarbageBatchAsync(
         CancellationToken cancellationToken)
     {
-        var page = chunks.EnumerateChunkIdsPage(
+        var page = await chunks.EnumerateChunkIdsPageAsync(
             _garbageCollectionCursor,
-            _options.GarbageCollectionChunksPerMaintenancePass);
+            _options.GarbageCollectionChunksPerMaintenancePass,
+            cancellationToken);
         if (page.Items.Count == 0)
         {
             _garbageCollectionCursor = null;
@@ -1630,8 +1611,11 @@ public sealed class BlobService(
             foreach (var reservation in reservations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!confirmedReachability.Contains(reservation.Id) && reservation.TryDelete())
+                if (!confirmedReachability.Contains(reservation.Id) &&
+                    await reservation.TryDeleteAsync(cancellationToken))
+                {
                     deleted++;
+                }
             }
             _garbageCollectionCursor = page.HasMore ? page.Items[^1] : null;
             return deleted;
@@ -1706,6 +1690,36 @@ public sealed class BlobService(
         if (complete || !snapshot.Healthy || telemetry.Integrity.Healthy)
             telemetry.RecordIntegrity(snapshot);
         _integrityCursor = complete ? null : page.Items[^1];
+    }
+
+    private async Task<PackCompactionResult> CompactChunkPacksAsync(
+        CancellationToken cancellationToken)
+    {
+        var page = await metadata.ListSealedChunkPacksAsync(
+            _packCompactionCursor,
+            _options.ChunkPacksPerMaintenancePass,
+            cancellationToken);
+        if (page.Items.Count == 0)
+        {
+            _packCompactionCursor = null;
+            return PackCompactionResult.Skipped;
+        }
+
+        var examined = 0;
+        var compacted = 0;
+        var reclaimedRecords = 0;
+        long bytesSaved = 0;
+        foreach (var pack in page.Items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var result = await chunks.TryCompactPackAsync(pack, cancellationToken);
+            examined += result.ExaminedPacks;
+            compacted += result.CompactedPacks;
+            reclaimedRecords += result.ReclaimedRecords;
+            bytesSaved = checked(bytesSaved + result.BytesSaved);
+        }
+        _packCompactionCursor = page.HasMore ? page.Items[^1].PackId : null;
+        return new PackCompactionResult(examined, compacted, reclaimedRecords, bytesSaved);
     }
 
     private void ResetIntegrityCycle()

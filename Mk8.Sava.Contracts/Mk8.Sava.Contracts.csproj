@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Mk8.Sava.Contracts</AssemblyName>
+    <RootNamespace>Mk8.Sava</RootNamespace>
+  </PropertyGroup>
+</Project>

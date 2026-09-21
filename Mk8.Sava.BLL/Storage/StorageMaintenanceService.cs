@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 
@@ -5,7 +7,7 @@ namespace Mk8.Sava.Storage;
 
 public sealed class StorageMaintenanceService(
     BlobService blobs,
-    StorageTelemetry telemetry,
+    IStorageTelemetry telemetry,
     IOptions<SavaOptions> configuredOptions,
     ILogger<StorageMaintenanceService> logger) : BackgroundService
 {
@@ -18,17 +20,21 @@ public sealed class StorageMaintenanceService(
             try
             {
                 var result = await blobs.RunMaintenanceAsync(stoppingToken);
-                if (result is not { CompletedCopies: 0, CompletedRehydrations: 0, ExpiredBlobs: 0,
+                if (result is not
+                    {
+                        CompletedCopies: 0, CompletedRehydrations: 0, ExpiredBlobs: 0,
                         PurgedSoftDeletedBlobs: 0, PurgedSoftDeletedContainers: 0,
                         ExpiredUncommittedBlocks: 0, ReclaimedChunks: 0, ReclaimedStagingFiles: 0,
-                        RecompressedChunks: 0 })
+                        RecompressedChunks: 0, CompactedChunkPacks: 0
+                    })
                 {
                     logger.LogInformation(
                         "Storage maintenance completed: {CompletedCopies} copies, {CompletedRehydrations} rehydrations, " +
                         "{ExpiredBlobs} expired blobs, {PurgedBlobs} purged blobs, {PurgedContainers} purged containers, " +
                         "{ExpiredBlocks} expired blocks, {ReclaimedChunks} reclaimed chunks, and " +
                         "{ReclaimedStagingFiles} reclaimed staging files; {RecompressedChunks} chunks recompressed, " +
-                        "saving {RecompressionBytesSaved} bytes.",
+                        "saving {RecompressionBytesSaved} bytes; {CompactedPacks} chunk packs compacted, " +
+                        "saving {PackCompactionBytesSaved} bytes.",
                         result.CompletedCopies,
                         result.CompletedRehydrations,
                         result.ExpiredBlobs,
@@ -38,7 +44,9 @@ public sealed class StorageMaintenanceService(
                         result.ReclaimedChunks,
                         result.ReclaimedStagingFiles,
                         result.RecompressedChunks,
-                        result.RecompressionBytesSaved);
+                        result.RecompressionBytesSaved,
+                        result.CompactedChunkPacks,
+                        result.PackCompactionBytesSaved);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

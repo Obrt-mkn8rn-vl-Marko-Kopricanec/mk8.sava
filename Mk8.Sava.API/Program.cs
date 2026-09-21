@@ -44,7 +44,9 @@ builder.Services.AddOptions<JwtBearerOptions>(StorageAuthenticator.BearerScheme)
         jwt.MapInboundClaims = false;
     });
 builder.Services.AddSingleton<StoragePaths>();
+builder.Services.AddSingleton<IStoragePaths>(services => services.GetRequiredService<StoragePaths>());
 builder.Services.AddSingleton<StorageTelemetry>();
+builder.Services.AddSingleton<IStorageTelemetry>(services => services.GetRequiredService<StorageTelemetry>());
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<BlobService>();
@@ -108,7 +110,7 @@ app.UseMiddleware<RequestContextMiddleware>();
 app.MapGet("/health/live", () => Results.Ok(new { status = "live" }));
 app.MapGet("/health/ready", async (
     MetadataStore store,
-    StorageTelemetry telemetry,
+    IStorageTelemetry telemetry,
     CancellationToken cancellationToken) =>
 {
     var metadataReady = await store.IsReadyAsync(cancellationToken);
@@ -132,7 +134,7 @@ app.MapGet("/health/ready", async (
         },
         statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
 });
-app.MapGet("/metrics", (StorageTelemetry telemetry) =>
+app.MapGet("/metrics", (IStorageTelemetry telemetry) =>
     Results.Text(telemetry.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 

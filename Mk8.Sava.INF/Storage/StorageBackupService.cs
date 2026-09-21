@@ -4,15 +4,6 @@ using Mk8.Sava.Configuration;
 
 namespace Mk8.Sava.Storage;
 
-public sealed record StorageBackupValidation(
-    string BackupPath,
-    DateTimeOffset CreatedAt,
-    int BlobRecordCount,
-    int StagedBlockCount,
-    int ChunkCount,
-    long LogicalBytes,
-    long PhysicalBytes);
-
 public sealed class StorageBackupService(
     MetadataStore metadata,
     ChunkStore chunks,
@@ -51,6 +42,9 @@ public sealed class StorageBackupService(
                 metadataPath,
                 chunks.PinChunkIds,
                 cancellationToken);
+            await MetadataStore.NormalizePackedLocationsForStandaloneBackupAsync(
+                metadataPath,
+                cancellationToken);
             FlushFileToDisk(metadataPath);
             var chunkEntries = new List<BackupChunkEntry>();
             foreach (var id in snapshot.Inventory.ReachableChunkIds
@@ -62,10 +56,10 @@ public sealed class StorageBackupService(
                 if (status is ChunkIntegrityStatus.Missing or ChunkIntegrityStatus.Corrupt)
                     throw new InvalidDataException($"Cannot back up chunk '{id}' because its integrity status is {status}.");
 
-                var source = chunks.GetChunkPathForBackup(id);
                 var destinationChunk = GetChunkPath(Path.Combine(temporary, "chunks"), id);
                 Directory.CreateDirectory(Path.GetDirectoryName(destinationChunk)!);
-                var copied = await CopyAndHashAsync(source, destinationChunk, cancellationToken);
+                await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken);
+                var copied = await HashFileAsync(destinationChunk, cancellationToken);
                 chunkEntries.Add(new BackupChunkEntry(id, copied.Length, copied.Sha256));
             }
 
