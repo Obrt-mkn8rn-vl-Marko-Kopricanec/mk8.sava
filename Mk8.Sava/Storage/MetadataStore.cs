@@ -51,6 +51,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                 );
                 CREATE INDEX IF NOT EXISTS ix_containers_listing
                     ON containers(account, deleted, name);
+                CREATE INDEX IF NOT EXISTS ix_containers_enumeration
+                    ON containers(account, name);
 
                 CREATE TABLE IF NOT EXISTS blobs (
                     generation_id TEXT PRIMARY KEY,
@@ -74,6 +76,8 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
                     ON blobs(account, container, name, snapshot) WHERE snapshot IS NOT NULL;
                 CREATE INDEX IF NOT EXISTS ix_blobs_listing
                     ON blobs(account, container, is_current, is_deleted, name);
+                CREATE INDEX IF NOT EXISTS ix_blobs_enumeration
+                    ON blobs(account, container, name);
 
                 CREATE TABLE IF NOT EXISTS staged_blocks (
                     account TEXT NOT NULL,
@@ -155,6 +159,39 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
             : "SELECT data FROM containers WHERE account = $account AND deleted = 0 ORDER BY name;";
         command.Parameters.AddWithValue("$account", account);
         return await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken);
+    }
+
+    internal async Task<ContainerListPage> ListContainersPageAsync(
+        string account,
+        bool includeDeleted,
+        string prefix,
+        string marker,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT data FROM containers
+            WHERE account = $account
+              {(includeDeleted ? string.Empty : "AND deleted = 0")}
+              AND name >= $prefix
+              AND substr(name, 1, length($prefix)) = $prefix
+              AND name > $marker
+            ORDER BY name
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$prefix", prefix);
+        command.Parameters.AddWithValue("$marker", marker);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken)).ToList();
+        var hasMore = records.Count > maximum;
+        if (hasMore)
+            records.RemoveAt(records.Count - 1);
+        return new ContainerListPage(records, hasMore);
     }
 
     public async Task<ContainerRecord?> GetContainerAsync(
@@ -335,6 +372,154 @@ public sealed class MetadataStore(StoragePaths paths, TimeProvider? timeProvider
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+    }
+
+    internal async Task<BlobListPage> ListBlobsPageAsync(
+        string account,
+        string container,
+        bool includeVersions,
+        bool includeSnapshots,
+        bool includeDeleted,
+        string prefix,
+        string delimiter,
+        BlobListCursor? cursor,
+        int legacyOffset,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+        if (legacyOffset < 0)
+            throw new ArgumentOutOfRangeException(nameof(legacyOffset));
+
+        var predicates = new List<string>
+        {
+            "account = $account",
+            "container = $container",
+            "name >= $prefix",
+            "substr(name, 1, length($prefix)) = $prefix"
+        };
+        if (!includeVersions && !includeSnapshots)
+            predicates.Add("is_current = 1");
+        else if (!includeVersions)
+            predicates.Add("(is_current = 1 OR snapshot IS NOT NULL)");
+        else if (!includeSnapshots)
+            predicates.Add("snapshot IS NULL");
+        if (!includeDeleted)
+            predicates.Add("is_deleted = 0");
+
+        const string rankExpression = """
+            CASE
+                WHEN is_current = 1 THEN 0
+                WHEN version_id IS NOT NULL THEN 1
+                WHEN snapshot IS NULL THEN 2
+                ELSE 3
+            END
+            """;
+        var eligible = $"""
+            SELECT data, name, version_id, snapshot, generation_id,
+                   {rankExpression} AS rank
+            FROM blobs
+            WHERE {string.Join(" AND ", predicates)}
+            """;
+        var entries = string.IsNullOrEmpty(delimiter)
+            ? $"""
+                WITH entries AS (
+                    SELECT data, name AS entry_name, 1 AS entry_type, rank,
+                           version_id, snapshot, generation_id
+                    FROM ({eligible})
+                )
+                """
+            : $"""
+                WITH eligible AS (
+                    SELECT source.*,
+                           instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
+                    FROM ({eligible}) AS source
+                ),
+                entries AS (
+                    SELECT DISTINCT
+                           NULL AS data,
+                           substr(
+                               name,
+                               1,
+                               length($prefix) + delimiter_offset + length($delimiter) - 1) AS entry_name,
+                           0 AS entry_type,
+                           -1 AS rank,
+                           NULL AS version_id,
+                           NULL AS snapshot,
+                           '' AS generation_id
+                    FROM eligible
+                    WHERE delimiter_offset > 0
+                    UNION ALL
+                    SELECT data, name AS entry_name, 1 AS entry_type, rank,
+                           version_id, snapshot, generation_id
+                    FROM eligible
+                    WHERE delimiter_offset = 0
+                )
+                """;
+
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            {entries}
+            SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id
+            FROM entries
+            WHERE $has_cursor = 0
+               OR ($name_complete = 1 AND entry_name > $cursor_name)
+               OR ($name_complete = 0 AND (
+                    entry_name > $cursor_name
+                    OR (entry_name = $cursor_name AND (
+                        entry_type > $cursor_type
+                        OR (entry_type = $cursor_type AND entry_type = 1 AND (
+                            rank > $cursor_rank
+                            OR (rank = $cursor_rank AND (
+                                ($cursor_rank = 1 AND (
+                                    version_id < $ordered_id
+                                    OR (version_id = $ordered_id AND generation_id > $generation_id)
+                                ))
+                                OR ($cursor_rank = 3 AND (
+                                    snapshot > $ordered_id
+                                    OR (snapshot = $ordered_id AND generation_id > $generation_id)
+                                ))
+                                OR ($cursor_rank NOT IN (1, 3) AND generation_id > $generation_id)
+                            ))
+                        ))
+                    ))
+               ))
+            ORDER BY entry_name COLLATE BINARY,
+                     entry_type,
+                     rank,
+                     CASE WHEN rank = 1 THEN version_id END DESC,
+                     CASE WHEN rank = 3 THEN snapshot END,
+                     generation_id
+            LIMIT $limit OFFSET $offset;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$prefix", prefix);
+        command.Parameters.AddWithValue("$delimiter", delimiter);
+        command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
+        command.Parameters.AddWithValue("$name_complete", cursor?.NameComplete == true ? 1 : 0);
+        command.Parameters.AddWithValue("$cursor_name", cursor?.Name ?? string.Empty);
+        command.Parameters.AddWithValue("$cursor_type", cursor?.IsPrefix == true ? 0 : 1);
+        command.Parameters.AddWithValue("$cursor_rank", cursor?.Rank ?? -1);
+        command.Parameters.AddWithValue("$ordered_id", cursor?.OrderedId ?? string.Empty);
+        command.Parameters.AddWithValue("$generation_id", cursor?.GenerationId ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        command.Parameters.AddWithValue("$offset", legacyOffset);
+
+        var items = new List<BlobListEntry>(maximum + 1);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            items.Add(reader.GetInt32(2) == 0
+                ? new BlobListEntry(null, reader.GetString(1))
+                : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null));
+        }
+        var hasMore = items.Count > maximum;
+        if (hasMore)
+            items.RemoveAt(items.Count - 1);
+        return new BlobListPage(items, hasMore);
     }
 
     internal async Task<KeysetPage<BlobRecord>> ListBlobMaintenancePageAsync(
