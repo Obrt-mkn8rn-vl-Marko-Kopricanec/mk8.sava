@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Tests;
@@ -10,6 +11,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 {
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
     private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
+    private readonly TimeProvider? _timeProvider;
     private readonly bool _deleteDataPath;
 
     public const string AccountName = "devstoreaccount1";
@@ -20,17 +22,17 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public SavaWebApplicationFactory()
-        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null, true)
+        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null, null, true)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath)
-        : this(dataPath, null, null, true)
+        : this(dataPath, null, null, null, true)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath, bool deleteDataPath)
-        : this(dataPath, null, null, deleteDataPath)
+        : this(dataPath, null, null, null, deleteDataPath)
     {
     }
 
@@ -38,7 +40,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         string dataPath,
         IReadOnlyDictionary<string, string?> configurationOverrides,
         bool deleteDataPath)
-        : this(dataPath, null, configurationOverrides, deleteDataPath)
+        : this(dataPath, null, configurationOverrides, null, deleteDataPath)
     {
     }
 
@@ -46,6 +48,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         : this(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
             urlTransferHandlerFactory,
+            null,
             null,
             true)
     {
@@ -56,6 +59,19 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
             null,
             configurationOverrides,
+            null,
+            true)
+    {
+    }
+
+    internal SavaWebApplicationFactory(
+        TimeProvider timeProvider,
+        IReadOnlyDictionary<string, string?> configurationOverrides)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            null,
+            configurationOverrides,
+            timeProvider,
             true)
     {
     }
@@ -64,11 +80,13 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         string dataPath,
         Func<HttpMessageHandler>? urlTransferHandlerFactory,
         IReadOnlyDictionary<string, string?>? configurationOverrides,
+        TimeProvider? timeProvider,
         bool deleteDataPath)
     {
         DataPath = dataPath;
         _urlTransferHandlerFactory = urlTransferHandlerFactory;
         _configurationOverrides = configurationOverrides;
+        _timeProvider = timeProvider;
         _deleteDataPath = deleteDataPath;
     }
 
@@ -123,6 +141,14 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             builder.ConfigureServices(services =>
                 services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
                     .ConfigurePrimaryHttpMessageHandler(_urlTransferHandlerFactory));
+        }
+        if (_timeProvider is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton(_timeProvider);
+            });
         }
     }
 

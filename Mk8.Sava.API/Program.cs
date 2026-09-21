@@ -47,6 +47,7 @@ builder.Services.AddSingleton<StoragePaths>();
 builder.Services.AddSingleton<IStoragePaths>(services => services.GetRequiredService<StoragePaths>());
 builder.Services.AddSingleton<StorageTelemetry>();
 builder.Services.AddSingleton<IStorageTelemetry>(services => services.GetRequiredService<StorageTelemetry>());
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<BlobService>();
