@@ -231,11 +231,79 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.Equal("gzip", overriddenProperties.ContentEncoding);
             Assert.Equal("metadata", overriddenProperties.Metadata["destination"]);
             Assert.False(overriddenProperties.Metadata.ContainsKey("source"));
+
+            var tagged = container.GetBlockBlobClient("tagged.bin");
+            await tagged.SyncUploadFromUriAsync(
+                source,
+                new BlobSyncUploadFromUriOptions
+                {
+                    CopySourceTagsMode = BlobCopySourceTagsMode.Copy
+                });
+            Assert.Equal("copied", (await tagged.GetTagsAsync()).Value.Tags["source-tag"]);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    [Fact]
+    public async Task SynchronousCopyUsesItsOwnResponseLimitsAndSourceStateContract()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"sync-copy-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlockBlobClient("source.bin");
+        var blockId = Convert.ToBase64String("sync-copy-block-0001"u8);
+        await source.StageBlockAsync(blockId, BinaryData.FromString("synchronous copy payload").ToStream());
+        await source.CommitBlockListAsync(
+            [blockId],
+            new CommitBlockListOptions
+            {
+                HttpHeaders = FullHeaders("application/x-sync-source"),
+                Metadata = new Dictionary<string, string> { ["source"] = "metadata" },
+                Tags = new Dictionary<string, string> { ["source"] = "tag" }
+            });
+
+        var destination = container.GetBlockBlobClient("destination.bin");
+        var copy = await destination.SyncCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions
+            {
+                CopySourceTagsMode = BlobCopySourceTagsMode.Copy
+            });
+        Assert.Equal(202, copy.GetRawResponse().Status);
+        Assert.Equal(CopyStatus.Success, copy.Value.CopyStatus);
+        Assert.False(string.IsNullOrWhiteSpace(copy.Value.CopyId));
+        Assert.False(copy.GetRawResponse().Headers.TryGetValue("Content-MD5", out _));
+        Assert.False(copy.GetRawResponse().Headers.TryGetValue("x-ms-content-crc64", out _));
+
+        var properties = (await destination.GetPropertiesAsync()).Value;
+        Assert.Equal("application/x-sync-source", properties.ContentType);
+        Assert.Equal("br", properties.ContentEncoding);
+        Assert.Equal("metadata", properties.Metadata["source"]);
+        Assert.Equal("tag", (await destination.GetTagsAsync()).Value.Tags["source"]);
+        var blocks = await destination.GetBlockListAsync(BlockListTypes.Committed);
+        Assert.Equal(blockId, Assert.Single(blocks.Value.CommittedBlocks).Name);
+
+        var replaced = container.GetBlobClient("replaced-tags.bin");
+        await replaced.SyncCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions
+            {
+                CopySourceTagsMode = BlobCopySourceTagsMode.Replace,
+                Tags = new Dictionary<string, string> { ["destination"] = "tag" }
+            });
+        var replacedTags = (await replaced.GetTagsAsync()).Value.Tags;
+        Assert.Equal("tag", replacedTags["destination"]);
+        Assert.False(replacedTags.ContainsKey("source"));
+
+        var append = container.GetAppendBlobClient("append-source.bin");
+        await append.CreateAsync();
+        var invalidType = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            container.GetBlobClient("append-copy.bin").SyncCopyFromUriAsync(append.Uri));
+        Assert.Equal(409, invalidType.Status);
+        Assert.Equal("InvalidSourceBlobType", invalidType.ErrorCode);
     }
 
     private static HttpRequestMessage PutBlobRequest(BlockBlobClient blob, byte[] payload)
@@ -301,6 +369,17 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
+            if (request.RequestUri?.Query.Contains("comp=tags", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "<Tags><TagSet><Tag><Key>source-tag</Key><Value>copied</Value></Tag></TagSet></Tags>",
+                        Encoding.UTF8,
+                        "application/xml"),
+                    RequestMessage = request
+                });
+            }
             var response = new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new ByteArrayContent(payload),
