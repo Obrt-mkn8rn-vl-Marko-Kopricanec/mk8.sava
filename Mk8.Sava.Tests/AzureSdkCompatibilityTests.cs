@@ -189,6 +189,91 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task MetadataAndContainerPropertyResponsesExposeOnlyAzureOperationHeaders()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"response-shape-{Guid.NewGuid():N}");
+        var created = await container.CreateAsync(
+            PublicAccessType.None,
+            new Dictionary<string, string> { ["scope"] = "container" });
+        Assert.False(created.GetRawResponse().Headers.TryGetValue("x-ms-meta-scope", out _));
+
+        var properties = await container.GetPropertiesAsync();
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseStatus.Unlocked, properties.Value.LeaseStatus);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Available, properties.Value.LeaseState);
+        Assert.False(properties.Value.HasImmutabilityPolicy);
+        Assert.False(properties.Value.HasLegalHold);
+        Assert.Equal("container", properties.Value.Metadata["scope"]);
+
+        var accessPolicy = await container.GetAccessPolicyAsync();
+        Assert.False(accessPolicy.GetRawResponse().Headers.TryGetValue("x-ms-meta-scope", out _));
+        Assert.False(accessPolicy.GetRawResponse().Headers.TryGetValue("x-ms-lease-state", out _));
+
+        var setContainerMetadata = await container.SetMetadataAsync(
+            new Dictionary<string, string> { ["scope"] = "updated" });
+        Assert.False(setContainerMetadata.GetRawResponse().Headers.TryGetValue("x-ms-meta-scope", out _));
+        Assert.False(setContainerMetadata.GetRawResponse().Headers.TryGetValue("x-ms-lease-state", out _));
+
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Read);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var containerMetadataUri = AppendQuery(
+            container.Uri,
+            $"restype=container&comp=metadata&{accountSas.ToSasQueryParameters(credential)}");
+
+        var blob = container.GetBlobClient("metadata.bin");
+        await blob.UploadAsync(
+            BinaryData.FromString("metadata response payload"),
+            new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string> { ["owner"] = "mk8" },
+                Tags = new Dictionary<string, string> { ["class"] = "response" },
+                HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-response-test" }
+            });
+        var setBlobMetadata = await blob.SetMetadataAsync(
+            new Dictionary<string, string> { ["owner"] = "sava" });
+        var setBlobHeaders = setBlobMetadata.GetRawResponse().Headers;
+        Assert.True(setBlobHeaders.TryGetValue("x-ms-request-server-encrypted", out var encrypted));
+        Assert.Equal("true", encrypted);
+        Assert.False(setBlobHeaders.TryGetValue("x-ms-meta-owner", out _));
+        Assert.False(setBlobHeaders.TryGetValue("x-ms-blob-type", out _));
+        Assert.False(setBlobHeaders.TryGetValue("x-ms-lease-status", out _));
+
+        var blobMetadataUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=metadata");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        foreach (var (method, uri, metadataName, metadataValue) in new[]
+                 {
+                     (HttpMethod.Get, containerMetadataUri, "x-ms-meta-scope", "updated"),
+                     (HttpMethod.Head, containerMetadataUri, "x-ms-meta-scope", "updated"),
+                     (HttpMethod.Get, blobMetadataUri, "x-ms-meta-owner", "sava"),
+                     (HttpMethod.Head, blobMetadataUri, "x-ms-meta-owner", "sava")
+                 })
+        {
+            using var request = new HttpRequestMessage(method, uri);
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(metadataValue, response.Headers.GetValues(metadataName).Single());
+            Assert.False(response.Headers.Contains("x-ms-blob-type"));
+            Assert.False(response.Headers.Contains("x-ms-lease-status"));
+            Assert.False(response.Headers.Contains("x-ms-lease-state"));
+            Assert.False(response.Headers.Contains("x-ms-server-encrypted"));
+            Assert.False(response.Headers.Contains("x-ms-tag-count"));
+            Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+        }
+    }
+
+    [Fact]
     public async Task EscapedSegmentedAndRootBlobNamesRemainExactAndHonorAzureLimits()
     {
         var service = CreateClient(factory);
