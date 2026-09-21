@@ -136,10 +136,14 @@ public sealed class AzureResponseWriter
                     writer.WriteElementString("VersionId", blob.VersionId);
                     writer.WriteElementString("IsCurrentVersion", blob.IsCurrent ? "true" : "false");
                 }
-                if (includes.Contains("deleted") || includes.Contains("deletedwithversions"))
-                    writer.WriteElementString("Deleted", blob.IsDeleted ? "true" : "false");
+                if (blob.IsDeleted &&
+                    (includes.Contains("deleted") || includes.Contains("deletedwithversions")))
+                {
+                    writer.WriteElementString("Deleted", "true");
+                }
                 writer.WriteStartElement("Properties");
-                writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
+                if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+                    writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("Last-Modified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("Etag", blob.ETag);
                 writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
@@ -148,22 +152,33 @@ public sealed class AzureResponseWriter
                 WriteOptional(writer, "Content-Language", blob.Http.ContentLanguage);
                 WriteOptional(writer, "Content-MD5", blob.Http.ContentMd5);
                 WriteOptional(writer, "Cache-Control", blob.Http.CacheControl);
-                WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
+                if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+                    WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
-                writer.WriteElementString("AccessTier", blob.AccessTier);
-                if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
+                if (blob.Kind == Storage.BlobKind.BlockBlob &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
                 {
-                    WriteOptional(writer, "SmartAccessTier", blob.SmartAccessTier);
+                    writer.WriteElementString("AccessTier", blob.AccessTier);
+                    if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
+                        IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
+                    {
+                        WriteOptional(writer, "SmartAccessTier", blob.SmartAccessTier);
+                    }
+                    WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
+                    WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
                 }
-                writer.WriteElementString("ServerEncrypted", "true");
-                WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
-                WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
-                WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
-                WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
-                WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
-                WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
-                if (blob.IsDeleted)
+                if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+                    writer.WriteElementString("ServerEncrypted", "true");
+                if (IsServiceVersionAtLeast(request, new DateOnly(2019, 2, 2)))
+                {
+                    WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
+                    WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
+                }
+                if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+                    WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
+                if (IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+                    WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
+                if (blob.IsDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
                 {
                     WriteOptional(writer, "DeletedTime", blob.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
                     if (blob.DeleteRetentionUntil.HasValue)
@@ -176,12 +191,15 @@ public sealed class AzureResponseWriter
                 if (blob.Snapshot is null && !blob.IsDeleted)
                 {
                     writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
-                    writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
-                    if (blob.Lease.State == Storage.LeaseState.Leased)
+                    if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
                     {
-                        writer.WriteElementString(
-                            "LeaseDuration",
-                            blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+                        writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
+                        if (blob.Lease.State == Storage.LeaseState.Leased)
+                        {
+                            writer.WriteElementString(
+                                "LeaseDuration",
+                                blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+                        }
                     }
                 }
                 if (blob.Kind == Storage.BlobKind.PageBlob)
@@ -193,10 +211,10 @@ public sealed class AzureResponseWriter
                 if (blob.Kind == Storage.BlobKind.AppendBlob)
                 {
                     writer.WriteElementString("CommittedBlockCount", blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture));
-                    if (blob.IsSealed)
+                    if (blob.IsSealed && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
                         writer.WriteElementString("Sealed", "true");
                 }
-                if (blob.Tags.Count > 0)
+                if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
                     writer.WriteElementString("TagCount", blob.Tags.Count.ToString(CultureInfo.InvariantCulture));
                 if (includes.Contains("immutabilitypolicy") && blob.ImmutabilityUntil.HasValue)
                 {
@@ -205,7 +223,9 @@ public sealed class AzureResponseWriter
                 }
                 if (includes.Contains("legalhold"))
                     writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
-                if (includes.Contains("copy") && blob.Copy is not null)
+                if (includes.Contains("copy") &&
+                    blob.Copy is not null &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
                 {
                     writer.WriteElementString("CopyId", blob.Copy.Id);
                     writer.WriteElementString("CopySource", blob.Copy.Source);
@@ -214,14 +234,14 @@ public sealed class AzureResponseWriter
                     WriteOptional(writer, "CopyCompletionTime", blob.Copy.CompletedAt?.ToString("R", CultureInfo.InvariantCulture));
                     WriteOptional(writer, "CopyStatusDescription", blob.Copy.Description);
                 }
-                if (blob.IsIncrementalCopy)
+                if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
                     writer.WriteElementString("IncrementalCopy", "true");
-                if (blob.Copy?.Status == "success")
+                if (blob.Copy?.Status == "success" && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
                     WriteOptional(writer, "DestinationSnapshot", blob.CopyDestinationSnapshot);
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
                     WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
-                if (includes.Contains("tags"))
+                if (includes.Contains("tags") && blob.Tags.Count > 0)
                     WriteTags(writer, blob.Tags);
                 writer.WriteEndElement();
             }
@@ -390,54 +410,75 @@ public sealed class AzureResponseWriter
 
     public static void AddBlobHeaders(HttpResponse response, BlobRecord blob)
     {
+        var request = StorageRequestContext.Get(response.HttpContext);
         response.Headers.ETag = blob.ETag;
         response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
-        response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+            response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
-        response.Headers["x-ms-server-encrypted"] = "true";
-        SetOptional(response.Headers, "x-ms-encryption-key-sha256", blob.CustomerProvidedKeySha256);
-        SetOptional(response.Headers, "x-ms-encryption-scope", blob.EncryptionScope);
-        response.Headers["x-ms-access-tier"] = blob.AccessTier;
-        if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
-            IsServiceVersionAtLeast(StorageRequestContext.Get(response.HttpContext), new DateOnly(2026, 2, 6)))
+        if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+            response.Headers["x-ms-server-encrypted"] = "true";
+        if (IsServiceVersionAtLeast(request, new DateOnly(2019, 2, 2)))
         {
-            SetOptional(response.Headers, "x-ms-smart-access-tier", blob.SmartAccessTier);
+            SetOptional(response.Headers, "x-ms-encryption-key-sha256", blob.CustomerProvidedKeySha256);
+            SetOptional(response.Headers, "x-ms-encryption-scope", blob.EncryptionScope);
         }
-        SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
-        SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
-        SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
-        SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
+        if (blob.Kind == Storage.BlobKind.BlockBlob &&
+            IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
+        {
+            response.Headers["x-ms-access-tier"] = blob.AccessTier;
+            if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
+                IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
+            {
+                SetOptional(response.Headers, "x-ms-smart-access-tier", blob.SmartAccessTier);
+            }
+            SetOptional(response.Headers, "x-ms-archive-status", blob.ArchiveStatus);
+            SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
+        }
+        if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+            SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+            SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
-        response.Headers["x-ms-lease-state"] = LeaseStateValue(blob.Lease);
-        response.Headers["Accept-Ranges"] = "bytes";
+        if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+        {
+            response.Headers["x-ms-lease-state"] = LeaseStateValue(blob.Lease);
+            if (blob.Lease.State == Storage.LeaseState.Leased)
+                response.Headers["x-ms-lease-duration"] = blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed";
+        }
+        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+            response.Headers["Accept-Ranges"] = "bytes";
         response.ContentType = blob.Http.ContentType;
         SetOptional(response.Headers, "Content-Encoding", blob.Http.ContentEncoding);
         SetOptional(response.Headers, "Content-Language", blob.Http.ContentLanguage);
         SetOptional(response.Headers, "Cache-Control", blob.Http.CacheControl);
-        SetOptional(response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+            SetOptional(response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
         SetOptional(response.Headers, "Content-MD5", blob.Http.ContentMd5);
         foreach (var (name, value) in blob.Metadata)
             response.Headers[$"x-ms-meta-{name}"] = value;
-        if (blob.Tags.Count > 0)
+        if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             response.Headers["x-ms-tag-count"] = blob.Tags.Count.ToString(CultureInfo.InvariantCulture);
-        if (blob.VersionId is not null)
+        if (blob.VersionId is not null && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             response.Headers["x-ms-version-id"] = blob.VersionId;
         if (blob.Snapshot is not null)
             response.Headers["x-ms-snapshot"] = blob.Snapshot;
         if (blob.Kind == Storage.BlobKind.PageBlob)
             response.Headers["x-ms-blob-sequence-number"] = blob.SequenceNumber.ToString(CultureInfo.InvariantCulture);
-        if (blob.ImmutabilityUntil.HasValue)
+        if (blob.ImmutabilityUntil.HasValue && IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
         {
             response.Headers["x-ms-immutability-policy-until-date"] = blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture);
             response.Headers["x-ms-immutability-policy-mode"] = blob.ImmutabilityLocked ? "locked" : "unlocked";
         }
-        response.Headers["x-ms-legal-hold"] = blob.HasLegalHold ? "true" : "false";
+        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
+            response.Headers["x-ms-legal-hold"] = blob.HasLegalHold ? "true" : "false";
         if (blob.Kind == Storage.BlobKind.AppendBlob)
         {
             response.Headers["x-ms-blob-committed-block-count"] = blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture);
-            response.Headers["x-ms-blob-sealed"] = blob.IsSealed ? "true" : "false";
+            if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+                response.Headers["x-ms-blob-sealed"] = blob.IsSealed ? "true" : "false";
         }
-        if (blob.Copy is not null)
+        if (blob.Copy is not null && IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
         {
             response.Headers["x-ms-copy-id"] = blob.Copy.Id;
             response.Headers["x-ms-copy-source"] = blob.Copy.Source;
@@ -447,9 +488,9 @@ public sealed class AzureResponseWriter
                 response.Headers["x-ms-copy-completion-time"] = blob.Copy.CompletedAt.Value.ToString("R", CultureInfo.InvariantCulture);
             SetOptional(response.Headers, "x-ms-copy-status-description", blob.Copy.Description);
         }
-        if (blob.IsIncrementalCopy)
+        if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
             response.Headers["x-ms-incremental-copy"] = "true";
-        if (blob.Copy?.Status == "success")
+        if (blob.Copy?.Status == "success" && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
             SetOptional(response.Headers, "x-ms-copy-destination-snapshot", blob.CopyDestinationSnapshot);
     }
 
