@@ -72,12 +72,19 @@ public sealed class SavaOptions : IValidatableObject
                 yield return new ValidationResult($"The key for account '{accountName}' must contain at least 256 bits.", [nameof(Accounts)]);
         }
 
-        foreach (var accountName in AccountCapabilities.Keys)
+        foreach (var (accountName, capabilities) in AccountCapabilities)
         {
             if (!Accounts.ContainsKey(accountName))
             {
                 yield return new ValidationResult(
                     $"AccountCapabilities references unknown account '{accountName}'.",
+                    [nameof(AccountCapabilities)]);
+            }
+            if (capabilities.HierarchicalNamespaceBlobIndexTagsEnabled &&
+                !capabilities.HierarchicalNamespaceEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' enables hierarchical blob index tags without hierarchical namespace.",
                     [nameof(AccountCapabilities)]);
             }
         }
@@ -264,6 +271,7 @@ public sealed class SavaOptions : IValidatableObject
 public sealed class StorageAccountCapabilities
 {
     public bool HierarchicalNamespaceEnabled { get; init; }
+    public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
 }
 
 public sealed class BearerAuthenticationOptions

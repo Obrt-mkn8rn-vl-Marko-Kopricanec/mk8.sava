@@ -103,6 +103,11 @@ public sealed class AzureStorageException : Exception
         "BlobOperationNotSupported",
         "The operation is not supported in this scenario.");
 
+    public static AzureStorageException BlobTagsNotSupportedForAccountType() => new(
+        (int)HttpStatusCode.BadRequest,
+        "BlobTagsNotSupportedForAccountType",
+        "Blob tags aren't supported for this storage account configuration.");
+
     public static AzureStorageException BearerAuthenticationRequired() => new(
         (int)HttpStatusCode.Unauthorized,
         "AuthenticationFailed",
