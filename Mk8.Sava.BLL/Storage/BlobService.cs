@@ -667,7 +667,7 @@ public sealed class BlobService(
         if (current.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
-            throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
+            throw AzureStorageException.InvalidPageRange();
         if (!clear && end - start + 1 > 4L * 1024 * 1024)
             throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
         if (!chunks.IsInDomain(current.Account, encryption, current.Content))
@@ -688,10 +688,7 @@ public sealed class BlobService(
         }
         catch (EndOfStreamException)
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "InvalidPageRange",
-                "The request body length must match the page range length.");
+            throw AzureStorageException.InvalidPageRange();
         }
         using (content)
         {

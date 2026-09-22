@@ -68,6 +68,11 @@ public sealed class AzureStorageException : Exception
         headerName,
         headerValue);
 
+    public static AzureStorageException InvalidPageRange() => new(
+        (int)HttpStatusCode.RequestedRangeNotSatisfiable,
+        "InvalidPageRange",
+        "The page range specified is invalid.");
+
     public static AzureStorageException AuthenticationFailed(string detail = "Server failed to authenticate the request.") => new(
         (int)HttpStatusCode.Forbidden,
         "AuthenticationFailed",

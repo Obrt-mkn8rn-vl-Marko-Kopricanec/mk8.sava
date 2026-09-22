@@ -39,8 +39,9 @@ public sealed partial class AzureResponseWriter
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
+        var request = StorageRequestContext.Get(context);
         var nextMarker = page.HasMore && page.Items.Count > 0 ? page.Items[^1].Name : string.Empty;
-        var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{StorageRequestContext.Get(context).Account}";
+        var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
 
         return WriteXmlAsync(context, writer =>
         {
@@ -59,7 +60,7 @@ public sealed partial class AzureResponseWriter
                 writer.WriteElementString("Name", container.Name);
                 writer.WriteStartElement("Properties");
                 writer.WriteElementString("Last-Modified", container.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Etag", container.ETag);
+                writer.WriteElementString("Etag", FormatEntityTag(request, container.ETag));
                 if (includeDeleted)
                 {
                     writer.WriteElementString("Deleted", container.DeletedAt.HasValue ? "true" : "false");
@@ -161,7 +162,7 @@ public sealed partial class AzureResponseWriter
                 if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
                     writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("Last-Modified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Etag", blob.ETag);
+                writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
                 writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
                 writer.WriteElementString("Content-Type", blob.Http.ContentType);
                 WriteOptional(writer, "Content-Encoding", blob.Http.ContentEncoding);
@@ -446,7 +447,7 @@ public sealed partial class AzureResponseWriter
 
     public static void AddContainerHeaders(HttpResponse response, ContainerRecord container)
     {
-        response.Headers.ETag = container.ETag;
+        AddEntityTag(response, container.ETag);
         response.Headers.LastModified = container.LastModified.ToString("R", CultureInfo.InvariantCulture);
     }
 
@@ -491,7 +492,7 @@ public sealed partial class AzureResponseWriter
 
     public static void AddBlobEntityHeaders(HttpResponse response, BlobRecord blob)
     {
-        response.Headers.ETag = blob.ETag;
+        AddEntityTag(response, blob.ETag);
         response.Headers.LastModified = blob.LastModified.ToString("R", CultureInfo.InvariantCulture);
     }
 
@@ -595,7 +596,7 @@ public sealed partial class AzureResponseWriter
             if (blob.Lease.State == Storage.LeaseState.Leased)
                 response.Headers["x-ms-lease-duration"] = blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed";
         }
-        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+        if (IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)))
             response.Headers["Accept-Ranges"] = "bytes";
         response.ContentType = blob.Http.ContentType;
         SetOptional(response.Headers, "Content-Encoding", blob.Http.ContentEncoding);
@@ -603,7 +604,18 @@ public sealed partial class AzureResponseWriter
         SetOptional(response.Headers, "Cache-Control", blob.Http.CacheControl);
         if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
             SetOptional(response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
-        SetOptional(response.Headers, "Content-MD5", blob.Http.ContentMd5);
+        var isRangedGet = HttpMethods.IsGet(response.HttpContext.Request.Method) &&
+                          (response.HttpContext.Request.Headers.ContainsKey("x-ms-range") ||
+                           response.HttpContext.Request.Headers.ContainsKey("Range"));
+        if (isRangedGet)
+        {
+            if (IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+                SetOptional(response.Headers, "x-ms-blob-content-md5", blob.Http.ContentMd5);
+        }
+        else
+        {
+            SetOptional(response.Headers, "Content-MD5", blob.Http.ContentMd5);
+        }
         foreach (var (name, value) in blob.Metadata)
             response.Headers[$"x-ms-meta-{name}"] = value;
         if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
@@ -750,6 +762,19 @@ public sealed partial class AzureResponseWriter
             CultureInfo.InvariantCulture,
             DateTimeStyles.None,
             out var version) && version >= minimum;
+
+    internal static void AddEntityTag(HttpResponse response, string etag) =>
+        response.Headers.ETag = FormatEntityTag(StorageRequestContext.Get(response.HttpContext), etag);
+
+    private static string FormatEntityTag(StorageRequestContext request, string etag)
+    {
+        var unquoted = etag.Length >= 2 && etag[0] == '"' && etag[^1] == '"'
+            ? etag[1..^1]
+            : etag;
+        return IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18))
+            ? $"\"{unquoted}\""
+            : unquoted;
+    }
 
     private static string CreateBlobListingScope(
         StorageRequestContext request,

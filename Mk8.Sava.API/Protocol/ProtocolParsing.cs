@@ -519,6 +519,49 @@ internal static class ProtocolParsing
         return (start, Math.Min(end, length - 1));
     }
 
+    public static (long Start, long End) ParseStorageRange(
+        string value,
+        long length,
+        bool allowOpenEnded,
+        bool allowEndPastLength = true)
+    {
+        if (!value.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains(',', StringComparison.Ordinal))
+        {
+            throw InvalidRange();
+        }
+
+        var components = value[6..].Split('-', 2);
+        if (components.Length != 2 ||
+            string.IsNullOrEmpty(components[0]) ||
+            !long.TryParse(components[0], NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
+            start < 0)
+        {
+            throw InvalidRange();
+        }
+
+        long end;
+        if (string.IsNullOrEmpty(components[1]))
+        {
+            if (!allowOpenEnded)
+                throw InvalidRange();
+            end = length - 1;
+        }
+        else if (!long.TryParse(components[1], NumberStyles.None, CultureInfo.InvariantCulture, out end))
+        {
+            throw InvalidRange();
+        }
+
+        if (length == 0 ||
+            start >= length ||
+            end < start ||
+            !allowEndPastLength && end >= length)
+        {
+            throw InvalidRange();
+        }
+        return (start, Math.Min(end, length - 1));
+    }
+
     public static long ParseLongHeader(IHeaderDictionary headers, string name, bool required = false, long? defaultValue = null)
     {
         var value = First(headers, name);
