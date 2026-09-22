@@ -473,6 +473,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
+        ValidateEncryptionContext(account, options);
         options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var encryption = EncryptionOf(options);
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
@@ -507,6 +508,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
+        ValidateEncryptionContext(account, options);
         options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now) with
@@ -535,6 +537,7 @@ public sealed class BlobService(
     {
         EnsureBlobKindSupported(account, BlobKind.PageBlob);
         ValidateBlobName(name);
+        ValidateEncryptionContext(account, options);
         const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
         if (length > maximumPageBlobBytes)
             throw new RequestBodyTooLargeException(maximumPageBlobBytes);
@@ -631,6 +634,7 @@ public sealed class BlobService(
         if (blockList.Count > BlobServiceLimits.MaximumCommittedBlockCount)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
+        ValidateEncryptionContext(account, options);
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
         options = await ApplyContainerEncryptionPolicyAsync(
             account,
@@ -2852,9 +2856,24 @@ public sealed class BlobService(
             ImmutabilityLocked = options.ImmutabilityLocked,
             HasLegalHold = options.HasLegalHold,
             EncryptionScope = options.EncryptionScope,
+            EncryptionContext = string.IsNullOrEmpty(options.EncryptionContext)
+                ? null
+                : options.EncryptionContext,
             CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256,
             SmartTierLastAccessedAt = options.AccessTier == "Smart" ? now : null
         };
+    }
+
+    private void ValidateEncryptionContext(string account, BlobWriteOptions options)
+    {
+        if (string.IsNullOrEmpty(options.EncryptionContext))
+            return;
+        if (!IsHierarchicalNamespaceEnabled(account) || options.EncryptionContext.Length > 1024)
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-encryption-context",
+                options.EncryptionContext);
+        }
     }
 
     private async Task<BlobWriteOptions> ApplyContainerEncryptionPolicyAsync(

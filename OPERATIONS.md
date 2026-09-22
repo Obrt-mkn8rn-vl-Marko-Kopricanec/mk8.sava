@@ -47,6 +47,14 @@ account already enrolled in that preview. Without it, mk8.sava rejects snapshot
 creation, selectors, listings, source copies, and delete-snapshot options on the
 HNS account instead of applying flat-namespace behavior.
 
+HNS accounts support the Blob REST encryption-context system property. Put Blob
+and Put Block List accept `x-ms-encryption-context` from service version
+2021-08-06, reject values longer than 1,024 characters, and clear the property
+when a replacement omits the header. Get Blob and Get Blob Properties expose it
+from 2021-08-06; List Blobs exposes `EncryptionContext` from 2021-06-08. The
+header is rejected on flat-namespace accounts and on copy operations, matching
+the Azure Blob operation-specific contract.
+
 ## Health and metrics
 
 - `GET /health/live` reports that the process is running.
