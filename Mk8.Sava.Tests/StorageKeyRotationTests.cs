@@ -14,6 +14,63 @@ public sealed class StorageKeyRotationTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task StartupRejectsChangedDataKeyBeforeServingExistingContent(bool fingerprintRecorded)
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-key-continuity-{Guid.NewGuid():N}");
+        var account = SavaWebApplicationFactory.AccountName;
+        var containerName = $"key-continuity-{Guid.NewGuid():N}";
+        var content = RandomNumberGenerator.GetBytes(64 * 1024);
+        try
+        {
+            await using (var initial = new SavaWebApplicationFactory(dataPath, deleteDataPath: false))
+            {
+                await initial.InitializeAsync();
+                var container = CreateClient(initial, SavaWebApplicationFactory.AccountKey)
+                    .GetBlobContainerClient(containerName);
+                await container.CreateAsync();
+                await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(content));
+            }
+
+            if (fingerprintRecorded)
+            {
+                await using var recorded = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+                await recorded.InitializeAsync();
+                Assert.Equal(content, (await CreateClient(recorded, SavaWebApplicationFactory.AccountKey)
+                    .GetBlobContainerClient(containerName)
+                    .GetBlobClient("retained.bin")
+                    .DownloadContentAsync()).Value.Content.ToArray());
+            }
+
+            await using (var wrong = new SavaWebApplicationFactory(
+                             dataPath,
+                             new Dictionary<string, string?>
+                             {
+                                 [$"Sava:DataEncryptionKeys:{account}"] =
+                                     Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                             },
+                             deleteDataPath: false))
+            {
+                var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
+                Assert.Contains("data encryption key", failure.Message, StringComparison.OrdinalIgnoreCase);
+            }
+
+            await using var recovered = new SavaWebApplicationFactory(dataPath, deleteDataPath: true);
+            await recovered.InitializeAsync();
+            Assert.Equal(content, (await CreateClient(recovered, SavaWebApplicationFactory.AccountKey)
+                .GetBlobContainerClient(containerName)
+                .GetBlobClient("retained.bin")
+                .DownloadContentAsync()).Value.Content.ToArray());
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task StableDataKeyPreservesBlobsAndDeduplicationAcrossAccountCredentialRotation(
         bool independentDataKeyFromFirstWrite)
     {

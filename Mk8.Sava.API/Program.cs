@@ -57,6 +57,7 @@ builder.Services.AddSingleton<IStorageAnalyticsSink>(services =>
     services.GetRequiredService<StorageAnalyticsService>());
 builder.Services.AddSingleton<BlobService>();
 builder.Services.AddSingleton<StorageBackupService>();
+builder.Services.AddSingleton<StorageDataKeyContinuity>();
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<AzureResponseWriter>();
@@ -98,8 +99,17 @@ if (operatorCommand is { Name: "validate" })
     return;
 }
 
-await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
-await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync();
+try
+{
+    await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
+    await app.Services.GetRequiredService<StorageDataKeyContinuity>().EnsureAsync(CancellationToken.None);
+    await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync();
+}
+catch
+{
+    await app.DisposeAsync();
+    throw;
+}
 
 if (operatorCommand is { Name: "create" })
 {

@@ -10,10 +10,11 @@ public sealed class MetadataStore(
     IStorageFaultInjector faultInjector,
     TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
     private const int ChunkIndexSchemaVersion = 2;
     private const int TagIndexSchemaVersion = 3;
     private const int PackIndexSchemaVersion = 4;
+    private const int ObjectReplicationSchemaVersion = 5;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -135,6 +136,11 @@ public sealed class MetadataStore(
                     data TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS data_encryption_keys (
+                    key_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS chunk_packs (
                     pack_id TEXT PRIMARY KEY,
                     domain TEXT NOT NULL,
@@ -187,7 +193,7 @@ public sealed class MetadataStore(
                 await MigrateVersion2ToVersion3Async(connection, cancellationToken);
                 schemaVersion = TagIndexSchemaVersion;
             }
-            if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion)
+            if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion or ObjectReplicationSchemaVersion)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
@@ -212,6 +218,64 @@ public sealed class MetadataStore(
         catch (SqliteException)
         {
             return false;
+        }
+    }
+
+    public async Task EnsureDataEncryptionKeyFingerprintsAsync(
+        IReadOnlyDictionary<string, string> expected,
+        Func<string, CancellationToken, Task> verifyUnrecordedKey,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var recorded = new Dictionary<string, string>(StringComparer.Ordinal);
+            await using (var read = connection.CreateCommand())
+            {
+                read.Transaction = transaction;
+                read.CommandText = "SELECT key_id, fingerprint FROM data_encryption_keys;";
+                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                    recorded.Add(reader.GetString(0), reader.GetString(1));
+            }
+
+            foreach (var (keyId, fingerprint) in expected)
+            {
+                if (recorded.TryGetValue(keyId, out var previous))
+                {
+                    if (!string.Equals(previous, fingerprint, StringComparison.Ordinal))
+                    {
+                        throw new InvalidDataException(
+                            $"The configured data encryption key for '{keyId}' differs from the key recorded for reachable content.");
+                    }
+                    continue;
+                }
+
+                await verifyUnrecordedKey(keyId, cancellationToken);
+                await using var insert = connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = "INSERT INTO data_encryption_keys(key_id, fingerprint) VALUES ($key, $fingerprint);";
+                insert.Parameters.AddWithValue("$key", keyId);
+                insert.Parameters.AddWithValue("$fingerprint", fingerprint);
+                await insert.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            foreach (var keyId in recorded.Keys.Except(expected.Keys, StringComparer.Ordinal))
+            {
+                await using var delete = connection.CreateCommand();
+                delete.Transaction = transaction;
+                delete.CommandText = "DELETE FROM data_encryption_keys WHERE key_id = $key;";
+                delete.Parameters.AddWithValue("$key", keyId);
+                await delete.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
         }
     }
 

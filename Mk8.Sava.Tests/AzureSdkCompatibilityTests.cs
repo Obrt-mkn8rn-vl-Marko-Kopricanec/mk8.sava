@@ -10228,7 +10228,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 await connection.OpenAsync();
                 await using var version = connection.CreateCommand();
                 version.CommandText = "PRAGMA user_version;";
-                Assert.Equal(5L, Convert.ToInt64(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                Assert.Equal(
+                    MetadataStore.CurrentSchemaVersion,
+                    Convert.ToInt32(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
                 await using var references = connection.CreateCommand();
                 references.CommandText = """
                     SELECT
