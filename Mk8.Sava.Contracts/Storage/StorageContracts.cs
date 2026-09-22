@@ -16,6 +16,8 @@ public sealed record BlobWriteOptions(
 
 public sealed record PageRange(long Start, long End);
 
+public sealed record CopySourceBlock(string Id, long Length);
+
 public sealed record PageRangeDiff(
     IReadOnlyList<PageRange> PageRanges,
     IReadOnlyList<PageRange> ClearRanges);

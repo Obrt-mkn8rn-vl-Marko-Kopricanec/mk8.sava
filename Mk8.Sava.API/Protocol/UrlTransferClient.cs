@@ -16,7 +16,12 @@ internal sealed record UrlSource(
     Dictionary<string, string> Metadata,
     Dictionary<string, string> Tags,
     BlobKind? Kind,
-    string? ETag);
+    string? ETag,
+    long SequenceNumber,
+    bool IsSealed,
+    int AppendBlockCount,
+    IReadOnlyList<CopySourceBlock> CommittedBlocks,
+    IReadOnlyList<PageRange> PageRanges);
 
 internal sealed record UrlTransferResult<TResult>(TResult Value, TransactionalChecksums Checksums);
 
@@ -46,7 +51,8 @@ internal sealed class UrlTransferClient(
         bool sourceLengthConflict,
         Func<UrlSource, Task<TResult>> consume,
         CancellationToken cancellationToken,
-        bool copySourceTags = false)
+        bool copySourceTags = false,
+        bool preserveSourceShape = false)
     {
         var effectiveMaximumBytes = Math.Min(maximumBytes, _options.MaximumRequestBodyBytes);
         if (effectiveMaximumBytes <= 0)
@@ -72,6 +78,9 @@ internal sealed class UrlTransferClient(
         using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         AddSourceAuthorization(destinationRequest, sourceRequest);
         AddSourceConditions(destinationRequest, sourceRequest);
+        sourceRequest.Headers.TryAddWithoutValidation(
+            "x-ms-version",
+            StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
         AddSourceCustomerProvidedKey(
             destinationRequest,
             sourceRequest,
@@ -115,7 +124,6 @@ internal sealed class UrlTransferClient(
                 throw CannotVerifyCopySource("The source did not honor the requested byte range.");
             }
 
-            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
             var contentLength = response.Content.Headers.ContentLength;
             if (!contentLength.HasValue &&
                 response.Content.Headers.ContentRange is { From: { } from, To: { } to })
@@ -135,14 +143,32 @@ internal sealed class UrlTransferClient(
                 }
                 throw new RequestBodyTooLargeException(effectiveMaximumBytes);
             }
+            var kind = ReadBlobKind(response);
+            var etag = response.Headers.ETag?.ToString();
+            var sourceShape = preserveSourceShape
+                ? await ReadSourceShapeAsync(
+                    destinationRequest,
+                    sourceUri,
+                    response,
+                    kind,
+                    etag,
+                    contentLength.Value,
+                    cancellationToken)
+                : UrlSourceShape.Empty;
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
             var sourceInfo = new UrlSource(
                 new LengthLimitedReadStream(source, effectiveMaximumBytes),
                 contentLength,
                 ReadHttpProperties(response),
                 ReadMetadata(response),
                 sourceTags,
-                ReadBlobKind(response),
-                response.Headers.ETag?.ToString());
+                kind,
+                etag,
+                sourceShape.SequenceNumber,
+                sourceShape.IsSealed,
+                sourceShape.AppendBlockCount,
+                sourceShape.CommittedBlocks,
+                sourceShape.PageRanges);
             return await ConsumeWithChecksumValidationAsync(
                 destinationRequest,
                 sourceInfo,
@@ -281,9 +307,6 @@ internal sealed class UrlTransferClient(
         source.Headers.TryAddWithoutValidation("x-ms-encryption-key", encryption.EncodedKey);
         source.Headers.TryAddWithoutValidation("x-ms-encryption-key-sha256", encryption.EncodedHash);
         source.Headers.TryAddWithoutValidation("x-ms-encryption-algorithm", encryption.Algorithm);
-        source.Headers.TryAddWithoutValidation(
-            "x-ms-version",
-            StorageRequestContext.Get(destination.HttpContext).ServiceVersion);
     }
 
     private static SourceCustomerProvidedKey? ReadSourceCustomerProvidedKey(
@@ -432,6 +455,275 @@ internal sealed class UrlTransferClient(
             await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
             return await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken);
         }
+    }
+
+    private async Task<UrlSourceShape> ReadSourceShapeAsync(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        HttpResponseMessage sourceResponse,
+        BlobKind? kind,
+        string? etag,
+        long contentLength,
+        CancellationToken cancellationToken)
+    {
+        switch (kind)
+        {
+            case BlobKind.BlockBlob:
+                {
+                    var blocks = await ReadCommittedBlocksAsync(
+                        destinationRequest,
+                        sourceUri,
+                        etag,
+                        cancellationToken);
+                    long blockLength;
+                    try
+                    {
+                        blockLength = blocks.Aggregate(0L, (total, block) => checked(total + block.Length));
+                    }
+                    catch (OverflowException)
+                    {
+                        throw CannotVerifyCopySource("The source committed block list length is invalid.");
+                    }
+                    if (blockLength != contentLength)
+                        throw CannotVerifyCopySource("The source committed block list does not match its content length.");
+                    return new UrlSourceShape(0, false, 0, blocks, []);
+                }
+            case BlobKind.AppendBlob:
+                return new UrlSourceShape(
+                    0,
+                    ReadBooleanHeader("x-ms-blob-sealed", defaultValue: false),
+                    ReadIntegerHeader("x-ms-blob-committed-block-count"),
+                    [],
+                    []);
+            case BlobKind.PageBlob:
+                {
+                    if (contentLength % 512 != 0)
+                        throw CannotVerifyCopySource("The source page blob length is not 512-byte aligned.");
+                    var ranges = await ReadPageRangesAsync(
+                        destinationRequest,
+                        sourceUri,
+                        etag,
+                        contentLength,
+                        cancellationToken);
+                    return new UrlSourceShape(
+                        ReadLongHeader("x-ms-blob-sequence-number"),
+                        false,
+                        0,
+                        [],
+                        ranges);
+                }
+            default:
+                return UrlSourceShape.Empty;
+        }
+
+        bool ReadBooleanHeader(string name, bool defaultValue)
+        {
+            var value = CurrentResponseHeader(name);
+            if (value is null)
+                return defaultValue;
+            return bool.TryParse(value, out var parsed)
+                ? parsed
+                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+        }
+
+        int ReadIntegerHeader(string name)
+        {
+            var value = CurrentResponseHeader(name);
+            return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
+                ? parsed
+                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+        }
+
+        long ReadLongHeader(string name)
+        {
+            var value = CurrentResponseHeader(name);
+            return long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
+                ? parsed
+                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+        }
+
+        string? CurrentResponseHeader(string name)
+        {
+            if (sourceResponse.Headers.TryGetValues(name, out var values) ||
+                sourceResponse.Content.Headers.TryGetValues(name, out values))
+            {
+                return values.SingleOrDefault();
+            }
+            return null;
+        }
+    }
+
+    private async Task<IReadOnlyList<CopySourceBlock>> ReadCommittedBlocksAsync(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        string? etag,
+        CancellationToken cancellationToken)
+    {
+        var document = await ReadSourceXmlAsync(
+            destinationRequest,
+            BuildComponentUri(
+                sourceUri,
+                new KeyValuePair<string, string?>("comp", "blocklist"),
+                new KeyValuePair<string, string?>("blocklisttype", "committed")),
+            etag,
+            cancellationToken);
+        var committed = document.Descendants()
+            .FirstOrDefault(element => element.Name.LocalName == "CommittedBlocks");
+        if (committed is null)
+            throw CannotVerifyCopySource("The source did not return a committed block list.");
+
+        var blocks = new List<CopySourceBlock>();
+        int? blockIdLength = null;
+        foreach (var block in committed.Elements().Where(element => element.Name.LocalName == "Block"))
+        {
+            var name = block.Elements().FirstOrDefault(element => element.Name.LocalName == "Name")?.Value;
+            var sizeText = block.Elements().FirstOrDefault(element => element.Name.LocalName == "Size")?.Value;
+            if (string.IsNullOrEmpty(name) ||
+                !long.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out var size) ||
+                size < 0)
+            {
+                throw CannotVerifyCopySource("The source returned an invalid committed block list.");
+            }
+            try
+            {
+                var decoded = Convert.FromBase64String(name);
+                if (decoded.Length is 0 or > BlobServiceLimits.MaximumBlockIdBytes)
+                    throw new FormatException();
+                if (blockIdLength.HasValue && blockIdLength.Value != decoded.Length)
+                    throw new FormatException();
+                blockIdLength = decoded.Length;
+            }
+            catch (FormatException)
+            {
+                throw CannotVerifyCopySource("The source returned an invalid committed block ID.");
+            }
+            blocks.Add(new CopySourceBlock(name, size));
+            if (blocks.Count > BlobServiceLimits.MaximumCommittedBlockCount)
+                throw CannotVerifyCopySource("The source committed block count exceeds the service limit.");
+        }
+        return blocks;
+    }
+
+    private async Task<IReadOnlyList<PageRange>> ReadPageRangesAsync(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        string? etag,
+        long contentLength,
+        CancellationToken cancellationToken)
+    {
+        var ranges = new List<PageRange>();
+        var markers = new HashSet<string>(StringComparer.Ordinal);
+        string? marker = null;
+        do
+        {
+            var parameters = new List<KeyValuePair<string, string?>>
+            {
+                new("comp", "pagelist")
+            };
+            if (!string.IsNullOrEmpty(marker))
+                parameters.Add(new KeyValuePair<string, string?>("marker", marker));
+            var document = await ReadSourceXmlAsync(
+                destinationRequest,
+                BuildComponentUri(sourceUri, parameters.ToArray()),
+                etag,
+                cancellationToken);
+            foreach (var range in document.Descendants().Where(element => element.Name.LocalName == "PageRange"))
+            {
+                var startText = range.Elements().FirstOrDefault(element => element.Name.LocalName == "Start")?.Value;
+                var endText = range.Elements().FirstOrDefault(element => element.Name.LocalName == "End")?.Value;
+                if (!long.TryParse(startText, NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
+                    !long.TryParse(endText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
+                    start < 0 || end < start || end == long.MaxValue ||
+                    start % 512 != 0 || (end + 1) % 512 != 0 || end >= contentLength)
+                {
+                    throw CannotVerifyCopySource("The source returned an invalid page range list.");
+                }
+                ranges.Add(new PageRange(start, end));
+            }
+            marker = document.Descendants()
+                .FirstOrDefault(element => element.Name.LocalName == "NextMarker")
+                ?.Value;
+            if (!string.IsNullOrEmpty(marker) && !markers.Add(marker))
+                throw CannotVerifyCopySource("The source page range continuation marker repeated.");
+        } while (!string.IsNullOrEmpty(marker));
+        return ranges;
+    }
+
+    private async Task<XDocument> ReadSourceXmlAsync(
+        HttpRequest destinationRequest,
+        Uri uri,
+        string? etag,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        AddSourceAuthorization(destinationRequest, request);
+        request.Headers.TryAddWithoutValidation(
+            "x-ms-version",
+            StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
+        if (!string.IsNullOrEmpty(etag))
+            request.Headers.TryAddWithoutValidation("If-Match", etag);
+
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        }
+        catch (HttpRequestException)
+        {
+            throw CannotVerifyCopySource("The source shape could not be read.");
+        }
+        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw CannotVerifyCopySource("The source shape request did not complete before the transfer timeout.");
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken);
+            try
+            {
+                await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var reader = XmlReader.Create(body, new XmlReaderSettings
+                {
+                    Async = true,
+                    DtdProcessing = DtdProcessing.Prohibit,
+                    MaxCharactersInDocument = 32L * 1024 * 1024
+                });
+                return await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+            }
+            catch (Exception exception) when (exception is XmlException or InvalidOperationException)
+            {
+                throw CannotVerifyCopySource("The source returned an invalid shape document.");
+            }
+        }
+    }
+
+    private static Uri BuildComponentUri(
+        Uri sourceUri,
+        params KeyValuePair<string, string?>[] componentParameters)
+    {
+        var replaced = componentParameters.Select(parameter => parameter.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(sourceUri.Query);
+        var values = query
+            .Where(pair => !replaced.Contains(pair.Key))
+            .SelectMany(pair => pair.Value.Select(value => new KeyValuePair<string, string?>(pair.Key, value)))
+            .Concat(componentParameters);
+        var builder = new UriBuilder(sourceUri)
+        {
+            Query = QueryString.Create(values).Value?.TrimStart('?') ?? string.Empty
+        };
+        return builder.Uri;
+    }
+
+    private sealed record UrlSourceShape(
+        long SequenceNumber,
+        bool IsSealed,
+        int AppendBlockCount,
+        IReadOnlyList<CopySourceBlock> CommittedBlocks,
+        IReadOnlyList<PageRange> PageRanges)
+    {
+        public static UrlSourceShape Empty { get; } = new(0, false, 0, [], []);
     }
 
     private static BlobKind? ReadBlobKind(HttpResponseMessage response)

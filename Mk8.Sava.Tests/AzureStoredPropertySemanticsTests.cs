@@ -419,6 +419,90 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.False((await customerKeyDestination.ExistsAsync()).Value);
     }
 
+    [Fact]
+    public async Task ExternalAsynchronousCopyPreservesTheCompleteAzureBlobShape()
+    {
+        var sourceHandler = new CopyShapeSourceHandler();
+        var application = new SavaWebApplicationFactory(() => sourceHandler);
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"remote-shape-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+
+            var block = container.GetBlockBlobClient("block-copy.bin");
+            var blockCopy = await block.StartCopyFromUriAsync(new Uri("https://source.example/block"));
+            await blockCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+            var blockProperties = (await block.GetPropertiesAsync()).Value;
+            Assert.Equal(BlobType.Block, blockProperties.BlobType);
+            Assert.Equal("block", blockProperties.Metadata["shape"]);
+            Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await block.DownloadContentAsync()).Value.Content.ToArray());
+            var committed = (await block.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks;
+            Assert.Equal(CopyShapeSourceHandler.BlockIds, committed.Select(item => item.Name));
+            Assert.Equal(CopyShapeSourceHandler.BlockLengths, committed.Select(item => item.SizeLong));
+
+            var synchronousBlock = container.GetBlockBlobClient("synchronous-block-copy.bin");
+            await synchronousBlock.SyncCopyFromUriAsync(new Uri("https://source.example/block"));
+            var synchronousBlocks = (await synchronousBlock.GetBlockListAsync(BlockListTypes.Committed))
+                .Value
+                .CommittedBlocks;
+            Assert.Equal(CopyShapeSourceHandler.BlockIds, synchronousBlocks.Select(item => item.Name));
+            Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await synchronousBlock.DownloadContentAsync()).Value.Content.ToArray());
+
+            var append = container.GetAppendBlobClient("append-copy.bin");
+            var appendCopy = await append.StartCopyFromUriAsync(new Uri("https://source.example/append"));
+            await appendCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+            var appendProperties = (await append.GetPropertiesAsync()).Value;
+            Assert.Equal(BlobType.Append, appendProperties.BlobType);
+            Assert.Equal(2, appendProperties.BlobCommittedBlockCount);
+            Assert.True(appendProperties.IsSealed);
+            Assert.Equal(CopyShapeSourceHandler.AppendPayload, (await append.DownloadContentAsync()).Value.Content.ToArray());
+            var sealedAppend = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+                append.AppendBlockAsync(BinaryData.FromString("rejected").ToStream()));
+            Assert.Equal("BlobIsSealed", sealedAppend.ErrorCode);
+
+            var page = container.GetPageBlobClient("page-copy.bin");
+            var pageCopy = await page.StartCopyFromUriAsync(new Uri("https://source.example/page"));
+            var pendingPage = (await page.GetPropertiesAsync()).Value;
+            Assert.Equal(BlobType.Page, pendingPage.BlobType);
+            Assert.Equal(CopyShapeSourceHandler.PagePayload.LongLength, pendingPage.ContentLength);
+            Assert.Empty((await page.GetPageRangesAsync()).Value.PageRanges);
+            await pageCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+            var pageProperties = (await page.GetPropertiesAsync()).Value;
+            Assert.Equal(42, pageProperties.BlobSequenceNumber);
+            Assert.Equal(CopyShapeSourceHandler.PagePayload, (await page.DownloadContentAsync()).Value.Content.ToArray());
+            var ranges = (await page.GetPageRangesAsync()).Value.PageRanges;
+            Assert.Collection(
+                ranges,
+                range =>
+                {
+                    Assert.Equal(0, range.Offset);
+                    Assert.Equal(512, range.Length);
+                },
+                range =>
+                {
+                    Assert.Equal(1024, range.Offset);
+                    Assert.Equal(512, range.Length);
+                });
+
+            var wrongType = container.GetBlockBlobClient("wrong-type.bin");
+            await wrongType.UploadAsync(BinaryData.FromString("existing block").ToStream());
+            var mismatch = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+                wrongType.StartCopyFromUriAsync(new Uri("https://source.example/page")));
+            Assert.Equal(409, mismatch.Status);
+            Assert.Equal("InvalidBlobType", mismatch.ErrorCode);
+
+            Assert.True(sourceHandler.BlockListReadWithPinnedEtag);
+            Assert.Equal(4, sourceHandler.PageListRequests);
+            Assert.True(sourceHandler.PageListReadWithPinnedEtag);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
     private static HttpRequestMessage PutBlobRequest(BlockBlobClient blob, byte[] payload)
     {
         var request = new HttpRequestMessage(HttpMethod.Put, WriteUri(blob))
@@ -522,6 +606,103 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             response.Headers.ETag = new EntityTagHeaderValue("\"source-etag\"");
             response.Headers.TryAddWithoutValidation("x-ms-meta-source", "metadata");
             return Task.FromResult(response);
+        }
+    }
+
+    private sealed class CopyShapeSourceHandler : HttpMessageHandler
+    {
+        private const string SourceEtag = "\"shape-source-etag\"";
+        private static readonly byte[][] Blocks = ["first-"u8.ToArray(), "second-block"u8.ToArray()];
+
+        public static byte[] BlockPayload { get; } = Blocks.SelectMany(block => block).ToArray();
+        public static string[] BlockIds { get; } =
+        [
+            Convert.ToBase64String("remote-block-0001"u8),
+            Convert.ToBase64String("remote-block-0002"u8)
+        ];
+        public static long[] BlockLengths { get; } = Blocks.Select(block => (long)block.Length).ToArray();
+        public static byte[] AppendPayload { get; } = "first append|second append"u8.ToArray();
+        public static byte[] PagePayload { get; } = CreatePagePayload();
+
+        public bool BlockListReadWithPinnedEtag { get; private set; }
+        public bool PageListReadWithPinnedEtag { get; private set; }
+        public int PageListRequests { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri?.AbsolutePath;
+            var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(
+                request.RequestUri?.Query ?? string.Empty);
+            if (query.TryGetValue("comp", out var component) && component == "blocklist")
+            {
+                BlockListReadWithPinnedEtag = HasPinnedEtag(request);
+                return Task.FromResult(XmlResponse(
+                    $"<BlockList><CommittedBlocks>" +
+                    $"<Block><Name>{BlockIds[0]}</Name><Size>{BlockLengths[0]}</Size></Block>" +
+                    $"<Block><Name>{BlockIds[1]}</Name><Size>{BlockLengths[1]}</Size></Block>" +
+                    "</CommittedBlocks></BlockList>",
+                    request));
+            }
+            if (query.TryGetValue("comp", out component) && component == "pagelist")
+            {
+                PageListRequests++;
+                PageListReadWithPinnedEtag |= HasPinnedEtag(request);
+                var next = query.ContainsKey("marker")
+                    ? "<PageRange><Start>1024</Start><End>1535</End></PageRange>"
+                    : "<PageRange><Start>0</Start><End>511</End></PageRange><NextMarker>next</NextMarker>";
+                return Task.FromResult(XmlResponse($"<PageList>{next}</PageList>", request));
+            }
+
+            var response = path switch
+            {
+                "/block" => BlobResponse(BlockPayload, "BlockBlob", request),
+                "/append" => BlobResponse(AppendPayload, "AppendBlob", request),
+                "/page" => BlobResponse(PagePayload, "PageBlob", request),
+                _ => new HttpResponseMessage(HttpStatusCode.NotFound) { RequestMessage = request }
+            };
+            if (path == "/append")
+            {
+                response.Headers.TryAddWithoutValidation("x-ms-blob-committed-block-count", "2");
+                response.Headers.TryAddWithoutValidation("x-ms-blob-sealed", "true");
+            }
+            if (path == "/page")
+                response.Headers.TryAddWithoutValidation("x-ms-blob-sequence-number", "42");
+            response.Headers.TryAddWithoutValidation("x-ms-meta-shape", path?.TrimStart('/'));
+            return Task.FromResult(response);
+        }
+
+        private static HttpResponseMessage BlobResponse(
+            byte[] payload,
+            string kind,
+            HttpRequestMessage request)
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(payload),
+                RequestMessage = request
+            };
+            response.Headers.ETag = EntityTagHeaderValue.Parse(SourceEtag);
+            response.Headers.TryAddWithoutValidation("x-ms-blob-type", kind);
+            return response;
+        }
+
+        private static HttpResponseMessage XmlResponse(string xml, HttpRequestMessage request) => new(HttpStatusCode.OK)
+        {
+            Content = new StringContent(xml, Encoding.UTF8, "application/xml"),
+            RequestMessage = request
+        };
+
+        private static bool HasPinnedEtag(HttpRequestMessage request) =>
+            request.Headers.IfMatch.Any(value => string.Equals(value.Tag, SourceEtag, StringComparison.Ordinal));
+
+        private static byte[] CreatePagePayload()
+        {
+            var payload = new byte[1536];
+            Array.Fill(payload, (byte)0x31, 0, 512);
+            Array.Fill(payload, (byte)0x33, 1024, 512);
+            return payload;
         }
     }
 }
