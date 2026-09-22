@@ -40,17 +40,18 @@ intentional terminations.
 ## SDK substitution checks
 
 The normal .NET integration suite uses the official Azure Storage client.
-Separate JavaScript and Python process lanes prove that endpoint substitution
-also works through independent official protocol stacks, including path-style
-account URLs, service and blob listings, block/append/page blobs, staged blocks,
-snapshots, leases, tags, byte ranges, and SAS authentication.
+Separate JavaScript, Python, and Go process lanes prove that endpoint
+substitution also works through independent official protocol stacks, including
+path-style account URLs, service and blob listings, block/append/page blobs,
+staged blocks, snapshots, leases, tags, byte ranges, and SAS authentication.
 
-Run it from the repository root with Node.js 20 or later, Corepack, and the .NET
-SDK available:
+Run the applicable lane from the repository root with the .NET SDK and the
+lane-specific prerequisites described below:
 
 ```bash
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/javascript/run.sh
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/python/run.sh
+DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/go/run.sh
 ```
 
 The JavaScript harness requires Node.js 20 or later and Corepack. It pins the
@@ -58,9 +59,11 @@ newest Azure client line supporting Node.js 20 and locks its transitive Azure
 packages to Node.js 20-compatible releases. The Python harness requires Python
 3.10 or later and `curl`; it hash-verifies a pinned pip wheel, installs an entirely
 hash-locked dependency graph into a disposable target, and never modifies the
-host Python installation. Each harness starts a real loopback mk8.sava process
-with a disposable storage root rather than routing the client through ASP.NET's
-in-memory test server.
+host Python installation. The Go harness hash-verifies the current stable Linux
+x86-64 toolchain from `go.dev`; `go.mod` and `go.sum` pin and authenticate the
+official SDK and its complete module graph. Each harness starts a real loopback
+mk8.sava process with a disposable storage root rather than routing the client
+through ASP.NET's in-memory test server.
 
 ## Account capabilities
 
