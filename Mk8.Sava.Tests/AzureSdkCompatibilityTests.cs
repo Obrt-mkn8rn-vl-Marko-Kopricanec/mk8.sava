@@ -2665,6 +2665,87 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ObjectScopedAccountSasAuthorizesFindAndBatchParentRequests()
+    {
+        var owner = CreateClient(factory);
+        var container = owner.GetBlobContainerClient($"account-object-sas-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var tagged = container.GetBlobClient("tagged.bin");
+        await tagged.UploadAsync(
+            BinaryData.FromString("tagged"),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string> { ["scope"] = "account-object" }
+            });
+        var deleteTarget = container.GetBlobClient("delete.bin");
+        await deleteTarget.UploadAsync(BinaryData.FromString("delete"));
+        var tierTarget = container.GetBlobClient("tier.bin");
+        await tierTarget.UploadAsync(BinaryData.FromString("tier"));
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var builder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(
+            AccountSasPermissions.Read |
+            AccountSasPermissions.Write |
+            AccountSasPermissions.Delete |
+            AccountSasPermissions.Filter);
+        var endpoint = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost" +
+            $"?{builder.ToSasQueryParameters(credential)}");
+        var sasService = new BlobServiceClient(
+            endpoint,
+            new BlobClientOptions
+            {
+                Transport = new HttpClientTransport(new HttpClient(factory.Server.CreateHandler())
+                {
+                    BaseAddress = endpoint
+                }),
+                Retry = { MaxRetries = 0 }
+            });
+
+        var matches = new List<string>();
+        await foreach (var item in sasService.FindBlobsByTagsAsync("\"scope\" = 'account-object'"))
+            matches.Add($"{item.BlobContainerName}/{item.BlobName}");
+        Assert.Equal([$"{container.Name}/{tagged.Name}"], matches);
+
+        var serviceBatchClient = sasService.GetBlobBatchClient();
+        using (var batch = serviceBatchClient.CreateBatch())
+        {
+            var deleted = batch.DeleteBlob(container.Name, deleteTarget.Name);
+            var submitted = await serviceBatchClient.SubmitBatchAsync(batch);
+            Assert.Equal(StatusCodes.Status202Accepted, submitted.Status);
+            Assert.Equal(StatusCodes.Status202Accepted, deleted.Status);
+        }
+        Assert.False((await deleteTarget.ExistsAsync()).Value);
+
+        var containerBatchClient = sasService
+            .GetBlobContainerClient(container.Name)
+            .GetBlobBatchClient();
+        using (var batch = containerBatchClient.CreateBatch())
+        {
+            var tiered = batch.SetBlobAccessTier(container.Name, tierTarget.Name, AccessTier.Cool);
+            var submitted = await containerBatchClient.SubmitBatchAsync(batch);
+            Assert.Equal(StatusCodes.Status202Accepted, submitted.Status);
+            Assert.Equal(StatusCodes.Status200OK, tiered.Status);
+        }
+        Assert.Equal(AccessTier.Cool, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
+
+        var deniedServiceOperation = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sasService.GetPropertiesAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedServiceOperation.Status);
+        Assert.Equal("AuthorizationResourceTypeMismatch", deniedServiceOperation.ErrorCode);
+    }
+
+    [Fact]
     public async Task ServiceAnalyticsPropertiesRoundTripAndPartialUpdatesPreserveOtherGroups()
     {
         var service = CreateClient(factory);

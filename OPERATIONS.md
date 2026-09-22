@@ -89,6 +89,13 @@ service version fail authentication. An HNS account can issue a directory SAS
 virtual directory and its descendants. Parent and sibling paths do not share
 that authorization, and flat-namespace accounts reject directory SAS.
 
+Account-SAS resource types follow the operation rather than only the parent
+request URI. Service-wide Find Blobs by Tags and Blob Batch parent requests use
+the object resource type (`srt=o`), including a batch submitted through a
+container-scoped URI. Container-scoped tag searches continue to use the
+container resource type (`srt=c`), ordinary service operations use `srt=s`, and
+Undelete Blob retains Azure's documented container-resource exception.
+
 A container SAS continues to cover snapshots and versions in the container
 without signing their individual identifiers. Snapshot (`sr=bs`) and version
 (`sr=bv`) tokens instead bind those identifiers explicitly; version SAS begins
