@@ -103,6 +103,13 @@ permissions are subject to the same canonical and version gates as permissions
 carried by the token. Account and user-delegation SAS cannot reference a stored
 access policy.
 
+Valid SAS protocol and IPv4 restrictions that exclude the request return
+Azure's dedicated `403 AuthorizationProtocolMismatch` and
+`403 AuthorizationSourceIPMismatch` errors. A malformed `spr` value, malformed
+or reversed `sip` range, IPv6 range, or use before service version `2015-04-05`
+instead fails SAS authentication. IP ranges are inclusive and are evaluated
+against the request's remote IPv4 address.
+
 A container SAS continues to cover snapshots and versions in the container
 without signing their individual identifiers. Snapshot (`sr=bs`) and version
 (`sr=bv`) tokens instead bind those identifiers explicitly; version SAS begins

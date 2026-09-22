@@ -5594,6 +5594,78 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task SasProtocolAndIpRestrictionsReturnAzureErrorCodes()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"sas-restrictions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("restricted.txt");
+        await blob.UploadAsync(BinaryData.FromString("restricted payload"));
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+
+        BlobSasBuilder CreateBuilder() => new()
+        {
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
+            Resource = "b",
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
+        };
+
+        Uri CreateUri(BlobSasBuilder builder)
+        {
+            builder.SetPermissions(BlobSasPermissions.Read);
+            return new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
+                $"?{builder.ToSasQueryParameters(credential)}");
+        }
+
+        static Uri ReplaceQueryValue(Uri uri, string name, string value)
+        {
+            var pairs = uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries);
+            var replaced = false;
+            for (var index = 0; index < pairs.Length; index++)
+            {
+                var separator = pairs[index].IndexOf('=');
+                var encodedName = separator < 0 ? pairs[index] : pairs[index][..separator];
+                if (!string.Equals(Uri.UnescapeDataString(encodedName), name, StringComparison.Ordinal))
+                    continue;
+
+                pairs[index] = $"{encodedName}={Uri.EscapeDataString(value)}";
+                replaced = true;
+                break;
+            }
+
+            Assert.True(replaced, $"The {name} query parameter was not present.");
+            return new UriBuilder(uri) { Query = string.Join('&', pairs) }.Uri;
+        }
+
+        async Task AssertErrorAsync(Uri uri, string code)
+        {
+            var client = CreateBlobClient(factory, uri);
+            var failure = await Assert.ThrowsAsync<RequestFailedException>(() => client.DownloadContentAsync());
+            Assert.Equal(StatusCodes.Status403Forbidden, failure.Status);
+            Assert.Equal(code, failure.ErrorCode);
+        }
+
+        var protocolBuilder = CreateBuilder();
+        protocolBuilder.Protocol = SasProtocol.Https;
+        var protocolUri = CreateUri(protocolBuilder);
+        await AssertErrorAsync(protocolUri, "AuthorizationProtocolMismatch");
+        await AssertErrorAsync(ReplaceQueryValue(protocolUri, "spr", "ftp"), "AuthenticationFailed");
+
+        var ipBuilder = CreateBuilder();
+        ipBuilder.Protocol = SasProtocol.HttpsAndHttp;
+        ipBuilder.IPRange = new SasIPRange(IPAddress.Parse("203.0.113.10"), IPAddress.None);
+        var ipUri = CreateUri(ipBuilder);
+        await AssertErrorAsync(ipUri, "AuthorizationSourceIPMismatch");
+        await AssertErrorAsync(ReplaceQueryValue(ipUri, "sip", "not-an-ip"), "AuthenticationFailed");
+    }
+
+    [Fact]
     public async Task DisabledSharedKeyAccessRejectsKeyBasedAuthButAllowsUserDelegationSas()
     {
         await using var application = new SavaWebApplicationFactory(

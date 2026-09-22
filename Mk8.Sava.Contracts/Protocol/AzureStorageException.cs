@@ -103,6 +103,16 @@ public sealed class AzureStorageException : Exception
         "AuthorizationResourceTypeMismatch",
         "This request is not authorized to perform this operation using this resource type.");
 
+    public static AzureStorageException AuthorizationProtocolMismatch() => new(
+        (int)HttpStatusCode.Forbidden,
+        "AuthorizationProtocolMismatch",
+        "This request is not authorized to perform this operation using this protocol.");
+
+    public static AzureStorageException AuthorizationSourceIpMismatch(IPAddress? address) => new(
+        (int)HttpStatusCode.Forbidden,
+        "AuthorizationSourceIPMismatch",
+        $"This request is not authorized to perform this operation using this source IP {address}.");
+
     public static AzureStorageException BlobOperationNotSupported() => new(
         (int)HttpStatusCode.Conflict,
         "BlobOperationNotSupported",

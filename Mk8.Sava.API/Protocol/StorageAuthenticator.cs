@@ -324,14 +324,18 @@ public sealed class StorageAuthenticator(
         {
             throw AzureStorageException.AuthenticationFailed();
         }
-        if (protocol is not ("" or "https" or "https,http") ||
-            protocol == "https" && !context.Request.IsHttps)
-        {
-            throw AzureStorageException.AuthenticationFailed("The request protocol is not permitted by the signed protocol field.");
-        }
+        if (protocol is not ("" or "https" or "https,http"))
+            throw AzureStorageException.AuthenticationFailed("The signed protocol field is invalid.");
+        if (protocol == "https" && !context.Request.IsHttps)
+            throw AzureStorageException.AuthorizationProtocolMismatch();
 
-        if (!string.IsNullOrEmpty(signedIp) && !MatchesIpRange(context.Connection.RemoteIpAddress, signedIp))
-            throw AzureStorageException.AuthenticationFailed("The request IP address is not permitted by the signed IP field.");
+        if (!string.IsNullOrEmpty(signedIp))
+        {
+            if (!TryParseIpRange(signedIp, out var rangeStart, out var rangeEnd))
+                throw AzureStorageException.AuthenticationFailed("The signed IP field is invalid.");
+            if (!MatchesIpRange(context.Connection.RemoteIpAddress, rangeStart, rangeEnd))
+                throw AzureStorageException.AuthorizationSourceIpMismatch(context.Connection.RemoteIpAddress);
+        }
 
         var permissions = query["sp"].ToString();
         var signedStartsAt = ParseSasTime(query["st"].ToString());
@@ -1136,18 +1140,37 @@ public sealed class StorageAuthenticator(
         Guid.TryParse(right, out var rightTenant) &&
         leftTenant == rightTenant;
 
-    private static bool MatchesIpRange(IPAddress? address, string range)
+    private static bool TryParseIpRange(
+        string range,
+        out IPAddress start,
+        out IPAddress end)
+    {
+        start = IPAddress.None;
+        end = IPAddress.None;
+        var values = range.Split('-', 2);
+        if (!IPAddress.TryParse(values[0], out var parsedStart) ||
+            parsedStart.AddressFamily != AddressFamily.InterNetwork)
+            return false;
+
+        start = parsedStart;
+        if (values.Length == 1)
+        {
+            end = start;
+            return true;
+        }
+
+        if (!IPAddress.TryParse(values[1], out var parsedEnd) ||
+            parsedEnd.AddressFamily != AddressFamily.InterNetwork ||
+            Compare(start.GetAddressBytes(), parsedEnd.GetAddressBytes()) > 0)
+            return false;
+
+        end = parsedEnd;
+        return true;
+    }
+
+    private static bool MatchesIpRange(IPAddress? address, IPAddress start, IPAddress end)
     {
         if (address is null || address.AddressFamily != AddressFamily.InterNetwork)
-            return false;
-        var values = range.Split('-', 2);
-        if (!IPAddress.TryParse(values[0], out var start) ||
-            start.AddressFamily != AddressFamily.InterNetwork)
-            return false;
-        if (values.Length == 1)
-            return address.Equals(start);
-        if (!IPAddress.TryParse(values[1], out var end) ||
-            end.AddressFamily != AddressFamily.InterNetwork)
             return false;
         var candidateBytes = address.GetAddressBytes();
         return Compare(candidateBytes, start.GetAddressBytes()) >= 0 &&
