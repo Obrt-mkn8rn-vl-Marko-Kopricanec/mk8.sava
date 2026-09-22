@@ -408,6 +408,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
+            RequireAccountSasForContainerOperation(request);
             RequireAny(request, 'c', 'w');
             RequireZeroContentLength(http.Request);
             var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
@@ -430,6 +431,7 @@ public static class BlobProtocolEndpoint
         if (comp == "undelete" && HttpMethods.IsPut(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
+            RequireAccountSasForContainerOperation(request);
             Require(request, 'w');
             RequireZeroContentLength(http.Request);
             var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name")
@@ -452,6 +454,7 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
             string.IsNullOrEmpty(comp))
         {
+            RequireAccountSasForContainerOperation(request);
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerPropertiesHeaders(http.Response, container);
@@ -534,6 +537,7 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
             comp == "metadata")
         {
+            RequireAccountSasForContainerOperation(request);
             await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerMetadataHeaders(http.Response, container);
@@ -542,6 +546,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "metadata")
         {
+            RequireAccountSasForContainerOperation(request);
             Require(request, 'w');
             RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateContainerWrite(
@@ -591,7 +596,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
         {
             RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Lease Container");
-            Require(request, 'w');
+            RequireContainerLeasePermission(request, http.Request);
             BlobConditionEvaluator.EvaluateContainerWrite(
                 http.Request,
                 container.LastModified,
@@ -603,6 +608,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
+            RequireAccountSasForContainerOperation(request);
             Require(request, 'd');
             BlobConditionEvaluator.EvaluateContainerWrite(
                 http.Request,
@@ -3000,6 +3006,31 @@ public static class BlobProtocolEndpoint
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas)
             throw AzureStorageException.AuthorizationFailure();
         Require(request, 'p');
+    }
+
+    private static void RequireAccountSasForContainerOperation(StorageRequestContext request)
+    {
+        if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
+            !request.Authorization.IsAccountSas)
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+    }
+
+    private static void RequireContainerLeasePermission(
+        StorageRequestContext request,
+        HttpRequest httpRequest)
+    {
+        RequireAccountSasForContainerOperation(request);
+        var action = ProtocolParsing.First(httpRequest.Headers, "x-ms-lease-action");
+        if (string.Equals(action, "break", StringComparison.OrdinalIgnoreCase) &&
+            IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
+        {
+            RequireAny(request, 'w', 'd');
+            return;
+        }
+
+        Require(request, 'w');
     }
 
     private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
