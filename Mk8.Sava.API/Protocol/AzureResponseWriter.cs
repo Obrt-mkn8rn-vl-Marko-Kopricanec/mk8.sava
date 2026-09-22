@@ -41,12 +41,13 @@ public sealed partial class AzureResponseWriter
     {
         var request = StorageRequestContext.Get(context);
         var nextMarker = page.HasMore && page.Items.Count > 0 ? page.Items[^1].Name : string.Empty;
-        var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
+        var endpoint = StorageResourcePath.GetServiceEndpoint(context.Request, request.Account);
+        var usesModernEndpointShape = IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15));
 
         return WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("EnumerationResults");
-            writer.WriteAttributeString("ServiceEndpoint", endpoint);
+            writer.WriteAttributeString(usesModernEndpointShape ? "ServiceEndpoint" : "AccountName", endpoint);
             if (context.Request.Query.ContainsKey("prefix"))
                 writer.WriteElementString("Prefix", prefix);
             if (context.Request.Query.ContainsKey("marker"))
@@ -58,14 +59,54 @@ public sealed partial class AzureResponseWriter
             {
                 writer.WriteStartElement("Container");
                 writer.WriteElementString("Name", container.Name);
-                writer.WriteStartElement("Properties");
-                writer.WriteElementString("Last-Modified", container.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Etag", FormatEntityTag(request, container.ETag));
-                if (includeDeleted)
+                if (!usesModernEndpointShape)
                 {
-                    writer.WriteElementString("Deleted", container.DeletedAt.HasValue ? "true" : "false");
-                    if (container.DeletedVersion is not null)
-                        writer.WriteElementString("Version", container.DeletedVersion);
+                    writer.WriteElementString(
+                        "Url",
+                        StorageResourcePath.GetContainerEndpoint(
+                            context.Request,
+                            request.Account,
+                            container.Name));
+                }
+                var isDeleted = includeDeleted && container.DeletedAt.HasValue;
+                if (isDeleted)
+                {
+                    WriteOptional(writer, "Version", container.DeletedVersion);
+                    writer.WriteElementString("Deleted", "true");
+                }
+                writer.WriteStartElement("Properties");
+                writer.WriteElementString(
+                    IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19))
+                        ? "Last-Modified"
+                        : "LastModified",
+                    container.LastModified.ToString("R", CultureInfo.InvariantCulture));
+                writer.WriteElementString("Etag", FormatEntityTag(request, container.ETag));
+                if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+                {
+                    writer.WriteElementString("LeaseStatus", LeaseStatus(container.Lease));
+                    writer.WriteElementString("LeaseState", LeaseStateValue(container.Lease));
+                    if (container.Lease.State == Storage.LeaseState.Leased)
+                    {
+                        writer.WriteElementString(
+                            "LeaseDuration",
+                            container.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+                    }
+                }
+                if (!isDeleted &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+                {
+                    WriteOptional(writer, "PublicAccess", container.PublicAccess);
+                }
+                if (!isDeleted &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+                {
+                    writer.WriteElementString(
+                        "HasImmutabilityPolicy",
+                        container.ImmutabilityUntil.HasValue ? "true" : "false");
+                    writer.WriteElementString("HasLegalHold", container.HasLegalHold ? "true" : "false");
+                }
+                if (isDeleted)
+                {
                     WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
                     if (container.DeleteRetentionUntil.HasValue)
                     {
@@ -105,13 +146,26 @@ public sealed partial class AzureResponseWriter
             : string.Empty;
         if (arrow)
             return WriteArrowBlobsAsync(context, listing, nextMarker, includes, cancellationToken);
-        var endpoint = $"{context.Request.Scheme}://{context.Request.Host}/{request.Account}";
+        var serviceEndpoint = StorageResourcePath.GetServiceEndpoint(context.Request, request.Account);
+        var containerEndpoint = StorageResourcePath.GetContainerEndpoint(
+            context.Request,
+            request.Account,
+            request.Container!);
+        var usesModernEndpointShape = IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15));
+        var usesModernPropertyShape = IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19));
 
         return WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("EnumerationResults");
-            writer.WriteAttributeString("ServiceEndpoint", endpoint);
-            writer.WriteAttributeString("ContainerName", request.Container);
+            if (usesModernEndpointShape)
+            {
+                writer.WriteAttributeString("ServiceEndpoint", serviceEndpoint);
+                writer.WriteAttributeString("ContainerName", request.Container);
+            }
+            else
+            {
+                writer.WriteAttributeString("ContainerName", containerEndpoint);
+            }
             if (context.Request.Query.ContainsKey("prefix"))
                 writer.WriteElementString("Prefix", prefix);
             if (context.Request.Query.ContainsKey("marker"))
@@ -135,6 +189,16 @@ public sealed partial class AzureResponseWriter
                 {
                     writer.WriteStartElement("Blob");
                     writer.WriteElementString("Name", entry.Name);
+                    if (!usesModernEndpointShape)
+                    {
+                        writer.WriteElementString(
+                            "Url",
+                            StorageResourcePath.GetBlobEndpoint(
+                                context.Request,
+                                request.Account,
+                                request.Container!,
+                                entry.Name));
+                    }
                     writer.WriteStartElement("Properties");
                     writer.WriteElementString("Content-Length", "0");
                     writer.WriteElementString("BlobType", "BlockBlob");
@@ -146,6 +210,16 @@ public sealed partial class AzureResponseWriter
                 var blob = entry.Blob!;
                 writer.WriteStartElement("Blob");
                 writer.WriteElementString("Name", blob.Name);
+                if (!usesModernEndpointShape)
+                {
+                    writer.WriteElementString(
+                        "Url",
+                        StorageResourcePath.GetBlobEndpoint(
+                            context.Request,
+                            request.Account,
+                            request.Container!,
+                            blob.Name));
+                }
                 if (blob.Snapshot is not null)
                     writer.WriteElementString("Snapshot", blob.Snapshot);
                 if (includes.Contains("versions") && blob.VersionId is not null)
@@ -158,6 +232,12 @@ public sealed partial class AzureResponseWriter
                 {
                     writer.WriteElementString("Deleted", "true");
                 }
+                if (!usesModernPropertyShape)
+                {
+                    WriteLegacyBlobProperties(writer, request, blob);
+                    writer.WriteEndElement();
+                    continue;
+                }
                 writer.WriteStartElement("Properties");
                 if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
                     writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
@@ -165,12 +245,12 @@ public sealed partial class AzureResponseWriter
                 writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
                 writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
                 writer.WriteElementString("Content-Type", blob.Http.ContentType);
-                WriteOptional(writer, "Content-Encoding", blob.Http.ContentEncoding);
-                WriteOptional(writer, "Content-Language", blob.Http.ContentLanguage);
+                writer.WriteElementString("Content-Encoding", blob.Http.ContentEncoding ?? string.Empty);
+                writer.WriteElementString("Content-Language", blob.Http.ContentLanguage ?? string.Empty);
                 WriteOptional(writer, "Content-MD5", blob.Http.ContentMd5);
-                WriteOptional(writer, "Cache-Control", blob.Http.CacheControl);
+                writer.WriteElementString("Cache-Control", blob.Http.CacheControl ?? string.Empty);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
-                    WriteOptional(writer, "Content-Disposition", blob.Http.ContentDisposition);
+                    writer.WriteElementString("Content-Disposition", blob.Http.ContentDisposition ?? string.Empty);
                 writer.WriteElementString("BlobType", BlobType(blob.Kind));
                 if (blob.Kind == Storage.BlobKind.BlockBlob &&
                     IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
@@ -207,7 +287,9 @@ public sealed partial class AzureResponseWriter
                             RemainingRetentionDays(blob.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
                     }
                 }
-                if (blob.Snapshot is null && !blob.IsDeleted)
+                if (blob.Snapshot is null &&
+                    !blob.IsDeleted &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)))
                 {
                     writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
                     if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
@@ -669,6 +751,19 @@ public sealed partial class AzureResponseWriter
                 writer.WriteElementString(XmlConvert.EncodeLocalName(name), value);
         }
         writer.WriteEndElement();
+    }
+
+    private static void WriteLegacyBlobProperties(
+        XmlWriter writer,
+        StorageRequestContext request,
+        BlobRecord blob)
+    {
+        writer.WriteElementString("LastModified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
+        writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
+        writer.WriteElementString("Size", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
+        writer.WriteElementString("ContentType", blob.Http.ContentType);
+        writer.WriteElementString("ContentEncoding", blob.Http.ContentEncoding ?? string.Empty);
+        writer.WriteElementString("ContentLanguage", blob.Http.ContentLanguage ?? string.Empty);
     }
 
     private static void WriteTags(XmlWriter writer, IReadOnlyDictionary<string, string> tags)
