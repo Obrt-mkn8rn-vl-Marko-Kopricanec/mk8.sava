@@ -766,9 +766,7 @@ internal static class ProtocolParsing
     {
         if (version < minimum)
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
         }
     }

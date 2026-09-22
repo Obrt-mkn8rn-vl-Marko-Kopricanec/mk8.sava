@@ -161,9 +161,7 @@ internal static class BlobConditionEvaluator
             return;
         if (!IsServiceVersionAtLeast(request, new DateOnly(2025, 5, 5)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Access-tier conditional headers require service version 2025-05-05 or later.");
         }
         if (hasModified && hasUnmodified)

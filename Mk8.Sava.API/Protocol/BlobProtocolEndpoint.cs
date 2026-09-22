@@ -438,9 +438,7 @@ public static class BlobProtocolEndpoint
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "FeatureVersionMismatch",
+                throw AzureStorageException.FeatureVersionMismatch(
                     "The startFrom parameter requires service version 2023-05-03 or later.");
             }
             var arrow = IsArrowListRequest(http.Request, request);
@@ -448,9 +446,7 @@ public static class BlobProtocolEndpoint
             {
                 if (!IsServiceVersionAtLeast(request, new DateOnly(2026, 6, 6)))
                 {
-                    throw new AzureStorageException(
-                        StatusCodes.Status400BadRequest,
-                        "FeatureVersionMismatch",
+                    throw AzureStorageException.FeatureVersionMismatch(
                         "The endBefore parameter requires service version 2026-06-06 or later.");
                 }
                 if (string.IsNullOrEmpty(endBefore))
@@ -485,6 +481,7 @@ public static class BlobProtocolEndpoint
                 decodedMarker,
                 maxResults,
                 cancellationToken);
+            ValidateListedBlobTypes(request, blobs);
             await writer.WriteBlobsAsync(
                 http,
                 blobs,
@@ -595,9 +592,7 @@ public static class BlobProtocolEndpoint
                 DateTimeStyles.None,
                 out var version) || version < minimumVersion)
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 $"Blob Batch requires service version {minimumVersion:yyyy-MM-dd} or later.");
         }
 
@@ -908,6 +903,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "block")
         {
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
@@ -950,6 +946,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "blocklist")
         {
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
             EvaluateWriteConditions(http.Request, current);
             if (current is not null)
@@ -980,6 +977,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "appendblock")
         {
+            RequireAppendBlobVersion(request);
             RequireAny(request, 'a', 'w');
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
@@ -1030,6 +1028,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "page")
         {
+            RequirePageBlobVersion(request);
             Require(request, 'w');
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
@@ -1121,9 +1120,7 @@ public static class BlobProtocolEndpoint
                     DateTimeStyles.None,
                     out var serviceVersion) || serviceVersion < new DateOnly(2016, 5, 31))
             {
-                throw new AzureStorageException(
-                    StatusCodes.Status409Conflict,
-                    "FeatureVersionMismatch",
+                throw AzureStorageException.FeatureVersionMismatch(
                     "Incremental Copy Blob requires service version 2016-05-31 or later.");
             }
 
@@ -1173,6 +1170,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'r');
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            ValidateBlobTypeVersion(request, current?.Kind);
             if (current is null)
                 EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
             else
@@ -1222,6 +1220,7 @@ public static class BlobProtocolEndpoint
             snapshot,
             includeDeleted: permanentDelete,
             cancellationToken);
+        ValidateBlobTypeVersion(request, blob.Kind);
 
         if (blob.IsIncrementalCopy && blob.Snapshot is null &&
             !(HttpMethods.IsHead(http.Request.Method) && string.IsNullOrEmpty(comp)) &&
@@ -1592,6 +1591,7 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+        ValidateBlobTypeVersion(request, current?.Kind);
         RequireAny(request, current is null ? 'c' : 'w', 'w');
         EvaluateWriteConditions(http.Request, current);
         if (current is not null ||
@@ -1625,6 +1625,7 @@ public static class BlobProtocolEndpoint
                     legacySourceReference.Snapshot,
                     includeDeleted: false,
                     cancellationToken);
+                ValidateBlobTypeVersion(request, legacySource.Kind);
                 ValidateOptionalLease(
                     http.Request,
                     legacySource.Lease,
@@ -1851,6 +1852,7 @@ public static class BlobProtocolEndpoint
                     async source =>
                     {
                         var sourceKind = source.Kind ?? BlobKind.BlockBlob;
+                        ValidateBlobTypeVersion(request, sourceKind);
                         ValidateCopyDestinationType(current, sourceKind);
                         return await service.BeginCopyFromStreamAsync(
                             request.Account,
@@ -1918,7 +1920,7 @@ public static class BlobProtocolEndpoint
                         : "x-ms-blob-content-md5");
                 break;
             case "AppendBlob":
-                RequireFeatureVersion(request, new DateOnly(2015, 2, 21), "Append Blob");
+                RequireAppendBlobVersion(request);
                 RequireZeroContentLength(http.Request);
                 created = await service.CreateAppendBlobAsync(
                     request.Account,
@@ -1931,6 +1933,7 @@ public static class BlobProtocolEndpoint
                     cancellationToken);
                 break;
             case "PageBlob":
+                RequirePageBlobVersion(request);
                 RequireZeroContentLength(http.Request);
                 var length = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-content-length", required: true);
                 var sequence = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number", defaultValue: 0);
@@ -2015,9 +2018,7 @@ public static class BlobProtocolEndpoint
                     DateTimeStyles.None,
                     out var serviceVersion) || serviceVersion < new DateOnly(2025, 1, 5))
             {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "FeatureVersionMismatch",
+                throw AzureStorageException.FeatureVersionMismatch(
                     "Structured response bodies require service version 2025-01-05 or later.");
             }
 
@@ -2094,9 +2095,7 @@ public static class BlobProtocolEndpoint
                 DateTimeStyles.None,
                 out var version) || version < new DateOnly(2019, 12, 12))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Query Blob Contents requires service version 2019-12-12 or later.");
         }
 
@@ -2386,7 +2385,7 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.AuthorizationFailure();
         }
 
-        return await service.GetBlobAsync(
+        var sourceBlob = await service.GetBlobAsync(
             source.Account,
             source.Container,
             source.Blob,
@@ -2394,6 +2393,8 @@ public static class BlobProtocolEndpoint
             source.Snapshot,
             false,
             cancellationToken);
+        ValidateBlobTypeVersion(destinationRequest, sourceBlob.Kind);
+        return sourceBlob;
     }
 
     private static async Task HandleContainerLeaseAsync(
@@ -2553,9 +2554,7 @@ public static class BlobProtocolEndpoint
                 out var serviceVersion) ||
             serviceVersion < new DateOnly(2019, 12, 12))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Find Blobs by Tags requires service version 2019-12-12 or later.");
         }
 
@@ -2819,9 +2818,7 @@ public static class BlobProtocolEndpoint
             return;
         if (!IsServiceVersionAtLeast(context, new DateOnly(2025, 11, 5)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Blob tag ETag and date conditions require service version 2025-11-05 or later.");
         }
 
@@ -2960,9 +2957,7 @@ public static class BlobProtocolEndpoint
         };
         if (!IsServiceVersionAtLeast(context, minimum))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 $"The {tier} access tier requires service version {minimum:yyyy-MM-dd} or later.");
         }
     }
@@ -3030,9 +3025,7 @@ public static class BlobProtocolEndpoint
     {
         if (IsServiceVersionAtLeast(request, minimum))
             return;
-        throw new AzureStorageException(
-            StatusCodes.Status400BadRequest,
-            "FeatureVersionMismatch",
+        throw AzureStorageException.FeatureVersionMismatch(
             $"{feature} requires service version {minimum:yyyy-MM-dd} or later.");
     }
 
@@ -3089,6 +3082,50 @@ public static class BlobProtocolEndpoint
             !IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
         {
             throw AzureStorageException.InvalidQuery("include");
+        }
+    }
+
+    private static void ValidateListedBlobTypes(
+        StorageRequestContext request,
+        BlobListPage page)
+    {
+        if ((page.Items.Any(item => item.Blob?.Kind == BlobKind.PageBlob) &&
+             !IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19))) ||
+            (page.Items.Any(item => item.Blob?.Kind == BlobKind.AppendBlob) &&
+             !IsServiceVersionAtLeast(request, new DateOnly(2015, 2, 21))))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "The type of a blob in the container is unrecognized by this version.");
+        }
+    }
+
+    private static void ValidateBlobTypeVersion(
+        StorageRequestContext request,
+        BlobKind? kind)
+    {
+        if (kind == BlobKind.PageBlob)
+            RequirePageBlobVersion(request);
+        if (kind == BlobKind.AppendBlob)
+            RequireAppendBlobVersion(request);
+    }
+
+    private static void RequirePageBlobVersion(StorageRequestContext request)
+    {
+        if (!IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidVersionForPageBlobOperation",
+                "All operations on page blobs require at least version 2009-09-19.");
+        }
+    }
+
+    private static void RequireAppendBlobVersion(StorageRequestContext request)
+    {
+        if (!IsServiceVersionAtLeast(request, new DateOnly(2015, 2, 21)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "The operation for AppendBlob requires at least version 2015-02-21.");
         }
     }
 
@@ -3464,9 +3501,7 @@ public static class BlobProtocolEndpoint
                  DateTimeStyles.None,
                  out var serviceVersion) || serviceVersion < new DateOnly(2019, 2, 2)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Customer-provided keys and encryption scopes require service version 2019-02-02 or later.");
         }
         if (!hasCustomerKeyHeader)
@@ -3667,9 +3702,7 @@ public static class BlobProtocolEndpoint
                 DateTimeStyles.None,
                 out var serviceVersion) || serviceVersion < new DateOnly(2019, 12, 12))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 $"The {headerName} condition requires service version 2019-12-12 or later.",
                 headerName,
                 expression);
@@ -3726,17 +3759,13 @@ public static class BlobProtocolEndpoint
         if (expectedCrc64 is not null &&
             !IsServiceVersionAtLeast(requestContext, new DateOnly(2019, 2, 2)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Transactional CRC64 checksums require service version 2019-02-02 or later.");
         }
         if ((structuredBody is not null || structuredContentLength is not null) &&
             !IsServiceVersionAtLeast(requestContext, new DateOnly(2025, 1, 5)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Structured request bodies require service version 2025-01-05 or later.");
         }
         if (structuredBody is not null)

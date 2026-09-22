@@ -60,9 +60,7 @@ internal sealed class UrlTransferClient(
         if (ProtocolParsing.First(destinationRequest.Headers, "x-ms-source-content-crc64") is not null &&
             !IsServiceVersionAtLeast(destinationRequest, new DateOnly(2019, 2, 2)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Source transactional CRC64 checksums require service version 2019-02-02 or later.");
         }
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
@@ -258,9 +256,7 @@ internal sealed class UrlTransferClient(
             return;
         if (!IsServiceVersionAtLeast(destination, new DateOnly(2020, 10, 2)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Copy source authorization requires service version 2020-10-02 or later.");
         }
         if (!AuthenticationHeaderValue.TryParse(value, out var authorization) ||
@@ -280,9 +276,7 @@ internal sealed class UrlTransferClient(
         if (destination.Headers.ContainsKey("x-ms-source-if-tags") &&
             !IsServiceVersionAtLeast(destination, new DateOnly(2019, 12, 12)))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Source tag conditions require service version 2019-12-12 or later.");
         }
         Copy("x-ms-source-if-tags", "x-ms-if-tags");
@@ -338,9 +332,7 @@ internal sealed class UrlTransferClient(
                 DateTimeStyles.None,
                 out var version) || version < new DateOnly(2026, 2, 6))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "Source customer-provided keys require service version 2026-02-06 or later.");
         }
         if (!request.IsHttps || !string.Equals(sourceUri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
