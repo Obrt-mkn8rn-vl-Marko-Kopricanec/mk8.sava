@@ -2157,6 +2157,107 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceUpnProjectionValidatesItsDocumentedRequestShape()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-upn-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/item.bin");
+        await blob.UploadAsync(BinaryData.FromString("identity"));
+        using var transport = new HttpClient(application.Server.CreateHandler());
+
+        async Task<HttpResponseMessage> ListAsync(string version, string include, string upn)
+        {
+            var uri = AppendQuery(
+                container.GenerateSasUri(
+                    BlobContainerSasPermissions.List,
+                    DateTimeOffset.UtcNow.AddMinutes(5)),
+                $"restype=container&comp=list{include}");
+            var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            request.Headers.TryAddWithoutValidation("x-ms-upn", upn);
+            return await transport.SendAsync(request);
+        }
+
+        using (var projected = await ListAsync("2020-06-12", "&include=permissions", "TRUE"))
+        {
+            Assert.Equal(HttpStatusCode.OK, projected.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(await projected.Content.ReadAsStringAsync());
+            var properties = document.Descendants("Blob").Single(element =>
+                element.Element("Name")?.Value == blob.Name).Element("Properties");
+            Assert.Equal("$superuser", properties?.Element("Owner")?.Value);
+            Assert.Equal("$superuser", properties?.Element("Group")?.Value);
+            Assert.NotNull(properties?.Element("Acl"));
+        }
+        using (var missingPermissions = await ListAsync("2023-11-03", string.Empty, "true"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, missingPermissions.StatusCode);
+            Assert.Equal("InvalidHeaderValue", GetResponseHeader(missingPermissions, "x-ms-error-code"));
+        }
+        using (var invalid = await ListAsync("2023-11-03", "&include=permissions", "yes"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+            Assert.Equal("InvalidHeaderValue", GetResponseHeader(invalid, "x-ms-error-code"));
+        }
+
+        async Task<HttpResponseMessage> HeadAsync(
+            BlobClient target,
+            string version,
+            string upn,
+            HttpClient client)
+        {
+            var request = new HttpRequestMessage(
+                HttpMethod.Head,
+                target.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            request.Headers.TryAddWithoutValidation("x-ms-upn", upn);
+            return await client.SendAsync(request);
+        }
+
+        using (var projected = await HeadAsync(blob, "2023-11-03", "false", transport))
+        {
+            Assert.Equal(HttpStatusCode.OK, projected.StatusCode);
+            Assert.Equal("$superuser", GetResponseHeader(projected, "x-ms-owner"));
+            Assert.Equal("$superuser", GetResponseHeader(projected, "x-ms-group"));
+        }
+        using (var legacy = await HeadAsync(blob, "2021-08-06", "true", transport))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, legacy.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", GetResponseHeader(legacy, "x-ms-error-code"));
+        }
+        using (var invalid = await HeadAsync(blob, "2023-11-03", "yes", transport))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+            Assert.Equal("InvalidHeaderValue", GetResponseHeader(invalid, "x-ms-error-code"));
+        }
+
+        await using var flatApplication = new SavaWebApplicationFactory();
+        var flatService = CreateClient(flatApplication);
+        var flatContainer = flatService.GetBlobContainerClient($"flat-upn-{Guid.NewGuid():N}");
+        await flatContainer.CreateAsync();
+        var flatBlob = flatContainer.GetBlobClient("item.bin");
+        await flatBlob.UploadAsync(BinaryData.FromString("flat"));
+        using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
+        using (var flat = await HeadAsync(
+                   flatBlob,
+                   "2023-11-03",
+                   "true",
+                   flatTransport))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, flat.StatusCode);
+            Assert.Equal("InvalidHeaderValue", GetResponseHeader(flat, "x-ms-error-code"));
+        }
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

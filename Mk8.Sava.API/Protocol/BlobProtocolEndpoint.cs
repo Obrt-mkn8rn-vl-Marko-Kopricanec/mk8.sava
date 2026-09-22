@@ -486,6 +486,7 @@ public static class BlobProtocolEndpoint
                 hierarchicalNamespace,
                 service.SupportsBlobIndexTags(request.Account),
                 service.SupportsBlobSnapshots(request.Account));
+            ValidateListUpnHeader(http.Request, hierarchicalNamespace, includes.Contains("permissions"));
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -1456,6 +1457,7 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+            ValidateBlobUpnHeader(http.Request, service.IsHierarchicalNamespaceEnabled(request.Account));
             var encryption = await EnsureBlobEncryptionAsync(
                 http.Request,
                 service,
@@ -3533,6 +3535,35 @@ public static class BlobProtocolEndpoint
             "directories" => BlobListShowOnly.Directories,
             _ => throw AzureStorageException.InvalidQuery("showonly")
         };
+    }
+
+    private static void ValidateListUpnHeader(
+        HttpRequest request,
+        bool hierarchicalNamespace,
+        bool includesPermissions)
+    {
+        const string headerName = "x-ms-upn";
+        if (!request.Headers.ContainsKey(headerName))
+            return;
+
+        var value = ProtocolParsing.First(request.Headers, headerName);
+        if (!hierarchicalNamespace || !includesPermissions || !bool.TryParse(value, out _))
+            throw AzureStorageException.InvalidHeader(headerName, value);
+    }
+
+    private static void ValidateBlobUpnHeader(HttpRequest request, bool hierarchicalNamespace)
+    {
+        const string headerName = "x-ms-upn";
+        if (!request.Headers.ContainsKey(headerName))
+            return;
+
+        var value = ProtocolParsing.First(request.Headers, headerName);
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2023, 11, 3),
+            "User principal name projection");
+        if (!hierarchicalNamespace || !bool.TryParse(value, out _))
+            throw AzureStorageException.InvalidHeader(headerName, value);
     }
 
     private static void ValidateContainerListFeatures(
