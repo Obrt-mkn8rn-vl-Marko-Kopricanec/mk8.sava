@@ -1,0 +1,7 @@
+{
+  "name": "mk8-sava-azure-storage-blobs-compatibility",
+  "version-string": "1.0.0",
+  "dependencies": [
+    "azure-storage-blobs-cpp"
+  ]
+}
