@@ -455,10 +455,12 @@ public sealed class StorageAuthenticator(
             {
                 throw AzureStorageException.AuthorizationFailure();
             }
-            if (hasUnauthorizedObjectId)
+            if (hasAuthorizedObjectId || hasUnauthorizedObjectId)
             {
-                // suoid requires a POSIX ACL decision for an HNS path. The Blob
-                // endpoint does not treat a signed identity as an ACL grant.
+                // saoid requires the delegation-key owner to have an HNS
+                // ownership/superuser action and changes ownership semantics.
+                // suoid additionally requires a POSIX ACL decision. Neither
+                // can be granted by a signed identity alone in this model.
                 throw AzureStorageException.AuthorizationFailure();
             }
 
