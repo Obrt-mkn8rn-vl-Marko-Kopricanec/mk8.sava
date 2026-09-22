@@ -900,6 +900,10 @@ public static class BlobProtocolEndpoint
             StatusCodes.Status409Conflict,
             "PendingCopyOperation",
             pending.Message),
+        StorageBlobTypeMismatchException mismatch => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "InvalidBlobType",
+            mismatch.Message),
         _ => new AzureStorageException(
             StatusCodes.Status500InternalServerError,
             "InternalError",
@@ -1858,7 +1862,7 @@ public static class BlobProtocolEndpoint
                     "x-ms-source-lease-id");
                 EvaluateCopySourceConditions(http.Request, legacySource);
                 ValidateCopySourceTier(http.Request, legacySource, allowArchivedSource: false);
-                ValidateCopyDestinationType(current, legacySource.Kind);
+                ValidateDestinationBlobType(current, legacySource.Kind);
                 var legacyCopy = await service.CopyBlobFromBlobSynchronouslyAsync(
                     request.Account,
                     containerName,
@@ -1934,7 +1938,7 @@ public static class BlobProtocolEndpoint
             {
                 RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
                 ValidateSynchronousCopyEncryption(http.Request);
-                ValidateCopyDestinationType(current, BlobKind.BlockBlob);
+                ValidateDestinationBlobType(current, BlobKind.BlockBlob);
                 RequireZeroContentLength(http.Request);
                 if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
                     throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
@@ -2053,7 +2057,7 @@ public static class BlobProtocolEndpoint
                     requireTagsPermission: HasSourceTagCondition(http.Request));
                 EvaluateCopySourceConditions(http.Request, source);
                 ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
-                ValidateCopyDestinationType(current, source.Kind);
+                ValidateDestinationBlobType(current, source.Kind);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
                     containerName,
@@ -2081,7 +2085,7 @@ public static class BlobProtocolEndpoint
                     {
                         var sourceKind = source.Kind ?? BlobKind.BlockBlob;
                         ValidateBlobTypeVersion(request, sourceKind);
-                        ValidateCopyDestinationType(current, sourceKind);
+                        ValidateDestinationBlobType(current, sourceKind);
                         return await service.BeginCopyFromStreamAsync(
                             request.Account,
                             containerName,
@@ -2118,15 +2122,28 @@ public static class BlobProtocolEndpoint
         EnsureDestinationCanBeOverwritten(current);
         var type = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type")
                    ?? throw AzureStorageException.InvalidHeader("x-ms-blob-type");
+        var requestedKind = type switch
+        {
+            "BlockBlob" => BlobKind.BlockBlob,
+            "AppendBlob" => BlobKind.AppendBlob,
+            "PageBlob" => BlobKind.PageBlob,
+            _ => throw AzureStorageException.InvalidHeader("x-ms-blob-type", type)
+        };
+        ValidateDestinationBlobType(current, requestedKind);
+        if (requestedKind != BlobKind.PageBlob)
+        {
+            RejectInvalidHeader(http.Request, "x-ms-blob-content-length");
+            RejectInvalidHeader(http.Request, "x-ms-blob-sequence-number");
+        }
         var explicitlyRequestedTier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier");
-        if (explicitlyRequestedTier is not null && type != "BlockBlob")
+        if (explicitlyRequestedTier is not null && requestedKind != BlobKind.BlockBlob)
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", explicitlyRequestedTier);
         var expiresAt = ReadWriteExpiry(http.Request, service, request.Account, fallback: null);
         BlobRecord created;
         TransactionalChecksums? checksums = null;
-        switch (type)
+        switch (requestedKind)
         {
-            case "BlockBlob":
+            case BlobKind.BlockBlob:
                 created = null!;
                 var persistedMd5 = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-content-md5");
                 checksums = await WithIntegrityValidationAsync(http.Request, async body =>
@@ -2150,7 +2167,7 @@ public static class BlobProtocolEndpoint
                         ? "Content-MD5"
                         : "x-ms-blob-content-md5");
                 break;
-            case "AppendBlob":
+            case BlobKind.AppendBlob:
                 RequireAppendBlobVersion(request);
                 RequireZeroContentLength(http.Request);
                 created = await service.CreateAppendBlobAsync(
@@ -2167,7 +2184,7 @@ public static class BlobProtocolEndpoint
                     current?.Revision,
                     cancellationToken);
                 break;
-            case "PageBlob":
+            case BlobKind.PageBlob:
                 RequirePageBlobVersion(request);
                 RequireFlatNamespace(service, request.Account);
                 RequireZeroContentLength(http.Request);
@@ -3931,6 +3948,12 @@ public static class BlobProtocolEndpoint
         }
     }
 
+    private static void RejectInvalidHeader(HttpRequest request, string headerName)
+    {
+        if (request.Headers.ContainsKey(headerName))
+            throw AzureStorageException.InvalidHeader(headerName, ProtocolParsing.First(request.Headers, headerName));
+    }
+
     private static void RejectExpiryHeaders(HttpRequest request)
     {
         RejectUnsupportedHeader(request, "x-ms-expiry-option");
@@ -3991,14 +4014,14 @@ public static class BlobProtocolEndpoint
             "An archived copy source requires an explicit online destination access tier.");
     }
 
-    private static void ValidateCopyDestinationType(BlobRecord? destination, BlobKind sourceKind)
+    private static void ValidateDestinationBlobType(BlobRecord? destination, BlobKind requestedKind)
     {
-        if (destination is null || destination.Kind == sourceKind)
+        if (destination is null || destination.Kind == requestedKind)
             return;
         throw new AzureStorageException(
             StatusCodes.Status409Conflict,
             "InvalidBlobType",
-            "The destination blob type does not match the copy source blob type.");
+            "The blob type is invalid for this operation.");
     }
 
     private static bool ReadCopySourceTags(HttpRequest request)

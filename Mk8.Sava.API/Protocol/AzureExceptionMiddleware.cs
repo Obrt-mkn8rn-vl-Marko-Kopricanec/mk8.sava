@@ -43,6 +43,13 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
                 "PendingCopyOperation",
                 exception.Message));
         }
+        catch (StorageBlobTypeMismatchException exception)
+        {
+            await WriteErrorAsync(context, new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "InvalidBlobType",
+                exception.Message));
+        }
         catch (StoragePathConflictException)
         {
             await WriteErrorAsync(context, AzureStorageException.PathAlreadyExists());

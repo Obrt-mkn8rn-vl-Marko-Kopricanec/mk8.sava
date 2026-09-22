@@ -1415,6 +1415,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             if (!string.Equals(activeCurrent?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
                 !string.Equals(activeCurrent?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
+            if (activeCurrent is not null && activeCurrent.Kind != proposed.Kind)
+                throw new StorageBlobTypeMismatchException();
 
             if (hierarchicalNamespace)
                 await EnsureHierarchicalParentsAsync(connection, transaction, proposed, cancellationToken);
@@ -3185,6 +3187,11 @@ public sealed class StorageImmutabilityException(bool legalHold) : Exception(
 public sealed class StoragePendingCopyException : Exception
 {
     public StoragePendingCopyException() : base("There is currently a pending copy operation.") { }
+}
+
+public sealed class StorageBlobTypeMismatchException : Exception
+{
+    public StorageBlobTypeMismatchException() : base("The blob type is invalid for this operation.") { }
 }
 
 public sealed class StoragePathConflictException : Exception
