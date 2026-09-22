@@ -9943,6 +9943,54 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(3.5D, (await QueryValueAsync("MAX(price)")).GetDouble());
     }
 
+    [Fact]
+    public async Task QueryBlobContentsTraversesNestedJsonAndDistinguishesMissingFields()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"nested-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.json");
+        await blob.UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(
+            "{\"id\":1,\"weight\":0.2,\"tags\":[\"wireless\",\"accessory\"]," +
+            "\"dimensions\":{\"length\":3},\"warehouses\":[" +
+            "{\"latitude\":41.8,\"longitude\":-87.6}," +
+            "{\"latitude\":45.1}," +
+            "{\"latitude\":46.0,\"longitude\":null}]}\n")));
+
+        var options = new BlobQueryOptions
+        {
+            InputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" },
+            OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+        };
+        var nested = await blob.QueryAsync(
+            "SELECT source.weight AS weight, source.warehouses[0].longitude AS longitude, " +
+            "source.tags[1] AS tag, source.dimensions.length AS length " +
+            "FROM BlobStorage[*] AS source;",
+            options);
+        using (var reader = new StreamReader(nested.Value.Content))
+        using (var result = JsonDocument.Parse((await reader.ReadToEndAsync()).Trim()))
+        {
+            Assert.Equal(0.2D, result.RootElement.GetProperty("weight").GetDouble());
+            Assert.Equal(-87.6D, result.RootElement.GetProperty("longitude").GetDouble());
+            Assert.Equal("accessory", result.RootElement.GetProperty("tag").GetString());
+            Assert.Equal(3, result.RootElement.GetProperty("length").GetInt64());
+        }
+
+        async Task<long> CountAsync(string predicate)
+        {
+            var response = await blob.QueryAsync(
+                $"SELECT COUNT(*) AS value FROM BlobStorage[*].warehouses[*] WHERE {predicate};",
+                options);
+            using var reader = new StreamReader(response.Value.Content);
+            using var result = JsonDocument.Parse((await reader.ReadToEndAsync()).Trim());
+            return result.RootElement.GetProperty("value").GetInt64();
+        }
+
+        Assert.Equal(1, await CountAsync("longitude IS MISSING"));
+        Assert.Equal(1, await CountAsync("longitude IS NULL"));
+        Assert.Equal(2, await CountAsync("longitude IS NOT MISSING"));
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 

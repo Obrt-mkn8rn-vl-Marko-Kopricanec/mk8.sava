@@ -79,7 +79,14 @@ internal static class BlobQueryProtocol
 
             var input = ReadFormat(Child(root, "InputSerialization"), input: true);
             var output = ReadFormat(Child(root, "OutputSerialization"), input: false);
-            _ = BlobQueryPlan.Parse(expression);
+            var plan = BlobQueryPlan.Parse(expression);
+            if (plan.HasJsonTablePath && input.Kind != BlobQueryFormatKind.Json)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidQueryParameterValue",
+                    "Nested BlobStorage table paths require JSON query input.");
+            }
             return new BlobQueryRequest(expression, input, output);
         }
         catch (AzureStorageException)
@@ -105,7 +112,7 @@ internal static class BlobQueryProtocol
 
         try
         {
-            await using var enumerator = ReadRowsAsync(input, request.Input, cancellationToken)
+            await using var enumerator = ReadRowsAsync(input, request.Input, plan, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
             await using var selections = SelectRowsAsync(enumerator, plan, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
@@ -368,7 +375,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else if (cell.Value is long integer)
                                 builder.Append(integer);
@@ -385,7 +392,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else if (cell.Value is bool boolean)
                                 builder.Append(boolean);
@@ -403,7 +410,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else if (cell.Value is DateTimeOffset timestamp)
                                 builder.Append(timestamp);
@@ -426,7 +433,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else
                                 builder.Append(cell.ToText());
@@ -439,7 +446,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else if (cell.Value is double floating)
                                 builder.Append(floating);
@@ -458,7 +465,7 @@ internal static class BlobQueryProtocol
                         foreach (var row in rows)
                         {
                             var cell = row.Values[column];
-                            if (cell.Value is null)
+                            if (cell.IsNullLike)
                                 builder.AppendNull();
                             else
                                 builder.Append(cell.ToText());
@@ -704,6 +711,7 @@ internal static class BlobQueryProtocol
     private static async IAsyncEnumerable<QueryRow> ReadRowsAsync(
         Stream input,
         BlobQueryTextFormat format,
+        BlobQueryPlan plan,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (format.Kind == BlobQueryFormatKind.Parquet)
@@ -768,27 +776,16 @@ internal static class BlobQueryProtocol
             using (document)
             {
                 var root = document.RootElement;
-                if (root.ValueKind == JsonValueKind.Object)
-                {
-                    var properties = root.EnumerateObject().ToArray();
-                    yield return new QueryRow(
-                        properties.Select(property => property.Name).ToArray(),
-                        properties.Select(property => QueryCell.FromJson(property.Value)).ToArray());
-                }
-                else if (root.ValueKind == JsonValueKind.Array)
-                {
-                    var values = root.EnumerateArray().Select(QueryCell.FromJson).ToArray();
-                    yield return new QueryRow(
-                        Enumerable.Range(1, values.Length).Select(index => $"_{index}").ToArray(),
-                        values);
-                }
-                else
+                if (!plan.HasJsonTablePath &&
+                    root.ValueKind is not (JsonValueKind.Object or JsonValueKind.Array))
                 {
                     throw new BlobQueryDataException(
                         "InvalidJsonType",
                         "Each JSON query input record must be an object or array.",
                         position);
                 }
+                foreach (var row in plan.ExpandJsonRows(root))
+                    yield return row;
             }
 
             position += record.Length + format.RecordSeparator.Length;
@@ -1234,8 +1231,20 @@ internal sealed class BlobQueryAvroWriter(Stream destination)
     }
 }
 
+internal sealed class QueryMissing
+{
+    public static QueryMissing Value { get; } = new();
+
+    private QueryMissing()
+    {
+    }
+}
+
 internal sealed record QueryCell(object? Value)
 {
+    public bool IsMissing => Value is QueryMissing;
+    public bool IsNullLike => Value is null or QueryMissing;
+
     public static QueryCell FromJson(JsonElement element) => element.ValueKind switch
     {
         JsonValueKind.Null or JsonValueKind.Undefined => new QueryCell((object?)null),
@@ -1244,6 +1253,7 @@ internal sealed record QueryCell(object? Value)
         JsonValueKind.False => new QueryCell(false),
         JsonValueKind.Number when element.TryGetInt64(out var integer) => new QueryCell(integer),
         JsonValueKind.Number when element.TryGetDecimal(out var number) => new QueryCell(number),
+        JsonValueKind.Object or JsonValueKind.Array => new QueryCell(element.Clone()),
         _ => new QueryCell(element.GetRawText())
     };
 
@@ -1253,6 +1263,8 @@ internal sealed record QueryCell(object? Value)
         bool boolean => boolean ? "true" : "false",
         DateTimeOffset timestamp => timestamp.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
         DateTime timestamp => timestamp.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+        JsonElement element => element.GetRawText(),
+        QueryMissing => string.Empty,
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture) ?? string.Empty,
         _ => Value.ToString() ?? string.Empty
     };
@@ -1282,6 +1294,13 @@ internal sealed record QueryCell(object? Value)
             case DateTime timestamp:
                 writer.WriteString(name, timestamp.ToUniversalTime());
                 break;
+            case JsonElement element:
+                writer.WritePropertyName(name);
+                element.WriteTo(writer);
+                break;
+            case QueryMissing:
+                writer.WriteNull(name);
+                break;
             default:
                 writer.WriteString(name, ToText());
                 break;
@@ -1289,7 +1308,10 @@ internal sealed record QueryCell(object? Value)
     }
 }
 
-internal sealed record QueryRow(IReadOnlyList<string> Names, IReadOnlyList<QueryCell> Values)
+internal sealed record QueryRow(
+    IReadOnlyList<string> Names,
+    IReadOnlyList<QueryCell> Values,
+    bool PreserveMissing = false)
 {
     public QueryCell Resolve(string name, bool caseSensitive = false)
     {
@@ -1308,7 +1330,7 @@ internal sealed record QueryRow(IReadOnlyList<string> Names, IReadOnlyList<Query
                     caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase))
                 return Values[index];
         }
-        return new QueryCell(null);
+        return new QueryCell(PreserveMissing ? QueryMissing.Value : null);
     }
 }
 
@@ -1320,24 +1342,37 @@ internal sealed class BlobQueryPlan
     private readonly QueryPredicate? _predicate;
     private readonly long? _limit;
     private readonly QueryAggregateState? _aggregate;
+    private readonly IReadOnlyList<QueryTableSegment> _tablePath;
     private long _selectedRows;
 
     private BlobQueryPlan(
         IReadOnlyList<QueryProjection> projections,
         QueryPredicate? predicate,
         long? limit,
-        QueryAggregateState? aggregate)
+        QueryAggregateState? aggregate,
+        IReadOnlyList<QueryTableSegment> tablePath)
     {
         _projections = projections;
         _predicate = predicate;
         _limit = limit;
         _aggregate = aggregate;
+        _tablePath = tablePath;
     }
 
     public static BlobQueryPlan Parse(string expression) => new QueryParser(expression).Parse();
 
     public bool LimitReached => _limit.HasValue && _selectedRows >= _limit.Value;
     public bool IsAggregate => _aggregate is not null;
+    public bool HasJsonTablePath => _tablePath.Count > 0;
+
+    public IEnumerable<QueryRow> ExpandJsonRows(JsonElement root)
+    {
+        IEnumerable<JsonElement> nodes = [root];
+        foreach (var segment in _tablePath)
+            nodes = ExpandJsonSegment(nodes, segment);
+        foreach (var node in nodes)
+            yield return CreateJsonRow(node);
+    }
 
     public QuerySelection? Select(QueryRow row)
     {
@@ -1373,18 +1408,56 @@ internal sealed class BlobQueryPlan
 
     private sealed record QueryProjection(bool Star, QueryExpression? Expression, string Name);
 
+    private sealed record QueryTableSegment(
+        string? Name,
+        int? Index,
+        bool Wildcard,
+        bool CaseSensitive);
+
     private abstract record QueryExpression
     {
         public abstract QueryCell Evaluate(QueryRow row);
     }
 
+    private sealed record QueryFieldSegment(string? Name, int? Index, bool CaseSensitive);
+
     private sealed record QueryOperand(
-        string? Field,
-        bool FieldCaseSensitive,
+        IReadOnlyList<QueryFieldSegment>? Path,
         QueryCell? Literal) : QueryExpression
     {
-        public override QueryCell Evaluate(QueryRow row) =>
-            Field is null ? Literal! : row.Resolve(Field, FieldCaseSensitive);
+        public override QueryCell Evaluate(QueryRow row)
+        {
+            if (Path is null)
+                return Literal!;
+            var first = Path[0];
+            var value = row.Resolve(first.Name!, first.CaseSensitive);
+            for (var index = 1; index < Path.Count; index++)
+            {
+                if (value.IsNullLike)
+                    return value;
+                if (value.Value is not JsonElement element)
+                    return new QueryCell(QueryMissing.Value);
+                var segment = Path[index];
+                if (segment.Index is { } arrayIndex)
+                {
+                    if (element.ValueKind != JsonValueKind.Array ||
+                        arrayIndex < 0 ||
+                        arrayIndex >= element.GetArrayLength())
+                    {
+                        return new QueryCell(QueryMissing.Value);
+                    }
+                    value = QueryCell.FromJson(element[arrayIndex]);
+                    continue;
+                }
+                if (element.ValueKind != JsonValueKind.Object ||
+                    !TryGetJsonProperty(element, segment.Name!, segment.CaseSensitive, out var property))
+                {
+                    return new QueryCell(QueryMissing.Value);
+                }
+                value = QueryCell.FromJson(property);
+            }
+            return value;
+        }
     }
 
     private sealed record QueryBinaryExpression(
@@ -1403,7 +1476,7 @@ internal sealed class BlobQueryPlan
         public override QueryCell Evaluate(QueryRow row)
         {
             var value = Operand.Evaluate(row);
-            if (value.Value is null || !Negate)
+            if (value.IsNullLike || !Negate)
                 return value;
             try
             {
@@ -1465,11 +1538,17 @@ internal sealed class BlobQueryPlan
         public override bool Evaluate(QueryRow row) => (Operand.Evaluate(row).Value is null) != Negated;
     }
 
+    private sealed record MissingPredicate(QueryExpression Operand, bool Negated) : QueryPredicate
+    {
+        public override bool Evaluate(QueryRow row) => Operand.Evaluate(row).IsMissing != Negated;
+    }
+
     private sealed record TruthPredicate(QueryExpression Operand) : QueryPredicate
     {
         public override bool Evaluate(QueryRow row) => Operand.Evaluate(row).Value switch
         {
             null => false,
+            QueryMissing => false,
             bool boolean => boolean,
             string text => !string.IsNullOrEmpty(text),
             long integer => integer != 0,
@@ -1488,7 +1567,7 @@ internal sealed class BlobQueryPlan
         {
             var left = Left.Evaluate(row);
             var right = Right.Evaluate(row);
-            if (left.Value is null || right.Value is null)
+            if (left.IsNullLike || right.IsNullLike)
                 return false;
 
             var comparison = CompareValues(left, right);
@@ -1516,7 +1595,7 @@ internal sealed class BlobQueryPlan
             var value = Value.Evaluate(row);
             var lower = Lower.Evaluate(row);
             var upper = Upper.Evaluate(row);
-            if (value.Value is null || lower.Value is null || upper.Value is null)
+            if (value.IsNullLike || lower.IsNullLike || upper.IsNullLike)
                 return false;
             var matches = CompareValues(value, lower) >= 0 && CompareValues(value, upper) <= 0;
             return matches != Negated;
@@ -1531,11 +1610,11 @@ internal sealed class BlobQueryPlan
         public override bool Evaluate(QueryRow row)
         {
             var value = Value.Evaluate(row);
-            if (value.Value is null)
+            if (value.IsNullLike)
                 return false;
             var matches = Candidates
                 .Select(candidate => candidate.Evaluate(row))
-                .Any(candidate => candidate.Value is not null && CompareValues(value, candidate) == 0);
+                .Any(candidate => !candidate.IsNullLike && CompareValues(value, candidate) == 0);
             return matches != Negated;
         }
     }
@@ -1581,7 +1660,7 @@ internal sealed class BlobQueryPlan
             }
 
             var value = operand!.Evaluate(row);
-            if (value.Value is null)
+            if (value.IsNullLike)
                 return;
 
             switch (kind)
@@ -1667,7 +1746,7 @@ internal sealed class BlobQueryPlan
 
     private static QueryCell EvaluateBinary(QueryCell left, QueryCell right, string operation)
     {
-        if (left.Value is null || right.Value is null)
+        if (left.IsNullLike || right.IsNullLike)
             return new QueryCell(null);
 
         try
@@ -1717,7 +1796,7 @@ internal sealed class BlobQueryPlan
 
     private static QueryCell Cast(QueryCell value, QueryValueType type)
     {
-        if (value.Value is null)
+        if (value.IsNullLike)
             return value;
 
         try
@@ -1752,7 +1831,7 @@ internal sealed class BlobQueryPlan
             foreach (var argument in arguments)
             {
                 var candidate = argument.Evaluate(row);
-                if (candidate.Value is not null)
+                if (!candidate.IsNullLike)
                     return candidate;
             }
             return new QueryCell(null);
@@ -1765,11 +1844,11 @@ internal sealed class BlobQueryPlan
         if (name == "NULLIF")
         {
             var second = arguments[1].Evaluate(row);
-            return first.Value is not null && second.Value is not null && CompareValues(first, second) == 0
+            return !first.IsNullLike && !second.IsNullLike && CompareValues(first, second) == 0
                 ? new QueryCell(null)
                 : first;
         }
-        if (first.Value is null)
+        if (first.IsNullLike)
             return first;
 
         return name switch
@@ -1816,10 +1895,10 @@ internal sealed class BlobQueryPlan
     {
         var quantity = Cast(arguments[1].Evaluate(row), QueryValueType.Int);
         var timestamp = Cast(arguments[2].Evaluate(row), QueryValueType.Timestamp);
-        if (quantity.Value is null || timestamp.Value is null)
+        if (quantity.IsNullLike || timestamp.IsNullLike)
             return new QueryCell(null);
-        var amount = (long)quantity.Value;
-        var value = (DateTimeOffset)timestamp.Value;
+        var amount = (long)quantity.Value!;
+        var value = (DateTimeOffset)timestamp.Value!;
         try
         {
             value = NormalizeDatePart(part.ToText()) switch
@@ -1851,10 +1930,10 @@ internal sealed class BlobQueryPlan
     {
         var start = Cast(arguments[1].Evaluate(row), QueryValueType.Timestamp);
         var end = Cast(arguments[2].Evaluate(row), QueryValueType.Timestamp);
-        if (start.Value is null || end.Value is null)
+        if (start.IsNullLike || end.IsNullLike)
             return new QueryCell(null);
-        var startTimestamp = ((DateTimeOffset)start.Value).ToUniversalTime();
-        var endTimestamp = ((DateTimeOffset)end.Value).ToUniversalTime();
+        var startTimestamp = ((DateTimeOffset)start.Value!).ToUniversalTime();
+        var endTimestamp = ((DateTimeOffset)end.Value!).ToUniversalTime();
         var difference = NormalizeDatePart(part.ToText()) switch
         {
             "year" => endTimestamp.Year - startTimestamp.Year,
@@ -1874,9 +1953,9 @@ internal sealed class BlobQueryPlan
         QueryRow row)
     {
         var timestamp = Cast(arguments[1].Evaluate(row), QueryValueType.Timestamp);
-        if (timestamp.Value is null)
+        if (timestamp.IsNullLike)
             return new QueryCell(null);
-        var value = (DateTimeOffset)timestamp.Value;
+        var value = (DateTimeOffset)timestamp.Value!;
         var extracted = NormalizeDatePart(part.ToText()) switch
         {
             "year" => value.Year,
@@ -1899,9 +1978,9 @@ internal sealed class BlobQueryPlan
     {
         var converted = Cast(timestamp, QueryValueType.Timestamp);
         var format = arguments[1].Evaluate(row);
-        if (converted.Value is null || format.Value is null)
+        if (converted.IsNullLike || format.IsNullLike)
             return new QueryCell(null);
-        return new QueryCell(FormatTimestamp((DateTimeOffset)converted.Value, format.ToText()));
+        return new QueryCell(FormatTimestamp((DateTimeOffset)converted.Value!, format.ToText()));
     }
 
     private static QueryCell EvaluateTrim(
@@ -1914,7 +1993,7 @@ internal sealed class BlobQueryPlan
 
         var characters = arguments[1].Evaluate(row);
         var value = arguments[2].Evaluate(row);
-        if (characters.Value is null || value.Value is null)
+        if (characters.IsNullLike || value.IsNullLike)
             return new QueryCell(null);
         var trimCharacters = characters.ToText().ToCharArray();
         var text = value.ToText();
@@ -2030,6 +2109,74 @@ internal sealed class BlobQueryPlan
         return string.Compare(left.ToText(), right.ToText(), StringComparison.Ordinal);
     }
 
+    private static bool TryGetJsonProperty(
+        JsonElement element,
+        string name,
+        bool caseSensitive,
+        out JsonElement value)
+    {
+        if (caseSensitive)
+            return element.TryGetProperty(name, out value);
+        foreach (var property in element.EnumerateObject())
+        {
+            if (!string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+                continue;
+            value = property.Value;
+            return true;
+        }
+        value = default;
+        return false;
+    }
+
+    private static IEnumerable<JsonElement> ExpandJsonSegment(
+        IEnumerable<JsonElement> nodes,
+        QueryTableSegment segment)
+    {
+        foreach (var node in nodes)
+        {
+            if (segment.Wildcard)
+            {
+                if (node.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var item in node.EnumerateArray())
+                    yield return item;
+                continue;
+            }
+            if (segment.Index is { } index)
+            {
+                if (node.ValueKind == JsonValueKind.Array && index >= 0 && index < node.GetArrayLength())
+                    yield return node[index];
+                continue;
+            }
+            if (node.ValueKind == JsonValueKind.Object &&
+                TryGetJsonProperty(node, segment.Name!, segment.CaseSensitive, out var property))
+            {
+                yield return property;
+            }
+        }
+    }
+
+    private static QueryRow CreateJsonRow(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var properties = element.EnumerateObject().ToArray();
+            return new QueryRow(
+                properties.Select(property => property.Name).ToArray(),
+                properties.Select(property => QueryCell.FromJson(property.Value)).ToArray(),
+                PreserveMissing: true);
+        }
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            var values = element.EnumerateArray().Select(QueryCell.FromJson).ToArray();
+            return new QueryRow(
+                Enumerable.Range(1, values.Length).Select(index => $"_{index}").ToArray(),
+                values,
+                PreserveMissing: true);
+        }
+        return new QueryRow(["_1"], [QueryCell.FromJson(element)], PreserveMissing: true);
+    }
+
     private static bool TryDecimal(QueryCell value, out decimal number)
     {
         switch (value.Value)
@@ -2130,11 +2277,13 @@ internal sealed class BlobQueryPlan
     private sealed class QueryParser
     {
         private readonly IReadOnlyList<QueryToken> _tokens;
+        private readonly string? _sourceAlias;
         private int _position;
 
         public QueryParser(string expression)
         {
             _tokens = Tokenize(expression);
+            _sourceAlias = FindSourceAlias(_tokens);
         }
 
         public BlobQueryPlan Parse()
@@ -2145,6 +2294,7 @@ internal sealed class BlobQueryPlan
             var source = Expect(QueryTokenKind.Identifier, "BlobStorage");
             if (!string.Equals(source.Text, "BlobStorage", StringComparison.OrdinalIgnoreCase))
                 throw InvalidQuery(source.Position, "Queries must read from BlobStorage.");
+            var tablePath = ParseTablePath(source.Position);
 
             if (MatchKeyword("AS"))
                 _ = Expect(QueryTokenKind.Identifier, "alias");
@@ -2183,7 +2333,49 @@ internal sealed class BlobQueryPlan
                     expression.CountStar);
                 projections = [];
             }
-            return new BlobQueryPlan(projections, predicate, limit, aggregate);
+            return new BlobQueryPlan(projections, predicate, limit, aggregate, tablePath);
+        }
+
+        private IReadOnlyList<QueryTableSegment> ParseTablePath(int sourcePosition)
+        {
+            var rootWildcard = false;
+            if (MatchSymbol("["))
+            {
+                if (!MatchSymbol("*"))
+                    throw InvalidQuery(Current.Position, "BlobStorage accepts only [*] at the root.");
+                ExpectSymbol("]");
+                rootWildcard = true;
+            }
+
+            var path = new List<QueryTableSegment>();
+            while (MatchSymbol("."))
+            {
+                var property = Expect(QueryTokenKind.Identifier, "JSON table path field");
+                path.Add(new QueryTableSegment(property.Text, null, false, property.Quoted));
+                while (MatchSymbol("["))
+                {
+                    if (MatchSymbol("*"))
+                    {
+                        path.Add(new QueryTableSegment(null, null, true, false));
+                    }
+                    else
+                    {
+                        var indexToken = Expect(QueryTokenKind.Number, "JSON table path index");
+                        if (!int.TryParse(indexToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var index))
+                            throw InvalidQuery(indexToken.Position, "A JSON table path index must be a non-negative integer.");
+                        path.Add(new QueryTableSegment(null, index, false, false));
+                    }
+                    ExpectSymbol("]");
+                }
+            }
+
+            if (path.Count > 0 && !rootWildcard)
+            {
+                throw InvalidQuery(
+                    sourcePosition,
+                    "A nested JSON table path must begin with BlobStorage[*].");
+            }
+            return path;
         }
 
         private IReadOnlyList<QueryProjection> ParseProjections()
@@ -2246,8 +2438,11 @@ internal sealed class BlobQueryPlan
             if (MatchKeyword("IS"))
             {
                 var negated = MatchKeyword("NOT");
-                ExpectKeyword("NULL");
-                return new NullPredicate(left, negated);
+                if (MatchKeyword("NULL"))
+                    return new NullPredicate(left, negated);
+                if (MatchKeyword("MISSING"))
+                    return new MissingPredicate(left, negated);
+                throw InvalidQuery(Current.Position, "Expected NULL or MISSING after IS.");
             }
             var negatedSet = MatchKeyword("NOT");
             if (MatchKeyword("BETWEEN"))
@@ -2322,11 +2517,11 @@ internal sealed class BlobQueryPlan
             {
                 case QueryTokenKind.Identifier:
                     if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, false, new QueryCell(null));
+                        return new QueryOperand(null, new QueryCell(null));
                     if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, false, new QueryCell(true));
+                        return new QueryOperand(null, new QueryCell(true));
                     if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, false, new QueryCell(false));
+                        return new QueryOperand(null, new QueryCell(false));
                     if (!token.Quoted &&
                         string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) &&
                         MatchSymbol("("))
@@ -2352,22 +2547,44 @@ internal sealed class BlobQueryPlan
                         ValidateFunction(token, arguments.Count);
                         return new QueryFunctionExpression(function, arguments);
                     }
-                    var field = token.Text;
-                    var caseSensitive = token.Quoted;
-                    if (MatchSymbol("."))
+                    var path = new List<QueryFieldSegment>
                     {
-                        var fieldToken = Expect(QueryTokenKind.Identifier, "field name");
-                        field = fieldToken.Text;
-                        caseSensitive = fieldToken.Quoted;
+                        new(token.Text, null, token.Quoted)
+                    };
+                    while (true)
+                    {
+                        if (MatchSymbol("."))
+                        {
+                            var fieldToken = Expect(QueryTokenKind.Identifier, "field name");
+                            path.Add(new QueryFieldSegment(fieldToken.Text, null, fieldToken.Quoted));
+                            continue;
+                        }
+                        if (MatchSymbol("["))
+                        {
+                            var indexToken = Expect(QueryTokenKind.Number, "array index");
+                            if (!int.TryParse(indexToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var arrayIndex))
+                                throw InvalidQuery(indexToken.Position, "A JSON array index must be a non-negative integer.");
+                            ExpectSymbol("]");
+                            path.Add(new QueryFieldSegment(null, arrayIndex, false));
+                            continue;
+                        }
+                        break;
                     }
-                    return new QueryOperand(field, caseSensitive, null);
+                    if (path.Count > 1 &&
+                        (string.Equals(path[0].Name, "BlobStorage", StringComparison.OrdinalIgnoreCase) ||
+                         _sourceAlias is not null &&
+                         string.Equals(path[0].Name, _sourceAlias, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        path.RemoveAt(0);
+                    }
+                    return new QueryOperand(path, null);
                 case QueryTokenKind.String:
-                    return new QueryOperand(null, false, new QueryCell(token.Text));
+                    return new QueryOperand(null, new QueryCell(token.Text));
                 case QueryTokenKind.Number:
                     if (long.TryParse(token.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
-                        return new QueryOperand(null, false, new QueryCell(integer));
+                        return new QueryOperand(null, new QueryCell(integer));
                     if (double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && double.IsFinite(number))
-                        return new QueryOperand(null, false, new QueryCell(number));
+                        return new QueryOperand(null, new QueryCell(number));
                     throw InvalidQuery(token.Position, $"The numeric literal '{token.Text}' is invalid.");
                 case QueryTokenKind.Symbol when token.Text == "(":
                     var nested = ParseExpression();
@@ -2478,7 +2695,7 @@ internal sealed class BlobQueryPlan
         }
 
         private static QueryExpression Literal(object? value) =>
-            new QueryOperand(null, false, new QueryCell(value));
+            new QueryOperand(null, new QueryCell(value));
 
         private QueryToken Current => _tokens[_position];
 
@@ -2558,6 +2775,57 @@ internal sealed class BlobQueryPlan
 
         private static bool IsClauseKeyword(QueryToken token) =>
             IsKeyword(token, "FROM") || IsKeyword(token, "WHERE") || IsKeyword(token, "LIMIT");
+
+        private static string? FindSourceAlias(IReadOnlyList<QueryToken> tokens)
+        {
+            var depth = 0;
+            for (var index = 0; index < tokens.Count; index++)
+            {
+                if (tokens[index].Kind == QueryTokenKind.Symbol)
+                {
+                    if (tokens[index].Text == "(")
+                        depth++;
+                    else if (tokens[index].Text == ")")
+                        depth--;
+                    continue;
+                }
+                if (depth != 0 || !IsKeyword(tokens[index], "FROM"))
+                    continue;
+
+                index++;
+                if (index >= tokens.Count ||
+                    tokens[index].Kind != QueryTokenKind.Identifier ||
+                    !string.Equals(tokens[index].Text, "BlobStorage", StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+                index++;
+                if (index < tokens.Count && tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == "[")
+                {
+                    index += 3;
+                }
+                while (index + 1 < tokens.Count &&
+                       tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == ".")
+                {
+                    index += 2;
+                    while (index < tokens.Count &&
+                           tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == "[")
+                    {
+                        index += 3;
+                    }
+                }
+                if (index < tokens.Count && IsKeyword(tokens[index], "AS"))
+                    index++;
+                if (index < tokens.Count &&
+                    tokens[index].Kind == QueryTokenKind.Identifier &&
+                    !IsClauseKeyword(tokens[index]))
+                {
+                    return tokens[index].Text;
+                }
+                return null;
+            }
+            return null;
+        }
 
         private static IReadOnlyList<QueryToken> Tokenize(string expression)
         {
@@ -2646,7 +2914,7 @@ internal sealed class BlobQueryPlan
                     index += 2;
                     continue;
                 }
-                if (character is '*' or '/' or '%' or '+' or '-' or ',' or '.' or '(' or ')' or ';' or '=' or '<' or '>')
+                if (character is '*' or '/' or '%' or '+' or '-' or ',' or '.' or '(' or ')' or '[' or ']' or ';' or '=' or '<' or '>')
                 {
                     tokens.Add(new QueryToken(QueryTokenKind.Symbol, character.ToString(), start));
                     index++;

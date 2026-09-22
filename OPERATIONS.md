@@ -93,6 +93,10 @@ Date expressions include `DATE_ADD`, `DATE_DIFF`, `EXTRACT`, `TO_STRING`,
 `COUNT(*)`, `COUNT(expression)`, `SUM`, `AVG`, `MIN`, and `MAX` retain only
 constant accumulator state as input streams through the evaluator; matching
 rows are never collected in memory.
+JSON queries support Azure's `BlobStorage[*].path[*]` table descriptors, source
+aliases, nested object members, zero-based array indexes, and distinct
+`IS MISSING`/`IS NOT MISSING` semantics. An explicit JSON null remains different
+from a property that is absent from the input object.
 
 ## Account capabilities
 
