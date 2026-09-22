@@ -2737,7 +2737,8 @@ public static class BlobProtocolEndpoint
                 source.Container,
                 includeDeleted: false,
                 cancellationToken);
-            if (!service.AllowsAnonymousPublicAccess || sourceContainer.PublicAccess is not ("blob" or "container"))
+            if (!service.AllowsAnonymousPublicAccess(source.Account) ||
+                sourceContainer.PublicAccess is not ("blob" or "container"))
                 throw AzureStorageException.AuthorizationFailure();
         }
         else if (!sourceContext.Authorization.Allows('r') ||
@@ -3133,7 +3134,9 @@ public static class BlobProtocolEndpoint
             return;
         }
         var container = await service.GetContainerAsync(blob.Account, blob.Container, false, cancellationToken);
-        if (!service.AllowsAnonymousPublicAccess || container.PublicAccess is not ("blob" or "container"))
+        if (!service.AllowsAnonymousPublicAccess(blob.Account))
+            throw AzureStorageException.PublicAccessNotPermitted();
+        if (container.PublicAccess is not ("blob" or "container"))
             throw AzureStorageException.AuthorizationFailure();
     }
 
@@ -3145,8 +3148,13 @@ public static class BlobProtocolEndpoint
     {
         if (request.Authorization.Kind != StorageAuthorizationKind.Anonymous)
             Require(request, 'r');
-        else if (!service.AllowsAnonymousPublicAccess || !allowContainerPublic || container.PublicAccess != "container")
-            throw AzureStorageException.AuthorizationFailure();
+        else
+        {
+            if (!service.AllowsAnonymousPublicAccess(container.Account))
+                throw AzureStorageException.PublicAccessNotPermitted();
+            if (!allowContainerPublic || container.PublicAccess != "container")
+                throw AzureStorageException.AuthorizationFailure();
+        }
         return Task.CompletedTask;
     }
 
@@ -3157,8 +3165,13 @@ public static class BlobProtocolEndpoint
     {
         if (request.Authorization.Kind != StorageAuthorizationKind.Anonymous)
             Require(request, 'l');
-        else if (!service.AllowsAnonymousPublicAccess || container.PublicAccess != "container")
-            throw AzureStorageException.AuthorizationFailure();
+        else
+        {
+            if (!service.AllowsAnonymousPublicAccess(container.Account))
+                throw AzureStorageException.PublicAccessNotPermitted();
+            if (container.PublicAccess != "container")
+                throw AzureStorageException.AuthorizationFailure();
+        }
         return Task.CompletedTask;
     }
 

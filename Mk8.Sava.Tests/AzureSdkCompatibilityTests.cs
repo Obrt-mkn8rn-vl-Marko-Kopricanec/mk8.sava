@@ -11577,6 +11577,104 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task PerAccountPublicAccessPolicyOverridesGlobalSettingWithoutBlockingStaticWebsite()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-public-policy-{Guid.NewGuid():N}");
+        var containerName = $"public-policy-{Guid.NewGuid():N}";
+        const string blobName = "content.txt";
+        await using (var initial = new SavaWebApplicationFactory(
+                         dataPath,
+                         new Dictionary<string, string?> { ["Sava:AllowAnonymousPublicAccess"] = "true" },
+                         deleteDataPath: false))
+        {
+            await initial.InitializeAsync();
+            foreach (var (account, key) in new[]
+            {
+                (SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+                (SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey)
+            })
+            {
+                var client = CreateClient(initial, account, key);
+                var container = client.GetBlobContainerClient(containerName);
+                await container.CreateAsync(
+                    account == SavaWebApplicationFactory.AccountName
+                        ? PublicAccessType.Blob
+                        : PublicAccessType.BlobContainer);
+                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account));
+            }
+
+            var secondAccount = CreateClient(
+                initial,
+                SavaWebApplicationFactory.SecondAccountName,
+                SavaWebApplicationFactory.SecondAccountKey);
+            var properties = (await secondAccount.GetPropertiesAsync()).Value;
+            properties.StaticWebsite.Enabled = true;
+            properties.StaticWebsite.IndexDocument = "index.html";
+            await secondAccount.SetPropertiesAsync(properties);
+            await secondAccount.GetBlobContainerClient("$web")
+                .GetBlobClient("index.html")
+                .UploadAsync(BinaryData.FromString("website remains public"));
+        }
+
+        await using var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            new Dictionary<string, string?>
+            {
+                ["Sava:AllowAnonymousPublicAccess"] = "false",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowBlobPublicAccess"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:AllowBlobPublicAccess"] = "false"
+            },
+            deleteDataPath: true);
+        await restarted.InitializeAsync();
+        using var anonymous = new HttpClient(restarted.Server.CreateHandler());
+        using (var allowed = await anonymous.GetAsync(
+                   $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}"))
+        {
+            Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
+            Assert.Equal(SavaWebApplicationFactory.AccountName, await allowed.Content.ReadAsStringAsync());
+        }
+        using (var denied = await anonymous.GetAsync(
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}"))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, denied.StatusCode);
+            Assert.Equal("PublicAccessNotPermitted", denied.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var deniedList = await anonymous.GetAsync(
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list"))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, deniedList.StatusCode);
+            Assert.Equal("PublicAccessNotPermitted", deniedList.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var authorized = CreateClient(
+            restarted,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey)
+            .GetBlobContainerClient(containerName);
+        Assert.Equal(
+            SavaWebApplicationFactory.SecondAccountName,
+            (await authorized.GetBlobClient(blobName).DownloadContentAsync()).Value.Content.ToString());
+        var aclDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            authorized.SetAccessPolicyAsync(PublicAccessType.Blob));
+        Assert.Equal(409, aclDenied.Status);
+        Assert.Equal("PublicAccessNotPermitted", aclDenied.ErrorCode);
+        var createDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            CreateClient(
+                restarted,
+                SavaWebApplicationFactory.SecondAccountName,
+                SavaWebApplicationFactory.SecondAccountKey)
+                .GetBlobContainerClient($"denied-public-{Guid.NewGuid():N}")
+                .CreateAsync(PublicAccessType.Blob));
+        Assert.Equal(409, createDenied.Status);
+        Assert.Equal("PublicAccessNotPermitted", createDenied.ErrorCode);
+
+        using var website = await anonymous.GetAsync(
+            $"http://{SavaWebApplicationFactory.SecondAccountName}.z1.web.local/");
+        Assert.Equal(HttpStatusCode.OK, website.StatusCode);
+        Assert.Equal("website remains public", await website.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task ConditionalHeadersMatchAzureCombinationPriorityAndOperationRules()
     {
         var service = CreateClient(factory);
