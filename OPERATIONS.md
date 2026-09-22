@@ -25,6 +25,18 @@ The integration suite has deterministic checkpoints at extent publication,
 metadata pre-commit and post-commit, and the final reclamation delete so these
 boundaries can be exercised without making fault injection a deployment feature.
 
+Run the separate process-termination matrix from the repository root when
+changing publication, SQLite, staging, or reclamation code:
+
+```bash
+DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run.sh
+```
+
+The harness creates a distinct temporary storage root for each checkpoint,
+terminates the worker without unwinding it, and validates recovery in a new test
+host before deleting that exact temporary root. Core dumps are disabled for the
+intentional terminations.
+
 ## Account capabilities
 
 Storage-account capabilities are configured independently so one deployment can

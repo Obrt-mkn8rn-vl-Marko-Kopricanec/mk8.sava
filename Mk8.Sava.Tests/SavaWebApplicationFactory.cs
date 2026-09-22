@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
@@ -15,6 +16,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private readonly TimeProvider? _timeProvider;
     private readonly IStorageFaultInjector? _faultInjector;
     private readonly IStorageAnalyticsSink? _analyticsSink;
+    private readonly bool _disableMaintenance;
     private readonly bool _deleteDataPath;
 
     public const string AccountName = "devstoreaccount1";
@@ -99,11 +101,13 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         IStorageFaultInjector faultInjector,
         IStorageAnalyticsSink? analyticsSink,
         IReadOnlyDictionary<string, string?>? configurationOverrides,
-        bool deleteDataPath)
+        bool deleteDataPath,
+        bool disableMaintenance = false)
         : this(dataPath, null, configurationOverrides, null, deleteDataPath)
     {
         _faultInjector = faultInjector;
         _analyticsSink = analyticsSink;
+        _disableMaintenance = disableMaintenance;
     }
 
     private SavaWebApplicationFactory(
@@ -194,6 +198,19 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                     services.RemoveAll<IStorageAnalyticsSink>();
                     services.AddSingleton(_analyticsSink);
                 }
+            });
+        }
+        if (_disableMaintenance)
+        {
+            builder.ConfigureServices(services =>
+            {
+                var registrations = services
+                    .Where(descriptor =>
+                        descriptor.ServiceType == typeof(IHostedService) &&
+                        descriptor.ImplementationType == typeof(StorageMaintenanceService))
+                    .ToArray();
+                foreach (var registration in registrations)
+                    services.Remove(registration);
             });
         }
     }
