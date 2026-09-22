@@ -280,6 +280,9 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         var permissions = query["sp"].ToString();
         var startsAt = ParseSasTime(query["st"].ToString());
         var expiresAt = ParseSasTime(query["se"].ToString());
+        var signedEncryptionScope = query["ses"].ToString();
+        if (!string.IsNullOrEmpty(signedEncryptionScope) && signedVersion < new DateOnly(2020, 12, 6))
+            throw AzureStorageException.AuthorizationFailure();
         string stringToSign;
         var isAccountSas = query.ContainsKey("ss");
         var isUserDelegationSas = query.ContainsKey("skoid");
@@ -318,8 +321,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
             var resourceType = query["sr"].ToString();
             signedResource = resourceType;
+            if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
+                throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
+            var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query);
 
             var objectId = query["skoid"].ToString();
             var tenantId = query["sktid"].ToString();
@@ -357,8 +363,30 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
             var authorizedObjectId = query["saoid"].ToString();
             var unauthorizedObjectId = query["suoid"].ToString();
-            if (!string.IsNullOrEmpty(authorizedObjectId) || !string.IsNullOrEmpty(unauthorizedObjectId))
+            var correlationId = query["scid"].ToString();
+            var hasAuthorizedObjectId = !string.IsNullOrEmpty(authorizedObjectId);
+            var hasUnauthorizedObjectId = !string.IsNullOrEmpty(unauthorizedObjectId);
+            var hasCorrelationId = !string.IsNullOrEmpty(correlationId);
+            if (hasAuthorizedObjectId && hasUnauthorizedObjectId ||
+                (hasAuthorizedObjectId || hasUnauthorizedObjectId || hasCorrelationId) &&
+                signedVersion < new DateOnly(2020, 2, 10) ||
+                hasAuthorizedObjectId && !Guid.TryParse(authorizedObjectId, out _) ||
+                hasUnauthorizedObjectId && !Guid.TryParse(unauthorizedObjectId, out _) ||
+                hasCorrelationId && !Guid.TryParse(correlationId, out _))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+            if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) &&
+                !IsHierarchicalNamespaceEnabled(request.Account))
+            {
                 throw AzureStorageException.AuthorizationFailure();
+            }
+            if (hasUnauthorizedObjectId)
+            {
+                // suoid requires a POSIX ACL decision for an HNS path. The Blob
+                // endpoint does not treat a signed identity as an ACL grant.
+                throw AzureStorageException.AuthorizationFailure();
+            }
 
             var delegatedUserTenantId = query["skdutid"].ToString();
             var delegatedUserObjectId = query["sduoid"].ToString();
@@ -392,7 +420,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 query["sp"].ToString(),
                 query["st"].ToString(),
                 query["se"].ToString(),
-                BuildSasCanonicalResource(request, resourceType),
+                canonicalizedResource,
                 objectId,
                 tenantId,
                 keyStartText,
@@ -401,7 +429,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 keyVersion,
                 authorizedObjectId,
                 unauthorizedObjectId,
-                query["scid"].ToString()
+                correlationId
             };
             if (signedVersion >= new DateOnly(2025, 7, 5))
             {
@@ -432,9 +460,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         {
             var resourceType = query["sr"].ToString();
             signedResource = resourceType;
+            if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
+                throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
-            var canonicalizedResource = BuildSasCanonicalResource(request, resourceType);
+            var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query);
             var fields = new List<string>
             {
                 permissions,
@@ -659,24 +689,51 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                     request.Blob is not null &&
                     request.Snapshot is not null &&
                     request.VersionId is null,
-            "bv" => signedVersion >= new DateOnly(2018, 11, 9) &&
+            "bv" => signedVersion >= new DateOnly(2019, 12, 12) &&
                     request.ResourceKind == StorageResourceKind.Blob &&
                     request.Blob is not null &&
                     request.VersionId is not null &&
                     request.Snapshot is null,
+            "d" => signedVersion >= new DateOnly(2020, 2, 10) &&
+                   request.ResourceKind == StorageResourceKind.Blob &&
+                   request.Container is not null &&
+                   request.Blob is not null,
             _ => false
         };
 
     private static string GetSignedSnapshotOrVersion(IQueryCollection query, string resourceType) =>
         resourceType == "bv"
             ? query["versionid"].ToString()
-            : query["snapshot"].ToString();
+            : resourceType == "bs"
+                ? query["snapshot"].ToString()
+                : string.Empty;
 
-    private static string BuildSasCanonicalResource(StorageRequestContext request, string resourceType)
+    private static string BuildSasCanonicalResource(
+        StorageRequestContext request,
+        string resourceType,
+        IQueryCollection query)
     {
         var path = $"/blob/{request.Account}";
         if (request.Container is not null)
             path += "/" + request.Container;
+        if (resourceType == "d")
+        {
+            var directoryDepthText = query["sdd"].ToString();
+            if (!int.TryParse(
+                    directoryDepthText,
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out var directoryDepth) ||
+                request.Blob is null)
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+
+            var segments = request.Blob.Split('/', StringSplitOptions.None);
+            if (directoryDepth > segments.Length)
+                throw AzureStorageException.AuthenticationFailed();
+            return path + "/" + string.Join('/', segments.Take(directoryDepth));
+        }
         if (resourceType is not "c" && request.Blob is not null)
             path += "/" + request.Blob;
         return path;
@@ -747,6 +804,10 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
     private static bool Covers(IReadOnlyCollection<string> configuredValues, string value) =>
         configuredValues.Count == 0 || configuredValues.Contains("*", StringComparer.Ordinal) || configuredValues.Contains(value, StringComparer.Ordinal);
+
+    private bool IsHierarchicalNamespaceEnabled(string account) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.HierarchicalNamespaceEnabled;
 
     private static bool MatchesIpRange(IPAddress? address, string range)
     {
