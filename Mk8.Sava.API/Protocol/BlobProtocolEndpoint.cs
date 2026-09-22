@@ -476,7 +476,12 @@ public static class BlobProtocolEndpoint
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
             var hierarchicalNamespace = service.IsHierarchicalNamespaceEnabled(request.Account);
-            ValidateBlobListFeatures(request, includes, delimiter, hierarchicalNamespace);
+            var showOnly = ValidateBlobListFeatures(
+                request,
+                includes,
+                delimiter,
+                http.Request.Query["showonly"].ToString(),
+                hierarchicalNamespace);
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -484,6 +489,8 @@ public static class BlobProtocolEndpoint
                     "The startFrom parameter requires service version 2023-05-03 or later.");
             }
             var arrow = IsArrowListRequest(http.Request, request);
+            if (arrow && hierarchicalNamespace)
+                throw AzureStorageException.BlobOperationNotSupported();
             if (http.Request.Query.ContainsKey("endbefore"))
             {
                 if (!IsServiceVersionAtLeast(request, new DateOnly(2026, 6, 6)))
@@ -512,6 +519,7 @@ public static class BlobProtocolEndpoint
             var blobs = await service.ListBlobsPageAsync(
                 request.Account,
                 containerName,
+                showOnly,
                 includes.Contains("versions"),
                 includes.Contains("snapshots"),
                 includes.Contains("deleted") || includes.Contains("deletedwithversions"),
@@ -1298,7 +1306,24 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Undelete Blob");
             Require(request, 'w');
             RequireZeroContentLength(http.Request);
-            await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
+            if (service.IsHierarchicalNamespaceEnabled(request.Account))
+            {
+                RequireFeatureVersion(request, new DateOnly(2020, 8, 4), "Undelete hierarchical namespace path");
+                var source = ProtocolParsing.First(http.Request.Headers, "x-ms-undelete-source")
+                             ?? throw AzureStorageException.MissingHeader("x-ms-undelete-source");
+                var (sourceName, deletionId) = ParseHierarchicalUndeleteSource(source);
+                await service.UndeleteHierarchicalBlobAsync(
+                    request.Account,
+                    containerName,
+                    sourceName,
+                    blobName,
+                    deletionId,
+                    cancellationToken);
+            }
+            else
+            {
+                await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
+            }
             return;
         }
 
@@ -3350,10 +3375,40 @@ public static class BlobProtocolEndpoint
         };
     }
 
-    private static void ValidateBlobListFeatures(
+    private static (string SourceName, ulong DeletionId) ParseHierarchicalUndeleteSource(string value)
+    {
+        const string separator = "?deletionid=";
+        var separatorOffset = value.LastIndexOf(separator, StringComparison.OrdinalIgnoreCase);
+        if (separatorOffset <= 0 ||
+            !ulong.TryParse(
+                value[(separatorOffset + separator.Length)..],
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var deletionId) ||
+            deletionId == 0)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-undelete-source", value);
+        }
+
+        string sourceName;
+        try
+        {
+            sourceName = Uri.UnescapeDataString(value[..separatorOffset]);
+        }
+        catch (UriFormatException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-undelete-source", value);
+        }
+        if (string.IsNullOrEmpty(sourceName) || sourceName[0] == '/')
+            throw AzureStorageException.InvalidHeader("x-ms-undelete-source", value);
+        return (sourceName, deletionId);
+    }
+
+    private static BlobListShowOnly ValidateBlobListFeatures(
         StorageRequestContext request,
         IReadOnlySet<string> includes,
         string delimiter,
+        string showOnly,
         bool hierarchicalNamespace)
     {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -3406,6 +3461,25 @@ public static class BlobProtocolEndpoint
         {
             throw AzureStorageException.InvalidQuery("include");
         }
+
+        if (string.IsNullOrEmpty(showOnly))
+            return BlobListShowOnly.None;
+        if (!hierarchicalNamespace)
+            throw AzureStorageException.InvalidQuery("showonly");
+        if (string.Equals(showOnly, "deleted", StringComparison.Ordinal))
+        {
+            RequireFeatureVersion(request, new DateOnly(2020, 8, 4), "Listing only deleted paths");
+            if (includes.Contains("deleted"))
+                throw AzureStorageException.InvalidQuery("showonly");
+            return BlobListShowOnly.Deleted;
+        }
+        RequireFeatureVersion(request, new DateOnly(2020, 12, 6), "Filtering hierarchical namespace paths");
+        return showOnly switch
+        {
+            "files" => BlobListShowOnly.Files,
+            "directories" => BlobListShowOnly.Directories,
+            _ => throw AzureStorageException.InvalidQuery("showonly")
+        };
     }
 
     private static void ValidateContainerListFeatures(

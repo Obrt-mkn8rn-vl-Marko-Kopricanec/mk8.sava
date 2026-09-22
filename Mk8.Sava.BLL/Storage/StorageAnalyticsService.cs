@@ -69,7 +69,12 @@ public sealed class StorageAnalyticsService(
 
             try
             {
-                _ = await metadata.PublishBlobAsync(proposed, null, null, cancellationToken);
+                _ = await metadata.PublishBlobAsync(
+                    proposed,
+                    null,
+                    null,
+                    hierarchicalNamespace: false,
+                    cancellationToken);
                 return;
             }
             catch (StorageConcurrencyException)
