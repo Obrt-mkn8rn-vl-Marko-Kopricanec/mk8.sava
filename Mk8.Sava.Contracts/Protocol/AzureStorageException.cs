@@ -123,6 +123,11 @@ public sealed class AzureStorageException : Exception
         "PathAlreadyExists",
         "The specified path already exists.");
 
+    public static AzureStorageException DirectoryIsNotEmpty() => new(
+        (int)HttpStatusCode.Conflict,
+        "DirectoryIsNotEmpty",
+        "This operation is not permitted on a non-empty directory.");
+
     public static AzureStorageException ConditionNotMet() => new(
         (int)HttpStatusCode.PreconditionFailed,
         "ConditionNotMet",

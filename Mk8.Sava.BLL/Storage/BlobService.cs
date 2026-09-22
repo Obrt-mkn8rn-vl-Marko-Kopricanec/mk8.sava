@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using Microsoft.Extensions.Options;
@@ -16,6 +17,8 @@ public sealed class BlobService(
 {
     private readonly SavaOptions _options = configuredOptions.Value;
     private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
+    private readonly SemaphoreSlim _hierarchicalDirectoryGate = new(1, 1);
+    private readonly ConcurrentDictionary<ContainerKey, byte> _indexedHierarchicalContainers = [];
     private string? _integrityCursor;
     private int _integrityChecked;
     private int _integrityVerified;
@@ -277,6 +280,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
         var effective = new List<BlobRecord>(blobs.Count);
         var properties = includeDeleted && blobs.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue)
@@ -313,6 +317,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var page = await metadata.ListBlobsPageAsync(
             account,
             container,
@@ -356,7 +361,7 @@ public sealed class BlobService(
                         properties.BlobSoftDeleteRetentionDays)
                 })
                 : EffectiveBlob(rehydrated);
-            effective.Add(new BlobListEntry(blob, null));
+            effective.Add(item with { Blob = blob });
         }
         return new BlobListPage(effective, page.HasMore);
     }
@@ -394,6 +399,7 @@ public sealed class BlobService(
     {
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
                    ?? throw AzureStorageException.BlobNotFound();
         blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
@@ -1217,6 +1223,15 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        if (current.IsDirectory &&
+            await metadata.HasActiveBlobDescendantsAsync(
+                current.Account,
+                current.Container,
+                current.Name,
+                cancellationToken))
+        {
+            throw AzureStorageException.DirectoryIsNotEmpty();
+        }
         var records = await metadata.ListBlobFamilyAsync(
             current.Account,
             current.Container,
@@ -3007,6 +3022,31 @@ public sealed class BlobService(
 
     private BlobRecord PrepareBlobWrite(BlobRecord blob) =>
         blob with { Lease = leases.ResetAfterBlobWrite(blob.Lease) };
+
+    private async Task EnsureHierarchicalDirectoryIndexAsync(
+        string account,
+        string container,
+        CancellationToken cancellationToken)
+    {
+        if (!IsHierarchicalNamespaceEnabled(account))
+            return;
+        var key = new ContainerKey(account, container);
+        if (_indexedHierarchicalContainers.ContainsKey(key))
+            return;
+
+        await _hierarchicalDirectoryGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_indexedHierarchicalContainers.ContainsKey(key))
+                return;
+            await metadata.EnsureHierarchicalDirectoriesAsync(account, container, cancellationToken);
+            _indexedHierarchicalContainers.TryAdd(key, 0);
+        }
+        finally
+        {
+            _hierarchicalDirectoryGate.Release();
+        }
+    }
 
     private static void ValidateContainerName(string name)
     {

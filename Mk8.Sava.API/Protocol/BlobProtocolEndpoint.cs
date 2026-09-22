@@ -514,6 +514,7 @@ public static class BlobProtocolEndpoint
                 startFrom,
                 endBefore,
                 delimiter,
+                http.Request.Query["showonly"].ToString(),
                 includes,
                 marker);
             var blobs = await service.ListBlobsPageAsync(

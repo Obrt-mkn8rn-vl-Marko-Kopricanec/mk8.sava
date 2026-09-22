@@ -1583,6 +1583,121 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespacePersistsDirectoriesAndListsTheirAzureProperties()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-directories-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("alpha/beta/file.txt").UploadAsync(BinaryData.FromString("nested"));
+        await container.GetBlobClient("alpha/root.txt").UploadAsync(BinaryData.FromString("root"));
+        await container.GetBlobClient("zeta.txt").UploadAsync(BinaryData.FromString("top"));
+
+        var listSas = container.GenerateSasUri(
+            BlobContainerSasPermissions.List,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        using var transport = new HttpClient(application.Server.CreateHandler());
+
+        async Task<System.Xml.Linq.XDocument> ListAsync(string query)
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                AppendQuery(listSas, $"restype=container&comp=list&{query}"));
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+        }
+
+        var recursive = await ListAsync("include=permissions");
+        var recursiveEntries = recursive.Descendants("Blob").ToDictionary(
+            element => Assert.IsType<System.Xml.Linq.XElement>(element.Element("Name")).Value,
+            StringComparer.Ordinal);
+        Assert.Equal(5, recursiveEntries.Count);
+        Assert.Equal("directory", recursiveEntries["alpha"].Element("Properties")?.Element("ResourceType")?.Value);
+        Assert.Equal("rwxr-x---", recursiveEntries["alpha"].Element("Properties")?.Element("Permissions")?.Value);
+        Assert.Equal("directory", recursiveEntries["alpha/beta"].Element("Properties")?.Element("ResourceType")?.Value);
+        Assert.Equal("file", recursiveEntries["alpha/beta/file.txt"].Element("Properties")?.Element("ResourceType")?.Value);
+
+        var onlyDirectories = await ListAsync("showonly=directories&include=permissions");
+        Assert.Equal(
+            new[] { "alpha", "alpha/beta" },
+            onlyDirectories.Descendants("Blob")
+                .Select(element => element.Element("Name")?.Value)
+                .ToArray());
+        var onlyFiles = await ListAsync("showonly=files");
+        Assert.Equal(
+            new[] { "alpha/beta/file.txt", "alpha/root.txt", "zeta.txt" },
+            onlyFiles.Descendants("Blob")
+                .Select(element => element.Element("Name")?.Value)
+                .ToArray());
+
+        var pagedNames = new List<string>();
+        var marker = string.Empty;
+        do
+        {
+            var page = await ListAsync(
+                "maxresults=1" +
+                (string.IsNullOrEmpty(marker) ? string.Empty : $"&marker={Uri.EscapeDataString(marker)}"));
+            pagedNames.Add(Assert.Single(page.Descendants("Blob")).Element("Name")!.Value);
+            marker = page.Root?.Element("NextMarker")?.Value ?? string.Empty;
+        }
+        while (!string.IsNullOrEmpty(marker));
+        Assert.Equal(recursiveEntries.Keys, pagedNames);
+
+        var root = await ListAsync("delimiter=/&include=permissions");
+        var rootPrefix = Assert.Single(root.Descendants("BlobPrefix"));
+        Assert.Equal("alpha/", rootPrefix.Element("Name")?.Value);
+        var prefixProperties = Assert.IsType<System.Xml.Linq.XElement>(rootPrefix.Element("Properties"));
+        Assert.Equal("directory", prefixProperties.Element("ResourceType")?.Value);
+        Assert.Equal("rwxr-x---", prefixProperties.Element("Permissions")?.Value);
+        Assert.Equal("alpha/", rootPrefix.Element("Name")?.Value);
+        Assert.Equal(
+            new[] { "zeta.txt" },
+            root.Descendants("Blob").Select(element => element.Element("Name")?.Value).ToArray());
+
+        var alpha = await ListAsync($"delimiter=/&prefix={Uri.EscapeDataString("alpha/")}&include=permissions");
+        Assert.Equal("alpha/beta/", Assert.Single(alpha.Descendants("BlobPrefix")).Element("Name")?.Value);
+        Assert.Equal("alpha/root.txt", Assert.Single(alpha.Descendants("Blob")).Element("Name")?.Value);
+
+        var directoryProperties = await container.GetBlobClient("alpha").GetPropertiesAsync();
+        Assert.True(directoryProperties.GetRawResponse().Headers.TryGetValue("x-ms-resource-type", out var resourceType));
+        Assert.Equal("directory", resourceType);
+        Assert.True(directoryProperties.GetRawResponse().Headers.TryGetValue("x-ms-permissions", out var permissions));
+        Assert.Equal("rwxr-x---", permissions);
+
+        var notEmpty = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("alpha").DeleteAsync());
+        Assert.Equal(StatusCodes.Status409Conflict, notEmpty.Status);
+        Assert.Equal("DirectoryIsNotEmpty", notEmpty.ErrorCode);
+
+        await container.GetBlobClient("conflict").UploadAsync(BinaryData.FromString("file"));
+        var fileAncestor = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("conflict/child.txt").UploadAsync(BinaryData.FromString("child")));
+        Assert.Equal(StatusCodes.Status409Conflict, fileAncestor.Status);
+        Assert.Equal("PathAlreadyExists", fileAncestor.ErrorCode);
+
+        await container.GetBlobClient("branch/child.txt").UploadAsync(BinaryData.FromString("child"));
+        var directoryTarget = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("branch").UploadAsync(BinaryData.FromString("replacement"), overwrite: true));
+        Assert.Equal(StatusCodes.Status409Conflict, directoryTarget.Status);
+        Assert.Equal("PathAlreadyExists", directoryTarget.ErrorCode);
+
+        await container.GetBlobClient("alpha/beta/file.txt").DeleteAsync();
+        await container.GetBlobClient("alpha/beta").DeleteAsync();
+        await container.GetBlobClient("alpha/root.txt").DeleteAsync();
+        var deleteEmptyDirectory = await container.GetBlobClient("alpha").DeleteAsync();
+        Assert.Equal(StatusCodes.Status202Accepted, deleteEmptyDirectory.Status);
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

@@ -43,6 +43,10 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
                 "PendingCopyOperation",
                 exception.Message));
         }
+        catch (StoragePathConflictException)
+        {
+            await WriteErrorAsync(context, AzureStorageException.PathAlreadyExists());
+        }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             context.Abort();
