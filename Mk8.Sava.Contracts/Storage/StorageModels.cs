@@ -77,6 +77,7 @@ public sealed record ContainerRecord
     public bool HasLegalHold { get; init; }
     public DateTimeOffset? ImmutabilityUntil { get; init; }
     public bool ImmutabilityLocked { get; init; }
+    public bool ImmutableStorageWithVersioningEnabled { get; init; }
 }
 
 public sealed record StoredAccessPolicy

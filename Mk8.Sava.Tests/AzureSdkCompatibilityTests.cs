@@ -6740,8 +6740,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
     {
-        var service = CreateClient(factory);
-        var container = service.GetBlobContainerClient($"worm-{Guid.NewGuid():N}");
+        var containerName = $"worm-{Guid.NewGuid():N}";
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningContainers:0"] = containerName
+            });
+        var service = CreateClient(application);
+        var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
         var blob = container.GetBlobClient("retained.txt");
         var expiresOn = DateTimeOffset.UtcNow.AddHours(2);
@@ -6797,6 +6804,160 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("BlobImmutableDueToPolicy", cannotUnlock.ErrorCode);
         var cannotDelete = await Assert.ThrowsAsync<RequestFailedException>(() => locked.DeleteImmutabilityPolicyAsync());
         Assert.Equal("BlobImmutableDueToPolicy", cannotDelete.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ImmutableStorageWithVersioningCapabilityMatchesContainerAndPolicySemantics()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningEnabled"] = "true"
+            });
+        var service = CreateClient(application);
+        var container = service.GetBlobContainerClient($"version-worm-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        Assert.True((await container.GetPropertiesAsync()).Value.HasImmutableStorageWithVersioning);
+        BlobContainerItem? listed = null;
+        await foreach (var item in service.GetBlobContainersAsync(prefix: container.Name))
+            listed = item;
+        Assert.NotNull(listed);
+        Assert.True(listed!.Properties.HasImmutableStorageWithVersioning);
+
+        var versioned = container.GetBlobClient("versioned.txt");
+        await versioned.UploadAsync(BinaryData.FromString("first"));
+        await versioned.UploadAsync(BinaryData.FromString("second"), overwrite: true);
+        var versions = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Prefix = versioned.Name,
+            States = BlobStates.Version
+        }))
+        {
+            versions.Add(item);
+        }
+        Assert.Equal(2, versions.Count);
+        Assert.All(versions, item => Assert.False(string.IsNullOrEmpty(item.VersionId)));
+
+        var append = container.GetAppendBlobClient("append-versioned.bin");
+        var appendVersion = (await append.CreateAsync()).Value.VersionId;
+        await append.AppendBlockAsync(BinaryData.FromString("append").ToStream());
+        Assert.Equal(appendVersion, (await append.GetPropertiesAsync()).Value.VersionId);
+        var appendVersions = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Prefix = append.Name,
+            States = BlobStates.Version
+        }))
+        {
+            appendVersions.Add(item);
+        }
+        Assert.Single(appendVersions);
+
+        var page = container.GetPageBlobClient("page-versioned.bin");
+        var pageVersion = (await page.CreateAsync(512)).Value.VersionId;
+        await page.UploadPagesAsync(BinaryData.FromBytes(new byte[512]).ToStream(), 0);
+        Assert.Equal(pageVersion, (await page.GetPropertiesAsync()).Value.VersionId);
+        var pageVersions = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Prefix = page.Name,
+            States = BlobStates.Version
+        }))
+        {
+            pageVersions.Add(item);
+        }
+        Assert.Single(pageVersions);
+
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddDays(7),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Read);
+        var containerSas = AppendQuery(
+            container.Uri,
+            accountSas.ToSasQueryParameters(new StorageSharedKeyCredential(
+                SavaWebApplicationFactory.AccountName,
+                SavaWebApplicationFactory.AccountKey)).ToString());
+        using (var legacy = new HttpRequestMessage(HttpMethod.Head, AppendQuery(containerSas, "restype=container")))
+        {
+            legacy.Headers.TryAddWithoutValidation("x-ms-version", "2020-06-12");
+            using var response = await transport.SendAsync(legacy);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(response.Headers.Contains("x-ms-immutable-storage-with-versioning-enabled"));
+        }
+        using (var supported = new HttpRequestMessage(HttpMethod.Head, AppendQuery(containerSas, "restype=container")))
+        {
+            supported.Headers.TryAddWithoutValidation("x-ms-version", "2020-10-02");
+            using var response = await transport.SendAsync(supported);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(
+                "true",
+                response.Headers.GetValues("x-ms-immutable-storage-with-versioning-enabled").Single());
+        }
+
+        var protectedEmpty = service.GetBlobContainerClient($"version-worm-empty-{Guid.NewGuid():N}");
+        await protectedEmpty.CreateAsync();
+        var protectedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => protectedEmpty.DeleteAsync());
+        Assert.Equal(409, protectedDelete.Status);
+        Assert.Equal("ContainerImmutableStorageWithVersioningEnabled", protectedDelete.ErrorCode);
+        Assert.True((await protectedEmpty.ExistsAsync()).Value);
+
+        var ordinaryService = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var ordinaryContainer = ordinaryService.GetBlobContainerClient($"ordinary-worm-{Guid.NewGuid():N}");
+        await ordinaryContainer.CreateAsync();
+        Assert.False((await ordinaryContainer.GetPropertiesAsync()).Value.HasImmutableStorageWithVersioning);
+        var ordinaryAccountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddDays(7),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        ordinaryAccountSas.SetPermissions(AccountSasPermissions.Read);
+        var ordinarySas = AppendQuery(
+            ordinaryContainer.Uri,
+            ordinaryAccountSas.ToSasQueryParameters(new StorageSharedKeyCredential(
+                SavaWebApplicationFactory.SecondAccountName,
+                SavaWebApplicationFactory.SecondAccountKey)).ToString());
+        using (var ordinaryProperties = new HttpRequestMessage(
+                   HttpMethod.Head,
+                   AppendQuery(ordinarySas, "restype=container")))
+        {
+            ordinaryProperties.Headers.TryAddWithoutValidation("x-ms-version", "2020-10-02");
+            using var response = await transport.SendAsync(ordinaryProperties);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(
+                "false",
+                response.Headers.GetValues("x-ms-immutable-storage-with-versioning-enabled").Single());
+        }
+
+        var unsupported = ordinaryContainer.GetBlobClient("unsupported.txt");
+        var unsupportedPolicy = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            unsupported.UploadAsync(
+                BinaryData.FromString("must not publish"),
+                new BlobUploadOptions
+                {
+                    ImmutabilityPolicy = new BlobImmutabilityPolicy
+                    {
+                        ExpiresOn = DateTimeOffset.UtcNow.AddDays(1),
+                        PolicyMode = BlobImmutabilityPolicyMode.Unlocked
+                    }
+                }));
+        Assert.Equal(409, unsupportedPolicy.Status);
+        Assert.Equal("BlobOperationNotSupported", unsupportedPolicy.ErrorCode);
+        Assert.False((await unsupported.ExistsAsync()).Value);
     }
 
     [Fact]
@@ -9529,10 +9690,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task VersionedBlobFeaturesRejectBeforeMutationAndHideNewerResponseFields()
     {
-        var service = CreateClient(factory);
-        var container = service.GetBlobContainerClient($"feature-versions-{Guid.NewGuid():N}");
+        var containerName = $"feature-versions-{Guid.NewGuid():N}";
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningContainers:0"] = containerName
+            });
+        var service = CreateClient(application);
+        var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
-        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var transport = new HttpClient(application.Server.CreateHandler());
 
         static async Task AssertFeatureVersionMismatchAsync(HttpClient client, HttpRequestMessage request)
         {
@@ -9607,7 +9775,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Content = new ByteArrayContent("must not publish"u8.ToArray())
         })
         {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-06-12");
             request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             request.Headers.TryAddWithoutValidation(
                 "x-ms-immutability-policy-until-date",
@@ -9722,7 +9890,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Content = new ByteArrayContent([])
         })
         {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-06-12");
             request.Headers.TryAddWithoutValidation(
                 "x-ms-immutability-policy-until-date",
                 DateTimeOffset.UtcNow.AddDays(1).ToString("R", CultureInfo.InvariantCulture));
@@ -9735,7 +9903,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Content = new ByteArrayContent([])
         })
         {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-06-12");
             request.Headers.TryAddWithoutValidation("x-ms-legal-hold", "true");
             await AssertFeatureVersionMismatchAsync(transport, request);
         }

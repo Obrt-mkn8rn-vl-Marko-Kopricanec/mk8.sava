@@ -138,6 +138,10 @@ before clients write data:
         "HierarchicalNamespaceBlobIndexTagsEnabled": false,
         "HierarchicalNamespaceBlobSnapshotsEnabled": false,
         "LastAccessTimeTrackingEnabled": true
+      },
+      "complianceaccount": {
+        "VersioningEnabled": true,
+        "ImmutableStorageWithVersioningEnabled": true
       }
     }
   }
@@ -172,6 +176,25 @@ tracking rule. Get Blob, Get Blob Properties, XML List Blobs, and Arrow List
 Blobs expose the property when their respective response format supports it; the
 REST header and XML element require service version `2020-02-10` or later.
 Accounts without the capability omit it.
+
+`VersioningEnabled` represents Azure's control-plane blob-versioning setting.
+mk8.sava applies it to the account's durable service state at startup. Put Blob,
+Put Block List, Copy Blob, and Set Blob Metadata create versions. Append Block
+and Put Page mutate the current append/page version, matching Azure's narrower
+versioning surface for those blob types.
+
+`ImmutableStorageWithVersioningEnabled` models account-level version-level WORM
+and enables it for every container in that account. To model container-level
+enablement instead, leave that flag false and list immutable container names in
+`ImmutableStorageWithVersioningContainers`. The setting is persisted into newly
+created container records, is projected by Get Container Properties and List
+Containers from service version `2020-10-02`, and is a prerequisite for blob
+immutability policies, legal holds, and immutability headers on writes. Azure
+does not permit a data-plane Delete Container request for such a container, so
+mk8.sava returns `ContainerImmutableStorageWithVersioningEnabled` even when the
+container is empty. Version-level immutable storage requires
+`VersioningEnabled` and cannot be combined with hierarchical namespace or
+last-access-time tracking; invalid combinations fail configuration validation.
 
 HNS accounts support the Blob REST encryption-context system property. Put Blob
 and Put Block List accept `x-ms-encryption-context` from service version
