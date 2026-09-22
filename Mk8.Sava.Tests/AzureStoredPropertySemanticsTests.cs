@@ -584,6 +584,136 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         }
     }
 
+    [Fact]
+    public async Task AsynchronousCopyRequiresAndPreservesAnInfiniteDestinationLease()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"copy-lease-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlobClient("source.bin");
+        await source.UploadAsync(BinaryData.FromString("leased copy source"));
+
+        var finiteDestination = container.GetBlobClient("finite.bin");
+        await finiteDestination.UploadAsync(BinaryData.FromString("original finite destination"));
+        var finiteLeaseId = Guid.NewGuid().ToString();
+        var finiteLease = finiteDestination.GetBlobLeaseClient(finiteLeaseId);
+        await finiteLease.AcquireAsync(TimeSpan.FromSeconds(30));
+        var finiteFailure = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            finiteDestination.StartCopyFromUriAsync(
+                source.Uri,
+                new BlobCopyFromUriOptions
+                {
+                    DestinationConditions = new BlobRequestConditions { LeaseId = finiteLeaseId }
+                }));
+        Assert.Equal(412, finiteFailure.Status);
+        Assert.Equal("InfiniteLeaseDurationRequired", finiteFailure.ErrorCode);
+        Assert.Equal(
+            "original finite destination",
+            (await finiteDestination.DownloadContentAsync()).Value.Content.ToString());
+        await finiteLease.ReleaseAsync();
+
+        var infiniteDestination = container.GetBlobClient("infinite.bin");
+        await infiniteDestination.UploadAsync(BinaryData.FromString("original infinite destination"));
+        var infiniteLeaseId = Guid.NewGuid().ToString();
+        var infiniteLease = infiniteDestination.GetBlobLeaseClient(infiniteLeaseId);
+        await infiniteLease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+
+        var missingLease = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            infiniteDestination.StartCopyFromUriAsync(source.Uri));
+        Assert.Equal(412, missingLease.Status);
+        Assert.Equal("LeaseIdMissing", missingLease.ErrorCode);
+
+        var mismatchedLease = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            infiniteDestination.StartCopyFromUriAsync(
+                source.Uri,
+                new BlobCopyFromUriOptions
+                {
+                    DestinationConditions = new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() }
+                }));
+        Assert.Equal(412, mismatchedLease.Status);
+        Assert.Equal("LeaseIdMismatchWithBlobOperation", mismatchedLease.ErrorCode);
+
+        var operation = await infiniteDestination.StartCopyFromUriAsync(
+            source.Uri,
+            new BlobCopyFromUriOptions
+            {
+                DestinationConditions = new BlobRequestConditions { LeaseId = infiniteLeaseId }
+            });
+        var pending = (await infiniteDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(CopyStatus.Pending, pending.CopyStatus);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, pending.LeaseState);
+        Assert.Equal(LeaseDurationType.Infinite, pending.LeaseDuration);
+
+        var pendingLeaseOperation = await Assert.ThrowsAsync<Azure.RequestFailedException>(() => infiniteLease.RenewAsync());
+        Assert.Equal(409, pendingLeaseOperation.Status);
+        Assert.Equal("PendingCopyOperation", pendingLeaseOperation.ErrorCode);
+
+        await operation.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var completed = (await infiniteDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(CopyStatus.Success, completed.CopyStatus);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, completed.LeaseState);
+        Assert.Equal(LeaseDurationType.Infinite, completed.LeaseDuration);
+        Assert.Equal("leased copy source", (await infiniteDestination.DownloadContentAsync()).Value.Content.ToString());
+        await infiniteLease.ReleaseAsync();
+
+        var absentDestination = container.GetBlobClient("absent.bin");
+        var absentLease = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            absentDestination.StartCopyFromUriAsync(
+                source.Uri,
+                new BlobCopyFromUriOptions
+                {
+                    DestinationConditions = new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() }
+                }));
+        Assert.Equal(412, absentLease.Status);
+        Assert.Equal("LeaseNotPresentWithBlobOperation", absentLease.ErrorCode);
+        Assert.False((await absentDestination.ExistsAsync()).Value);
+    }
+
+    [Fact]
+    public async Task PendingCopyRejectsMutationsBeforeSourceOrBodyIngestion()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"copy-conflict-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlobClient("source.bin");
+        await source.UploadAsync(BinaryData.FromString("pending copy source"));
+        var destination = container.GetBlockBlobClient("destination.bin");
+        var operation = await destination.StartCopyFromUriAsync(source.Uri);
+
+        var secondCopy = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            destination.StartCopyFromUriAsync(container.GetBlobClient("missing-source.bin").Uri));
+        Assert.Equal(409, secondCopy.Status);
+        Assert.Equal("PendingCopyOperation", secondCopy.ErrorCode);
+
+        var stage = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            destination.StageBlockAsync(
+                Convert.ToBase64String("pending-block-0001"u8),
+                BinaryData.FromString("must not stage").ToStream()));
+        Assert.Equal(409, stage.Status);
+        Assert.Equal("PendingCopyOperation", stage.ErrorCode);
+
+        var overwrite = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            container.GetBlobClient(destination.Name)
+                .UploadAsync(BinaryData.FromString("must not overwrite"), overwrite: true));
+        Assert.Equal(409, overwrite.Status);
+        Assert.Equal("PendingCopyOperation", overwrite.ErrorCode);
+
+        await destination.AbortCopyFromUriAsync(operation.Id);
+
+        var bodyDestination = container.GetBlobClient("body-copy.bin");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var bodyCopy = new HttpRequestMessage(HttpMethod.Put, WriteUri(bodyDestination))
+        {
+            Content = new ByteArrayContent([0x42])
+        };
+        bodyCopy.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        bodyCopy.Headers.TryAddWithoutValidation("x-ms-copy-source", source.Uri.AbsoluteUri);
+        using var bodyCopyResponse = await transport.SendAsync(bodyCopy);
+        Assert.Equal(HttpStatusCode.BadRequest, bodyCopyResponse.StatusCode);
+        Assert.Equal("InvalidHeaderValue", bodyCopyResponse.Headers.GetValues("x-ms-error-code").Single());
+        Assert.False((await bodyDestination.ExistsAsync()).Value);
+    }
+
     private static HttpRequestMessage PutBlobRequest(BlockBlobClient blob, byte[] payload)
     {
         var request = new HttpRequestMessage(HttpMethod.Put, WriteUri(blob))

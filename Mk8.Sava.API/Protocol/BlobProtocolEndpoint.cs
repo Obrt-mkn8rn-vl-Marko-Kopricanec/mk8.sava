@@ -1144,6 +1144,7 @@ public static class BlobProtocolEndpoint
                 EnsureLease(http.Request, current.Lease, "blob");
                 EnsureCustomerProvidedKey(http.Request, current, write: true);
             }
+            EnsureNoPendingCopyDestination(current);
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
             _ = SanitizeCopySource(copySource);
@@ -1598,8 +1599,13 @@ public static class BlobProtocolEndpoint
         var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
         RequireAny(request, current is null ? 'c' : 'w', 'w');
         EvaluateWriteConditions(http.Request, current);
-        if (current is not null)
-            EnsureLease(http.Request, current.Lease, "blob");
+        if (current is not null ||
+            http.Request.Headers.ContainsKey("x-ms-lease-id") &&
+            IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+        {
+            EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
+        }
+        EnsureNoPendingCopyDestination(current);
 
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
@@ -1766,6 +1772,8 @@ public static class BlobProtocolEndpoint
                     ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
             }
             ValidateAsynchronousCopyEncryption(http.Request);
+            EnsureAsynchronousCopyDestinationLease(http.Request, current);
+            RequireZeroContentLength(http.Request);
             BlobRecord copied;
             var internalSource = ResolveInternalCopySource(http.Request, request, copySource);
             if (internalSource is not null)
@@ -1794,7 +1802,6 @@ public static class BlobProtocolEndpoint
             }
             else
             {
-                RequireZeroContentLength(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 var transfer = await transfers.ReadAsync(
                     http.Request,
@@ -2746,6 +2753,32 @@ public static class BlobProtocolEndpoint
             lease,
             ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
             resource);
+    }
+
+    private static void EnsureAsynchronousCopyDestinationLease(
+        HttpRequest request,
+        BlobRecord? destination)
+    {
+        if (destination is null)
+            return;
+        var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
+        var effective = leases.GetEffective(destination.Lease);
+        if ((effective.State is LeaseState.Leased or LeaseState.Breaking) &&
+            effective.DurationSeconds != -1)
+        {
+            throw AzureStorageException.InfiniteLeaseDurationRequired();
+        }
+    }
+
+    private static void EnsureNoPendingCopyDestination(BlobRecord? destination)
+    {
+        if (destination?.Copy?.Status == "pending")
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "PendingCopyOperation",
+                "There is currently a pending copy operation.");
+        }
     }
 
     private static void ValidateOptionalLease(HttpRequest request, LeaseRecord lease, string resource)
