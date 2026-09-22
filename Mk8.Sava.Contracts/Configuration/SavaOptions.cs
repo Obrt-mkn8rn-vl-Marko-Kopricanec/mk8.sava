@@ -68,8 +68,12 @@ public sealed class SavaOptions : IValidatableObject
 
         foreach (var (accountName, accountKey) in Accounts)
         {
-            if (string.IsNullOrWhiteSpace(accountName))
-                yield return new ValidationResult("Storage account names cannot be blank.", [nameof(Accounts)]);
+            if (!IsValidAccountName(accountName))
+            {
+                yield return new ValidationResult(
+                    $"Storage account name '{accountName}' must have 3 to 24 lowercase ASCII letters or digits.",
+                    [nameof(Accounts)]);
+            }
 
             if (!TryDecodeKey(accountKey, out var keyBytes))
                 yield return new ValidationResult($"The key for account '{accountName}' must be valid base64.", [nameof(Accounts)]);
@@ -476,6 +480,10 @@ public sealed class SavaOptions : IValidatableObject
             return false;
         }
     }
+
+    private static bool IsValidAccountName(string? name) =>
+        name is { Length: >= 3 and <= 24 } &&
+        name.All(character => character is >= 'a' and <= 'z' or >= '0' and <= '9');
 
     public string ResolveAccountDataEncryptionKey(string account) =>
         DataEncryptionKeys.TryGetValue(account, out var key)

@@ -244,6 +244,10 @@ reports the setting through Get Account Information and applies the correspondin
 Blob API restrictions and hierarchical listing/property shape. The separate Data
 Lake `dfs` protocol is outside this service's endpoint boundary.
 
+Configured account names follow Azure's 3–24-character lowercase ASCII letter
+or digit rule. Startup rejects other names, including path separators, rather
+than allowing an account identity to alter the chunk-storage path layout.
+
 `AllowSharedKeyAccess` defaults to `true`, matching an Azure account whose
 management-plane property is unset. Setting it to `false` rejects Shared Key and
 Shared Key Lite headers plus service and account SAS tokens with
