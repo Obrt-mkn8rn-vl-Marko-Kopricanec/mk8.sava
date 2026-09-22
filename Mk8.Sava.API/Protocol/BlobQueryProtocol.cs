@@ -56,6 +56,7 @@ internal static class BlobQueryProtocol
     private const int MaximumExpressionBytes = 256 * 1024;
     private const int MaximumRecordCharacters = 16 * 1024 * 1024;
     private const int ArrowRecordBatchSize = 1024;
+    private static readonly byte[] Utf8Preamble = [0xEF, 0xBB, 0xBF];
 
     public static async Task<BlobQueryRequest> ReadRequestAsync(
         Stream body,
@@ -87,6 +88,13 @@ internal static class BlobQueryProtocol
                     "InvalidQueryParameterValue",
                     "Nested BlobStorage table paths require JSON query input.");
             }
+            if (plan.IsSplit && input.Kind != BlobQueryFormatKind.Delimited)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidQueryParameterValue",
+                    "Sys.Split requires delimited query input.");
+            }
             return new BlobQueryRequest(expression, input, output);
         }
         catch (AzureStorageException)
@@ -112,9 +120,7 @@ internal static class BlobQueryProtocol
 
         try
         {
-            await using var enumerator = ReadRowsAsync(input, request.Input, plan, cancellationToken)
-                .GetAsyncEnumerator(cancellationToken);
-            await using var selections = SelectRowsAsync(enumerator, plan, cancellationToken)
+            await using var selections = ExecutePlanAsync(input, request.Input, plan, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
             if (request.Output.Kind == BlobQueryFormatKind.Arrow)
             {
@@ -159,6 +165,32 @@ internal static class BlobQueryProtocol
         }
 
         await avro.CompleteAsync(totalBytes, cancellationToken);
+    }
+
+    private static async IAsyncEnumerable<QuerySelection> ExecutePlanAsync(
+        Stream input,
+        BlobQueryTextFormat format,
+        BlobQueryPlan plan,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (plan.IsSplit)
+        {
+            await foreach (var selection in ReadSplitSelectionsAsync(
+                               input,
+                               format,
+                               plan.SplitSize,
+                               plan.SplitName,
+                               cancellationToken))
+            {
+                yield return selection;
+            }
+            yield break;
+        }
+
+        await using var rows = ReadRowsAsync(input, format, plan, cancellationToken)
+            .GetAsyncEnumerator(cancellationToken);
+        await foreach (var selection in SelectRowsAsync(rows, plan, cancellationToken))
+            yield return selection;
     }
 
     private static async IAsyncEnumerable<QuerySelection> SelectRowsAsync(
@@ -708,6 +740,98 @@ internal static class BlobQueryProtocol
         message,
         0);
 
+    private static async IAsyncEnumerable<QuerySelection> ReadSplitSelectionsAsync(
+        Stream input,
+        BlobQueryTextFormat format,
+        long targetBytes,
+        string outputName,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var recordSeparator = Encoding.UTF8.GetBytes(format.RecordSeparator);
+        var columnSeparator = Encoding.UTF8.GetBytes(format.ColumnSeparator);
+        var quote = Encoding.UTF8.GetBytes(format.Quote.ToString());
+        var escape = Encoding.UTF8.GetBytes(format.Escape.ToString());
+        var doubledQuoteEscaping = format.Quote == format.Escape;
+        using var reader = new BlobQueryByteReader(input);
+        var recordBytes = 0L;
+        var batchBytes = 0L;
+        var inQuotes = false;
+        var atFieldStart = true;
+
+        if (await reader.TryConsumeAsync(Utf8Preamble, cancellationToken))
+            recordBytes += Utf8Preamble.Length;
+
+        while (await reader.HasDataAsync(cancellationToken))
+        {
+            if (inQuotes)
+            {
+                if (doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken))
+                {
+                    recordBytes = checked(recordBytes + quote.Length);
+                    if (await reader.TryConsumeAsync(quote, cancellationToken))
+                    {
+                        recordBytes = checked(recordBytes + quote.Length);
+                        continue;
+                    }
+                    inQuotes = false;
+                    continue;
+                }
+                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(escape, cancellationToken))
+                {
+                    recordBytes = checked(recordBytes + escape.Length);
+                    recordBytes = checked(recordBytes + await reader.ConsumeUtf8ScalarAsync(cancellationToken));
+                    continue;
+                }
+                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken))
+                {
+                    recordBytes = checked(recordBytes + quote.Length);
+                    inQuotes = false;
+                    continue;
+                }
+                _ = await reader.ReadByteAsync(cancellationToken);
+                recordBytes = checked(recordBytes + 1);
+                continue;
+            }
+
+            if (atFieldStart && await reader.TryConsumeAsync(quote, cancellationToken))
+            {
+                recordBytes = checked(recordBytes + quote.Length);
+                atFieldStart = false;
+                inQuotes = true;
+                continue;
+            }
+            if (await reader.TryConsumeAsync(recordSeparator, cancellationToken))
+            {
+                recordBytes = checked(recordBytes + recordSeparator.Length);
+                batchBytes = checked(batchBytes + recordBytes);
+                recordBytes = 0;
+                atFieldStart = true;
+                if (batchBytes >= targetBytes)
+                {
+                    yield return new QuerySelection([outputName], [new QueryCell(batchBytes)]);
+                    batchBytes = 0;
+                }
+                continue;
+            }
+            if (await reader.TryConsumeAsync(columnSeparator, cancellationToken))
+            {
+                recordBytes = checked(recordBytes + columnSeparator.Length);
+                atFieldStart = true;
+                continue;
+            }
+
+            _ = await reader.ReadByteAsync(cancellationToken);
+            recordBytes = checked(recordBytes + 1);
+            atFieldStart = false;
+        }
+
+        if (inQuotes)
+            throw new BlobQueryDataException("UnclosedQuote", "A delimited query input field contains an unclosed quote.", 0);
+        batchBytes = checked(batchBytes + recordBytes);
+        if (batchBytes > 0)
+            yield return new QuerySelection([outputName], [new QueryCell(batchBytes)]);
+    }
+
     private static async IAsyncEnumerable<QueryRow> ReadRowsAsync(
         Stream input,
         BlobQueryTextFormat format,
@@ -1036,6 +1160,101 @@ internal static class BlobQueryProtocol
         StatusCodes.Status400BadRequest,
         "InvalidXmlDocument",
         $"The query request XML is invalid. {detail}");
+
+    private sealed class BlobQueryByteReader(Stream input) : IDisposable
+    {
+        private readonly byte[] _buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        private int _start;
+        private int _end;
+        private bool _endOfStream;
+
+        public ValueTask<bool> HasDataAsync(CancellationToken cancellationToken) =>
+            EnsureAsync(1, cancellationToken);
+
+        public ValueTask<bool> TryConsumeAsync(byte[] value, CancellationToken cancellationToken)
+        {
+            if (_end - _start >= value.Length)
+                return ValueTask.FromResult(TryConsumeBuffered(value));
+            return TryConsumeSlowAsync(value, cancellationToken);
+        }
+
+        public ValueTask<int> ReadByteAsync(CancellationToken cancellationToken)
+        {
+            if (_start < _end)
+                return ValueTask.FromResult((int)_buffer[_start++]);
+            return ReadByteSlowAsync(cancellationToken);
+        }
+
+        public async ValueTask<int> ConsumeUtf8ScalarAsync(CancellationToken cancellationToken)
+        {
+            var first = await ReadByteAsync(cancellationToken);
+            if (first < 0)
+                return 0;
+            var length = first switch
+            {
+                < 0x80 => 1,
+                >= 0xC2 and <= 0xDF => 2,
+                >= 0xE0 and <= 0xEF => 3,
+                >= 0xF0 and <= 0xF4 => 4,
+                _ => 1
+            };
+            var consumed = 1;
+            while (consumed < length && await ReadByteAsync(cancellationToken) >= 0)
+                consumed++;
+            return consumed;
+        }
+
+        public void Dispose()
+        {
+            ArrayPool<byte>.Shared.Return(_buffer, clearArray: true);
+        }
+
+        private bool TryConsumeBuffered(byte[] value)
+        {
+            if (!_buffer.AsSpan(_start, value.Length).SequenceEqual(value))
+                return false;
+            _start += value.Length;
+            return true;
+        }
+
+        private async ValueTask<bool> TryConsumeSlowAsync(
+            byte[] value,
+            CancellationToken cancellationToken) =>
+            await EnsureAsync(value.Length, cancellationToken) && TryConsumeBuffered(value);
+
+        private async ValueTask<int> ReadByteSlowAsync(CancellationToken cancellationToken) =>
+            await EnsureAsync(1, cancellationToken) ? _buffer[_start++] : -1;
+
+        private ValueTask<bool> EnsureAsync(int count, CancellationToken cancellationToken)
+        {
+            if (_end - _start >= count)
+                return ValueTask.FromResult(true);
+            return FillAsync(count, cancellationToken);
+        }
+
+        private async ValueTask<bool> FillAsync(int count, CancellationToken cancellationToken)
+        {
+            if (count > _buffer.Length)
+                throw new ArgumentOutOfRangeException(nameof(count));
+            if (_start > 0)
+            {
+                _buffer.AsSpan(_start, _end - _start).CopyTo(_buffer);
+                _end -= _start;
+                _start = 0;
+            }
+            while (_end < count && !_endOfStream)
+            {
+                var read = await input.ReadAsync(_buffer.AsMemory(_end), cancellationToken);
+                if (read == 0)
+                {
+                    _endOfStream = true;
+                    break;
+                }
+                _end += read;
+            }
+            return _end >= count;
+        }
+    }
 }
 
 internal sealed class BlobQueryAvroDataStream(
@@ -1343,6 +1562,8 @@ internal sealed class BlobQueryPlan
     private readonly long? _limit;
     private readonly QueryAggregateState? _aggregate;
     private readonly IReadOnlyList<QueryTableSegment> _tablePath;
+    private readonly long? _splitSize;
+    private readonly string? _splitName;
     private long _selectedRows;
 
     private BlobQueryPlan(
@@ -1350,13 +1571,17 @@ internal sealed class BlobQueryPlan
         QueryPredicate? predicate,
         long? limit,
         QueryAggregateState? aggregate,
-        IReadOnlyList<QueryTableSegment> tablePath)
+        IReadOnlyList<QueryTableSegment> tablePath,
+        long? splitSize,
+        string? splitName)
     {
         _projections = projections;
         _predicate = predicate;
         _limit = limit;
         _aggregate = aggregate;
         _tablePath = tablePath;
+        _splitSize = splitSize;
+        _splitName = splitName;
     }
 
     public static BlobQueryPlan Parse(string expression) => new QueryParser(expression).Parse();
@@ -1364,6 +1589,9 @@ internal sealed class BlobQueryPlan
     public bool LimitReached => _limit.HasValue && _selectedRows >= _limit.Value;
     public bool IsAggregate => _aggregate is not null;
     public bool HasJsonTablePath => _tablePath.Count > 0;
+    public bool IsSplit => _splitSize.HasValue;
+    public long SplitSize => _splitSize ?? throw new InvalidOperationException("The query is not a split query.");
+    public string SplitName => _splitName ?? throw new InvalidOperationException("The query is not a split query.");
 
     public IEnumerable<QueryRow> ExpandJsonRows(JsonElement root)
     {
@@ -1514,6 +1742,12 @@ internal sealed class BlobQueryPlan
     {
         public override QueryCell Evaluate(QueryRow row) =>
             throw new InvalidOperationException("Aggregate expressions are evaluated across rows.");
+    }
+
+    private sealed record QuerySplitExpression(long Size) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) =>
+            throw new InvalidOperationException("Sys.Split is evaluated over raw input records.");
     }
 
     private abstract record QueryPredicate
@@ -2333,7 +2567,31 @@ internal sealed class BlobQueryPlan
                     expression.CountStar);
                 projections = [];
             }
-            return new BlobQueryPlan(projections, predicate, limit, aggregate, tablePath);
+
+            long? splitSize = null;
+            string? splitName = null;
+            if (projections.Any(projection => projection.Expression is QuerySplitExpression))
+            {
+                if (projections.Count != 1 ||
+                    projections[0] is not { Star: false, Expression: QuerySplitExpression split } projection ||
+                    predicate is not null || limit.HasValue || tablePath.Count > 0)
+                {
+                    throw InvalidQuery(
+                        Current.Position,
+                        "Sys.Split must be the only projection and cannot use WHERE, LIMIT, or a table path.");
+                }
+                splitSize = split.Size;
+                splitName = projection.Name;
+                projections = [];
+            }
+            return new BlobQueryPlan(
+                projections,
+                predicate,
+                limit,
+                aggregate,
+                tablePath,
+                splitSize,
+                splitName);
         }
 
         private IReadOnlyList<QueryTableSegment> ParseTablePath(int sourcePosition)
@@ -2523,6 +2781,22 @@ internal sealed class BlobQueryPlan
                     if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
                         return new QueryOperand(null, new QueryCell(false));
                     if (!token.Quoted &&
+                        string.Equals(token.Text, "sys", StringComparison.OrdinalIgnoreCase) &&
+                        IsSysSplitStart())
+                    {
+                        _position += 3;
+                        var sizeToken = Expect(QueryTokenKind.Number, "Sys.Split size");
+                        if (!long.TryParse(sizeToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var size) ||
+                            size < 10L * 1024 * 1024)
+                        {
+                            throw InvalidQuery(
+                                sizeToken.Position,
+                                "The Sys.Split size must be an integer of at least 10485760 bytes.");
+                        }
+                        ExpectSymbol(")");
+                        return new QuerySplitExpression(size);
+                    }
+                    if (!token.Quoted &&
                         string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) &&
                         MatchSymbol("("))
                     {
@@ -2698,6 +2972,14 @@ internal sealed class BlobQueryPlan
             new QueryOperand(null, new QueryCell(value));
 
         private QueryToken Current => _tokens[_position];
+
+        private bool IsSysSplitStart() =>
+            _position + 2 < _tokens.Count &&
+            _tokens[_position].Kind == QueryTokenKind.Symbol &&
+            _tokens[_position].Text == "." &&
+            IsKeyword(_tokens[_position + 1], "split") &&
+            _tokens[_position + 2].Kind == QueryTokenKind.Symbol &&
+            _tokens[_position + 2].Text == "(";
 
         private bool MatchKeyword(string value)
         {

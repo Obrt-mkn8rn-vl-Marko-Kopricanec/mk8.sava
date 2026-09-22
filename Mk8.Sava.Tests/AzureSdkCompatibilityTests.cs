@@ -9991,6 +9991,65 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(2, await CountAsync("longitude IS NOT MISSING"));
     }
 
+    [Fact]
+    public async Task QueryBlobContentsSysSplitReturnsExactCsvRecordBatches()
+    {
+        const int mebibyte = 1024 * 1024;
+        const int firstRecordLength = 6 * mebibyte;
+        const int secondRecordLength = 6 * mebibyte;
+        const int thirdRecordLength = mebibyte;
+        var content = new byte[firstRecordLength + secondRecordLength + thirdRecordLength];
+        Array.Fill(content, (byte)'a');
+        content[firstRecordLength - 1] = (byte)'\n';
+
+        var secondStart = firstRecordLength;
+        Array.Fill(content, (byte)'b', secondStart, secondRecordLength);
+        content[secondStart] = (byte)'"';
+        content[secondStart + secondRecordLength / 2] = (byte)'\n';
+        content[secondStart + secondRecordLength - 2] = (byte)'"';
+        content[secondStart + secondRecordLength - 1] = (byte)'\n';
+
+        var thirdStart = firstRecordLength + secondRecordLength;
+        Array.Fill(content, (byte)'c', thirdStart, thirdRecordLength);
+        content[^1] = (byte)'\n';
+
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"split-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.csv");
+        await blob.UploadAsync(new MemoryStream(content, writable: false));
+        var options = new BlobQueryOptions
+        {
+            InputTextConfiguration = new BlobQueryCsvTextOptions
+            {
+                ColumnSeparator = ",",
+                QuotationCharacter = '"',
+                EscapeCharacter = '\\',
+                RecordSeparator = "\n"
+            },
+            OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+        };
+
+        var response = await blob.QueryAsync(
+            "SELECT sys.split(10485760) AS bytes FROM BlobStorage;",
+            options);
+        using var reader = new StreamReader(response.Value.Content);
+        var lines = (await reader.ReadToEndAsync()).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+        Assert.Equal(2, lines.Length);
+        using var firstBatch = JsonDocument.Parse(lines[0]);
+        using var secondBatch = JsonDocument.Parse(lines[1]);
+        Assert.Equal(
+            firstRecordLength + secondRecordLength,
+            firstBatch.RootElement.GetProperty("bytes").GetInt64());
+        Assert.Equal(thirdRecordLength, secondBatch.RootElement.GetProperty("bytes").GetInt64());
+
+        var invalid = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.QueryAsync("SELECT sys.split(1024) FROM BlobStorage;", options));
+        Assert.Equal(400, invalid.Status);
+        Assert.Equal("InvalidQueryParameterValue", invalid.ErrorCode);
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 

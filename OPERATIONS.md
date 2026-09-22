@@ -97,6 +97,9 @@ JSON queries support Azure's `BlobStorage[*].path[*]` table descriptors, source
 aliases, nested object members, zero-based array indexes, and distinct
 `IS MISSING`/`IS NOT MISSING` semantics. An explicit JSON null remains different
 from a property that is absent from the input object.
+`Sys.Split` scans delimited input as bounded raw UTF-8 buffers, honors quoted and
+escaped record separators, and emits exact byte counts at complete-record
+boundaries. It does not retain a requested 10 MiB-or-larger batch in memory.
 
 ## Account capabilities
 
