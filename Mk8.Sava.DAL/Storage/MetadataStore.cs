@@ -987,7 +987,9 @@ public sealed class MetadataStore(
             removeOld.Parameters.AddWithValue("$pack", oldPack.PackId);
             if (await removeOld.ExecuteNonQueryAsync(cancellationToken) != 1)
                 throw new StorageConcurrencyException();
+            faultInjector.Inject(StorageFaultPoint.BeforePackMetadataCommit);
             await transaction.CommitAsync(cancellationToken);
+            faultInjector.Inject(StorageFaultPoint.AfterPackMetadataCommit);
         }
         finally
         {

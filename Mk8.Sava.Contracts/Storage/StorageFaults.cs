@@ -5,6 +5,8 @@ public enum StorageFaultPoint
     BeforeChunkPublication,
     BeforeBlobMetadataCommit,
     AfterBlobMetadataCommit,
+    BeforePackMetadataCommit,
+    AfterPackMetadataCommit,
     BeforeGarbageCollectionDelete
 }
 
