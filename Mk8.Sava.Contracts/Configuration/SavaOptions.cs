@@ -87,6 +87,13 @@ public sealed class SavaOptions : IValidatableObject
                     $"AccountCapabilities for '{accountName}' enables hierarchical blob index tags without hierarchical namespace.",
                     [nameof(AccountCapabilities)]);
             }
+            if (capabilities.HierarchicalNamespaceBlobSnapshotsEnabled &&
+                !capabilities.HierarchicalNamespaceEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' enables hierarchical blob snapshots without hierarchical namespace.",
+                    [nameof(AccountCapabilities)]);
+            }
         }
 
         if (EnableCrossAccountDeduplication &&
@@ -272,6 +279,7 @@ public sealed class StorageAccountCapabilities
 {
     public bool HierarchicalNamespaceEnabled { get; init; }
     public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
+    public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }
 }
 
 public sealed class BearerAuthenticationOptions
