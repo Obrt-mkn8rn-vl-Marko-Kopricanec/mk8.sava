@@ -195,6 +195,13 @@ reports the setting through Get Account Information and applies the correspondin
 Blob API restrictions and hierarchical listing/property shape. The separate Data
 Lake `dfs` protocol is outside this service's endpoint boundary.
 
+`AllowSharedKeyAccess` defaults to `true`, matching an Azure account whose
+management-plane property is unset. Setting it to `false` rejects Shared Key and
+Shared Key Lite headers plus service and account SAS tokens with
+`KeyBasedAuthenticationNotPermitted`. Bearer authorization and user-delegation
+SAS remain available, as do anonymous reads from containers already configured
+for public access.
+
 Blob index tags on HNS accounts remain an Azure preview that requires the
 `Microsoft.Storage/BlobIndexForHns` feature registration. Set
 `HierarchicalNamespaceBlobIndexTagsEnabled` only for an account on which that
