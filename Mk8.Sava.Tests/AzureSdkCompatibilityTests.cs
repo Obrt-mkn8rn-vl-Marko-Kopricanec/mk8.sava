@@ -6430,6 +6430,157 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task SasExpirationPolicyLogsOrBlocksEveryAdHocSasType()
+    {
+        await using (var logApplication = new SavaWebApplicationFactory(
+                         new Dictionary<string, string?>
+                         {
+                             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationPeriod"] =
+                                 "00:05:00"
+                         }))
+        {
+            var owner = CreateClient(logApplication);
+            var container = owner.GetBlobContainerClient($"sas-expiry-log-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blob = container.GetBlobClient("allowed.txt");
+            await blob.UploadAsync(BinaryData.FromString("log-only expiration policy"));
+            var loggedMissingStart = CreateBlobClient(
+                logApplication,
+                HttpsSasUri(blob, BlobSasPermissions.Read));
+            Assert.Equal(
+                "log-only expiration policy",
+                (await loggedMissingStart.DownloadContentAsync()).Value.Content.ToString());
+        }
+
+        await using var blockApplication = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationPeriod"] =
+                    "00:05:00",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationAction"] =
+                    "Block"
+            });
+        var ownerClient = CreateClient(blockApplication);
+        var blockContainer = ownerClient.GetBlobContainerClient($"sas-expiry-block-{Guid.NewGuid():N}");
+        await blockContainer.CreateAsync();
+        var blockBlob = blockContainer.GetBlobClient("protected.txt");
+        await blockBlob.UploadAsync(BinaryData.FromString("expiration policy payload"));
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        BlobClient CreateServiceSas(DateTimeOffset? start, DateTimeOffset expiry)
+        {
+            var builder = new BlobSasBuilder
+            {
+                BlobContainerName = blockContainer.Name,
+                BlobName = blockBlob.Name,
+                Resource = "b",
+                StartsOn = start ?? default,
+                ExpiresOn = expiry,
+                Protocol = SasProtocol.HttpsAndHttp
+            };
+            builder.SetPermissions(BlobSasPermissions.Read);
+            return CreateBlobClient(
+                blockApplication,
+                new Uri(
+                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                    $"{blockContainer.Name}/{blockBlob.Name}?{builder.ToSasQueryParameters(credential)}"));
+        }
+
+        static void AssertAuthorizationFailure(RequestFailedException exception)
+        {
+            Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
+            Assert.Equal("AuthorizationFailure", exception.ErrorCode);
+        }
+
+        var compliant = CreateServiceSas(startsOn, startsOn.AddMinutes(5));
+        Assert.Equal(
+            "expiration policy payload",
+            (await compliant.DownloadContentAsync()).Value.Content.ToString());
+
+        var overlong = CreateServiceSas(startsOn, startsOn.AddMinutes(5).AddSeconds(1));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => overlong.DownloadContentAsync()));
+        var blockedMissingStart = CreateServiceSas(null, DateTimeOffset.UtcNow.AddMinutes(4));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => blockedMissingStart.DownloadContentAsync()));
+
+        var accountBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = startsOn,
+            ExpiresOn = startsOn.AddMinutes(6),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountBuilder.SetPermissions(AccountSasPermissions.Read);
+        var accountSas = CreateBlobClient(
+            blockApplication,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                $"{blockContainer.Name}/{blockBlob.Name}?{accountBuilder.ToSasQueryParameters(credential)}"));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => accountSas.DownloadContentAsync()));
+
+        var delegatorToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var delegator = CreateBearerClient(blockApplication, delegatorToken);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(startsOn.AddMinutes(10)) { StartsOn = startsOn })).Value;
+        var delegationBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = blockContainer.Name,
+            BlobName = blockBlob.Name,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = startsOn.AddMinutes(6),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        delegationBuilder.SetPermissions(BlobSasPermissions.Read);
+        var delegationSas = CreateBlobClient(
+            blockApplication,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                $"{blockContainer.Name}/{blockBlob.Name}?" +
+                delegationBuilder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName)));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => delegationSas.DownloadContentAsync()));
+
+        await blockContainer.SetAccessPolicyAsync(
+            PublicAccessType.None,
+            [new BlobSignedIdentifier
+            {
+                Id = "long-lived-policy",
+                AccessPolicy = new BlobAccessPolicy
+                {
+                    StartsOn = startsOn,
+                    ExpiresOn = startsOn.AddMinutes(10),
+                    Permissions = "r"
+                }
+            }]);
+        var policyBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = blockContainer.Name,
+            BlobName = blockBlob.Name,
+            Resource = "b",
+            Identifier = "long-lived-policy",
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        var policySas = CreateBlobClient(
+            blockApplication,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                $"{blockContainer.Name}/{blockBlob.Name}?{policyBuilder.ToSasQueryParameters(credential)}"));
+        Assert.Equal(
+            "expiration policy payload",
+            (await policySas.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task SasRejectsMissingRequiredFieldsAndNoncanonicalAuthorizationSets()
     {
         var owner = CreateClient(factory);

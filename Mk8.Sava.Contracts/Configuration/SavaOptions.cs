@@ -123,6 +123,13 @@ public sealed class SavaOptions : IValidatableObject
                     $"AccountCapabilities for '{accountName}' contains a blank immutable-storage container name.",
                     [nameof(AccountCapabilities)]);
             }
+            if (capabilities.SasExpirationPeriod is { } sasExpirationPeriod &&
+                sasExpirationPeriod <= TimeSpan.Zero)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' has a non-positive SAS expiration period.",
+                    [nameof(AccountCapabilities)]);
+            }
         }
 
         var replicationPolicyIds = new HashSet<Guid>();
@@ -460,6 +467,12 @@ public enum SasPolicyViolationAction
     Block
 }
 
+public enum SasExpirationPolicyAction
+{
+    Log,
+    Block
+}
+
 public sealed class StorageAccountCapabilities
 {
     public bool AllowSharedKeyAccess { get; init; } = true;
@@ -467,6 +480,8 @@ public sealed class StorageAccountCapabilities
     public bool RequireUserBoundUserDelegationSas { get; init; }
     public SasPolicyViolationAction RequireUserBoundUserDelegationSasAction { get; init; } =
         SasPolicyViolationAction.Log;
+    public TimeSpan? SasExpirationPeriod { get; init; }
+    public SasExpirationPolicyAction SasExpirationAction { get; init; } = SasExpirationPolicyAction.Log;
     public bool HierarchicalNamespaceEnabled { get; init; }
     public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
     public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }

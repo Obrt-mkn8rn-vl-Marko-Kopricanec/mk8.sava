@@ -212,6 +212,14 @@ every valid SAS that lacks a signed delegated-user object ID. Its companion
 or `Block`; log records identify the request and account without recording the
 SAS secret.
 
+`SasExpirationPeriod` configures Azure's maximum SAS validity interval as a
+.NET duration (for example, `1.12:05:06`). Every ad hoc service, account, and
+user-delegation SAS must carry a signed start time and may span no more than the
+configured interval. `SasExpirationAction` defaults to `Log`; set it to `Block`
+to deny out-of-policy tokens with `AuthorizationFailure`. A service SAS backed
+by a stored access policy is exempt, matching Azure's documented limitation,
+and the user-delegation key's own lifetime is not evaluated by this policy.
+
 Blob index tags on HNS accounts remain an Azure preview that requires the
 `Microsoft.Storage/BlobIndexForHns` feature registration. Set
 `HierarchicalNamespaceBlobIndexTagsEnabled` only for an account on which that

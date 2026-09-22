@@ -334,8 +334,10 @@ public sealed class StorageAuthenticator(
             throw AzureStorageException.AuthenticationFailed("The request IP address is not permitted by the signed IP field.");
 
         var permissions = query["sp"].ToString();
-        var startsAt = ParseSasTime(query["st"].ToString());
-        var expiresAt = ParseSasTime(query["se"].ToString());
+        var signedStartsAt = ParseSasTime(query["st"].ToString());
+        var signedExpiresAt = ParseSasTime(query["se"].ToString());
+        var startsAt = signedStartsAt;
+        var expiresAt = signedExpiresAt;
         var signedEncryptionScope = query["ses"].ToString();
         if (!string.IsNullOrEmpty(signedEncryptionScope) && signedVersion < new DateOnly(2020, 12, 6))
             throw AzureStorageException.AuthorizationFailure();
@@ -622,6 +624,13 @@ public sealed class StorageAuthenticator(
             throw AzureStorageException.AuthorizationFailure();
         if (isCrossTenantUserBoundSas && !AllowsCrossTenantDelegationSas(request.Account))
             throw AzureStorageException.AuthorizationFailure();
+        ApplySasExpirationPolicy(
+            request,
+            isStoredAccessPolicySas: !isAccountSas &&
+                                     !isUserDelegationSas &&
+                                     !string.IsNullOrEmpty(query["si"].ToString()),
+            signedStartsAt,
+            signedExpiresAt);
         ApplyUserBoundSasPolicy(
             request,
             isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
@@ -1081,6 +1090,36 @@ public sealed class StorageAuthenticator(
                 request.RequestId,
                 request.Account);
         }
+    }
+
+    private void ApplySasExpirationPolicy(
+        StorageRequestContext request,
+        bool isStoredAccessPolicySas,
+        DateTimeOffset? signedStartsAt,
+        DateTimeOffset? signedExpiresAt)
+    {
+        if (isStoredAccessPolicySas ||
+            !_options.AccountCapabilities.TryGetValue(request.Account, out var capabilities) ||
+            capabilities.SasExpirationPeriod is not { } maximumInterval)
+        {
+            return;
+        }
+
+        var violation = signedStartsAt is not { } signedStart
+            ? "missing a signed start time"
+            : signedExpiresAt is { } signedExpiry && signedExpiry - signedStart > maximumInterval
+                ? "exceeds the configured validity interval"
+                : null;
+        if (violation is null)
+            return;
+
+        if (capabilities.SasExpirationAction == SasExpirationPolicyAction.Block)
+            throw AzureStorageException.AuthorizationFailure();
+        logger.LogWarning(
+            "SAS request {RequestId} for account {Account} {Violation}.",
+            request.RequestId,
+            request.Account,
+            violation);
     }
 
     private static bool SameTenant(string left, string right) =>
