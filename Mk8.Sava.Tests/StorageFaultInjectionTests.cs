@@ -161,6 +161,73 @@ public sealed class StorageFaultInjectionTests
         }
     }
 
+    [Fact]
+    public async Task ConcurrentIdenticalSmallChunksPublishOnePackRecord()
+    {
+        using var publicationBarrier = new Barrier(2);
+        var injector = new BlockingPublicationInjector(publicationBarrier);
+        var application = new SavaWebApplicationFactory(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-race-{Guid.NewGuid():N}"),
+            injector,
+            analyticsSink: null,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "01:00:00",
+                ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
+            },
+            deleteDataPath: true,
+            disableMaintenance: true);
+        try
+        {
+            await application.InitializeAsync();
+            var store = application.Services.GetRequiredService<ChunkStore>();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var payload = RandomNumberGenerator.GetBytes(1024);
+            var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
+
+            Task<StoredContent> StoreAsync() => Task.Run(() => store.StorePinnedAsync(
+                SavaWebApplicationFactory.AccountName,
+                encryption,
+                new MemoryStream(payload, writable: false),
+                CancellationToken.None));
+
+            var pending = new[] { StoreAsync(), StoreAsync() };
+            var stored = await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(30));
+            try
+            {
+                var chunkId = Assert.Single(stored[0].Manifest.Chunks).Id;
+                Assert.Equal(chunkId, Assert.Single(stored[1].Manifest.Chunks).Id);
+                var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
+                Assert.NotNull(location);
+                Assert.Equal(1, metadata.CountPackedChunks());
+                var packPath = Path.Combine(
+                    application.DataPath,
+                    "packs",
+                    location.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+                Assert.Equal(location.RecordLength, new FileInfo(packPath).Length);
+
+                using var reconstructed = new MemoryStream();
+                await store.WriteRangeAsync(
+                    stored[1].Manifest,
+                    encryption,
+                    0,
+                    payload.Length,
+                    reconstructed,
+                    CancellationToken.None);
+                Assert.Equal(payload, reconstructed.ToArray());
+            }
+            finally
+            {
+                foreach (var item in stored)
+                    item.Dispose();
+            }
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
     private static SavaWebApplicationFactory CreateApplication(IStorageFaultInjector faultInjector) =>
         new(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-fault-{Guid.NewGuid():N}"),
@@ -227,6 +294,18 @@ public sealed class StorageFaultInjectionTests
                 _armed = false;
             }
             throw new IOException($"Injected storage failure at {point}.");
+        }
+    }
+
+    private sealed class BlockingPublicationInjector(Barrier barrier) : IStorageFaultInjector
+    {
+        public void Inject(StorageFaultPoint point)
+        {
+            if (point == StorageFaultPoint.BeforeChunkPublication &&
+                !barrier.SignalAndWait(TimeSpan.FromSeconds(15)))
+            {
+                throw new TimeoutException("Both competing chunk writers did not reach publication.");
+            }
         }
     }
 

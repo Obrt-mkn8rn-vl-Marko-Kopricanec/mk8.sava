@@ -17,6 +17,13 @@ and repeats the metadata reachability check before deleting an extent. If that
 pass is interrupted, disposing the reservation leaves the extent available to a
 future pass.
 
+Small-chunk publication serializes pack appends by sharing domain within one
+service process and repeats the existing-chunk lookup inside that gate. Concurrent
+identical uploads therefore reuse the first verified record without appending a
+dead duplicate to the pack.
+Pack compaction still removes records left by interrupted publication or other
+historical failures.
+
 Once the metadata transaction commits, the logical write is authoritative even
 if the client connection is lost or the server cannot return the response.
 Storage Analytics and ordinary request logging execute outside that transaction;
