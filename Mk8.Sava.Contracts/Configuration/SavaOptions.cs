@@ -17,6 +17,8 @@ public sealed class SavaOptions : IValidatableObject
     [Required]
     public Dictionary<string, string> Accounts { get; init; } = new(StringComparer.Ordinal);
 
+    public Dictionary<string, string> DataEncryptionKeys { get; init; } = new(StringComparer.Ordinal);
+
     public Dictionary<string, StorageAccountCapabilities> AccountCapabilities { get; init; } = new(StringComparer.Ordinal);
     public List<ObjectReplicationPolicyOptions> ObjectReplicationPolicies { get; init; } = [];
 
@@ -73,6 +75,22 @@ public sealed class SavaOptions : IValidatableObject
                 yield return new ValidationResult($"The key for account '{accountName}' must be valid base64.", [nameof(Accounts)]);
             else if (keyBytes.Length < 32)
                 yield return new ValidationResult($"The key for account '{accountName}' must contain at least 256 bits.", [nameof(Accounts)]);
+        }
+
+        foreach (var (accountName, dataKey) in DataEncryptionKeys)
+        {
+            if (!Accounts.ContainsKey(accountName))
+            {
+                yield return new ValidationResult(
+                    $"DataEncryptionKeys references unknown account '{accountName}'.",
+                    [nameof(DataEncryptionKeys)]);
+            }
+            if (!TryDecodeKey(dataKey, out var keyBytes) || keyBytes.Length < 32)
+            {
+                yield return new ValidationResult(
+                    $"The data encryption key for account '{accountName}' must be valid base64 containing at least 256 bits.",
+                    [nameof(DataEncryptionKeys)]);
+            }
         }
 
         foreach (var (accountName, capabilities) in AccountCapabilities)
@@ -458,6 +476,13 @@ public sealed class SavaOptions : IValidatableObject
             return false;
         }
     }
+
+    public string ResolveAccountDataEncryptionKey(string account) =>
+        DataEncryptionKeys.TryGetValue(account, out var key)
+            ? key
+            : Accounts.TryGetValue(account, out key)
+                ? key
+                : throw new InvalidDataException($"The data encryption key for account '{account}' is not configured.");
 }
 
 public enum SasPolicyViolationAction

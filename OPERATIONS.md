@@ -251,6 +251,24 @@ Shared Key Lite headers plus service and account SAS tokens with
 SAS remain available, as do anonymous reads from containers already configured
 for public access.
 
+`Sava:DataEncryptionKeys` may assign a stable base64 key of at least 256 bits
+to each configured account. It derives the account's at-rest chunk key; the
+corresponding `Sava:Accounts` key remains the Shared Key credential used to
+authorize requests. With a stable data key, the Shared Key credential can be
+rotated without rewriting or losing the account's encrypted chunks. A new
+deployment should provision its data key independently of the Shared Key
+credential. The default remains the existing behavior: an account without an
+explicit data key uses its Shared Key credential for chunk encryption.
+
+To rotate an existing account that used this default, first configure
+`DataEncryptionKeys:<account>` to the *current* `Accounts:<account>` value and
+verify a representative full read and a backup. Only then replace the Shared
+Key credential while retaining the same data key. Never replace or remove a
+data key while chunks in its domain are reachable: old content would become
+unreadable. Backups fingerprint the effective data key and reject restore with
+the wrong key, but a live-root startup key-continuity guard and online data-key
+rotation are still outstanding. Preserve data keys separately from backups.
+
 `AllowSharedKeyAccessForServices:Blob:Enabled` mirrors Azure's Blob-specific
 management setting. When set to `false`, it denies Blob Shared Key, Shared Key
 Lite, service SAS, and account SAS while bearer and user-delegation SAS continue
@@ -530,17 +548,19 @@ Store the completed directory on independent durable media. Validation checks:
 - exact agreement between metadata reachability and the chunk manifest;
 - SHA-256 and length for the metadata database and every encrypted chunk file;
 - absence of undeclared chunk files and symbolic-link traversal; and
-- fingerprints of the configured account or cross-account encryption keys
+- fingerprints of the effective account data or cross-account encryption keys
   needed to read the restored extents.
 
 Key material is never written to the backup manifest. Preserve the deployment's
-account keys separately; a fingerprint match cannot reconstruct a lost key.
+data encryption keys (or legacy account keys when no separate data key exists)
+separately; a fingerprint match cannot reconstruct a lost key.
 Customer-provided keys remain the responsibility of their callers.
 
 ## Restore
 
 Restore is deliberately offline and non-destructive. Stop the service, choose a
-new nonexistent data path, configure the same required account keys, then run:
+new nonexistent data path, configure the same required data encryption keys,
+then run:
 
 ```bash
 Sava__DataPath=/srv/mk8-sava-restored \
@@ -561,10 +581,11 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 4 and the backup container format is version 1. Schema 2 adds
+version 5 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
 schema 3 adds a transactional blob-tag search index; schema 4 adds authoritative
-pack and packed-chunk locator tables. The JSON blob/block manifests remain
+pack and packed-chunk locator tables; schema 5 adds object-replication state.
+The JSON blob/block manifests remain
 authoritative and startup and backup validation check the derived indexes against
 them. The service migrates schema 1, 2, or 3 on startup and can validate or
 restore backups using an older supported schema. Backups materialize packed
