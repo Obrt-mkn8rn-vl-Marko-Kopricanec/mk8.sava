@@ -16,6 +16,7 @@ internal sealed record UrlSource(
     Dictionary<string, string> Metadata,
     Dictionary<string, string> Tags,
     BlobKind? Kind,
+    string? AccessTier,
     string? ETag,
     long SequenceNumber,
     bool IsSealed,
@@ -161,6 +162,7 @@ internal sealed class UrlTransferClient(
                 ReadMetadata(response),
                 sourceTags,
                 kind,
+                ReadSingleHeader(response, "x-ms-access-tier"),
                 etag,
                 sourceShape.SequenceNumber,
                 sourceShape.IsSealed,
@@ -729,6 +731,16 @@ internal sealed class UrlTransferClient(
             "PageBlob" => BlobKind.PageBlob,
             _ => null
         };
+    }
+
+    private static string? ReadSingleHeader(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out var values) ||
+            response.Content.Headers.TryGetValues(name, out values))
+        {
+            return values.SingleOrDefault();
+        }
+        return null;
     }
 
     private static string? Join(IEnumerable<string> values)

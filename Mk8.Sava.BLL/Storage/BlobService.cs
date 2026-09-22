@@ -1048,6 +1048,7 @@ public sealed class BlobService(
         BlobRecord current,
         string tier,
         string? rehydratePriority,
+        bool allowRehydratePriorityUpdate,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -1078,12 +1079,16 @@ public sealed class BlobService(
                     "This operation is not permitted because the blob is being rehydrated.");
             }
 
-            var priority = current.RehydratePriority == "High" || rehydratePriority == "High" ? "High" : "Standard";
+            var priority = current.RehydratePriority switch
+            {
+                "High" => "High",
+                "Standard" when allowRehydratePriorityUpdate && rehydratePriority == "High" => "High",
+                "Standard" => "Standard",
+                _ => rehydratePriority ?? "Standard"
+            };
             var delay = priority == "High" ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
             var completion = now.Add(delay);
-            if (current.RehydrateCompleteAt.HasValue &&
-                current.RehydratePriority == priority &&
-                current.RehydrateCompleteAt.Value < completion)
+            if (current.RehydrateCompleteAt.HasValue && current.RehydrateCompleteAt.Value < completion)
             {
                 completion = current.RehydrateCompleteAt.Value;
             }
@@ -1092,7 +1097,6 @@ public sealed class BlobService(
                 ArchiveStatus = requestedStatus,
                 RehydratePriority = priority,
                 RehydrateCompleteAt = completion,
-                Copy = null,
                 Revision = MetadataStore.NewRevision()
             };
             pending = true;
@@ -1115,7 +1119,6 @@ public sealed class BlobService(
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
-                Copy = null,
                 Revision = MetadataStore.NewRevision(),
                 AccessTierChangedAt = now
             };
@@ -1483,6 +1486,8 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        var sourceIsArchived = string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal);
+        ValidateCopyRehydrationOptions(source.Kind, sourceIsArchived, options);
         options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var prepared = await PrepareCopyContentAsync(
             account,
@@ -1495,6 +1500,7 @@ public sealed class BlobService(
             container,
             name,
             source.Kind,
+            sourceIsArchived,
             prepared.Content,
             source.SequenceNumber,
             destinationIsSealed,
@@ -1776,6 +1782,7 @@ public sealed class BlobService(
         Stream source,
         long contentLength,
         BlobKind sourceKind,
+        bool sourceIsArchived,
         long sequenceNumber,
         bool destinationIsSealed,
         int appendBlockCount,
@@ -1788,6 +1795,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ValidateCopyRehydrationOptions(sourceKind, sourceIsArchived, options);
         options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var encryption = EncryptionOf(options);
         if (sourceKind == BlobKind.BlockBlob)
@@ -1804,6 +1812,7 @@ public sealed class BlobService(
                 container,
                 name,
                 sourceKind,
+                sourceIsArchived,
                 content.Content,
                 sequenceNumber,
                 destinationIsSealed,
@@ -1825,6 +1834,7 @@ public sealed class BlobService(
             container,
             name,
             sourceKind,
+            sourceIsArchived,
             stored.Manifest,
             sequenceNumber,
             destinationIsSealed,
@@ -1844,6 +1854,7 @@ public sealed class BlobService(
         string container,
         string name,
         BlobKind sourceKind,
+        bool sourceIsArchived,
         ContentManifest sourceContent,
         long sequenceNumber,
         bool destinationIsSealed,
@@ -1858,6 +1869,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureBlobKindSupported(account, sourceKind);
+        ValidateCopyRehydrationOptions(sourceKind, sourceIsArchived, options);
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var encryption = EncryptionOf(options);
@@ -1866,6 +1878,17 @@ public sealed class BlobService(
         using var sourcePin = chunks.Pin(sourceContent);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
+        var copyReadyAt = now.Add(_options.AsyncCopyCompletionDelay);
+        var rehydratePriority = sourceIsArchived
+            ? options.RehydratePriority ?? "Standard"
+            : null;
+        var rehydrateCompleteAt = sourceIsArchived
+            ? now.Add(rehydratePriority == "High"
+                ? _options.HighPriorityRehydrationDelay
+                : _options.StandardRehydrationDelay)
+            : (DateTimeOffset?)null;
+        if (rehydrateCompleteAt < copyReadyAt)
+            rehydrateCompleteAt = copyReadyAt;
         var visibleContent = sourceKind == BlobKind.PageBlob
             ? chunks.Sparse(account, encryption, sourceContent.Length)
             : chunks.Empty(account, encryption);
@@ -1882,6 +1905,13 @@ public sealed class BlobService(
             PendingCopyIsSealed = sourceKind == BlobKind.AppendBlob ? destinationIsSealed : null,
             PendingCopyPageRanges = sourceKind == BlobKind.PageBlob ? [.. pageRanges] : null,
             PendingCopyContent = sourceContent,
+            AccessTier = sourceIsArchived ? "Archive" : options.AccessTier ?? "Hot",
+            AccessTierInferred = sourceIsArchived ? false : options.AccessTierInferred ?? options.AccessTier is null,
+            ArchiveStatus = sourceIsArchived
+                ? $"rehydrate-pending-to-{options.AccessTier!.ToLowerInvariant()}"
+                : null,
+            RehydratePriority = rehydratePriority,
+            RehydrateCompleteAt = rehydrateCompleteAt,
             Copy = new CopyState
             {
                 Id = copyId,
@@ -1889,7 +1919,7 @@ public sealed class BlobService(
                 Status = "pending",
                 BytesCopied = 0,
                 TotalBytes = sourceContent.Length,
-                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
+                ReadyAt = copyReadyAt,
                 ExpiresAt = now.AddDays(14)
             }
         };
@@ -1899,6 +1929,26 @@ public sealed class BlobService(
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken);
+    }
+
+    private static void ValidateCopyRehydrationOptions(
+        BlobKind sourceKind,
+        bool sourceIsArchived,
+        BlobWriteOptions options)
+    {
+        if (options.RehydratePriority is not null && sourceKind != BlobKind.BlockBlob)
+            throw AzureStorageException.InvalidHeader("x-ms-rehydrate-priority", options.RehydratePriority);
+        if (!sourceIsArchived)
+            return;
+        if (sourceKind == BlobKind.BlockBlob &&
+            options.AccessTier is "Hot" or "Cool" or "Cold" or "Smart")
+        {
+            return;
+        }
+        throw new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "BlobArchived",
+            "An archived copy source requires an explicit online destination access tier.");
     }
 
     private static async Task EnsureSourceExhaustedAsync(Stream source, CancellationToken cancellationToken)
@@ -2127,6 +2177,7 @@ public sealed class BlobService(
         }
 
         var now = metadata.GetUtcNow();
+        var abortedTier = RehydrationTargetTier(current.ArchiveStatus) ?? current.AccessTier;
         var updated = current with
         {
             Content = current.Copy.IsIncremental
@@ -2141,6 +2192,10 @@ public sealed class BlobService(
             PageRanges = current.Copy.IsIncremental ? current.PageRanges : [],
             AppendBlockCount = current.Copy.IsIncremental ? current.AppendBlockCount : 0,
             IsSealed = current.Copy.IsIncremental && current.IsSealed,
+            AccessTier = abortedTier,
+            ArchiveStatus = null,
+            RehydratePriority = null,
+            RehydrateCompleteAt = null,
             Copy = current.Copy with
             {
                 Status = "aborted",
@@ -2624,6 +2679,7 @@ public sealed class BlobService(
         if (blob.Copy.ExpiresAt <= now &&
             (!blob.Copy.ReadyAt.HasValue || blob.Copy.ReadyAt > blob.Copy.ExpiresAt))
         {
+            var failedTier = RehydrationTargetTier(blob.ArchiveStatus) ?? blob.AccessTier;
             var failed = blob with
             {
                 Content = blob.Copy.IsIncremental
@@ -2638,6 +2694,10 @@ public sealed class BlobService(
                 PageRanges = blob.Copy.IsIncremental ? blob.PageRanges : [],
                 AppendBlockCount = blob.Copy.IsIncremental ? blob.AppendBlockCount : 0,
                 IsSealed = blob.Copy.IsIncremental && blob.IsSealed,
+                AccessTier = failedTier,
+                ArchiveStatus = null,
+                RehydratePriority = null,
+                RehydrateCompleteAt = null,
                 Copy = blob.Copy with
                 {
                     Status = "failed",
@@ -2727,19 +2787,17 @@ public sealed class BlobService(
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
-        if (blob.ArchiveStatus is null ||
+        if (blob.Copy?.Status == "pending" ||
+            blob.ArchiveStatus is null ||
             !blob.RehydrateCompleteAt.HasValue ||
             blob.RehydrateCompleteAt.Value > metadata.GetUtcNow())
         {
             return blob;
         }
 
-        var targetTier = blob.ArchiveStatus switch
+        var targetTier = RehydrationTargetTier(blob.ArchiveStatus) switch
         {
-            "rehydrate-pending-to-hot" => "Hot",
-            "rehydrate-pending-to-cool" => "Cool",
-            "rehydrate-pending-to-cold" => "Cold",
-            "rehydrate-pending-to-smart" => "Smart",
+            { } tier => tier,
             _ => throw new InvalidDataException("The blob has an invalid archive rehydration status.")
         };
         var now = metadata.GetUtcNow();
@@ -2772,6 +2830,15 @@ public sealed class BlobService(
                    ?? throw AzureStorageException.BlobNotFound();
         }
     }
+
+    private static string? RehydrationTargetTier(string? archiveStatus) => archiveStatus switch
+    {
+        "rehydrate-pending-to-hot" => "Hot",
+        "rehydrate-pending-to-cool" => "Cool",
+        "rehydrate-pending-to-cold" => "Cold",
+        "rehydrate-pending-to-smart" => "Smart",
+        _ => null
+    };
 
     private async Task<BlobRecord> TransitionSmartTierIfDueAsync(
         BlobRecord blob,

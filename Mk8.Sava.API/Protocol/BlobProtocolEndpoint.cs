@@ -826,11 +826,12 @@ public static class BlobProtocolEndpoint
                     var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
                                ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
                     ValidateAccessTierVersion(inner.Request, tier);
-                    ValidateRehydratePriorityVersion(inner.Request);
+                    var rehydratePriority = ReadRehydratePriority(inner.Request);
                     var tierUpdate = await service.SetTierAsync(
                         blob,
                         tier,
-                        ProtocolParsing.First(inner.Request.Headers, "x-ms-rehydrate-priority"),
+                        rehydratePriority,
+                        IsServiceVersionAtLeast(subrequestContext, new DateOnly(2020, 6, 12)),
                         cancellationToken);
                     return new BlobBatchSubresponse(
                         tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
@@ -1059,6 +1060,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "blocklist")
         {
+            RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
@@ -1642,11 +1644,12 @@ public static class BlobProtocolEndpoint
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
             ValidateAccessTierVersion(http.Request, tier);
-            ValidateRehydratePriorityVersion(http.Request);
+            var rehydratePriority = ReadRehydratePriority(http.Request);
             var updated = await service.SetTierAsync(
                 blob,
                 tier,
-                ProtocolParsing.First(http.Request.Headers, "x-ms-rehydrate-priority"),
+                rehydratePriority,
+                IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)),
                 cancellationToken);
             http.Response.StatusCode = updated.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK;
             return;
@@ -1888,6 +1891,7 @@ public static class BlobProtocolEndpoint
 
             if (requestedType is not null)
             {
+                RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
                 if (requestedType != "BlockBlob")
                     throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
                 if (requiresSync)
@@ -1936,6 +1940,7 @@ public static class BlobProtocolEndpoint
             var publicSource = SanitizeCopySource(copySource);
             if (requiresSync)
             {
+                RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
                 RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
                 ValidateSynchronousCopyEncryption(http.Request);
                 ValidateDestinationBlobType(current, BlobKind.BlockBlob);
@@ -2042,6 +2047,7 @@ public static class BlobProtocolEndpoint
                     ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
             }
             ValidateAsynchronousCopyEncryption(http.Request);
+            _ = ReadRehydratePriority(http.Request);
             EnsureAsynchronousCopyDestinationLease(http.Request, current);
             RequireZeroContentLength(http.Request);
             BlobRecord copied;
@@ -2085,6 +2091,7 @@ public static class BlobProtocolEndpoint
                     {
                         var sourceKind = source.Kind ?? BlobKind.BlockBlob;
                         ValidateBlobTypeVersion(request, sourceKind);
+                        ValidateCopySourceTier(http.Request, source.AccessTier, allowArchivedSource: true);
                         ValidateDestinationBlobType(current, sourceKind);
                         return await service.BeginCopyFromStreamAsync(
                             request.Account,
@@ -2093,6 +2100,7 @@ public static class BlobProtocolEndpoint
                             source.Content,
                             source.ContentLength!.Value,
                             sourceKind,
+                            string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal),
                             source.SequenceNumber,
                             ReadCopySealDestination(http.Request, sourceKind, source.IsSealed),
                             source.AppendBlockCount,
@@ -2119,6 +2127,7 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
         EnsureDestinationCanBeOverwritten(current);
         var type = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type")
                    ?? throw AzureStorageException.InvalidHeader("x-ms-blob-type");
@@ -3292,7 +3301,7 @@ public static class BlobProtocolEndpoint
         DateTimeOffset? expiresAt = null)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
-        ValidateRehydratePriorityVersion(request);
+        RejectUnsupportedHeader(request, "x-ms-rehydrate-priority");
         var encryption = ReadRequestEncryption(request, write: true);
         return new BlobWriteOptions(
             ProtocolParsing.ReadHttpProperties(request.Headers, useStandardProperties: useStandardProperties),
@@ -3388,14 +3397,19 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static void ValidateRehydratePriorityVersion(HttpRequest request)
+    private static string? ReadRehydratePriority(HttpRequest request)
     {
-        if (!request.Headers.ContainsKey("x-ms-rehydrate-priority"))
-            return;
+        const string headerName = "x-ms-rehydrate-priority";
+        var value = ProtocolParsing.First(request.Headers, headerName);
+        if (value is null)
+            return null;
         RequireFeatureVersion(
             StorageRequestContext.Get(request.HttpContext),
             new DateOnly(2019, 2, 2),
             "Rehydrate priority");
+        if (value is not ("High" or "Standard"))
+            throw AzureStorageException.InvalidHeader(headerName, value);
+        return value;
     }
 
     private static Dictionary<string, string> ReadTagsHeader(HttpRequest request)
@@ -3747,7 +3761,7 @@ public static class BlobProtocolEndpoint
         DateTimeOffset? expiresAt)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
-        ValidateRehydratePriorityVersion(request);
+        RejectUnsupportedHeader(request, "x-ms-rehydrate-priority");
         var encryption = ReadRequestEncryption(request, write: true);
         var copySourceProperties = ReadCopySourceBlobProperties(request);
         var hasReplacementMetadata = request.Headers.Keys.Any(name =>
@@ -3785,7 +3799,7 @@ public static class BlobProtocolEndpoint
         bool synchronous)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
-        ValidateRehydratePriorityVersion(request);
+        var rehydratePriority = ReadCopyRehydratePriority(request, synchronous);
         var encryption = synchronous
             ? ReadRequestEncryption(request, write: true)
             : ReadSignedCopyEncryption(request);
@@ -3809,7 +3823,8 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? destination?.AccessTierInferred
                 : false,
-            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
+            RehydratePriority: rehydratePriority);
     }
 
     private static bool ReadCopySourceBlobProperties(HttpRequest request)
@@ -3831,7 +3846,7 @@ public static class BlobProtocolEndpoint
         bool synchronous = false)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
-        ValidateRehydratePriorityVersion(request);
+        var rehydratePriority = ReadCopyRehydratePriority(request, synchronous);
         var encryption = synchronous
             ? ReadRequestEncryption(request, write: true)
             : ReadSignedCopyEncryption(request);
@@ -3855,7 +3870,16 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? destination?.AccessTierInferred
                 : false,
-            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
+            RehydratePriority: rehydratePriority);
+    }
+
+    private static string? ReadCopyRehydratePriority(HttpRequest request, bool synchronous)
+    {
+        if (!synchronous)
+            return ReadRehydratePriority(request);
+        RejectUnsupportedHeader(request, "x-ms-rehydrate-priority");
+        return null;
     }
 
     private static void ValidateSynchronousCopyEncryption(HttpRequest request)
@@ -4001,9 +4025,15 @@ public static class BlobProtocolEndpoint
     private static void ValidateCopySourceTier(
         HttpRequest request,
         BlobRecord source,
+        bool allowArchivedSource) =>
+        ValidateCopySourceTier(request, source.AccessTier, allowArchivedSource);
+
+    private static void ValidateCopySourceTier(
+        HttpRequest request,
+        string? sourceAccessTier,
         bool allowArchivedSource)
     {
-        if (!string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal))
+        if (!string.Equals(sourceAccessTier, "Archive", StringComparison.Ordinal))
             return;
         var destinationTier = ProtocolParsing.First(request.Headers, "x-ms-access-tier");
         if (allowArchivedSource && destinationTier is "Hot" or "Cool" or "Cold" or "Smart")
