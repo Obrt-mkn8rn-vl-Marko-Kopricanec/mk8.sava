@@ -390,11 +390,14 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
             RequireAny(request, 'c', 'w');
+            var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
+            if (publicAccess is not null)
+                RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
             var created = await service.CreateContainerAsync(
                 request.Account,
                 containerName,
                 ProtocolParsing.ReadMetadata(http.Request.Headers),
-                ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access"),
+                publicAccess,
                 cancellationToken);
             AzureResponseWriter.AddContainerHeaders(http.Response, created);
             http.Response.StatusCode = StatusCodes.Status201Created;
@@ -539,12 +542,15 @@ public static class BlobProtocolEndpoint
                 container.LastModified,
                 supportsIfUnmodifiedSince: true);
             ValidateOptionalLease(http.Request, container.Lease, "container");
+            var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
+            if (publicAccess is not null)
+                RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
             var policies = http.Request.ContentLength is null or 0
                 ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
                 : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken);
             var updated = await service.SetContainerAclAsync(
                 container,
-                ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access"),
+                publicAccess,
                 policies,
                 cancellationToken);
             AzureResponseWriter.AddContainerHeaders(http.Response, updated);
@@ -553,12 +559,14 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
         {
+            RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Lease Container");
             Require(request, 'w');
             BlobConditionEvaluator.EvaluateContainerWrite(
                 http.Request,
                 container.LastModified,
                 supportsIfUnmodifiedSince: true);
-            await HandleContainerLeaseAsync(http, service, container, cancellationToken);
+            RequireZeroContentLength(http.Request);
+            await HandleContainerLeaseAsync(http, request, service, container, cancellationToken);
             return;
         }
 
@@ -895,6 +903,8 @@ public static class BlobProtocolEndpoint
                               http.Request.Query.ContainsKey("deletetype");
         if (permanentDelete)
             ValidatePermanentDeleteRequest(request, http.Request.Query["deletetype"].ToString());
+        if (HttpMethods.IsPut(http.Request.Method) && comp is "snapshot" or "lease")
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), comp == "snapshot" ? "Snapshot Blob" : "Lease Blob");
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
             await HandlePutBlobAsync(http, request, service, containerName, blobName, cancellationToken);
@@ -1402,6 +1412,8 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "snapshot")
         {
             Require(request, 'w');
+            RequireZeroContentLength(http.Request);
+            EnsureMutableVersion(blob);
             EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
@@ -1469,7 +1481,8 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             EnsureMutableVersion(blob);
             EvaluateWriteConditions(http.Request, blob);
-            await HandleBlobLeaseAsync(http, service, blob, cancellationToken);
+            RequireZeroContentLength(http.Request);
+            await HandleBlobLeaseAsync(http, request, service, blob, cancellationToken);
             return;
         }
 
@@ -2430,43 +2443,72 @@ public static class BlobProtocolEndpoint
 
     private static async Task HandleContainerLeaseAsync(
         HttpContext http,
+        StorageRequestContext request,
         BlobService service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
-        var (action, transition) = ApplyLeaseAction(http.Request, container.Lease);
-        var updated = await service.SetContainerLeaseAsync(container, transition.Lease, cancellationToken);
+        var (action, transition) = ApplyLeaseAction(http.Request, container.Lease, useLegacySemantics: false);
+        var returnsProperties = IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15));
+        var updated = await service.SetContainerLeaseAsync(
+            container,
+            transition.Lease,
+            updateProperties: !returnsProperties,
+            cancellationToken);
         http.Response.StatusCode = LeaseStatusCode(action);
-        AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
-        http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        if (returnsProperties)
+        {
+            AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
+            http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        }
         AddLeaseResponseHeaders(http.Response, action, transition);
     }
 
     private static async Task HandleBlobLeaseAsync(
         HttpContext http,
+        StorageRequestContext request,
         BlobService service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
-        var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease);
+        var modernLease = IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12));
+        var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease, useLegacySemantics: !modernLease);
         var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken);
         http.Response.StatusCode = LeaseStatusCode(action);
-        AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
-        http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+        {
+            AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
+            http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
+        }
         AddLeaseResponseHeaders(http.Response, action, transition);
     }
 
     private static (LeaseAction Action, LeaseTransition Transition) ApplyLeaseAction(
         HttpRequest request,
-        LeaseRecord current)
+        LeaseRecord current,
+        bool useLegacySemantics)
     {
         var actionValue = ProtocolParsing.First(request.Headers, "x-ms-lease-action")
                           ?? throw AzureStorageException.MissingHeader("x-ms-lease-action");
         if (!Enum.TryParse<LeaseAction>(actionValue, ignoreCase: true, out var action))
             throw AzureStorageException.InvalidHeader("x-ms-lease-action", actionValue);
 
+        if (useLegacySemantics)
+        {
+            RejectUnsupportedHeader(request, "x-ms-lease-duration");
+            RejectUnsupportedHeader(request, "x-ms-lease-break-period");
+            RejectUnsupportedHeader(request, "x-ms-proposed-lease-id");
+            if (action == LeaseAction.Change)
+            {
+                throw AzureStorageException.FeatureVersionMismatch(
+                    "Changing a blob lease requires service version 2012-02-12 or later.");
+            }
+        }
+
         var duration = action == LeaseAction.Acquire
-            ? ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-duration", required: true)
+            ? useLegacySemantics
+                ? 60
+                : ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-duration", required: true)
             : null;
         var breakPeriod = action == LeaseAction.Break
             ? ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-break-period", required: false)
@@ -2478,7 +2520,8 @@ public static class BlobProtocolEndpoint
             duration,
             breakPeriod,
             ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
-            ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id")));
+            ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id"),
+            useLegacySemantics));
     }
 
     private static void AddLeaseResponseHeaders(
@@ -3094,6 +3137,8 @@ public static class BlobProtocolEndpoint
 
     internal static void ValidateBlobVersionRequest(StorageRequestContext request)
     {
+        if (request.Snapshot is not null)
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Blob snapshots");
         if (request.VersionId is not null)
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Blob versioning");
     }

@@ -48,7 +48,7 @@ public sealed class LeaseService(TimeProvider timeProvider)
     public LeaseRecord ResetAfterBlobWrite(LeaseRecord lease)
     {
         var effective = GetEffective(lease);
-        return effective.State is LeaseState.Expired or LeaseState.Broken
+        return effective.State is LeaseState.Available or LeaseState.Expired or LeaseState.Broken
             ? LeaseRecord.Available
             : effective;
     }
@@ -93,19 +93,26 @@ public sealed class LeaseService(TimeProvider timeProvider)
         int? durationSeconds,
         int? breakPeriodSeconds,
         string? suppliedId,
-        string? proposedId)
+        string? proposedId,
+        bool useLegacySemantics = false)
     {
         var current = GetEffective(lease);
         return action switch
         {
             LeaseAction.Acquire => Acquire(current, RequireDuration(durationSeconds), proposedId),
-            LeaseAction.Renew => Renew(current, ParseRequiredId(suppliedId, "x-ms-lease-id")),
+            LeaseAction.Renew => useLegacySemantics
+                ? RenewLegacy(current, ParseRequiredId(suppliedId, "x-ms-lease-id"))
+                : Renew(current, ParseRequiredId(suppliedId, "x-ms-lease-id")),
             LeaseAction.Change => Change(
                 current,
                 ParseRequiredId(suppliedId, "x-ms-lease-id"),
                 ParseRequiredId(proposedId, "x-ms-proposed-lease-id")),
-            LeaseAction.Release => Release(current, ParseRequiredId(suppliedId, "x-ms-lease-id")),
-            LeaseAction.Break => Break(current, ValidateBreakPeriod(breakPeriodSeconds)),
+            LeaseAction.Release => useLegacySemantics
+                ? ReleaseLegacy(current, ParseRequiredId(suppliedId, "x-ms-lease-id"))
+                : Release(current, ParseRequiredId(suppliedId, "x-ms-lease-id")),
+            LeaseAction.Break => useLegacySemantics
+                ? BreakLegacy(current)
+                : Break(current, ValidateBreakPeriod(breakPeriodSeconds)),
             _ => throw new ArgumentOutOfRangeException(nameof(action))
         };
     }
@@ -166,6 +173,28 @@ public sealed class LeaseService(TimeProvider timeProvider)
         }, null);
     }
 
+    private LeaseTransition RenewLegacy(LeaseRecord current, Guid supplied)
+    {
+        if (!Matches(current, supplied))
+            throw AzureStorageException.LeaseIdMismatchWithLeaseOperation();
+        if (current.State is LeaseState.Breaking or LeaseState.Broken)
+        {
+            throw LeaseConflict(
+                "LeaseIsBrokenAndCannotBeRenewed",
+                "The lease ID matched, but the lease has been broken explicitly and cannot be renewed.");
+        }
+
+        var now = timeProvider.GetUtcNow();
+        return new LeaseTransition(current with
+        {
+            State = LeaseState.Leased,
+            DurationSeconds = 60,
+            AcquiredAt = now,
+            ExpiresAt = now.AddSeconds(60),
+            BreakEndsAt = null
+        }, null);
+    }
+
     private static LeaseTransition Change(LeaseRecord current, Guid supplied, Guid proposed)
     {
         if (current.State == LeaseState.Breaking)
@@ -194,6 +223,37 @@ public sealed class LeaseService(TimeProvider timeProvider)
         if (current.State == LeaseState.Available)
             throw AzureStorageException.LeaseIdMismatchWithLeaseOperation();
         return new LeaseTransition(LeaseRecord.Available, null);
+    }
+
+    private static LeaseTransition ReleaseLegacy(LeaseRecord current, Guid supplied)
+    {
+        if (!Matches(current, supplied))
+            throw AzureStorageException.LeaseIdMismatchWithLeaseOperation();
+        return new LeaseTransition(current with
+        {
+            State = LeaseState.Available,
+            DurationSeconds = 60,
+            AcquiredAt = null,
+            ExpiresAt = null,
+            BreakEndsAt = null
+        }, null);
+    }
+
+    private LeaseTransition BreakLegacy(LeaseRecord current)
+    {
+        if (current.State == LeaseState.Available)
+        {
+            if (current.Id is null)
+                throw AzureStorageException.LeaseNotPresentWithLeaseOperation();
+            return new LeaseTransition(ToBroken(current), 0);
+        }
+        if (current.State is LeaseState.Breaking or LeaseState.Broken)
+        {
+            throw LeaseConflict(
+                "LeaseAlreadyBroken",
+                "The lease has already been broken and cannot be broken again.");
+        }
+        return Break(current, requestedSeconds: null);
     }
 
     private LeaseTransition Break(LeaseRecord current, int? requestedSeconds)
