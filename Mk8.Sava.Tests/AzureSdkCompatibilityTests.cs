@@ -6891,6 +6891,63 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(expectedHash, keyedProperties.EncryptionKeySha256);
         Assert.Equal(content, (await keyedBlob.DownloadContentAsync()).Value.Content.ToArray());
 
+        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        using (var oldTierRequest = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(
+                       keyedBlob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+                       "comp=tier"))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            oldTierRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
+            oldTierRequest.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cool");
+            using var oldTierResponse = await transport.SendAsync(oldTierRequest);
+            Assert.Equal(HttpStatusCode.Conflict, oldTierResponse.StatusCode);
+            Assert.Equal(
+                "BlobUsesCustomerSpecifiedEncryption",
+                oldTierResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+
+        var oldEndpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
+        var oldTransport = new HttpClient(factory.Server.CreateHandler()) { BaseAddress = oldEndpoint };
+        var oldOptions = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2021_12_02)
+        {
+            Transport = new HttpClientTransport(oldTransport),
+            Retry = { MaxRetries = 0 }
+        };
+        var oldService = new BlobServiceClient(
+            oldEndpoint,
+            new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+            oldOptions);
+        var oldBatchClient = oldService.GetBlobBatchClient();
+        using (var oldBatch = oldBatchClient.CreateBatch())
+        {
+            var rejectedTier = oldBatch.SetBlobAccessTier(containerName, keyedBlob.Name, AccessTier.Cool);
+            var batchResponse = await oldBatchClient.SubmitBatchAsync(oldBatch, throwOnAnyFailure: false);
+            Assert.Equal(StatusCodes.Status202Accepted, batchResponse.Status);
+            Assert.Equal(StatusCodes.Status409Conflict, rejectedTier.Status);
+            Assert.True(rejectedTier.Headers.TryGetValue("x-ms-error-code", out var errorCode));
+            Assert.Equal("BlobUsesCustomerSpecifiedEncryption", errorCode);
+        }
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+
+        var keyedTier = await keyedBlob.SetAccessTierAsync(AccessTier.Cool);
+        Assert.Equal(StatusCodes.Status200OK, keyedTier.Status);
+        Assert.Equal(AccessTier.Cool, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+
+        var batchClient = normalService.GetBlobBatchClient();
+        using (var batch = batchClient.CreateBatch())
+        {
+            var tiered = batch.SetBlobAccessTier(containerName, keyedBlob.Name, AccessTier.Hot);
+            var batchResponse = await batchClient.SubmitBatchAsync(batch, throwOnAnyFailure: false);
+            Assert.Equal(StatusCodes.Status202Accepted, batchResponse.Status);
+            Assert.Equal(StatusCodes.Status200OK, tiered.Status);
+        }
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+
         var missingKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
             normalService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").GetPropertiesAsync());
         Assert.Equal(409, missingKey.Status);
