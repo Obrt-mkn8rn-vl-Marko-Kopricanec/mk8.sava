@@ -1128,12 +1128,7 @@ public static class BlobProtocolEndpoint
             }
 
             ValidateAsynchronousCopyEncryption(http.Request);
-            if (http.Request.Headers.ContainsKey("x-ms-seal-blob"))
-            {
-                throw AzureStorageException.InvalidHeader(
-                    "x-ms-seal-blob",
-                    ProtocolParsing.First(http.Request.Headers, "x-ms-seal-blob"));
-            }
+            ValidateIncrementalCopyHeaders(http.Request);
 
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             RequireAny(request, current is null ? 'c' : 'w', 'w');
@@ -1610,6 +1605,8 @@ public static class BlobProtocolEndpoint
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
         {
+            if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+                RejectUnsupportedHeader(http.Request, "x-ms-source-lease-id");
             var requestedType = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type");
             var requiresSyncValue = ProtocolParsing.First(http.Request.Headers, "x-ms-requires-sync");
             var requiresSync = false;
@@ -1689,7 +1686,7 @@ public static class BlobProtocolEndpoint
                         service,
                         synchronousInternalSource,
                         cancellationToken,
-                        requireTagsPermission: copySourceTags);
+                        requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request));
                     EvaluateCopySourceConditions(http.Request, source);
                     ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
                     synchronousCopy = await service.CopyBlockBlobFromBlobAsync(
@@ -1783,7 +1780,8 @@ public static class BlobProtocolEndpoint
                     request,
                     service,
                     internalSource,
-                    cancellationToken);
+                    cancellationToken,
+                    requireTagsPermission: HasSourceTagCondition(http.Request));
                 EvaluateCopySourceConditions(http.Request, source);
                 ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
                 ValidateCopyDestinationType(current, source.Kind);
@@ -3187,6 +3185,50 @@ public static class BlobProtocolEndpoint
         }
     }
 
+    private static void ValidateIncrementalCopyHeaders(HttpRequest request)
+    {
+        foreach (var headerName in new[]
+                 {
+                     "x-ms-access-tier",
+                     "x-ms-copy-source-authorization",
+                     "x-ms-copy-source-blob-properties",
+                     "x-ms-copy-source-tag-option",
+                     "x-ms-immutability-policy-mode",
+                     "x-ms-immutability-policy-until-date",
+                     "x-ms-legal-hold",
+                     "x-ms-rehydrate-priority",
+                     "x-ms-seal-blob",
+                     "x-ms-source-if-match",
+                     "x-ms-source-if-modified-since",
+                     "x-ms-source-if-none-match",
+                     "x-ms-source-if-tags",
+                     "x-ms-source-if-unmodified-since",
+                     "x-ms-source-lease-id",
+                     "x-ms-tags"
+                 })
+        {
+            RejectUnsupportedHeader(request, headerName);
+        }
+
+        var metadataHeader = request.Headers.Keys.FirstOrDefault(name =>
+            name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
+        if (metadataHeader is not null)
+            RejectUnsupportedHeader(request, metadataHeader);
+    }
+
+    private static void RejectUnsupportedHeader(HttpRequest request, string headerName)
+    {
+        if (request.Headers.ContainsKey(headerName))
+        {
+            throw AzureStorageException.UnsupportedHeader(
+                headerName,
+                ProtocolParsing.First(request.Headers, headerName));
+        }
+    }
+
+    private static bool HasSourceTagCondition(HttpRequest request) =>
+        request.Headers.ContainsKey("x-ms-source-if-tags");
+
     private static bool ReadCopySealDestination(
         HttpRequest request,
         BlobKind sourceKind,
@@ -3495,14 +3537,15 @@ public static class BlobProtocolEndpoint
         BlobConditionEvaluator.EvaluateCopySource(request, source.ETag, source.LastModified);
         var tagCondition = ProtocolParsing.First(request.Headers, "x-ms-source-if-tags");
         if (tagCondition is not null)
-            EvaluateTagCondition(request, source, "x-ms-source-if-tags", source: true);
+            EvaluateTagCondition(request, source, "x-ms-source-if-tags", source: true, requirePermission: false);
     }
 
     private static void EvaluateTagCondition(
         HttpRequest request,
         BlobRecord? blob,
         string headerName,
-        bool source)
+        bool source,
+        bool requirePermission = true)
     {
         var expression = ProtocolParsing.First(request.Headers, headerName);
         if (expression is null)
@@ -3524,7 +3567,7 @@ public static class BlobProtocolEndpoint
                 expression);
         }
 
-        if (!context.Authorization.Allows('t'))
+        if (requirePermission && !context.Authorization.Allows('t'))
         {
             throw context.Authorization.Kind == StorageAuthorizationKind.Anonymous
                 ? AzureStorageException.AuthenticationFailed()

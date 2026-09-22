@@ -51,6 +51,13 @@ public sealed class AzureStorageException : Exception
         "An HTTP header that's mandatory for this request isn't specified.",
         header);
 
+    public static AzureStorageException UnsupportedHeader(string header, string? value = null) => new(
+        (int)HttpStatusCode.BadRequest,
+        "UnsupportedHeader",
+        "One of the headers specified in the request is not supported.",
+        header,
+        value);
+
     public static AzureStorageException AuthenticationFailed(string detail = "Server failed to authenticate the request.") => new(
         (int)HttpStatusCode.Forbidden,
         "AuthenticationFailed",
