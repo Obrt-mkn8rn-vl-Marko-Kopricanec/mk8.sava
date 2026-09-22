@@ -1,7 +1,6 @@
-using System.Globalization;
 using Microsoft.Extensions.Options;
-using Microsoft.Extensions.Primitives;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
@@ -40,8 +39,20 @@ public sealed record StorageRequestContext
 public sealed class RequestContextMiddleware(
     RequestDelegate next,
     IOptions<SavaOptions> options,
-    StorageAuthenticator authenticator)
+    StorageAuthenticator authenticator,
+    MetadataStore metadata)
 {
+    private enum ServiceVersionSource
+    {
+        Header,
+        SasApiVersion,
+        SasSignedVersion,
+        AccountDefault,
+        AnonymousFallback
+    }
+
+    private sealed record ParsedRequest(StorageRequestContext Context, ServiceVersionSource VersionSource);
+
     private readonly SavaOptions _options = options.Value;
 
     public async Task InvokeAsync(HttpContext context)
@@ -53,17 +64,18 @@ public sealed class RequestContextMiddleware(
             return;
         }
 
-        var parsed = Parse(context);
-        StorageRequestContext.Set(context, parsed);
-        BlobProtocolEndpoint.ValidateBlobVersionRequest(parsed);
-        parsed.Authorization = parsed.ResourceKind == StorageResourceKind.StaticWebsite
+        var parsed = await ParseAsync(context);
+        StorageRequestContext.Set(context, parsed.Context);
+        BlobProtocolEndpoint.ValidateBlobVersionRequest(parsed.Context);
+        parsed.Context.Authorization = parsed.Context.ResourceKind == StorageResourceKind.StaticWebsite
             ? StorageAuthorization.Anonymous
-            : await authenticator.AuthenticateAsync(context, parsed, context.RequestAborted);
+            : await authenticator.AuthenticateAsync(context, parsed.Context, context.RequestAborted);
+        ValidateAuthorizationVersion(parsed);
         AzureExceptionMiddleware.AddCommonHeaders(context);
         await next(context);
     }
 
-    private StorageRequestContext Parse(HttpContext context)
+    private async Task<ParsedRequest> ParseAsync(HttpContext context)
     {
         var segments = StorageResourcePath.DecodeRequestSegments(context.Request);
         var account = ResolveHostAccount(context.Request.Host.Host);
@@ -110,8 +122,11 @@ public sealed class RequestContextMiddleware(
         if (blob is not null)
             canonicalPath += "/" + blob;
 
-        var serviceVersion = ResolveServiceVersion(context.Request);
-        return new StorageRequestContext
+        var (serviceVersion, versionSource) = await ResolveServiceVersionAsync(
+            context.Request,
+            account,
+            context.RequestAborted);
+        var request = new StorageRequestContext
         {
             RequestId = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16)),
             Account = account,
@@ -124,6 +139,7 @@ public sealed class RequestContextMiddleware(
             ServiceVersion = serviceVersion,
             Authorization = StorageAuthorization.Anonymous
         };
+        return new ParsedRequest(request, versionSource);
     }
 
     private string? ResolveHostAccount(string host)
@@ -137,15 +153,61 @@ public sealed class RequestContextMiddleware(
             .Skip(1)
             .Any(label => string.Equals(label, "web", StringComparison.OrdinalIgnoreCase));
 
-    private static string ResolveServiceVersion(HttpRequest request)
+    private async Task<(string Version, ServiceVersionSource Source)> ResolveServiceVersionAsync(
+        HttpRequest request,
+        string account,
+        CancellationToken cancellationToken)
     {
         var version = request.Headers["x-ms-version"].ToString();
-        if (string.IsNullOrEmpty(version))
-            version = request.Query["api-version"].FirstOrDefault() ?? request.Query["sv"].FirstOrDefault() ?? "2023-11-03";
+        if (!string.IsNullOrEmpty(version))
+            return (StorageServiceVersions.RequireHeader(version), ServiceVersionSource.Header);
 
-        if (!DateOnly.TryParseExact(version, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
-            throw AzureStorageException.InvalidHeader("x-ms-version", version);
-        return version;
+        if (request.Query.ContainsKey("sig"))
+        {
+            version = request.Query["api-version"].ToString();
+            if (!string.IsNullOrEmpty(version))
+                return (StorageServiceVersions.RequireApiVersion(version), ServiceVersionSource.SasApiVersion);
+
+            version = request.Query["sv"].ToString();
+            if (!string.IsNullOrEmpty(version))
+            {
+                if (!StorageServiceVersions.TryParse(version, out _))
+                    throw AzureStorageException.AuthenticationFailed();
+                return (version, ServiceVersionSource.SasSignedVersion);
+            }
+        }
+
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        if (!string.IsNullOrEmpty(properties.DefaultServiceVersion))
+        {
+            return (
+                StorageServiceVersions.RequireHeader(properties.DefaultServiceVersion),
+                ServiceVersionSource.AccountDefault);
+        }
+
+        return (
+            StorageServiceVersions.AnonymousGeneralPurposeFallback,
+            ServiceVersionSource.AnonymousFallback);
+    }
+
+    private static void ValidateAuthorizationVersion(ParsedRequest request)
+    {
+        if (request.Context.Authorization.Kind == StorageAuthorizationKind.Bearer)
+        {
+            if (request.VersionSource != ServiceVersionSource.Header)
+                throw AzureStorageException.MissingHeader("x-ms-version");
+            if (!StorageServiceVersions.TryParse(request.Context.ServiceVersion, out var version) ||
+                version < new DateOnly(2017, 11, 9))
+            {
+                throw AzureStorageException.InvalidHeader("x-ms-version", request.Context.ServiceVersion);
+            }
+        }
+
+        if (request.Context.Authorization.Kind == StorageAuthorizationKind.SharedKey &&
+            request.VersionSource == ServiceVersionSource.AnonymousFallback)
+        {
+            throw AzureStorageException.MissingHeader("x-ms-version");
+        }
     }
 
     private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;

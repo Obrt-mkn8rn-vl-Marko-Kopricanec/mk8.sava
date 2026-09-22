@@ -402,8 +402,16 @@ internal static class ProtocolParsing
         if (corsElement is not null)
             ValidateCorsRules(cors);
 
-        if (Child(root, "DefaultServiceVersion") is not null)
+        var defaultServiceVersion = OptionalText(root, "DefaultServiceVersion");
+        if (defaultServiceVersion is not null)
+        {
             RequireServicePropertiesVersion(version, new DateOnly(2011, 8, 18), "DefaultServiceVersion");
+            if (!string.IsNullOrEmpty(defaultServiceVersion) &&
+                !StorageServiceVersions.TryParse(defaultServiceVersion, out _))
+            {
+                throw InvalidServicePropertiesXml("The DefaultServiceVersion value is invalid.");
+            }
+        }
         var deleteRetentionPolicy = Child(root, "DeleteRetentionPolicy");
         if (deleteRetentionPolicy is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2017, 7, 29), "DeleteRetentionPolicy");
@@ -466,7 +474,7 @@ internal static class ProtocolParsing
             HourMetrics = hourMetrics,
             MinuteMetrics = minuteMetrics,
             Cors = cors,
-            DefaultServiceVersion = OptionalText(root, "DefaultServiceVersion") ?? current.DefaultServiceVersion,
+            DefaultServiceVersion = defaultServiceVersion ?? current.DefaultServiceVersion,
             BlobSoftDeleteEnabled = deletePolicy.Enabled,
             BlobSoftDeleteRetentionDays = deletePolicy.Days,
             BlobPermanentDeleteEnabled = deletePolicy.AllowPermanentDelete,

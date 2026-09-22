@@ -1462,6 +1462,157 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ServiceVersionSelectionMatchesSharedKeySasBearerAndDefaultRules()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var container = service.GetBlobContainerClient($"versions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("selection.txt");
+        await blob.UploadAsync(BinaryData.FromString("service version selection"));
+        var blobUri = blob.Uri;
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Service,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Write);
+        var servicePropertiesUri = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            $"?restype=service&comp=properties&{accountSas.ToSasQueryParameters(credential)}");
+
+        try
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with { DefaultServiceVersion = null },
+                CancellationToken.None);
+
+            using (var unsupported = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                unsupported.Headers.TryAddWithoutValidation("x-ms-version", "9999-01-01");
+                using var response = await transport.SendAsync(unsupported);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var missing = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                AddSharedKeyLiteAuthorization(missing);
+                using var response = await transport.SendAsync(missing);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            using (var invalidDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
+            {
+                Content = new StringContent(
+                    "<StorageServiceProperties><DefaultServiceVersion>9999-01-01</DefaultServiceVersion></StorageServiceProperties>",
+                    Encoding.UTF8,
+                    "application/xml")
+            })
+            {
+                invalidDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(invalidDefault);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidXmlDocument", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            Assert.Null((await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None)).DefaultServiceVersion);
+
+            using (var setDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
+            {
+                Content = new StringContent(
+                    "<StorageServiceProperties><DefaultServiceVersion>2018-03-28</DefaultServiceVersion></StorageServiceProperties>",
+                    Encoding.UTF8,
+                    "application/xml")
+            })
+            {
+                setDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(setDefault);
+                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            }
+
+            using (var defaulted = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                AddSharedKeyLiteAuthorization(defaulted);
+                using var response = await transport.SendAsync(defaulted);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal("2018-03-28", response.Headers.GetValues("x-ms-version").Single());
+                Assert.True(response.Headers.Contains("x-ms-creation-time"));
+                Assert.False(response.Headers.Contains("x-ms-legal-hold"));
+            }
+
+            var sasUri = blob.GenerateSasUri(
+                BlobSasPermissions.Read,
+                DateTimeOffset.UtcNow.AddMinutes(10));
+            var signedVersion = ReadQueryParameter(sasUri, "sv");
+            using (var signedVersionRequest = new HttpRequestMessage(HttpMethod.Head, sasUri))
+            {
+                using var response = await transport.SendAsync(signedVersionRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal(signedVersion, response.Headers.GetValues("x-ms-version").Single());
+                Assert.True(response.Headers.Contains("x-ms-legal-hold"));
+            }
+
+            using (var apiVersionRequest = new HttpRequestMessage(
+                       HttpMethod.Head,
+                       AppendQuery(sasUri, "api-version=2012-02-12")))
+            {
+                using var response = await transport.SendAsync(apiVersionRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal("2012-02-12", response.Headers.GetValues("x-ms-version").Single());
+                Assert.False(response.Headers.Contains("x-ms-creation-time"));
+                Assert.False(response.Headers.Contains("Accept-Ranges"));
+            }
+
+            var bearerToken = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
+            using (var missingBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                missingBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+                using var response = await transport.SendAsync(missingBearerVersion);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            using (var oldBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                oldBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+                oldBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
+                using var response = await transport.SendAsync(oldBearerVersion);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            using (var supportedBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                supportedBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+                supportedBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-11-09");
+                using var response = await transport.SendAsync(supportedBearerVersion);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal("2017-11-09", response.Headers.GetValues("x-ms-version").Single());
+            }
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task PermanentDeletePurgesOnlySoftDeletedSnapshotsWithDedicatedPermission()
     {
         var service = CreateClient(factory);
@@ -6274,6 +6425,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         if (sourceLeaseId is not null)
             request.Headers.TryAddWithoutValidation("x-ms-source-lease-id", sourceLeaseId);
 
+        AddSharedKeyLiteAuthorization(request);
+        return request;
+    }
+
+    private static void AddSharedKeyLiteAuthorization(HttpRequestMessage request)
+    {
+        var requestUri = request.RequestUri
+                         ?? throw new InvalidOperationException("A request URI is required for Shared Key Lite signing.");
+        if (!string.IsNullOrEmpty(requestUri.Query))
+            throw new InvalidOperationException("This test signer only supports requests without query parameters.");
+        if (!request.Headers.Contains("x-ms-date"))
+        {
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-date",
+                DateTimeOffset.UtcNow.ToString("R", CultureInfo.InvariantCulture));
+        }
+
         var canonicalHeaders = new StringBuilder();
         foreach (var header in request.Headers
                      .Where(header => header.Key.StartsWith("x-ms-", StringComparison.OrdinalIgnoreCase))
@@ -6289,13 +6457,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
 
         var stringToSign = "\n" + canonicalHeaders +
-                           $"/{SavaWebApplicationFactory.AccountName}{destination.AbsolutePath}";
+                           $"/{SavaWebApplicationFactory.AccountName}{requestUri.AbsolutePath}";
         using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
         var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
         request.Headers.TryAddWithoutValidation(
             "Authorization",
             $"SharedKeyLite {SavaWebApplicationFactory.AccountName}:{signature}");
-        return request;
     }
 
     private static HttpRequestMessage CreateSourceKeyRequest(
@@ -6343,6 +6510,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 : uri.Query.TrimStart('?') + "&" + query
         };
         return builder.Uri;
+    }
+
+    private static string ReadQueryParameter(Uri uri, string name)
+    {
+        foreach (var pair in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var components = pair.Split('=', 2);
+            if (string.Equals(Uri.UnescapeDataString(components[0]), name, StringComparison.Ordinal))
+                return components.Length == 2 ? Uri.UnescapeDataString(components[1]) : string.Empty;
+        }
+        throw new InvalidOperationException($"The {name} query parameter is missing.");
     }
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app, string accountName, string accountKey)
