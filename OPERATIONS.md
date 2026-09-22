@@ -136,7 +136,8 @@ before clients write data:
       "datalakeaccount": {
         "HierarchicalNamespaceEnabled": true,
         "HierarchicalNamespaceBlobIndexTagsEnabled": false,
-        "HierarchicalNamespaceBlobSnapshotsEnabled": false
+        "HierarchicalNamespaceBlobSnapshotsEnabled": false,
+        "LastAccessTimeTrackingEnabled": true
       }
     }
   }
@@ -161,6 +162,16 @@ longer accepting new Azure customers. Set
 account already enrolled in that preview. Without it, mk8.sava rejects snapshot
 creation, selectors, listings, source copies, and delete-snapshot options on the
 HNS account instead of applying flat-namespace behavior.
+
+`LastAccessTimeTrackingEnabled` emulates Azure's account-level last-access-time
+policy. Data writes update the persisted access time immediately. The first data
+read in a 24-hour window updates it; later reads in the same window do not. Get
+Blob Properties, Get Blob Metadata, Get Blob Tags, and listing operations expose
+but do not update the value. Internal copy-source reads participate in the same
+tracking rule. Get Blob, Get Blob Properties, XML List Blobs, and Arrow List
+Blobs expose the property when their respective response format supports it; the
+REST header and XML element require service version `2020-02-10` or later.
+Accounts without the capability omit it.
 
 HNS accounts support the Blob REST encryption-context system property. Put Blob
 and Put Block List accept `x-ms-encryption-context` from service version

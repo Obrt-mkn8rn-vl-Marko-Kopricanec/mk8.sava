@@ -6996,6 +6996,109 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task LastAccessTimeTrackingMatchesAzureReadWriteAndListingSemantics()
+    {
+        var initialTime = new DateTimeOffset(2026, 9, 22, 14, 0, 0, TimeSpan.Zero);
+        var clock = new AdjustableTimeProvider(initialTime);
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:LastAccessTimeTrackingEnabled"] = "true",
+                ["Sava:MaintenanceScanInterval"] = "01:00:00"
+            });
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"last-access-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blob = container.GetBlobClient("tracked.bin");
+            await blob.UploadAsync(BinaryData.FromString("first"));
+
+            var created = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(initialTime, created.LastAccessed);
+
+            clock.Advance(TimeSpan.FromHours(23));
+            var propertiesOnly = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(initialTime, propertiesOnly.LastAccessed);
+            var firstRead = (await blob.DownloadContentAsync()).Value;
+            Assert.Equal("first", firstRead.Content.ToString());
+            Assert.Equal(initialTime, firstRead.Details.LastAccessed);
+
+            clock.Advance(TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
+            var secondAccess = clock.GetUtcNow();
+            var secondRead = (await blob.DownloadContentAsync()).Value;
+            Assert.Equal(secondAccess, secondRead.Details.LastAccessed);
+            Assert.Equal(secondAccess, (await blob.GetPropertiesAsync()).Value.LastAccessed);
+
+            BlobItem? listed = null;
+            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { Prefix = blob.Name }))
+                listed = item;
+            Assert.NotNull(listed);
+            Assert.Equal(secondAccess, listed!.Properties.LastAccessedOn);
+
+            clock.Advance(TimeSpan.FromMinutes(5));
+            var rewrittenAt = clock.GetUtcNow();
+            await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true);
+            Assert.Equal(rewrittenAt, (await blob.GetPropertiesAsync()).Value.LastAccessed);
+
+            clock.Advance(TimeSpan.FromHours(24) + TimeSpan.FromSeconds(1));
+            var copiedAt = clock.GetUtcNow();
+            var copied = container.GetBlobClient("copied.bin");
+            await copied.SyncCopyFromUriAsync(
+                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7)));
+            Assert.Equal(copiedAt, (await blob.GetPropertiesAsync()).Value.LastAccessed);
+            Assert.Equal(copiedAt, (await copied.GetPropertiesAsync()).Value.LastAccessed);
+
+            using var transport = new HttpClient(application.Server.CreateHandler());
+            var arrowUri = AppendQuery(
+                container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddDays(7)),
+                "restype=container&comp=list");
+            using (var arrowRequest = new HttpRequestMessage(HttpMethod.Get, arrowUri))
+            {
+                arrowRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+                arrowRequest.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
+                using var response = await transport.SendAsync(arrowRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                await using var stream = await response.Content.ReadAsStreamAsync();
+                using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(stream);
+                using var batch = await reader.ReadNextRecordBatchAsync();
+                Assert.NotNull(batch);
+                var names = Assert.IsType<Apache.Arrow.StringArray>(batch.Column("Name"));
+                var accesses = Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("LastAccessTime"));
+                var sourceIndex = Enumerable.Range(0, batch.Length).Single(index => names.GetString(index) == blob.Name);
+                Assert.Equal(copiedAt, accesses.GetTimestamp(sourceIndex));
+            }
+
+            using (var legacy = new HttpRequestMessage(
+                       HttpMethod.Head,
+                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7))))
+            {
+                legacy.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+                using var response = await transport.SendAsync(legacy);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.False(response.Headers.Contains("x-ms-last-access-time"));
+            }
+
+            var untrackedService = CreateClient(
+                application,
+                SavaWebApplicationFactory.SecondAccountName,
+                SavaWebApplicationFactory.SecondAccountKey);
+            var untrackedContainer = untrackedService.GetBlobContainerClient($"last-access-off-{Guid.NewGuid():N}");
+            await untrackedContainer.CreateAsync();
+            var untracked = untrackedContainer.GetBlobClient("untracked.bin");
+            await untracked.UploadAsync(BinaryData.FromString("untracked"));
+            Assert.Equal(default, (await untracked.GetPropertiesAsync()).Value.LastAccessed);
+            Assert.Equal(default, (await untracked.DownloadContentAsync()).Value.Details.LastAccessed);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task AsynchronousCopiesCompleteDurablyAndCanBeAborted()
     {
         var remoteBytes = Enumerable.Range(0, 48 * 1024).Select(index => (byte)(index % 241)).ToArray();

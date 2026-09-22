@@ -280,6 +280,7 @@ public sealed class StorageAccountCapabilities
     public bool HierarchicalNamespaceEnabled { get; init; }
     public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
     public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }
+    public bool LastAccessTimeTrackingEnabled { get; init; }
 }
 
 public sealed class BearerAuthenticationOptions

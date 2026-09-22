@@ -19,6 +19,7 @@ public sealed partial class AzureResponseWriter
         string nextMarker,
         IReadOnlySet<string> includes,
         bool hierarchicalNamespace,
+        bool lastAccessTimeTracking,
         CancellationToken cancellationToken)
     {
         var fields = new List<Field>();
@@ -130,6 +131,8 @@ public sealed partial class AzureResponseWriter
             entry.Blob?.DeleteRetentionUntil is { } retentionUntil
                 ? checked((ulong)RemainingRetentionDays(retentionUntil))
                 : null);
+        AddTimestampColumn(fields, arrays, "LastAccessTime", items, entry =>
+            lastAccessTimeTracking ? entry.Blob?.LastAccessedAt : null);
         AddMapColumn(fields, arrays, "Tags", items, entry =>
             includes.Contains("tags") && entry.Blob is { Tags.Count: > 0 } blob ? blob.Tags : null);
         AddUInt64Column(fields, arrays, "TagCount", items, entry =>

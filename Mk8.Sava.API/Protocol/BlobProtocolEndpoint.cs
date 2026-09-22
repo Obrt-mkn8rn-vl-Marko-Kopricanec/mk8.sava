@@ -328,10 +328,12 @@ public static class BlobProtocolEndpoint
         SetStaticWebsiteHeader(http.Response.Headers, "Content-Disposition", blob.Http.ContentDisposition);
         if (statusCode != StatusCodes.Status206PartialContent)
             SetStaticWebsiteHeader(http.Response.Headers, "Content-MD5", blob.Http.ContentMd5);
-        if (HttpMethods.IsHead(http.Request.Method) || length == 0)
+        if (HttpMethods.IsHead(http.Request.Method))
             return;
 
-        blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
+        if (length == 0)
+            return;
         await service.WriteContentAsync(
             blob,
             new BlobEncryption(blob.EncryptionScope, CustomerProvidedKeySha256: null),
@@ -570,6 +572,7 @@ public static class BlobProtocolEndpoint
                 includes,
                 arrow,
                 hierarchicalNamespace,
+                service.IsLastAccessTimeTrackingEnabled(request.Account),
                 cancellationToken);
             return;
         }
@@ -1315,6 +1318,7 @@ public static class BlobProtocolEndpoint
                 resolvedSource,
                 cancellationToken);
             EvaluateCopySourceConditions(http.Request, source);
+            source = await service.RecordDataAccessAsync(source, cancellationToken);
             var copied = await service.BeginIncrementalCopyAsync(
                 request.Account,
                 containerName,
@@ -1994,6 +1998,7 @@ public static class BlobProtocolEndpoint
                         requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request));
                     EvaluateCopySourceConditions(http.Request, source);
                     ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
+                    source = await service.RecordDataAccessAsync(source, cancellationToken);
                     synchronousCopy = await service.CopyBlockBlobFromBlobAsync(
                         request.Account,
                         containerName,
@@ -2093,6 +2098,7 @@ public static class BlobProtocolEndpoint
                 EvaluateCopySourceConditions(http.Request, source);
                 ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
                 ValidateDestinationBlobType(current, source.Kind);
+                source = await service.RecordDataAccessAsync(source, cancellationToken);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
                     containerName,
@@ -2287,7 +2293,8 @@ public static class BlobProtocolEndpoint
             AzureResponseWriter.AddBlobHeaders(
                 http.Response,
                 blob,
-                service.IsHierarchicalNamespaceEnabled(blob.Account));
+                service.IsHierarchicalNamespaceEnabled(blob.Account),
+                service.IsLastAccessTimeTrackingEnabled(blob.Account));
             ApplySasResponseOverrides(http);
             http.Response.ContentLength = length;
             return;
@@ -2340,11 +2347,12 @@ public static class BlobProtocolEndpoint
                     "Structured response bodies require service version 2025-01-05 or later.");
             }
 
-            blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+            blob = await service.RecordDataAccessAsync(blob, cancellationToken);
             AzureResponseWriter.AddBlobHeaders(
                 http.Response,
                 blob,
-                service.IsHierarchicalNamespaceEnabled(blob.Account));
+                service.IsHierarchicalNamespaceEnabled(blob.Account),
+                service.IsLastAccessTimeTrackingEnabled(blob.Account));
             ApplySasResponseOverrides(http);
             http.Response.Headers["x-ms-structured-body"] = structuredBody;
             http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
@@ -2374,11 +2382,12 @@ public static class BlobProtocolEndpoint
             }
         }
 
-        blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
             blob,
-            service.IsHierarchicalNamespaceEnabled(blob.Account));
+            service.IsHierarchicalNamespaceEnabled(blob.Account),
+            service.IsLastAccessTimeTrackingEnabled(blob.Account));
         ApplySasResponseOverrides(http);
         http.Response.ContentLength = length;
         if (length == 0)
@@ -2444,6 +2453,7 @@ public static class BlobProtocolEndpoint
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
         var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
         AzureResponseWriter.AddBlobQueryHeaders(http.Response, blob);
         http.Response.ContentType = "avro/binary";
         http.Response.StatusCode = StatusCodes.Status200OK;
