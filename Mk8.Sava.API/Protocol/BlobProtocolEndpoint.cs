@@ -1071,7 +1071,12 @@ public static class BlobProtocolEndpoint
                 http.Request,
                 current,
                 useStandardProperties: false,
-                encryptionContext: ReadEncryptionContext(http.Request, service, request.Account));
+                encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                expiresAt: ReadWriteExpiry(
+                    http.Request,
+                    service,
+                    request.Account,
+                    current?.ExpiresAt));
             var committed = await service.CommitBlockListAsync(
                 request.Account,
                 containerName,
@@ -1649,8 +1654,12 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             EnsureMutableVersion(blob);
             RequireZeroContentLength(http.Request);
+            RequireHierarchicalNamespace(service, request.Account);
+            if (blob.IsDirectory)
+                throw AzureStorageException.BlobOperationNotSupported();
             EnsureLease(http.Request, blob.Lease, "blob");
-            var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, DateTimeOffset.UtcNow);
+            var now = http.RequestServices.GetRequiredService<TimeProvider>().GetUtcNow();
+            var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, now);
             var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
             AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
             http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
@@ -1825,6 +1834,7 @@ public static class BlobProtocolEndpoint
             }
             else
             {
+                RejectExpiryHeaders(http.Request);
                 if (request.Authorization.Kind != StorageAuthorizationKind.SharedKey)
                     throw AzureStorageException.AuthorizationFailure();
                 RequireZeroContentLength(http.Request);
@@ -1868,6 +1878,8 @@ public static class BlobProtocolEndpoint
             var requiresSync = false;
             if (requiresSyncValue is not null && !bool.TryParse(requiresSyncValue, out requiresSync))
                 throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
+            if (requestedType is null)
+                RejectExpiryHeaders(http.Request);
             EnsureDestinationCanBeOverwritten(current);
 
             if (requestedType is not null)
@@ -1886,6 +1898,7 @@ public static class BlobProtocolEndpoint
                 RequireZeroContentLength(http.Request);
                 if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
                     throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
+                var urlExpiry = ReadWriteExpiry(http.Request, service, request.Account, fallback: null);
                 var copySourceTags = ReadCopySourceTags(http.Request);
                 var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
                 var transfer = await transfers.ReadAsync(
@@ -1900,7 +1913,7 @@ public static class BlobProtocolEndpoint
                         containerName,
                         blobName,
                         source.Content,
-                        ReadUrlWriteOptions(http.Request, source, copySourceTags, current),
+                        ReadUrlWriteOptions(http.Request, source, copySourceTags, current, urlExpiry),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
@@ -2108,6 +2121,7 @@ public static class BlobProtocolEndpoint
         var explicitlyRequestedTier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier");
         if (explicitlyRequestedTier is not null && type != "BlockBlob")
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", explicitlyRequestedTier);
+        var expiresAt = ReadWriteExpiry(http.Request, service, request.Account, fallback: null);
         BlobRecord created;
         TransactionalChecksums? checksums = null;
         switch (type)
@@ -2125,7 +2139,8 @@ public static class BlobProtocolEndpoint
                             http.Request,
                             current,
                             generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)),
-                            encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
+                            encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                            expiresAt: expiresAt),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
@@ -2145,7 +2160,8 @@ public static class BlobProtocolEndpoint
                     ReadWriteOptions(
                         http.Request,
                         current,
-                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
+                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                        expiresAt: expiresAt),
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
@@ -2165,7 +2181,8 @@ public static class BlobProtocolEndpoint
                     ReadWriteOptions(
                         http.Request,
                         current,
-                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
+                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                        expiresAt: expiresAt),
                     sequence,
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
@@ -3106,6 +3123,12 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.BlobOperationNotSupported();
     }
 
+    private static void RequireHierarchicalNamespace(BlobService service, string account)
+    {
+        if (!service.IsHierarchicalNamespaceEnabled(account))
+            throw AzureStorageException.BlobOperationNotSupported();
+    }
+
     private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
     {
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
@@ -3248,7 +3271,8 @@ public static class BlobProtocolEndpoint
         BlobRecord? fallback,
         bool useStandardProperties = true,
         bool generateContentMd5 = false,
-        string? encryptionContext = null)
+        string? encryptionContext = null,
+        DateTimeOffset? expiresAt = null)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
@@ -3269,7 +3293,8 @@ public static class BlobProtocolEndpoint
                 : false,
             generateContentMd5,
             AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
-            EncryptionContext: encryptionContext);
+            EncryptionContext: encryptionContext,
+            ExpiresAt: expiresAt);
     }
 
     private static string? ReadEncryptionContext(
@@ -3289,6 +3314,35 @@ public static class BlobProtocolEndpoint
         if (!service.IsHierarchicalNamespaceEnabled(account) || value.Length > 1024)
             throw AzureStorageException.InvalidHeader(headerName, value);
         return NullIfEmpty(value);
+    }
+
+    private static DateTimeOffset? ReadWriteExpiry(
+        HttpRequest request,
+        BlobService service,
+        string account,
+        DateTimeOffset? fallback)
+    {
+        const string optionHeader = "x-ms-expiry-option";
+        const string timeHeader = "x-ms-expiry-time";
+        var hasOption = request.Headers.ContainsKey(optionHeader);
+        var hasTime = request.Headers.ContainsKey(timeHeader);
+        if (!hasOption && !hasTime)
+            return fallback;
+
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2023, 8, 3),
+            "Blob expiry on creation");
+        if (!service.IsHierarchicalNamespaceEnabled(account))
+        {
+            var headerName = hasOption ? optionHeader : timeHeader;
+            throw AzureStorageException.InvalidHeader(
+                headerName,
+                ProtocolParsing.First(request.Headers, headerName));
+        }
+
+        var now = request.HttpContext.RequestServices.GetRequiredService<TimeProvider>().GetUtcNow();
+        return ParseExpiry(request.Headers, now, now, allowRelativeToCreation: false);
     }
 
     private static string? ReadAccessTier(HttpRequest request, string? fallback)
@@ -3672,7 +3726,8 @@ public static class BlobProtocolEndpoint
         HttpRequest request,
         UrlSource source,
         bool copySourceTags,
-        BlobRecord? destination)
+        BlobRecord? destination,
+        DateTimeOffset? expiresAt)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
@@ -3701,7 +3756,8 @@ public static class BlobProtocolEndpoint
                 ? destination?.AccessTierInferred
                 : false,
             GenerateContentMd5: true,
-            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
+            ExpiresAt: expiresAt);
     }
 
     private static BlobWriteOptions ReadUrlCopyWriteOptions(
@@ -3873,6 +3929,12 @@ public static class BlobProtocolEndpoint
                 headerName,
                 ProtocolParsing.First(request.Headers, headerName));
         }
+    }
+
+    private static void RejectExpiryHeaders(HttpRequest request)
+    {
+        RejectUnsupportedHeader(request, "x-ms-expiry-option");
+        RejectUnsupportedHeader(request, "x-ms-expiry-time");
     }
 
     private static bool HasSourceTagCondition(HttpRequest request) =>
@@ -4562,7 +4624,8 @@ public static class BlobProtocolEndpoint
     private static DateTimeOffset? ParseExpiry(
         IHeaderDictionary headers,
         DateTimeOffset createdAt,
-        DateTimeOffset metadataNow)
+        DateTimeOffset metadataNow,
+        bool allowRelativeToCreation = true)
     {
         var option = ProtocolParsing.First(headers, "x-ms-expiry-option")?.ToLowerInvariant()
                      ?? throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
@@ -4587,6 +4650,8 @@ public static class BlobProtocolEndpoint
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
                 return metadataNow.AddMilliseconds(milliseconds);
             case "relativetocreation":
+                if (!allowRelativeToCreation)
+                    throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option);
                 if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var fromCreation) || fromCreation <= 0)
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
                 return createdAt.AddMilliseconds(fromCreation);

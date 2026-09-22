@@ -62,6 +62,14 @@ Boolean and the header is rejected for flat-namespace accounts. Shared Key
 requests continue to report Azure's `$superuser` owner and group because that
 well-known identity has no user-principal-name substitution.
 
+Blob expiry is likewise confined to HNS files. Set Blob Expiry is available
+from service version 2020-02-10 and rejects directories. Put Blob, Put Block
+List, and Put Blob From URL accept `x-ms-expiry-option` and `x-ms-expiry-time`
+from 2023-08-03. Put Block List preserves the current expiry when those headers
+are omitted; `NeverExpire` removes it explicitly. Get Blob, Get Blob Properties,
+and List Blobs expose the expiry from 2020-02-10 only for HNS accounts. Expired
+files are reclaimed as expiration rather than converted into soft-deleted data.
+
 ## Health and metrics
 
 - `GET /health/live` reports that the process is running.
