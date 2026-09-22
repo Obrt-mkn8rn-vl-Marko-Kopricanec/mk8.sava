@@ -24,6 +24,12 @@ dead duplicate to the pack.
 Pack compaction still removes records left by interrupted publication or other
 historical failures.
 
+Pack compaction publishes its replacement file before switching SQLite's chunk
+locations. If the metadata operation fails or the process exits near commit, it
+keeps both pack files until the authoritative locations are known. A subsequent
+maintenance pass reclaims whichever pack is unreferenced; it never deletes the
+replacement merely because the commit response was lost.
+
 Once the metadata transaction commits, the logical write is authoritative even
 if the client connection is lost or the server cannot return the response.
 Storage Analytics and ordinary request logging execute outside that transaction;
@@ -39,7 +45,8 @@ changing publication, SQLite, staging, or reclamation code:
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run.sh
 ```
 
-The harness creates a distinct temporary storage root for each checkpoint,
+The harness creates a distinct temporary storage root for each of the six
+publication, metadata, pack-compaction, and reclamation checkpoints,
 terminates the worker without unwinding it, and validates recovery in a new test
 host before deleting that exact temporary root. Core dumps are disabled for the
 intentional terminations.

@@ -23,6 +23,18 @@ public sealed class StorageCrashHarnessTests
             ["Sava:AbandonedStagingRetention"] = "1.00:00:00"
         };
 
+    private static readonly IReadOnlyDictionary<string, string?> PackCrashConfiguration =
+        new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
+            ["Sava:ChunkPackMaximumRecords"] = "2",
+            ["Sava:ChunkPackSealAge"] = "00:00:00",
+            ["Sava:ChunkPacksPerMaintenancePass"] = "16",
+            ["Sava:ChunkPackCompactionMinimumSavingsBytes"] = "1",
+            ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
+        };
+
     [Fact]
     public async Task CrashWorker()
     {
@@ -30,7 +42,11 @@ public sealed class StorageCrashHarnessTests
             return;
 
         var faultInjector = new ProcessStorageFaultInjector();
-        var application = CreateApplication(dataPath, faultInjector, deleteDataPath: false);
+        var application = CreateApplication(
+            dataPath,
+            faultInjector,
+            deleteDataPath: false,
+            packScenario: scenario.StartsWith("pack-", StringComparison.Ordinal));
         try
         {
             await application.InitializeAsync();
@@ -63,6 +79,20 @@ public sealed class StorageCrashHarnessTests
                         .GetRequiredService<BlobService>()
                         .CollectGarbageAsync(CancellationToken.None);
                     break;
+                case "pack-metadata-precommit":
+                case "pack-metadata-postcommit":
+                    var discarded = container.GetBlobClient("discarded.bin");
+                    await discarded.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
+                    await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29)));
+                    await discarded.DeleteAsync();
+                    faultInjector.ArmTermination(
+                        scenario == "pack-metadata-precommit"
+                            ? StorageFaultPoint.BeforePackMetadataCommit
+                            : StorageFaultPoint.AfterPackMetadataCommit);
+                    await application.Services
+                        .GetRequiredService<BlobService>()
+                        .RunMaintenanceAsync(CancellationToken.None);
+                    break;
                 default:
                     throw new InvalidOperationException($"Unknown crash scenario '{scenario}'.");
             }
@@ -84,13 +114,25 @@ public sealed class StorageCrashHarnessTests
         var application = CreateApplication(
             dataPath,
             new NullStorageFaultInjector(),
-            deleteDataPath: true);
+            deleteDataPath: true,
+            packScenario: scenario.StartsWith("pack-", StringComparison.Ordinal));
         try
         {
             await application.InitializeAsync();
             var blob = CreateClient(application)
                 .GetBlobContainerClient(ContainerName)
                 .GetBlobClient(BlobName);
+
+            if (scenario.StartsWith("pack-", StringComparison.Ordinal))
+            {
+                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
+                var packService = application.Services.GetRequiredService<BlobService>();
+                await packService.RunMaintenanceAsync(CancellationToken.None);
+                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
+                Assert.Single(EnumerateContentFiles(dataPath));
+                Assert.Equal(1, application.Services.GetRequiredService<MetadataStore>().CountPackedChunks());
+                return;
+            }
 
             if (scenario == "metadata-postcommit")
             {
@@ -145,12 +187,13 @@ public sealed class StorageCrashHarnessTests
     private static SavaWebApplicationFactory CreateApplication(
         string dataPath,
         IStorageFaultInjector faultInjector,
-        bool deleteDataPath) =>
+        bool deleteDataPath,
+        bool packScenario = false) =>
         new(
             dataPath,
             faultInjector,
             analyticsSink: null,
-            configurationOverrides: CrashConfiguration,
+            configurationOverrides: packScenario ? PackCrashConfiguration : CrashConfiguration,
             deleteDataPath,
             disableMaintenance: true);
 
@@ -177,6 +220,14 @@ public sealed class StorageCrashHarnessTests
         var content = new byte[96 * 1024];
         for (var index = 0; index < content.Length; index++)
             content[index] = (byte)((index * 31 + 17) % 251);
+        return content;
+    }
+
+    private static byte[] CreateSmallContent(int seed)
+    {
+        var content = new byte[1024];
+        for (var index = 0; index < content.Length; index++)
+            content[index] = (byte)((index * 31 + seed) % 251);
         return content;
     }
 

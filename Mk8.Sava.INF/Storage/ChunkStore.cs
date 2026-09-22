@@ -619,20 +619,15 @@ public sealed class ChunkStore
 
                     Directory.CreateDirectory(Path.GetDirectoryName(replacementPath)!);
                     File.Move(temporaryPath, replacementPath, overwrite: false);
-                    try
-                    {
-                        await _metadata.ReplaceChunkPackAsync(
-                            pack,
-                            replacement,
-                            locations,
-                            replacements,
-                            cancellationToken);
-                    }
-                    catch
-                    {
-                        File.Delete(replacementPath);
-                        throw;
-                    }
+                    // A failure reported after the SQLite commit is ambiguous.
+                    // Keep the published pack; orphan recovery can remove it if
+                    // the transaction did not commit.
+                    await _metadata.ReplaceChunkPackAsync(
+                        pack,
+                        replacement,
+                        locations,
+                        replacements,
+                        cancellationToken);
                     File.Delete(oldPath);
                     var newLength = new FileInfo(replacementPath).Length;
                     return new PackCompactionResult(1, 1, 0, oldLength - newLength);

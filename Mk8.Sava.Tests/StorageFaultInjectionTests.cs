@@ -228,6 +228,80 @@ public sealed class StorageFaultInjectionTests
         }
     }
 
+    [Theory]
+    [InlineData(StorageFaultPoint.BeforePackMetadataCommit)]
+    [InlineData(StorageFaultPoint.AfterPackMetadataCommit)]
+    public async Task PackCompactionFailureKeepsTheAuthoritativePackReadable(StorageFaultPoint faultPoint)
+    {
+        var faultInjector = new ArmableStorageFaultInjector();
+        var application = new SavaWebApplicationFactory(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-commit-{Guid.NewGuid():N}"),
+            faultInjector,
+            analyticsSink: null,
+            configurationOverrides: new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "01:00:00",
+                ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
+                ["Sava:ChunkPackMaximumRecords"] = "2",
+                ["Sava:ChunkPackSealAge"] = "00:00:00",
+                ["Sava:ChunkPacksPerMaintenancePass"] = "16",
+                ["Sava:ChunkPackCompactionMinimumSavingsBytes"] = "1",
+                ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
+            },
+            deleteDataPath: true,
+            disableMaintenance: true);
+        try
+        {
+            await application.InitializeAsync();
+            var container = CreateClient(application).GetBlobContainerClient($"pack-commit-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var deleted = container.GetBlobClient("deleted.bin");
+            var live = container.GetBlobClient("live.bin");
+            var liveBytes = RandomNumberGenerator.GetBytes(1536);
+            await deleted.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(1024)));
+            await live.UploadAsync(BinaryData.FromBytes(liveBytes));
+            await deleted.DeleteAsync();
+
+            var service = application.Services.GetRequiredService<BlobService>();
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var liveRecord = await service.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                container.Name,
+                live.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                CancellationToken.None);
+            var chunkId = Assert.Single(liveRecord.Content.Chunks).Id;
+            faultInjector.Arm(faultPoint);
+            await Assert.ThrowsAsync<IOException>(() => service.RunMaintenanceAsync(CancellationToken.None));
+
+            var committedLocation = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
+            Assert.NotNull(committedLocation);
+            var committedPath = Path.Combine(
+                application.DataPath,
+                "packs",
+                committedLocation.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            Assert.True(File.Exists(committedPath));
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+
+            await service.RunMaintenanceAsync(CancellationToken.None);
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.Single(EnumerateContentFiles(application.DataPath));
+            var recoveredLocation = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
+            Assert.NotNull(recoveredLocation);
+            var recoveredPath = Path.Combine(
+                application.DataPath,
+                "packs",
+                recoveredLocation.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            Assert.True(File.Exists(recoveredPath));
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
     private static SavaWebApplicationFactory CreateApplication(IStorageFaultInjector faultInjector) =>
         new(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-fault-{Guid.NewGuid():N}"),
