@@ -1334,6 +1334,122 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceAccountsExposePosixPropertiesAndRejectUnsupportedBlobApis()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+
+        var accountInfo = (await service.GetAccountInfoAsync()).Value;
+        Assert.True(accountInfo.IsHierarchicalNamespaceEnabled);
+
+        var container = service.GetBlobContainerClient($"hns-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/file.txt");
+        await blob.UploadAsync(BinaryData.FromString("hierarchical namespace"));
+
+        var properties = await blob.GetPropertiesAsync();
+        var headers = properties.GetRawResponse().Headers;
+        Assert.True(headers.TryGetValue("x-ms-owner", out var owner));
+        Assert.Equal("$superuser", owner);
+        Assert.True(headers.TryGetValue("x-ms-group", out var group));
+        Assert.Equal("$superuser", group);
+        Assert.True(headers.TryGetValue("x-ms-permissions", out var permissions));
+        Assert.Equal("rw-r-----", permissions);
+        Assert.True(headers.TryGetValue("x-ms-acl", out var acl));
+        Assert.Equal("user::rw-,group::r--,other::---", acl);
+        Assert.True(headers.TryGetValue("x-ms-resource-type", out var resourceType));
+        Assert.Equal("file", resourceType);
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var listBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        listBuilder.SetPermissions(AccountSasPermissions.List);
+        var listUri = AppendQuery(
+            container.Uri,
+            $"restype=container&comp=list&include=permissions&{listBuilder.ToSasQueryParameters(credential)}");
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using (var list = new HttpRequestMessage(HttpMethod.Get, listUri))
+        {
+            list.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(list);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var xml = await response.Content.ReadAsStringAsync();
+            Assert.Contains("<Owner>$superuser</Owner>", xml, StringComparison.Ordinal);
+            Assert.Contains("<Group>$superuser</Group>", xml, StringComparison.Ordinal);
+            Assert.Contains("<Permissions>rw-r-----</Permissions>", xml, StringComparison.Ordinal);
+            Assert.Contains("<Acl>user::rw-,group::r--,other::---</Acl>", xml, StringComparison.Ordinal);
+            Assert.Contains("<ResourceType>file</ResourceType>", xml, StringComparison.Ordinal);
+        }
+
+        using (var invalidDelimiter = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   AppendQuery(listUri, "delimiter=:")))
+        {
+            invalidDelimiter.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(invalidDelimiter);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(
+                "InvalidQueryParameterValue",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var pageFailure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetPageBlobClient("page.bin").CreateAsync(512));
+        Assert.Equal(StatusCodes.Status409Conflict, pageFailure.Status);
+        Assert.Equal("BlobOperationNotSupported", pageFailure.ErrorCode);
+
+        var append = container.GetAppendBlobClient("append.log");
+        await append.CreateAsync();
+        await append.AppendBlockAsync(BinaryData.FromString("entry").ToStream());
+        var sealFailure = await Assert.ThrowsAsync<RequestFailedException>(() => append.SealAsync());
+        Assert.Equal(StatusCodes.Status409Conflict, sealFailure.Status);
+        Assert.Equal("BlobOperationNotSupported", sealFailure.ErrorCode);
+
+        var objectBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        objectBuilder.SetPermissions(AccountSasPermissions.Create | AccountSasPermissions.Write);
+        var incrementalCopyUri = AppendQuery(
+            container.GetPageBlobClient("incremental.vhd").Uri,
+            $"comp=incrementalcopy&{objectBuilder.ToSasQueryParameters(credential)}");
+        using (var incrementalCopy = new HttpRequestMessage(HttpMethod.Put, incrementalCopyUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            incrementalCopy.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            incrementalCopy.Headers.TryAddWithoutValidation(
+                "x-ms-copy-source",
+                "/source/source.vhd?snapshot=2026-09-22T00:00:00.0000000Z");
+            using var response = await transport.SendAsync(incrementalCopy);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal(
+                "BlobOperationNotSupported",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

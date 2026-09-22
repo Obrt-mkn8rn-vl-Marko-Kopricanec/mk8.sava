@@ -146,6 +146,7 @@ public sealed partial class AzureResponseWriter
         int maxResults,
         IReadOnlySet<string> includes,
         bool arrow,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
@@ -154,7 +155,15 @@ public sealed partial class AzureResponseWriter
             ? EncodeBlobMarker(listing.Items[^1].Cursor, listingScope)
             : string.Empty;
         if (arrow)
-            return WriteArrowBlobsAsync(context, listing, nextMarker, includes, cancellationToken);
+        {
+            return WriteArrowBlobsAsync(
+                context,
+                listing,
+                nextMarker,
+                includes,
+                hierarchicalNamespace,
+                cancellationToken);
+        }
         var serviceEndpoint = StorageResourcePath.GetServiceEndpoint(context.Request, request.Account);
         var containerEndpoint = StorageResourcePath.GetContainerEndpoint(
             context.Request,
@@ -252,6 +261,15 @@ public sealed partial class AzureResponseWriter
                     writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("Last-Modified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
                 writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
+                if (hierarchicalNamespace && includes.Contains("permissions"))
+                {
+                    writer.WriteElementString("Owner", "$superuser");
+                    writer.WriteElementString("Group", "$superuser");
+                    writer.WriteElementString("Permissions", "rw-r-----");
+                    writer.WriteElementString("Acl", "user::rw-,group::r--,other::---");
+                }
+                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+                    writer.WriteElementString("ResourceType", "file");
                 writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
                 writer.WriteElementString("Content-Type", blob.Http.ContentType);
                 writer.WriteElementString("Content-Encoding", blob.Http.ContentEncoding ?? string.Empty);
@@ -645,12 +663,25 @@ public sealed partial class AzureResponseWriter
         }
     }
 
-    public static void AddBlobHeaders(HttpResponse response, BlobRecord blob)
+    public static void AddBlobHeaders(
+        HttpResponse response,
+        BlobRecord blob,
+        bool hierarchicalNamespace = false)
     {
         var request = StorageRequestContext.Get(response.HttpContext);
         AddBlobEntityHeaders(response, blob);
         if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
+        {
+            response.Headers["x-ms-owner"] = "$superuser";
+            response.Headers["x-ms-group"] = "$superuser";
+            response.Headers["x-ms-permissions"] = "rw-r-----";
+        }
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+            response.Headers["x-ms-resource-type"] = "file";
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2023, 11, 3)))
+            response.Headers["x-ms-acl"] = "user::rw-,group::r--,other::---";
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
             response.Headers["x-ms-server-encrypted"] = "true";

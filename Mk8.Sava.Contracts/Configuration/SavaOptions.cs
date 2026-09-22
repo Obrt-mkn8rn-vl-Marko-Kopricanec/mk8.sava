@@ -15,6 +15,8 @@ public sealed class SavaOptions : IValidatableObject
     [Required]
     public Dictionary<string, string> Accounts { get; init; } = new(StringComparer.Ordinal);
 
+    public Dictionary<string, StorageAccountCapabilities> AccountCapabilities { get; init; } = new(StringComparer.Ordinal);
+
     public bool AllowAnonymousPublicAccess { get; init; }
     public int MinimumChunkBytes { get; init; } = 64 * 1024;
     public int TargetChunkBytes { get; init; } = 256 * 1024;
@@ -68,6 +70,16 @@ public sealed class SavaOptions : IValidatableObject
                 yield return new ValidationResult($"The key for account '{accountName}' must be valid base64.", [nameof(Accounts)]);
             else if (keyBytes.Length < 32)
                 yield return new ValidationResult($"The key for account '{accountName}' must contain at least 256 bits.", [nameof(Accounts)]);
+        }
+
+        foreach (var accountName in AccountCapabilities.Keys)
+        {
+            if (!Accounts.ContainsKey(accountName))
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities references unknown account '{accountName}'.",
+                    [nameof(AccountCapabilities)]);
+            }
         }
 
         if (EnableCrossAccountDeduplication &&
@@ -247,6 +259,11 @@ public sealed class SavaOptions : IValidatableObject
             return false;
         }
     }
+}
+
+public sealed class StorageAccountCapabilities
+{
+    public bool HierarchicalNamespaceEnabled { get; init; }
 }
 
 public sealed class BearerAuthenticationOptions
