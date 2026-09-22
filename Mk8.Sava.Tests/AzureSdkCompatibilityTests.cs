@@ -2356,6 +2356,259 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task RestoreContainerSupportsDestinationNamesAndPreservesTheCompleteContainerState()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            original with
+            {
+                ContainerSoftDeleteEnabled = true,
+                ContainerSoftDeleteRetentionDays = 7
+            },
+            CancellationToken.None);
+
+        try
+        {
+            var sourceName = $"restore-source-{Guid.NewGuid():N}";
+            var destinationName = $"restore-destination-{Guid.NewGuid():N}";
+            var source = service.GetBlobContainerClient(sourceName);
+            await source.CreateAsync(
+                PublicAccessType.None,
+                new Dictionary<string, string> { ["purpose"] = "restore" });
+            var committed = source.GetBlobClient("committed.bin");
+            await committed.UploadAsync(
+                BinaryData.FromString("preserved container content"),
+                new BlobUploadOptions
+                {
+                    Metadata = new Dictionary<string, string> { ["state"] = "committed" },
+                    Tags = new Dictionary<string, string> { ["kind"] = "restored" }
+                });
+            var staged = source.GetBlockBlobClient("staged.bin");
+            var blockId = Convert.ToBase64String("restore-block"u8);
+            await staged.StageBlockAsync(blockId, BinaryData.FromString("uncommitted content").ToStream());
+            await source.DeleteAsync();
+
+            var deleted = await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: sourceName)
+                .SingleAsync();
+            Assert.True(deleted.IsDeleted);
+            Assert.False(string.IsNullOrWhiteSpace(deleted.VersionId));
+
+#pragma warning disable AZC0015
+            var restore = await service.UndeleteBlobContainerAsync(
+                sourceName,
+                deleted.VersionId,
+                destinationName,
+                CancellationToken.None);
+#pragma warning restore AZC0015
+            Assert.Equal(201, restore.GetRawResponse().Status);
+            Assert.Equal(destinationName, restore.Value.Name);
+            Assert.False(restore.GetRawResponse().Headers.TryGetValue("ETag", out _));
+            Assert.False(restore.GetRawResponse().Headers.TryGetValue("Last-Modified", out _));
+            Assert.True(restore.GetRawResponse().Headers.TryGetValue("Content-Length", out var restoreLength));
+            Assert.Equal("0", restoreLength);
+
+            Assert.False((await source.ExistsAsync()).Value);
+            Assert.Empty(await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: sourceName)
+                .ToListAsync());
+
+            var destination = service.GetBlobContainerClient(destinationName);
+            var destinationProperties = (await destination.GetPropertiesAsync()).Value;
+            Assert.Equal("restore", destinationProperties.Metadata["purpose"]);
+            var restoredBlob = destination.GetBlobClient(committed.Name);
+            Assert.Equal("preserved container content", (await restoredBlob.DownloadContentAsync()).Value.Content.ToString());
+            Assert.Equal("committed", (await restoredBlob.GetPropertiesAsync()).Value.Metadata["state"]);
+            Assert.Equal("restored", (await restoredBlob.GetTagsAsync()).Value.Tags["kind"]);
+            var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'restored'").ToListAsync();
+            var restoredTag = Assert.Single(tagged, item => item.BlobName == committed.Name);
+            Assert.Equal(destinationName, restoredTag.BlobContainerName);
+            var restoredBlocks = (await destination.GetBlockBlobClient(staged.Name)
+                .GetBlockListAsync(BlockListTypes.Uncommitted)).Value;
+            Assert.Equal(blockId, Assert.Single(restoredBlocks.UncommittedBlocks).Name);
+
+            var sameName = service.GetBlobContainerClient($"restore-same-{Guid.NewGuid():N}");
+            await sameName.CreateAsync();
+            await sameName.GetBlobClient("same.bin").UploadAsync(BinaryData.FromString("same-name content"));
+            await sameName.DeleteAsync();
+            var sameDeleted = await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: sameName.Name)
+                .SingleAsync();
+            var sameRestore = await service.UndeleteBlobContainerAsync(sameName.Name, sameDeleted.VersionId);
+            Assert.Equal(201, sameRestore.GetRawResponse().Status);
+            Assert.Equal("same-name content", (await sameName.GetBlobClient("same.bin").DownloadContentAsync()).Value.Content.ToString());
+
+            var credential = new StorageSharedKeyCredential(
+                SavaWebApplicationFactory.AccountName,
+                SavaWebApplicationFactory.AccountKey);
+            Uri RestoreSasUri(string target, AccountSasPermissions permissions)
+            {
+                var builder = new AccountSasBuilder
+                {
+                    Services = AccountSasServices.Blobs,
+                    ResourceTypes = AccountSasResourceTypes.Container,
+                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+                    ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+                    Protocol = SasProtocol.HttpsAndHttp
+                };
+                builder.SetPermissions(permissions);
+                return new Uri(
+                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{target}" +
+                    $"?restype=container&comp=undelete&{builder.ToSasQueryParameters(credential)}");
+            }
+
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+            using (var missingName = new HttpRequestMessage(
+                       HttpMethod.Put,
+                       RestoreSasUri($"missing-name-{Guid.NewGuid():N}", AccountSasPermissions.Write))
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                missingName.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                missingName.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
+                using var response = await transport.SendAsync(missingName);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+                Assert.Contains(
+                    "<HeaderName>x-ms-deleted-container-name</HeaderName>",
+                    await response.Content.ReadAsStringAsync(),
+                    StringComparison.Ordinal);
+            }
+            using (var missingVersion = new HttpRequestMessage(
+                       HttpMethod.Put,
+                       RestoreSasUri($"missing-version-{Guid.NewGuid():N}", AccountSasPermissions.Write))
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                missingVersion.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                missingVersion.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
+                using var response = await transport.SendAsync(missingVersion);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            using (var createOnly = new HttpRequestMessage(
+                       HttpMethod.Put,
+                       RestoreSasUri($"create-only-{Guid.NewGuid():N}", AccountSasPermissions.Create))
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
+                createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
+                using var response = await transport.SendAsync(createOnly);
+                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+                Assert.Equal(
+                    "AuthorizationPermissionMismatch",
+                    response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            var collisionSource = service.GetBlobContainerClient($"restore-collision-source-{Guid.NewGuid():N}");
+            var collisionDestination = service.GetBlobContainerClient($"restore-collision-target-{Guid.NewGuid():N}");
+            await collisionSource.CreateAsync();
+            await collisionSource.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromString("retained"));
+            await collisionSource.DeleteAsync();
+            await collisionDestination.CreateAsync();
+            var collisionDeleted = await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: collisionSource.Name)
+                .SingleAsync();
+#pragma warning disable AZC0015
+            var collision = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                service.UndeleteBlobContainerAsync(
+                    collisionSource.Name,
+                    collisionDeleted.VersionId,
+                    collisionDestination.Name,
+                    CancellationToken.None));
+#pragma warning restore AZC0015
+            Assert.Equal(409, collision.Status);
+            Assert.Equal("ContainerAlreadyExists", collision.ErrorCode);
+            Assert.Single(await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: collisionSource.Name)
+                .ToListAsync());
+
+            var consumed = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                service.UndeleteBlobContainerAsync(sourceName, deleted.VersionId));
+            Assert.Equal(404, consumed.Status);
+            Assert.Equal("ContainerNotFound", consumed.ErrorCode);
+
+            var inventory = await metadata.GetStorageInventoryAsync(CancellationToken.None);
+            Assert.True(inventory.BlobRecordCount >= 3);
+            Assert.True(inventory.StagedBlockCount >= 1);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task RestoreContainerRejectsTheExactRetentionDeadline()
+    {
+        var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 10, 0, 0, TimeSpan.Zero));
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                ["Sava:MaintenanceScanInterval"] = "1.00:00:00"
+            });
+        try
+        {
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var properties = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                properties with
+                {
+                    ContainerSoftDeleteEnabled = true,
+                    ContainerSoftDeleteRetentionDays = 1
+                },
+                CancellationToken.None);
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"restore-deadline-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            await container.DeleteAsync();
+            var deleted = await service.GetBlobContainersAsync(
+                    states: BlobContainerStates.Deleted,
+                    prefix: container.Name)
+                .SingleAsync();
+
+            clock.Advance(TimeSpan.FromDays(1));
+            var expired = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                service.UndeleteBlobContainerAsync(container.Name, deleted.VersionId));
+            Assert.Equal(404, expired.Status);
+            Assert.Equal("ContainerNotFound", expired.ErrorCode);
+
+            var retained = await metadata.GetContainerAsync(
+                SavaWebApplicationFactory.AccountName,
+                container.Name,
+                includeDeleted: true,
+                CancellationToken.None);
+            Assert.NotNull(retained?.DeletedAt);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task PermanentDeletePurgesOnlySoftDeletedSnapshotsWithDedicatedPermission()
     {
         var service = CreateClient(factory);

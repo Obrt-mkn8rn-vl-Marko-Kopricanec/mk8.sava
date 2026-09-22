@@ -210,23 +210,26 @@ public sealed class BlobService(
 
     public async Task<ContainerRecord> RestoreContainerAsync(
         string account,
-        string name,
+        string sourceName,
+        string destinationName,
         string deletedVersion,
         CancellationToken cancellationToken)
     {
-        var current = await GetContainerAsync(account, name, includeDeleted: true, cancellationToken);
+        ValidateContainerName(destinationName);
+        var current = await GetContainerAsync(account, sourceName, includeDeleted: true, cancellationToken);
         if (current.DeletedAt is null || !string.Equals(current.DeletedVersion, deletedVersion, StringComparison.Ordinal))
             throw AzureStorageException.ContainerNotFound();
         var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
         var retentionUntil = current.DeleteRetentionUntil ??
                              current.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays);
-        if (retentionUntil < metadata.GetUtcNow())
+        if (retentionUntil <= metadata.GetUtcNow())
         {
             throw AzureStorageException.ContainerNotFound();
         }
 
         var restored = current with
         {
+            Name = destinationName,
             Revision = MetadataStore.NewRevision(),
             DeletedAt = null,
             DeleteRetentionUntil = null,
@@ -234,7 +237,13 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
-        await metadata.PutContainerAsync(restored, current.Revision, cancellationToken);
+        if (!await metadata.TryRestoreContainerAsync(sourceName, restored, current.Revision, cancellationToken))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "ContainerAlreadyExists",
+                "The specified container already exists.");
+        }
         return restored;
     }
 
