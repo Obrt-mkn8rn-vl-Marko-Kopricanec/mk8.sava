@@ -30,6 +30,10 @@ public sealed class BlobService(
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
+    public bool IsHierarchicalNamespaceEnabled(string account) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.HierarchicalNamespaceEnabled;
+
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
@@ -492,6 +496,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        EnsureBlobKindSupported(account, BlobKind.PageBlob);
         ValidateBlobName(name);
         const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
         if (length > maximumPageBlobBytes)
@@ -700,6 +705,7 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        EnsureFlatNamespace(current.Account);
         var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken);
         encryption = ApplyContainerEncryptionPolicy(container, encryption, current);
         EnsureNoPendingCopy(current);
@@ -1414,6 +1420,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        EnsureBlobKindSupported(account, source.Kind);
         options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var prepared = await PrepareCopyContentAsync(
             account,
@@ -1514,6 +1521,7 @@ public sealed class BlobService(
         BlobRecord? current,
         CancellationToken cancellationToken)
     {
+        EnsureFlatNamespace(account);
         ValidateBlobName(name);
         options = await ApplyContainerEncryptionPolicyAsync(
             account,
@@ -1694,6 +1702,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        EnsureBlobKindSupported(account, sourceKind);
         ValidateBlobName(name);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var encryption = EncryptionOf(options);
@@ -2768,6 +2777,18 @@ public sealed class BlobService(
         StatusCodes.Status409Conflict,
         "BlobOperationNotSupported",
         "The copy source and destination use different request-level encryption settings.");
+
+    private void EnsureFlatNamespace(string account)
+    {
+        if (IsHierarchicalNamespaceEnabled(account))
+            throw AzureStorageException.BlobOperationNotSupported();
+    }
+
+    private void EnsureBlobKindSupported(string account, BlobKind kind)
+    {
+        if (kind == BlobKind.PageBlob)
+            EnsureFlatNamespace(account);
+    }
 
     private static AzureStorageException EncryptionScopeTierChangeNotSupported() => new(
         StatusCodes.Status409Conflict,

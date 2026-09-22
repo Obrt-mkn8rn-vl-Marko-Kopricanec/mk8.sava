@@ -7,6 +7,30 @@ may be atomically replaced by background recompression or pack compaction. The
 configured `Sava:DataPath` is a single storage root; do not copy a live root with
 a generic filesystem command and assume the result is consistent.
 
+## Account capabilities
+
+Storage-account capabilities are configured independently so one deployment can
+serve both flat-namespace and hierarchical-namespace accounts. Hierarchical
+namespace is immutable account identity in Azure and must likewise be configured
+before clients write data:
+
+```json
+{
+  "Sava": {
+    "AccountCapabilities": {
+      "datalakeaccount": {
+        "HierarchicalNamespaceEnabled": true
+      }
+    }
+  }
+}
+```
+
+Every capability entry must name an account in `Sava:Accounts`. The Blob endpoint
+reports the setting through Get Account Information and applies the corresponding
+Blob API restrictions and hierarchical listing/property shape. The separate Data
+Lake `dfs` protocol is outside this service's endpoint boundary.
+
 ## Health and metrics
 
 - `GET /health/live` reports that the process is running.

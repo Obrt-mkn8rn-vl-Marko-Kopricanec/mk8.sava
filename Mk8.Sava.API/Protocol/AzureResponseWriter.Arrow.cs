@@ -18,6 +18,7 @@ public sealed partial class AzureResponseWriter
         BlobListPage listing,
         string nextMarker,
         IReadOnlySet<string> includes,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
         var fields = new List<Field>();
@@ -39,6 +40,18 @@ public sealed partial class AzureResponseWriter
             nullable: false,
             required: true);
         AddStringColumn(fields, arrays, "Etag", items, entry => entry.Blob?.ETag);
+        if (hierarchicalNamespace && includes.Contains("permissions"))
+        {
+            AddStringColumn(fields, arrays, "Owner", items, entry => entry.Blob is null ? null : "$superuser");
+            AddStringColumn(fields, arrays, "Group", items, entry => entry.Blob is null ? null : "$superuser");
+            AddStringColumn(fields, arrays, "Permissions", items, entry => entry.Blob is null ? null : "rw-r-----");
+            AddStringColumn(
+                fields,
+                arrays,
+                "Acl",
+                items,
+                entry => entry.Blob is null ? null : "user::rw-,group::r--,other::---");
+        }
         AddUInt64Column(fields, arrays, "Content-Length", items, entry =>
             entry.Blob is { } blob
                 ? checked((ulong)blob.Content.Length)

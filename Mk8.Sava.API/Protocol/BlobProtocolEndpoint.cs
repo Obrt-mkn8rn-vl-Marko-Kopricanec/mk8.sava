@@ -38,7 +38,7 @@ public static class BlobProtocolEndpoint
                 "account",
                 StringComparison.OrdinalIgnoreCase))
         {
-            await HandleAccountInformationAsync(http, request);
+            await HandleAccountInformationAsync(http, request, service);
             return;
         }
 
@@ -63,7 +63,8 @@ public static class BlobProtocolEndpoint
 
     private static Task HandleAccountInformationAsync(
         HttpContext http,
-        StorageRequestContext request)
+        StorageRequestContext request,
+        BlobService service)
     {
         if (!string.Equals(
                 http.Request.Query["comp"].ToString(),
@@ -81,7 +82,10 @@ public static class BlobProtocolEndpoint
         http.Response.Headers["x-ms-sku-name"] = "Standard_LRS";
         http.Response.Headers["x-ms-account-kind"] = "StorageV2";
         if (IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
-            http.Response.Headers["x-ms-is-hns-enabled"] = "false";
+        {
+            http.Response.Headers["x-ms-is-hns-enabled"] =
+                service.IsHierarchicalNamespaceEnabled(request.Account) ? "true" : "false";
+        }
         http.Response.ContentLength = 0;
         return Task.CompletedTask;
     }
@@ -471,7 +475,8 @@ public static class BlobProtocolEndpoint
             var delimiter = http.Request.Query["delimiter"].ToString();
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
-            ValidateBlobListFeatures(request, includes, delimiter);
+            var hierarchicalNamespace = service.IsHierarchicalNamespaceEnabled(request.Account);
+            ValidateBlobListFeatures(request, includes, delimiter, hierarchicalNamespace);
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -530,6 +535,7 @@ public static class BlobProtocolEndpoint
                 maxResults,
                 includes,
                 arrow,
+                hierarchicalNamespace,
                 cancellationToken);
             return;
         }
@@ -1113,6 +1119,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "page")
         {
             RequirePageBlobVersion(request);
+            RequireFlatNamespace(service, request.Account);
             Require(request, 'w');
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
@@ -1212,6 +1219,8 @@ public static class BlobProtocolEndpoint
                 throw AzureStorageException.FeatureVersionMismatch(
                     "Incremental Copy Blob requires service version 2016-05-31 or later.");
             }
+
+            RequireFlatNamespace(service, request.Account);
 
             ValidateAsynchronousCopyEncryption(http.Request);
             ValidateIncrementalCopyHeaders(http.Request);
@@ -1553,6 +1562,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "seal")
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Append Blob Seal");
+            RequireFlatNamespace(service, request.Account);
             Require(request, 'w');
             EnsureMutableVersion(blob);
             RequireZeroContentLength(http.Request);
@@ -1614,6 +1624,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "pagelist")
         {
+            RequireFlatNamespace(service, request.Account);
             Require(request, 'r');
             if (blob.Kind != BlobKind.PageBlob)
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
@@ -2090,6 +2101,7 @@ public static class BlobProtocolEndpoint
                 break;
             case "PageBlob":
                 RequirePageBlobVersion(request);
+                RequireFlatNamespace(service, request.Account);
                 RequireZeroContentLength(http.Request);
                 var length = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-content-length", required: true);
                 var sequence = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number", defaultValue: 0);
@@ -2144,7 +2156,10 @@ public static class BlobProtocolEndpoint
         var length = blob.Content.Length == 0 ? 0 : end - start + 1;
         if (HttpMethods.IsHead(http.Request.Method))
         {
-            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            AzureResponseWriter.AddBlobHeaders(
+                http.Response,
+                blob,
+                service.IsHierarchicalNamespaceEnabled(blob.Account));
             ApplySasResponseOverrides(http);
             http.Response.ContentLength = length;
             return;
@@ -2198,7 +2213,10 @@ public static class BlobProtocolEndpoint
             }
 
             blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
-            AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+            AzureResponseWriter.AddBlobHeaders(
+                http.Response,
+                blob,
+                service.IsHierarchicalNamespaceEnabled(blob.Account));
             ApplySasResponseOverrides(http);
             http.Response.Headers["x-ms-structured-body"] = structuredBody;
             http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
@@ -2229,7 +2247,10 @@ public static class BlobProtocolEndpoint
         }
 
         blob = await service.RecordSmartTierAccessAsync(blob, cancellationToken);
-        AzureResponseWriter.AddBlobHeaders(http.Response, blob);
+        AzureResponseWriter.AddBlobHeaders(
+            http.Response,
+            blob,
+            service.IsHierarchicalNamespaceEnabled(blob.Account));
         ApplySasResponseOverrides(http);
         http.Response.ContentLength = length;
         if (length == 0)
@@ -3033,6 +3054,12 @@ public static class BlobProtocolEndpoint
         Require(request, 'w');
     }
 
+    private static void RequireFlatNamespace(BlobService service, string account)
+    {
+        if (service.IsHierarchicalNamespaceEnabled(account))
+            throw AzureStorageException.BlobOperationNotSupported();
+    }
+
     private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
     {
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
@@ -3326,7 +3353,8 @@ public static class BlobProtocolEndpoint
     private static void ValidateBlobListFeatures(
         StorageRequestContext request,
         IReadOnlySet<string> includes,
-        string delimiter)
+        string delimiter,
+        bool hierarchicalNamespace)
     {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -3367,8 +3395,11 @@ public static class BlobProtocolEndpoint
         if (includes.Contains("permissions"))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Listing hierarchical namespace permissions");
-            throw AzureStorageException.InvalidQuery("include");
+            if (!hierarchicalNamespace)
+                throw AzureStorageException.InvalidQuery("include");
         }
+        if (hierarchicalNamespace && !string.IsNullOrEmpty(delimiter) && delimiter != "/")
+            throw AzureStorageException.InvalidQuery("delimiter");
         if (!string.IsNullOrEmpty(delimiter) &&
             includes.Contains("snapshots") &&
             !IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
