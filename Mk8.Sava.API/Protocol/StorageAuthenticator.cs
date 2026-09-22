@@ -347,6 +347,8 @@ public sealed class StorageAuthenticator(
         var isCrossTenantUserBoundSas = false;
         if (isAccountSas)
         {
+            if (!string.IsNullOrEmpty(query["si"].ToString()))
+                throw AzureStorageException.AuthenticationFailed();
             var services = query["ss"].ToString();
             var resourceTypes = query["srt"].ToString();
             ValidateAccountSasFields(
@@ -600,9 +602,16 @@ public sealed class StorageAuthenticator(
                 var container = await metadata.GetContainerAsync(request.Account, request.Container, includeDeleted: false, cancellationToken);
                 if (container is null || !container.AccessPolicies.TryGetValue(identifier, out var policy))
                     throw AzureStorageException.AuthorizationFailure();
-                permissions = IntersectPermissions(permissions, policy.Permission);
-                startsAt = Latest(startsAt, policy.StartsAt);
-                expiresAt = Earliest(expiresAt, policy.ExpiresAt);
+                ValidateServiceSasPermissions(policy.Permission, signedVersion);
+                if (!string.IsNullOrEmpty(permissions) && !string.IsNullOrEmpty(policy.Permission))
+                    throw AzureStorageException.InvalidQuery("sp");
+                if (startsAt.HasValue && policy.StartsAt.HasValue)
+                    throw AzureStorageException.InvalidQuery("st");
+                if (expiresAt.HasValue && policy.ExpiresAt.HasValue)
+                    throw AzureStorageException.InvalidQuery("se");
+                permissions = string.IsNullOrEmpty(permissions) ? policy.Permission : permissions;
+                startsAt ??= policy.StartsAt;
+                expiresAt ??= policy.ExpiresAt;
             }
         }
 
