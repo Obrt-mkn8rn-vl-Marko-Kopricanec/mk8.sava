@@ -234,6 +234,13 @@ Shared Key Lite headers plus service and account SAS tokens with
 SAS remain available, as do anonymous reads from containers already configured
 for public access.
 
+`AllowSharedKeyAccessForServices:Blob:Enabled` mirrors Azure's Blob-specific
+management setting. When set to `false`, it denies Blob Shared Key, Shared Key
+Lite, service SAS, and account SAS while bearer and user-delegation SAS continue
+to work. An unset Blob setting preserves the account-wide default. The
+account-wide `AllowSharedKeyAccess=false` still denies key-based Blob access even
+when the Blob-specific setting is `true`.
+
 Cross-tenant user-bound user-delegation SAS is denied by default. Set
 `AllowCrossTenantDelegationSas` on the account only when the delegated user's
 tenant is intentionally different from the delegation-key tenant. The setting

@@ -1075,7 +1075,8 @@ public sealed class StorageAuthenticator(
     private void EnsureSharedKeyAccessAllowed(string account)
     {
         if (_options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
-            !capabilities.AllowSharedKeyAccess)
+            (!capabilities.AllowSharedKeyAccess ||
+             capabilities.AllowSharedKeyAccessForServices.Blob?.Enabled == false))
         {
             throw AzureStorageException.KeyBasedAuthenticationNotPermitted();
         }

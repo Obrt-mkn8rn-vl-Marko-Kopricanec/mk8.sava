@@ -5710,13 +5710,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(HttpStatusCode.OK, legacyReadOnly.StatusCode);
     }
 
-    [Fact]
-    public async Task DisabledSharedKeyAccessRejectsKeyBasedAuthButAllowsUserDelegationSas()
+    [Theory]
+    [InlineData(false, null)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task DisabledSharedKeyAccessRejectsKeyBasedAuthButAllowsUserDelegationSas(
+        bool accountSharedKeyEnabled,
+        bool? blobSharedKeyEnabled)
     {
         await using var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>
             {
-                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowSharedKeyAccess"] = "false",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowSharedKeyAccess"] =
+                    accountSharedKeyEnabled.ToString(),
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowSharedKeyAccessForServices:Blob:Enabled"] =
+                    blobSharedKeyEnabled?.ToString(),
                 [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] =
                     "racwdxytlfmeiopk"
             });

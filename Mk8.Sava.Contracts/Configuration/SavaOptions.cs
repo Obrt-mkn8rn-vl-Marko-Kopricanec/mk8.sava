@@ -476,6 +476,7 @@ public enum SasExpirationPolicyAction
 public sealed class StorageAccountCapabilities
 {
     public bool AllowSharedKeyAccess { get; init; } = true;
+    public StorageSharedKeyAccessForServices AllowSharedKeyAccessForServices { get; init; } = new();
     public bool AllowCrossTenantDelegationSas { get; init; }
     public bool RequireUserBoundUserDelegationSas { get; init; }
     public SasPolicyViolationAction RequireUserBoundUserDelegationSasAction { get; init; } =
@@ -490,6 +491,16 @@ public sealed class StorageAccountCapabilities
     public bool ChangeFeedEnabled { get; init; }
     public bool ImmutableStorageWithVersioningEnabled { get; init; }
     public HashSet<string> ImmutableStorageWithVersioningContainers { get; init; } = new(StringComparer.Ordinal);
+}
+
+public sealed class StorageSharedKeyAccessForServices
+{
+    public StorageServiceSharedKeyAccess? Blob { get; init; }
+}
+
+public sealed class StorageServiceSharedKeyAccess
+{
+    public bool? Enabled { get; init; }
 }
 
 public sealed class ObjectReplicationPolicyOptions
