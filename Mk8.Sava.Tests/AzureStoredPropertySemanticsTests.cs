@@ -714,6 +714,50 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.False((await bodyDestination.ExistsAsync()).Value);
     }
 
+    [Fact]
+    public async Task CopyPropertiesSurviveLeasePageAndBlockStagingButClearOnOtherWrites()
+    {
+        var service = CreateClient();
+        var container = service.GetBlobContainerClient($"copy-properties-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        var pageSource = container.GetPageBlobClient("page-source.bin");
+        await pageSource.CreateAsync(512);
+        await pageSource.UploadPagesAsync(
+            new MemoryStream(Enumerable.Repeat((byte)0x41, 512).ToArray()),
+            offset: 0);
+        var pageDestination = container.GetPageBlobClient("page-destination.bin");
+        var pageCopy = await pageDestination.StartCopyFromUriAsync(pageSource.Uri);
+        await pageCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+
+        var lease = pageDestination.GetBlobLeaseClient(Guid.NewGuid().ToString());
+        await lease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+        Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+        await lease.ReleaseAsync();
+        Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+
+        await pageDestination.UploadPagesAsync(
+            new MemoryStream(Enumerable.Repeat((byte)0x42, 512).ToArray()),
+            offset: 0);
+        Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+        await pageDestination.SetMetadataAsync(new Dictionary<string, string> { ["mutation"] = "metadata" });
+        Assert.Equal(default, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+
+        var blockSource = container.GetBlockBlobClient("block-source.bin");
+        await blockSource.UploadAsync(BinaryData.FromString("block copy source").ToStream());
+        var blockDestination = container.GetBlockBlobClient("block-destination.bin");
+        var blockCopy = await blockDestination.StartCopyFromUriAsync(blockSource.Uri);
+        await blockCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        Assert.Equal(CopyStatus.Success, (await blockDestination.GetPropertiesAsync()).Value.CopyStatus);
+
+        var blockId = Convert.ToBase64String("copy-property-block-0001"u8);
+        await blockDestination.StageBlockAsync(blockId, BinaryData.FromString("replacement").ToStream());
+        Assert.Equal(CopyStatus.Success, (await blockDestination.GetPropertiesAsync()).Value.CopyStatus);
+        await blockDestination.CommitBlockListAsync([blockId]);
+        Assert.Equal(default, (await blockDestination.GetPropertiesAsync()).Value.CopyStatus);
+    }
+
     private static HttpRequestMessage PutBlobRequest(BlockBlobClient blob, byte[] payload)
     {
         var request = new HttpRequestMessage(HttpMethod.Put, WriteUri(blob))

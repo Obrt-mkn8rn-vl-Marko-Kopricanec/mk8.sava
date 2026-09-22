@@ -3104,6 +3104,43 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task IncrementalCopyRejectsHeadersOutsideItsProtocolSurfaceBeforeResolvingTheSource()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"incremental-headers-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        foreach (var (header, value) in new[]
+                 {
+                     ("x-ms-meta-unsupported", "value"),
+                     ("x-ms-source-if-match", "\"etag\"")
+                 })
+        {
+            var destination = container.GetPageBlobClient($"{Guid.NewGuid():N}.vhd");
+            var destinationSas = destination.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5));
+            using var request = new HttpRequestMessage(
+                HttpMethod.Put,
+                AppendQuery(destinationSas, "comp=incrementalcopy"))
+            {
+                Content = new ByteArrayContent([])
+            };
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-copy-source",
+                "https://source.invalid/disk.vhd?snapshot=2026-09-22T00%3A00%3A00.0000000Z");
+            request.Headers.TryAddWithoutValidation(header, value);
+
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("UnsupportedHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            Assert.False((await destination.ExistsAsync()).Value);
+        }
+    }
+
+    [Fact]
     public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
     {
         var service = CreateClient(factory);
@@ -3383,6 +3420,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var pending = (await abortDestination.GetPropertiesAsync()).Value;
         Assert.Equal(CopyStatus.Pending, pending.CopyStatus);
         Assert.Equal(0, pending.ContentLength);
+        Assert.Contains("source=remote", pending.CopySource.AbsoluteUri, StringComparison.Ordinal);
         Assert.DoesNotContain("sig=", pending.CopySource.AbsoluteUri, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("abort", pending.Metadata["copy"]);
 
@@ -3422,7 +3460,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var content = Enumerable.Range(0, 32 * 1024).Select(index => (byte)(index % 239)).ToArray();
         await source.UploadAsync(BinaryData.FromBytes(content), new BlobUploadOptions
         {
-            Metadata = new Dictionary<string, string> { ["origin"] = "source-sas" }
+            Metadata = new Dictionary<string, string> { ["origin"] = "source-sas" },
+            Tags = new Dictionary<string, string> { ["class"] = "tagged" }
         });
 
         var sourceSas = source.GenerateSasUri(
@@ -3438,6 +3477,36 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         Assert.Equal(content, (await destination.DownloadContentAsync()).Value.Content.ToArray());
         Assert.Equal("source-sas", (await destination.GetPropertiesAsync()).Value.Metadata["origin"]);
+
+        var taggedSourceSas = source.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Tag,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var taggedDestination = container.GetBlobClient("tag-conditioned.bin");
+        var taggedDestinationSas = taggedDestination.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var taggedCopy = await CreateBlobClient(factory, taggedDestinationSas).StartCopyFromUriAsync(
+            taggedSourceSas,
+            new BlobCopyFromUriOptions
+            {
+                SourceConditions = new BlobRequestConditions { TagConditions = "\"class\" = 'tagged'" }
+            });
+        await taggedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        Assert.Equal(content, (await taggedDestination.DownloadContentAsync()).Value.Content.ToArray());
+
+        var untaggedSourceTarget = container.GetBlobClient("tag-condition-without-source-permission.bin");
+        var untaggedSourceTargetSas = untaggedSourceTarget.GenerateSasUri(
+            BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var missingSourceTagPermission = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            CreateBlobClient(factory, untaggedSourceTargetSas).StartCopyFromUriAsync(
+                sourceSas,
+                new BlobCopyFromUriOptions
+                {
+                    SourceConditions = new BlobRequestConditions { TagConditions = "\"class\" = 'tagged'" }
+                }));
+        Assert.Equal(403, missingSourceTagPermission.Status);
+        Assert.False((await untaggedSourceTarget.ExistsAsync()).Value);
 
         var bearerTarget = container.GetBlobClient("bearer-source.bin");
         var bearerTargetSas = bearerTarget.GenerateSasUri(
@@ -3492,6 +3561,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             CreateBlobClient(factory, wrongResourceTargetSas).StartCopyFromUriAsync(wrongResourceSource));
         Assert.Equal(403, wrongResource.Status);
         Assert.False((await wrongResourceTarget.ExistsAsync()).Value);
+
+        var sourceLeaseTarget = container.GetBlobClient("source-lease-header.bin");
+        var sourceLeaseTargetSas = sourceLeaseTarget.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        using var sourceLeaseTransport = new HttpClient(factory.Server.CreateHandler());
+        using var sourceLeaseRequest = new HttpRequestMessage(HttpMethod.Put, sourceLeaseTargetSas)
+        {
+            Content = new ByteArrayContent([])
+        };
+        sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceSas.AbsoluteUri);
+        sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-source-lease-id", Guid.NewGuid().ToString());
+        using var sourceLeaseResponse = await sourceLeaseTransport.SendAsync(sourceLeaseRequest);
+        Assert.Equal(HttpStatusCode.BadRequest, sourceLeaseResponse.StatusCode);
+        Assert.Equal("UnsupportedHeader", sourceLeaseResponse.Headers.GetValues("x-ms-error-code").Single());
+        Assert.False((await sourceLeaseTarget.ExistsAsync()).Value);
     }
 
     [Fact]
