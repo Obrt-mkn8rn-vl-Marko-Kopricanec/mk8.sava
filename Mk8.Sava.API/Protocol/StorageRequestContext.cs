@@ -67,7 +67,9 @@ public sealed class RequestContextMiddleware(
         var parsed = await ParseAsync(context);
         StorageRequestContext.Set(context, parsed.Context);
         BlobProtocolEndpoint.ValidateBlobVersionRequest(parsed.Context);
-        parsed.Context.Authorization = parsed.Context.ResourceKind == StorageResourceKind.StaticWebsite
+        var isCorsPreflight = parsed.Context.ResourceKind != StorageResourceKind.StaticWebsite &&
+                              HttpMethods.IsOptions(context.Request.Method);
+        parsed.Context.Authorization = parsed.Context.ResourceKind == StorageResourceKind.StaticWebsite || isCorsPreflight
             ? StorageAuthorization.Anonymous
             : await authenticator.AuthenticateAsync(context, parsed.Context, context.RequestAborted);
         ValidateAuthorizationVersion(parsed);

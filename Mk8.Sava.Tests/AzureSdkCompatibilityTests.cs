@@ -4796,6 +4796,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         var tierTarget = container.GetBlobClient("nested//tier.bin");
         await tierTarget.UploadAsync(BinaryData.FromString("tier me"));
+        var tierLeaseId = Guid.NewGuid().ToString();
+        var tierLease = tierTarget.GetBlobLeaseClient(tierLeaseId);
+        await tierLease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+        var rejectedDirectTier = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            tierTarget.SetAccessTierAsync(
+                AccessTier.Cool,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() }));
+        Assert.Equal(StatusCodes.Status412PreconditionFailed, rejectedDirectTier.Status);
+        Assert.Equal("LeaseIdMismatchWithBlobOperation", rejectedDirectTier.ErrorCode);
+        Assert.Equal(AccessTier.Hot, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
+        await tierTarget.SetAccessTierAsync(AccessTier.Cool);
+
         var containerBatchClient = container.GetBlobBatchClient();
         using (var tierBatch = containerBatchClient.CreateBatch())
         {
@@ -4811,6 +4823,31 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(404, missing.Status);
         }
         Assert.Equal(AccessTier.Cool, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
+
+        using (var conditionalBatch = containerBatchClient.CreateBatch())
+        {
+            var rejected = conditionalBatch.SetBlobAccessTier(
+                container.Name,
+                tierTarget.Name,
+                AccessTier.Hot,
+                null,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() });
+            var accepted = conditionalBatch.SetBlobAccessTier(
+                container.Name,
+                tierTarget.Name,
+                AccessTier.Hot,
+                null,
+                new BlobRequestConditions { LeaseId = tierLeaseId });
+            var submitted = await containerBatchClient.SubmitBatchAsync(
+                conditionalBatch,
+                throwOnAnyFailure: false);
+
+            Assert.Equal(StatusCodes.Status202Accepted, submitted.Status);
+            Assert.Equal(StatusCodes.Status412PreconditionFailed, rejected.Status);
+            Assert.Equal(StatusCodes.Status200OK, accepted.Status);
+        }
+        Assert.Equal(AccessTier.Hot, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
+        await tierLease.ReleaseAsync();
     }
 
     [Fact]
@@ -7172,6 +7209,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         preflightRequest.Headers.Add("Origin", "https://app.trusted.example");
         preflightRequest.Headers.Add("Access-Control-Request-Method", "HEAD");
         preflightRequest.Headers.Add("Access-Control-Request-Headers", "x-client-header");
+        preflightRequest.Headers.TryAddWithoutValidation("Authorization", "SharedKey deliberately-invalid");
         using var preflightResponse = await client.SendAsync(preflightRequest);
         Assert.Equal(HttpStatusCode.OK, preflightResponse.StatusCode);
         Assert.Equal(
@@ -7179,6 +7217,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             preflightResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
         Assert.Equal("true", preflightResponse.Headers.GetValues("Access-Control-Allow-Credentials").Single());
         Assert.Equal("HEAD", preflightResponse.Headers.GetValues("Access-Control-Allow-Methods").Single());
+        Assert.False(preflightResponse.Headers.Contains("Access-Control-Expose-Headers"));
+        Assert.Equal(0, preflightResponse.Content.Headers.ContentLength);
+        Assert.Empty(await preflightResponse.Content.ReadAsByteArrayAsync());
+
+        using var missingOriginRequest = new HttpRequestMessage(HttpMethod.Options, uri);
+        missingOriginRequest.Headers.Add("Access-Control-Request-Method", "HEAD");
+        missingOriginRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer deliberately-invalid");
+        using var missingOriginResponse = await client.SendAsync(missingOriginRequest);
+        Assert.Equal(HttpStatusCode.BadRequest, missingOriginResponse.StatusCode);
+        Assert.Equal(
+            "InvalidHeaderValue",
+            missingOriginResponse.Headers.GetValues("x-ms-error-code").Single());
+
+        using var lowerCaseMethodRequest = new HttpRequestMessage(HttpMethod.Options, uri);
+        lowerCaseMethodRequest.Headers.Add("Origin", "https://app.trusted.example");
+        lowerCaseMethodRequest.Headers.Add("Access-Control-Request-Method", "head");
+        using var lowerCaseMethodResponse = await client.SendAsync(lowerCaseMethodRequest);
+        Assert.Equal(HttpStatusCode.Forbidden, lowerCaseMethodResponse.StatusCode);
+        Assert.Equal(
+            "CorsPreflightFailure",
+            lowerCaseMethodResponse.Headers.GetValues("x-ms-error-code").Single());
 
         using var conditionalRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         conditionalRequest.Headers.IfNoneMatch.Add(new System.Net.Http.Headers.EntityTagHeaderValue(etag.ToString()));
