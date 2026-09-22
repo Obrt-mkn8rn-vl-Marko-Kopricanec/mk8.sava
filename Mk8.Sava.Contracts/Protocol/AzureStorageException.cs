@@ -88,6 +88,16 @@ public sealed class AzureStorageException : Exception
         "AuthorizationPermissionMismatch",
         "This request is not authorized to perform this operation using this permission.");
 
+    public static AzureStorageException AuthorizationServiceMismatch() => new(
+        (int)HttpStatusCode.Forbidden,
+        "AuthorizationServiceMismatch",
+        "This request is not authorized to perform this operation using this service.");
+
+    public static AzureStorageException AuthorizationResourceTypeMismatch() => new(
+        (int)HttpStatusCode.Forbidden,
+        "AuthorizationResourceTypeMismatch",
+        "This request is not authorized to perform this operation using this resource type.");
+
     public static AzureStorageException BearerAuthenticationRequired() => new(
         (int)HttpStatusCode.Unauthorized,
         "AuthenticationFailed",

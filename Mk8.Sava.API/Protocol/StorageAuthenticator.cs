@@ -253,8 +253,10 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         {
             var services = query["ss"].ToString();
             var resourceTypes = query["srt"].ToString();
-            if (!services.Contains('b') || !AccountSasCoversRequest(resourceTypes, request))
-                throw AzureStorageException.AuthorizationFailure();
+            if (!services.Contains('b'))
+                throw AzureStorageException.AuthorizationServiceMismatch();
+            if (!AccountSasCoversRequest(resourceTypes, request))
+                throw AzureStorageException.AuthorizationResourceTypeMismatch();
             var fields = new List<string>
             {
                 request.Account,
