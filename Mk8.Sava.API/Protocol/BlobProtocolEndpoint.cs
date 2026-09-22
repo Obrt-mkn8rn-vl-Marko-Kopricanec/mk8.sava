@@ -430,14 +430,20 @@ public static class BlobProtocolEndpoint
         if (comp == "undelete" && HttpMethods.IsPut(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
-            RequireAny(request, 'c', 'w');
+            Require(request, 'w');
             RequireZeroContentLength(http.Request);
-            var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name") ?? containerName;
+            var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name")
+                              ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-name");
             var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
-                          ?? throw AzureStorageException.InvalidHeader("x-ms-deleted-container-version");
-            var restored = await service.RestoreContainerAsync(request.Account, deletedName, version, cancellationToken);
-            AzureResponseWriter.AddContainerHeaders(http.Response, restored);
+                          ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-version");
+            _ = await service.RestoreContainerAsync(
+                request.Account,
+                deletedName,
+                containerName,
+                version,
+                cancellationToken);
             http.Response.StatusCode = StatusCodes.Status201Created;
+            http.Response.ContentLength = 0;
             return;
         }
 

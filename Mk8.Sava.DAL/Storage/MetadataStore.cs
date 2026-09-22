@@ -317,6 +317,161 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         }
     }
 
+    public async Task<bool> TryRestoreContainerAsync(
+        string sourceName,
+        ContainerRecord restored,
+        string expectedSourceRevision,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var source = await GetContainerAsync(
+                connection,
+                transaction,
+                restored.Account,
+                sourceName,
+                includeDeleted: true,
+                cancellationToken);
+            if (source is null || !string.Equals(source.Revision, expectedSourceRevision, StringComparison.Ordinal))
+                throw new StorageConcurrencyException();
+
+            if (string.Equals(sourceName, restored.Name, StringComparison.Ordinal))
+            {
+                await using var update = connection.CreateCommand();
+                update.Transaction = transaction;
+                update.CommandText = """
+                    UPDATE containers SET deleted = $deleted, modified_ticks = $modified, data = $data
+                    WHERE account = $account AND name = $name;
+                    """;
+                AddContainerParameters(update, restored);
+                if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    throw new StorageConcurrencyException();
+            }
+            else
+            {
+                var destination = await GetContainerAsync(
+                    connection,
+                    transaction,
+                    restored.Account,
+                    restored.Name,
+                    includeDeleted: true,
+                    cancellationToken);
+                if (destination is not null)
+                    return false;
+
+                await using (var addContainer = connection.CreateCommand())
+                {
+                    addContainer.Transaction = transaction;
+                    addContainer.CommandText = """
+                        INSERT INTO containers(account, name, deleted, modified_ticks, data)
+                        VALUES ($account, $name, $deleted, $modified, $data);
+                        """;
+                    AddContainerParameters(addContainer, restored);
+                    if (await addContainer.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                }
+
+                IReadOnlyList<BlobRecord> blobs;
+                await using (var listBlobs = connection.CreateCommand())
+                {
+                    listBlobs.Transaction = transaction;
+                    listBlobs.CommandText = """
+                        SELECT data FROM blobs
+                        WHERE account = $account AND container = $container;
+                        """;
+                    listBlobs.Parameters.AddWithValue("$account", restored.Account);
+                    listBlobs.Parameters.AddWithValue("$container", sourceName);
+                    blobs = await ReadJsonRowsAsync<BlobRecord>(listBlobs, cancellationToken);
+                }
+                foreach (var blob in blobs)
+                {
+                    await using var updateBlob = connection.CreateCommand();
+                    updateBlob.Transaction = transaction;
+                    updateBlob.CommandText = """
+                        UPDATE blobs SET container = $destination, data = $data
+                        WHERE generation_id = $generation AND account = $account AND container = $source;
+                        """;
+                    updateBlob.Parameters.AddWithValue("$destination", restored.Name);
+                    updateBlob.Parameters.AddWithValue("$data", Serialize(blob with { Container = restored.Name }));
+                    updateBlob.Parameters.AddWithValue("$generation", blob.GenerationId);
+                    updateBlob.Parameters.AddWithValue("$account", restored.Account);
+                    updateBlob.Parameters.AddWithValue("$source", sourceName);
+                    if (await updateBlob.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                }
+
+                IReadOnlyList<StagedBlockRecord> blocks;
+                await using (var listBlocks = connection.CreateCommand())
+                {
+                    listBlocks.Transaction = transaction;
+                    listBlocks.CommandText = """
+                        SELECT data FROM staged_blocks
+                        WHERE account = $account AND container = $container;
+                        """;
+                    listBlocks.Parameters.AddWithValue("$account", restored.Account);
+                    listBlocks.Parameters.AddWithValue("$container", sourceName);
+                    blocks = await ReadJsonRowsAsync<StagedBlockRecord>(listBlocks, cancellationToken);
+                }
+                foreach (var block in blocks)
+                {
+                    var renamed = block with { Container = restored.Name };
+                    await using var addBlock = connection.CreateCommand();
+                    addBlock.Transaction = transaction;
+                    addBlock.CommandText = """
+                        INSERT INTO staged_blocks(
+                            account, container, blob_name, block_id, created_ticks, logical_length, data)
+                        VALUES ($account, $container, $blob, $block, $created, $logical, $data);
+                        """;
+                    addBlock.Parameters.AddWithValue("$account", renamed.Account);
+                    addBlock.Parameters.AddWithValue("$container", renamed.Container);
+                    addBlock.Parameters.AddWithValue("$blob", renamed.BlobName);
+                    addBlock.Parameters.AddWithValue("$block", renamed.BlockId);
+                    addBlock.Parameters.AddWithValue("$created", renamed.CreatedAt.UtcTicks);
+                    addBlock.Parameters.AddWithValue("$logical", renamed.Content.Length);
+                    addBlock.Parameters.AddWithValue("$data", Serialize(renamed));
+                    if (await addBlock.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                    await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, renamed, cancellationToken);
+                }
+
+                await using (var deleteBlocks = connection.CreateCommand())
+                {
+                    deleteBlocks.Transaction = transaction;
+                    deleteBlocks.CommandText = """
+                        DELETE FROM staged_blocks
+                        WHERE account = $account AND container = $container;
+                        """;
+                    deleteBlocks.Parameters.AddWithValue("$account", restored.Account);
+                    deleteBlocks.Parameters.AddWithValue("$container", sourceName);
+                    await deleteBlocks.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await using (var deleteSource = connection.CreateCommand())
+                {
+                    deleteSource.Transaction = transaction;
+                    deleteSource.CommandText = """
+                        DELETE FROM containers
+                        WHERE account = $account AND name = $name;
+                        """;
+                    deleteSource.Parameters.AddWithValue("$account", restored.Account);
+                    deleteSource.Parameters.AddWithValue("$name", sourceName);
+                    if (await deleteSource.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                }
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
     public async Task<bool> DeleteContainerPermanentlyAsync(
         string account,
         string name,
