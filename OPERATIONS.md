@@ -73,6 +73,13 @@ binary-cache, install, and build roots. Each harness starts a real loopback
 mk8.sava process with a disposable storage root rather than routing the client
 through ASP.NET's in-memory test server.
 
+Query Blob Contents accepts Azure's `delimited`/`csv` and JSON input forms and
+its delimited/CSV, JSON, and Arrow result forms. Arrow results use the caller's
+declared schema and are emitted as bounded record batches inside Azure's Avro
+query envelope; the service does not retain or buffer the complete result set.
+The normal .NET compatibility suite exercises all six Azure Arrow field types
+and the empty-result stream shape through the official SDK.
+
 ## Account capabilities
 
 Storage-account capabilities are configured independently so one deployment can

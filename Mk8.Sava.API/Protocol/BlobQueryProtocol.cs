@@ -5,13 +5,17 @@ using System.Text;
 using System.Text.Json;
 using System.Xml;
 using System.Xml.Linq;
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Apache.Arrow.Types;
 
 namespace Mk8.Sava.Protocol;
 
 internal enum BlobQueryFormatKind
 {
     Delimited,
-    Json
+    Json,
+    Arrow
 }
 
 internal sealed record BlobQueryTextFormat(
@@ -20,7 +24,24 @@ internal sealed record BlobQueryTextFormat(
     char Quote,
     string RecordSeparator,
     char Escape,
-    bool HasHeaders);
+    bool HasHeaders,
+    IReadOnlyList<QueryArrowColumn> ArrowSchema);
+
+internal enum BlobQueryArrowFieldKind
+{
+    Int64,
+    Bool,
+    Timestamp,
+    String,
+    Double,
+    Decimal
+}
+
+internal sealed record QueryArrowColumn(
+    BlobQueryArrowFieldKind Kind,
+    string Name,
+    int Precision,
+    int Scale);
 
 internal sealed record BlobQueryRequest(
     string Expression,
@@ -31,6 +52,7 @@ internal static class BlobQueryProtocol
 {
     private const int MaximumExpressionBytes = 256 * 1024;
     private const int MaximumRecordCharacters = 16 * 1024 * 1024;
+    private const int ArrowRecordBatchSize = 1024;
 
     public static async Task<BlobQueryRequest> ReadRequestAsync(
         Stream body,
@@ -82,6 +104,18 @@ internal static class BlobQueryProtocol
         {
             await using var enumerator = ReadRowsAsync(input, request.Input, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
+            if (request.Output.Kind == BlobQueryFormatKind.Arrow)
+            {
+                await WriteArrowResultsAsync(
+                    enumerator,
+                    plan,
+                    request.Output.ArrowSchema,
+                    avro,
+                    cancellationToken);
+                await avro.CompleteAsync(totalBytes, cancellationToken);
+                return;
+            }
+
             var wroteHeader = false;
             while (await enumerator.MoveNextAsync())
             {
@@ -125,7 +159,7 @@ internal static class BlobQueryProtocol
         if (string.IsNullOrEmpty(type))
             throw InvalidXml("A query serialization format type is required.");
 
-        if (type == "delimited")
+        if (type is "delimited" or "csv")
         {
             var configuration = format is null ? null : Child(format, "DelimitedTextConfiguration");
             var column = ChildValue(configuration, "ColumnSeparator") ?? ",";
@@ -137,7 +171,14 @@ internal static class BlobQueryProtocol
             ValidateSeparator(record, "RecordSeparator");
             if (string.Equals(column, record, StringComparison.Ordinal))
                 throw InvalidXml("ColumnSeparator and RecordSeparator must differ.");
-            return new BlobQueryTextFormat(BlobQueryFormatKind.Delimited, column, quote, record, escape, headers);
+            return new BlobQueryTextFormat(
+                BlobQueryFormatKind.Delimited,
+                column,
+                quote,
+                record,
+                escape,
+                headers,
+                []);
         }
 
         if (type == "json")
@@ -145,7 +186,22 @@ internal static class BlobQueryProtocol
             var configuration = format is null ? null : Child(format, "JsonTextConfiguration");
             var record = ChildValue(configuration, "RecordSeparator") ?? "\n";
             ValidateSeparator(record, "RecordSeparator");
-            return new BlobQueryTextFormat(BlobQueryFormatKind.Json, ",", '"', record, '\\', false);
+            return new BlobQueryTextFormat(BlobQueryFormatKind.Json, ",", '"', record, '\\', false, []);
+        }
+
+        if (!input && type == "arrow")
+        {
+            var configuration = Child(format, "ArrowConfiguration")
+                                ?? throw InvalidXml("ArrowConfiguration is required for Arrow output.");
+            var schema = Child(configuration, "Schema")
+                         ?? throw InvalidXml("An Arrow output schema is required.");
+            var fields = schema.Elements()
+                .Where(element => element.Name.LocalName == "Field")
+                .Select((field, index) => ReadArrowField(field, index))
+                .ToArray();
+            if (fields.Length is < 1 or > 256)
+                throw InvalidXml("An Arrow output schema must contain between one and 256 fields.");
+            return new BlobQueryTextFormat(BlobQueryFormatKind.Arrow, ",", '"', "\n", '\\', false, fields);
         }
 
         var direction = input ? "input" : "output";
@@ -154,6 +210,264 @@ internal static class BlobQueryProtocol
             "BlobQueryError",
             $"The {direction} query format '{type}' is not supported.");
     }
+
+    private static QueryArrowColumn ReadArrowField(XElement field, int index)
+    {
+        var type = ChildValue(field, "Type")?.ToLowerInvariant();
+        var kind = type switch
+        {
+            "int64" => BlobQueryArrowFieldKind.Int64,
+            "bool" => BlobQueryArrowFieldKind.Bool,
+            "timestamp[ms]" => BlobQueryArrowFieldKind.Timestamp,
+            "string" => BlobQueryArrowFieldKind.String,
+            "double" => BlobQueryArrowFieldKind.Double,
+            "decimal" => BlobQueryArrowFieldKind.Decimal,
+            _ => throw InvalidXml($"Arrow field {index + 1} has an unsupported type '{type}'.")
+        };
+        var name = ChildValue(field, "Name");
+        if (string.IsNullOrWhiteSpace(name))
+            name = $"_{index + 1}";
+
+        var precision = ParseArrowInteger(field, "Precision", kind == BlobQueryArrowFieldKind.Decimal ? null : 0);
+        var scale = ParseArrowInteger(field, "Scale", kind == BlobQueryArrowFieldKind.Decimal ? null : 0);
+        if (kind == BlobQueryArrowFieldKind.Decimal &&
+            (precision is < 1 or > 38 || scale < 0 || scale > precision))
+        {
+            throw InvalidXml("Arrow decimal fields require precision from 1 through 38 and scale from 0 through precision.");
+        }
+        if (kind != BlobQueryArrowFieldKind.Decimal && (precision != 0 || scale != 0))
+            throw InvalidXml("Arrow Precision and Scale are valid only for decimal fields.");
+
+        return new QueryArrowColumn(kind, name, precision, scale);
+    }
+
+    private static int ParseArrowInteger(XElement field, string name, int? fallback)
+    {
+        var value = ChildValue(field, name);
+        if (string.IsNullOrEmpty(value))
+        {
+            if (fallback.HasValue)
+                return fallback.Value;
+            throw InvalidXml($"Arrow decimal field {name} is required.");
+        }
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed))
+            throw InvalidXml($"Arrow field {name} must be an integer.");
+        return parsed;
+    }
+
+    private static async Task WriteArrowResultsAsync(
+        IAsyncEnumerator<QueryRow> rows,
+        BlobQueryPlan plan,
+        IReadOnlyList<QueryArrowColumn> fields,
+        BlobQueryAvroWriter avro,
+        CancellationToken cancellationToken)
+    {
+        var schema = new Schema(
+            fields.Select(CreateArrowField),
+            new Dictionary<string, string>(StringComparer.Ordinal));
+        using var dataStream = new BlobQueryAvroDataStream(avro, cancellationToken);
+        using var writer = new ArrowStreamWriter(dataStream, schema, leaveOpen: true);
+        await writer.WriteStartAsync(cancellationToken);
+
+        var batch = new List<QuerySelection>(ArrowRecordBatchSize);
+        while (await rows.MoveNextAsync())
+        {
+            var selected = plan.Select(rows.Current);
+            if (selected is null)
+                continue;
+            if (selected.Values.Count != fields.Count)
+            {
+                throw new BlobQueryDataException(
+                    "InvalidArrowSchema",
+                    $"The query selected {selected.Values.Count} columns but the Arrow schema defines {fields.Count} fields.",
+                    0);
+            }
+
+            batch.Add(selected);
+            if (batch.Count < ArrowRecordBatchSize)
+                continue;
+            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken);
+            batch.Clear();
+        }
+
+        if (batch.Count > 0)
+            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken);
+        await writer.WriteEndAsync(cancellationToken);
+    }
+
+    private static Field CreateArrowField(QueryArrowColumn field)
+    {
+        IArrowType type = field.Kind switch
+        {
+            BlobQueryArrowFieldKind.Int64 => Int64Type.Default,
+            BlobQueryArrowFieldKind.Bool => BooleanType.Default,
+            BlobQueryArrowFieldKind.Timestamp => new TimestampType(TimeUnit.Millisecond, (string?)null),
+            BlobQueryArrowFieldKind.String => StringType.Default,
+            BlobQueryArrowFieldKind.Double => DoubleType.Default,
+            BlobQueryArrowFieldKind.Decimal => new Decimal128Type(field.Precision, field.Scale),
+            _ => throw new InvalidOperationException("Unknown Arrow field type.")
+        };
+        return new Field(field.Name, type, nullable: true);
+    }
+
+    private static async Task WriteArrowBatchAsync(
+        ArrowStreamWriter writer,
+        Schema schema,
+        IReadOnlyList<QueryArrowColumn> fields,
+        IReadOnlyList<QuerySelection> rows,
+        CancellationToken cancellationToken)
+    {
+        var arrays = fields
+            .Select((field, index) => BuildArrowArray(field, rows, index))
+            .ToArray();
+        using var batch = new RecordBatch(schema, arrays, rows.Count);
+        await writer.WriteRecordBatchAsync(batch, cancellationToken);
+    }
+
+    private static IArrowArray BuildArrowArray(
+        QueryArrowColumn field,
+        IReadOnlyList<QuerySelection> rows,
+        int column)
+    {
+        try
+        {
+            switch (field.Kind)
+            {
+                case BlobQueryArrowFieldKind.Int64:
+                    {
+                        var builder = new Int64Array.Builder().Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else if (cell.Value is long integer)
+                                builder.Append(integer);
+                            else if (long.TryParse(cell.ToText(), NumberStyles.Integer, CultureInfo.InvariantCulture, out integer))
+                                builder.Append(integer);
+                            else
+                                throw InvalidArrowValue(field, cell);
+                        }
+                        return builder.Build();
+                    }
+                case BlobQueryArrowFieldKind.Bool:
+                    {
+                        var builder = new BooleanArray.Builder().Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else if (cell.Value is bool boolean)
+                                builder.Append(boolean);
+                            else if (bool.TryParse(cell.ToText(), out boolean))
+                                builder.Append(boolean);
+                            else
+                                throw InvalidArrowValue(field, cell);
+                        }
+                        return builder.Build();
+                    }
+                case BlobQueryArrowFieldKind.Timestamp:
+                    {
+                        var type = new TimestampType(TimeUnit.Millisecond, (string?)null);
+                        var builder = new TimestampArray.Builder(type).Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else if (cell.Value is DateTimeOffset timestamp)
+                                builder.Append(timestamp);
+                            else if (DateTimeOffset.TryParse(
+                                         cell.ToText(),
+                                         CultureInfo.InvariantCulture,
+                                         DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                                         out timestamp))
+                            {
+                                builder.Append(timestamp);
+                            }
+                            else
+                                throw InvalidArrowValue(field, cell);
+                        }
+                        return builder.Build();
+                    }
+                case BlobQueryArrowFieldKind.String:
+                    {
+                        var builder = new StringArray.Builder().Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else
+                                builder.Append(cell.ToText());
+                        }
+                        return builder.Build();
+                    }
+                case BlobQueryArrowFieldKind.Double:
+                    {
+                        var builder = new DoubleArray.Builder().Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else if (cell.Value is double floating)
+                                builder.Append(floating);
+                            else if (double.TryParse(cell.ToText(), NumberStyles.Float, CultureInfo.InvariantCulture, out floating))
+                                builder.Append(floating);
+                            else
+                                throw InvalidArrowValue(field, cell);
+                        }
+                        return builder.Build();
+                    }
+                case BlobQueryArrowFieldKind.Decimal:
+                    {
+                        var builder = new Decimal128Array.Builder(
+                            new Decimal128Type(field.Precision, field.Scale));
+                        builder.Reserve(rows.Count);
+                        foreach (var row in rows)
+                        {
+                            var cell = row.Values[column];
+                            if (cell.Value is null)
+                                builder.AppendNull();
+                            else
+                                builder.Append(cell.ToText());
+                        }
+                        return builder.Build();
+                    }
+                default:
+                    throw new InvalidOperationException("Unknown Arrow field type.");
+            }
+        }
+        catch (BlobQueryDataException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is ArgumentException or FormatException or OverflowException)
+        {
+            throw new BlobQueryDataException(
+                "InvalidArrowType",
+                $"A value could not be represented by Arrow field '{field.Name}' as {ArrowTypeName(field.Kind)}.",
+                0);
+        }
+    }
+
+    private static BlobQueryDataException InvalidArrowValue(QueryArrowColumn field, QueryCell cell) => new(
+        "InvalidArrowType",
+        $"The value '{cell.ToText()}' could not be represented by Arrow field '{field.Name}' as {ArrowTypeName(field.Kind)}.",
+        0);
+
+    private static string ArrowTypeName(BlobQueryArrowFieldKind kind) => kind switch
+    {
+        BlobQueryArrowFieldKind.Int64 => "int64",
+        BlobQueryArrowFieldKind.Bool => "bool",
+        BlobQueryArrowFieldKind.Timestamp => "timestamp[ms]",
+        BlobQueryArrowFieldKind.String => "string",
+        BlobQueryArrowFieldKind.Double => "double",
+        BlobQueryArrowFieldKind.Decimal => "decimal",
+        _ => throw new InvalidOperationException("Unknown Arrow field type.")
+    };
 
     private static async IAsyncEnumerable<QueryRow> ReadRowsAsync(
         Stream input,
@@ -486,6 +800,69 @@ internal static class BlobQueryProtocol
         StatusCodes.Status400BadRequest,
         "InvalidXmlDocument",
         $"The query request XML is invalid. {detail}");
+}
+
+internal sealed class BlobQueryAvroDataStream(
+    BlobQueryAvroWriter writer,
+    CancellationToken requestCancellationToken) : Stream
+{
+    private long _position;
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => _position;
+    public override long Position
+    {
+        get => _position;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    public override void Write(byte[] buffer, int offset, int count) =>
+        Write(buffer.AsSpan(offset, count));
+
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        writer.AppendDataAsync(buffer.ToArray(), requestCancellationToken).GetAwaiter().GetResult();
+        _position += buffer.Length;
+    }
+
+    public override async Task WriteAsync(
+        byte[] buffer,
+        int offset,
+        int count,
+        CancellationToken cancellationToken)
+    {
+        await WriteAsync(buffer.AsMemory(offset, count), cancellationToken);
+    }
+
+    public override async ValueTask WriteAsync(
+        ReadOnlyMemory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        if (!cancellationToken.CanBeCanceled || cancellationToken == requestCancellationToken)
+        {
+            await writer.AppendDataAsync(buffer, requestCancellationToken);
+            _position += buffer.Length;
+            return;
+        }
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            requestCancellationToken,
+            cancellationToken);
+        await writer.AppendDataAsync(buffer, linked.Token);
+        _position += buffer.Length;
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
 }
 
 internal sealed class BlobQueryAvroWriter(Stream destination)
