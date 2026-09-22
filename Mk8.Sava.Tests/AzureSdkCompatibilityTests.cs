@@ -9876,6 +9876,39 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(5, result.RootElement.GetProperty("length").GetInt64());
     }
 
+    [Fact]
+    public async Task QueryBlobContentsEvaluatesDocumentedDateAndTrimFunctions()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"date-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("row.csv");
+        await blob.UploadAsync(new MemoryStream("ignored\n"u8.ToArray()));
+
+        var response = await blob.QueryAsync(
+            "SELECT DATE_ADD('day', 2, TO_TIMESTAMP('2026-09-20T10:15:30+02:30')) AS added, " +
+            "DATE_DIFF('hour', '2026-09-20T10:00:00Z', '2026-09-20T12:00:00Z') AS hours, " +
+            "EXTRACT(TIMEZONE_HOUR FROM TO_TIMESTAMP('2026-09-20T10:15:30+02:30')) AS zone_hour, " +
+            "EXTRACT(TIMEZONE_MINUTE FROM TO_TIMESTAMP('2026-09-20T10:15:30+02:30')) AS zone_minute, " +
+            "TO_STRING(TO_TIMESTAMP('2026-09-20T10:15:30+02:30'), 'yyyy-MM-dd HH:mm XXX') AS formatted, " +
+            "TRIM(BOTH 'xy' FROM 'xyvaluey') AS trimmed FROM BlobStorage LIMIT 1;",
+            new BlobQueryOptions
+            {
+                OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+            });
+        using var reader = new StreamReader(response.Value.Content);
+        using var result = JsonDocument.Parse((await reader.ReadToEndAsync()).Trim());
+
+        Assert.Equal(
+            new DateTimeOffset(2026, 9, 22, 7, 45, 30, TimeSpan.Zero),
+            result.RootElement.GetProperty("added").GetDateTimeOffset());
+        Assert.Equal(2, result.RootElement.GetProperty("hours").GetInt64());
+        Assert.Equal(2, result.RootElement.GetProperty("zone_hour").GetInt64());
+        Assert.Equal(30, result.RootElement.GetProperty("zone_minute").GetInt64());
+        Assert.Equal("2026-09-20 10:15 +02:30", result.RootElement.GetProperty("formatted").GetString());
+        Assert.Equal("value", result.RootElement.GetProperty("trimmed").GetString());
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
