@@ -99,6 +99,7 @@ if (operatorCommand is { Name: "validate" })
 }
 
 await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
+await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync();
 
 if (operatorCommand is { Name: "create" })
 {

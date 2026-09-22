@@ -94,6 +94,32 @@ public sealed class SavaOptions : IValidatableObject
                     $"AccountCapabilities for '{accountName}' enables hierarchical blob snapshots without hierarchical namespace.",
                     [nameof(AccountCapabilities)]);
             }
+            var versionLevelImmutability = capabilities.ImmutableStorageWithVersioningEnabled ||
+                                           capabilities.ImmutableStorageWithVersioningContainers.Count > 0;
+            if (versionLevelImmutability && !capabilities.VersioningEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' enables immutable storage with versioning without blob versioning.",
+                    [nameof(AccountCapabilities)]);
+            }
+            if (versionLevelImmutability && capabilities.HierarchicalNamespaceEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and hierarchical namespace.",
+                    [nameof(AccountCapabilities)]);
+            }
+            if (versionLevelImmutability && capabilities.LastAccessTimeTrackingEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and last-access-time tracking.",
+                    [nameof(AccountCapabilities)]);
+            }
+            if (capabilities.ImmutableStorageWithVersioningContainers.Any(string.IsNullOrWhiteSpace))
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' contains a blank immutable-storage container name.",
+                    [nameof(AccountCapabilities)]);
+            }
         }
 
         if (EnableCrossAccountDeduplication &&
@@ -281,6 +307,9 @@ public sealed class StorageAccountCapabilities
     public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
     public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }
     public bool LastAccessTimeTrackingEnabled { get; init; }
+    public bool VersioningEnabled { get; init; }
+    public bool ImmutableStorageWithVersioningEnabled { get; init; }
+    public HashSet<string> ImmutableStorageWithVersioningContainers { get; init; } = new(StringComparer.Ordinal);
 }
 
 public sealed class BearerAuthenticationOptions

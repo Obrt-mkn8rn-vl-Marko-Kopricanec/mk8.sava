@@ -52,6 +52,29 @@ public sealed class BlobService(
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         capabilities.LastAccessTimeTrackingEnabled;
 
+    public bool IsImmutableStorageWithVersioningEnabled(string account, string container) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        (capabilities.ImmutableStorageWithVersioningEnabled ||
+         capabilities.ImmutableStorageWithVersioningContainers.Contains(container));
+
+    public async Task ApplyConfiguredAccountCapabilitiesAsync(CancellationToken cancellationToken = default)
+    {
+        foreach (var (account, capabilities) in _options.AccountCapabilities)
+        {
+            if (!capabilities.VersioningEnabled)
+                continue;
+
+            var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+            if (!properties.VersioningEnabled)
+            {
+                await metadata.PutServicePropertiesAsync(
+                    account,
+                    properties with { VersioningEnabled = true },
+                    cancellationToken);
+            }
+        }
+    }
+
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
@@ -134,7 +157,9 @@ public sealed class BlobService(
             Metadata = userMetadata,
             PublicAccess = publicAccess,
             DefaultEncryptionScope = defaultEncryptionScope,
-            PreventEncryptionScopeOverride = preventEncryptionScopeOverride
+            PreventEncryptionScopeOverride = preventEncryptionScopeOverride,
+            ImmutableStorageWithVersioningEnabled =
+                IsImmutableStorageWithVersioningEnabled(account, name)
         };
 
         if (!await metadata.TryCreateContainerAsync(container, cancellationToken))
@@ -207,6 +232,13 @@ public sealed class BlobService(
                 StatusCodes.Status403Forbidden,
                 "ContainerOperationFailure",
                 "The account being accessed does not have sufficient permissions to execute this operation.");
+        }
+        if (current.ImmutableStorageWithVersioningEnabled)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "ContainerImmutableStorageWithVersioningEnabled",
+                "The requested operation is not allowed because the container has immutable storage with versioning enabled.");
         }
         EnsureContainerMutable(current);
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
@@ -795,7 +827,6 @@ public sealed class BlobService(
         var now = metadata.GetUtcNow();
         var updated = current with
         {
-            GenerationId = Guid.NewGuid().ToString("N"),
             Revision = MetadataStore.NewRevision(),
             Content = content,
             ETag = MetadataStore.NewETag(),
@@ -807,12 +838,8 @@ public sealed class BlobService(
             AppendBlockCount = checked(current.AppendBlockCount + 1),
             Copy = null
         };
-        return await metadata.PublishBlobAsync(
-            updated,
-            current.GenerationId,
-            current.Revision,
-            IsHierarchicalNamespaceEnabled(current.Account),
-            cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        return updated;
     }
 
     public async Task<BlobRecord> PutPageAsync(
@@ -861,7 +888,6 @@ public sealed class BlobService(
             var now = metadata.GetUtcNow();
             var updated = current with
             {
-                GenerationId = Guid.NewGuid().ToString("N"),
                 Revision = MetadataStore.NewRevision(),
                 Content = content.Manifest,
                 PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
@@ -871,12 +897,8 @@ public sealed class BlobService(
                     ? now
                     : current.LastAccessedAt
             };
-            return await metadata.PublishBlobAsync(
-                updated,
-                current.GenerationId,
-                current.Revision,
-                IsHierarchicalNamespaceEnabled(current.Account),
-                cancellationToken);
+            await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+            return updated;
         }
     }
 
@@ -1232,6 +1254,7 @@ public sealed class BlobService(
         bool locked,
         CancellationToken cancellationToken)
     {
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         if (expiresOn <= metadata.GetUtcNow())
@@ -1257,6 +1280,7 @@ public sealed class BlobService(
         BlobRecord current,
         CancellationToken cancellationToken)
     {
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         if (current.ImmutabilityLocked)
@@ -1277,6 +1301,7 @@ public sealed class BlobService(
         bool hasLegalHold,
         CancellationToken cancellationToken)
     {
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         var updated = current with
@@ -3052,6 +3077,8 @@ public sealed class BlobService(
         BlobRecord? current = null)
     {
         var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        if (options.ImmutabilityUntil.HasValue || options.ImmutabilityLocked || options.HasLegalHold)
+            EnsureVersionLevelImmutabilityEnabled(containerRecord);
         var resolved = ApplyContainerEncryptionPolicy(containerRecord, EncryptionOf(options), current);
         return options with
         {
@@ -3233,7 +3260,13 @@ public sealed class BlobService(
     }
 
     private ContainerRecord EffectiveContainer(ContainerRecord container) =>
-        container with { Lease = leases.GetEffective(container.Lease) };
+        container with
+        {
+            Lease = leases.GetEffective(container.Lease),
+            ImmutableStorageWithVersioningEnabled =
+                container.ImmutableStorageWithVersioningEnabled ||
+                IsImmutableStorageWithVersioningEnabled(container.Account, container.Name)
+        };
 
     private BlobRecord EffectiveBlob(BlobRecord blob) =>
         blob with
@@ -3326,6 +3359,29 @@ public sealed class BlobService(
             throw new AzureStorageException(StatusCodes.Status409Conflict, "ContainerHasLegalHold", "The container has a legal hold.");
         if (container.ImmutabilityLocked && container.ImmutabilityUntil > DateTimeOffset.UtcNow)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "ContainerImmutabilityPolicyLocked", "The container has a locked immutability policy.");
+    }
+
+    private async Task EnsureVersionLevelImmutabilityEnabledAsync(
+        BlobRecord blob,
+        CancellationToken cancellationToken)
+    {
+        var container = await GetContainerAsync(
+            blob.Account,
+            blob.Container,
+            includeDeleted: false,
+            cancellationToken);
+        EnsureVersionLevelImmutabilityEnabled(container);
+    }
+
+    private static void EnsureVersionLevelImmutabilityEnabled(ContainerRecord container)
+    {
+        if (!container.ImmutableStorageWithVersioningEnabled)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOperationNotSupported",
+                "The operation requires immutable storage with versioning to be enabled on the container.");
+        }
     }
 
     private void EnsureBlobMutable(BlobRecord blob)

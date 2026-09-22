@@ -114,6 +114,12 @@ public sealed partial class AzureResponseWriter
                         "DenyEncryptionScopeOverride",
                         container.PreventEncryptionScopeOverride ? "true" : "false");
                 }
+                if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+                {
+                    writer.WriteElementString(
+                        "ImmutableStorageWithVersioningEnabled",
+                        container.ImmutableStorageWithVersioningEnabled ? "true" : "false");
+                }
                 if (isDeleted)
                 {
                     WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
@@ -654,6 +660,11 @@ public sealed partial class AzureResponseWriter
             response.Headers["x-ms-default-encryption-scope"] = container.DefaultEncryptionScope;
             response.Headers["x-ms-deny-encryption-scope-override"] =
                 container.PreventEncryptionScopeOverride ? "true" : "false";
+        }
+        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+        {
+            response.Headers["x-ms-immutable-storage-with-versioning-enabled"] =
+                container.ImmutableStorageWithVersioningEnabled ? "true" : "false";
         }
     }
 

@@ -1426,7 +1426,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "immutabilitypolicies")
         {
-            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Set Blob Immutability Policy");
+            RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Set Blob Immutability Policy");
             Require(request, 'i');
             RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
@@ -1455,7 +1455,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsDelete(http.Request.Method) && comp == "immutabilitypolicies")
         {
-            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Delete Blob Immutability Policy");
+            RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Delete Blob Immutability Policy");
             Require(request, 'i');
             RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
@@ -1465,7 +1465,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "legalhold")
         {
-            RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Set Blob Legal Hold");
+            RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Set Blob Legal Hold");
             Require(request, 'i');
             RequireZeroContentLength(http.Request);
             var value = ProtocolParsing.First(http.Request.Headers, "x-ms-legal-hold");
@@ -4374,7 +4374,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(
                 StorageRequestContext.Get(request.HttpContext),
-                new DateOnly(2020, 6, 12),
+                new DateOnly(2020, 10, 2),
                 "Blob-level immutability headers");
         }
         if (untilValue is null && modeValue is not null)
