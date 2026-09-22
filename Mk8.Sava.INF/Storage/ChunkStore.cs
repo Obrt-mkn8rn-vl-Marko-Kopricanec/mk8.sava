@@ -1315,6 +1315,11 @@ public sealed class ChunkStore
         await gate.WaitAsync(cancellationToken);
         try
         {
+            // Another writer may have published the same verified bytes while this
+            // writer was encoding its temporary file. Skip an orphan pack record.
+            if (File.Exists(GetChunkPath(id)) || _metadata.PackedChunkExists(id))
+                return false;
+
             var payloadLength = checked((int)new FileInfo(chunkFilePath).Length);
             var idLength = Encoding.UTF8.GetByteCount(id);
             var recordLength = checked(PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
