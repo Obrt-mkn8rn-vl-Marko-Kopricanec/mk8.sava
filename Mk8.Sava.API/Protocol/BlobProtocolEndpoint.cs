@@ -607,6 +607,13 @@ public static class BlobProtocolEndpoint
         {
             RequireContainerAclPermission(request);
             ValidateOptionalLease(http.Request, container.Lease, "container");
+            if (!IsServiceVersionAtLeast(request, new DateOnly(2015, 4, 5)) &&
+                container.AccessPolicies.Values.Any(policy =>
+                    policy.Permission.Contains('a') || policy.Permission.Contains('c')))
+            {
+                throw AzureStorageException.FeatureVersionMismatch(
+                    "Stored access policy contains a permission that is not supported by this version.");
+            }
             AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
             if (HttpMethods.IsGet(http.Request.Method))
                 await writer.WriteAclAsync(http, container, cancellationToken);

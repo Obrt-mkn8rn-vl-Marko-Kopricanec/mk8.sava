@@ -5665,6 +5665,51 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await AssertErrorAsync(ReplaceQueryValue(ipUri, "sip", "not-an-ip"), "AuthenticationFailed");
     }
 
+    [Theory]
+    [InlineData("a")]
+    [InlineData("c")]
+    public async Task LegacyGetContainerAclRejectsStoredCreateAndAddPermissions(string permission)
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"acl-version-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        async Task SetPolicyAsync(string value) => await container.SetAccessPolicyAsync(
+            PublicAccessType.None,
+            [new BlobSignedIdentifier
+            {
+                Id = "versioned-policy",
+                AccessPolicy = new BlobAccessPolicy { Permissions = value }
+            }]);
+
+        async Task<HttpResponseMessage> GetAclAsync(string version)
+        {
+            var uri = AppendQuery(container.Uri, "restype=container&comp=acl");
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            AddSharedKeyLiteAuthorization(request);
+            using var client = new HttpClient(factory.Server.CreateHandler());
+            return await client.SendAsync(request);
+        }
+
+        await SetPolicyAsync(permission);
+        using (var legacy = await GetAclAsync("2014-02-14"))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, legacy.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", GetResponseHeader(legacy, "x-ms-error-code"));
+        }
+        using (var modern = await GetAclAsync("2015-04-05"))
+        {
+            Assert.Equal(HttpStatusCode.OK, modern.StatusCode);
+            Assert.Contains($"<Permission>{permission}</Permission>",
+                await modern.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        }
+
+        await SetPolicyAsync("r");
+        using var legacyReadOnly = await GetAclAsync("2014-02-14");
+        Assert.Equal(HttpStatusCode.OK, legacyReadOnly.StatusCode);
+    }
+
     [Fact]
     public async Task DisabledSharedKeyAccessRejectsKeyBasedAuthButAllowsUserDelegationSas()
     {

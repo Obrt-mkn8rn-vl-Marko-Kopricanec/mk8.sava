@@ -103,6 +103,10 @@ permissions are subject to the same canonical and version gates as permissions
 carried by the token. Account and user-delegation SAS cannot reference a stored
 access policy.
 
+Get Container ACL with a service version before `2015-04-05` returns
+`409 FeatureVersionMismatch` when any stored policy grants create or add
+permission. Those policies remain readable from `2015-04-05` onward.
+
 Valid SAS protocol and IPv4 restrictions that exclude the request return
 Azure's dedicated `403 AuthorizationProtocolMismatch` and
 `403 AuthorizationSourceIPMismatch` errors. A malformed `spr` value, malformed
