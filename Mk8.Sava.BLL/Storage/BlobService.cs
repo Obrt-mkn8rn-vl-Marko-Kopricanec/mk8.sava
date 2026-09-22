@@ -224,12 +224,15 @@ public sealed class BlobService(
     public async Task<ContainerRecord> SetContainerLeaseAsync(
         ContainerRecord current,
         LeaseRecord lease,
+        bool updateProperties,
         CancellationToken cancellationToken)
     {
         var updated = current with
         {
             Lease = lease,
-            Revision = MetadataStore.NewRevision()
+            Revision = MetadataStore.NewRevision(),
+            ETag = updateProperties ? MetadataStore.NewETag() : current.ETag,
+            LastModified = updateProperties ? metadata.GetUtcNow() : current.LastModified
         };
         await metadata.PutContainerAsync(updated, current.Revision, cancellationToken);
         return updated;
@@ -1115,6 +1118,13 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobArchived",
+                "This operation is not permitted on an archived blob.");
+        }
         return metadata.CreateSnapshotAsync(current, snapshotMetadata, metadata.GetUtcNow(), cancellationToken);
     }
 

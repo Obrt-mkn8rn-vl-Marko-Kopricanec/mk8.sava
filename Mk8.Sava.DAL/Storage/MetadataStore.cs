@@ -1446,6 +1446,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 VersionId = null,
                 Snapshot = snapshotId,
                 Metadata = snapshotMetadata ?? source.Metadata,
+                ETag = snapshotMetadata is null ? source.ETag : NewETag(),
+                LastModified = snapshotMetadata is null ? source.LastModified : now,
                 Lease = LeaseRecord.Available
             };
 

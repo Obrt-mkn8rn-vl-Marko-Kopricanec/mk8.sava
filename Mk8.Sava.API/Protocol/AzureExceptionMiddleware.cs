@@ -121,7 +121,13 @@ public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azure
     public static void AddCommonHeaders(HttpContext context)
     {
         context.Response.Headers["x-ms-request-id"] = GetRequestId(context);
-        context.Response.Headers["x-ms-version"] = StorageRequestContext.TryGet(context)?.ServiceVersion ?? "2023-11-03";
+        var request = StorageRequestContext.TryGet(context);
+        if (request is null ||
+            StorageServiceVersions.TryParse(request.ServiceVersion, out var version) &&
+            version >= new DateOnly(2009, 9, 19))
+        {
+            context.Response.Headers["x-ms-version"] = request?.ServiceVersion ?? "2023-11-03";
+        }
         context.Response.Headers.Date = DateTimeOffset.UtcNow.ToString("R", CultureInfo.InvariantCulture);
         context.Response.Headers.Server = "mk8.sava/1.0";
         if (context.Request.Headers.TryGetValue("x-ms-client-request-id", out var clientRequestId) &&
