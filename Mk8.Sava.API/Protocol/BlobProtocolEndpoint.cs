@@ -1477,8 +1477,13 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Append Blob Seal");
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            RequireZeroContentLength(http.Request);
+            BlobConditionEvaluator.EvaluateWrite(http.Request, blob.ETag, blob.LastModified);
             EnsureLease(http.Request, blob.Lease, "blob");
-            var updated = await service.SealAppendBlobAsync(blob, cancellationToken);
+            var expectedPosition = TryParseLongHeader(
+                http.Request.Headers,
+                "x-ms-blob-condition-appendpos");
+            var updated = await service.SealAppendBlobAsync(blob, expectedPosition, cancellationToken);
             AzureResponseWriter.AddAppendBlobSealHeaders(http.Response, updated);
             return;
         }
@@ -1507,8 +1512,10 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "expiry")
         {
+            RequireFeatureVersion(request, new DateOnly(2020, 2, 10), "Set Blob Expiry");
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            RequireZeroContentLength(http.Request);
             EnsureLease(http.Request, blob.Lease, "blob");
             var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, DateTimeOffset.UtcNow);
             var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
@@ -4198,7 +4205,12 @@ public static class BlobProtocolEndpoint
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
                 return null;
             case "absolute":
-                if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var absolute))
+                if (!DateTimeOffset.TryParseExact(
+                        value,
+                        "R",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out var absolute))
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
                 return absolute;
             case "relativetonow":

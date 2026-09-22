@@ -2854,6 +2854,44 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             new Dictionary<string, string> { ["locked"] = "true" },
             new BlobRequestConditions { LeaseId = acquired.Value.LeaseId });
         await lease.ReleaseAsync();
+
+        var beforeSeal = (await append.GetPropertiesAsync()).Value;
+        var wrongPosition = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            append.SealAsync(new AppendBlobRequestConditions
+            {
+                IfAppendPositionEqual = beforeSeal.ContentLength + 1
+            }));
+        Assert.Equal(StatusCodes.Status412PreconditionFailed, wrongPosition.Status);
+        Assert.Equal("AppendPositionConditionNotMet", wrongPosition.ErrorCode);
+
+        var wrongEtag = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            append.SealAsync(new AppendBlobRequestConditions
+            {
+                IfMatch = new ETag("\"not-the-current-etag\"")
+            }));
+        Assert.Equal(StatusCodes.Status412PreconditionFailed, wrongEtag.Status);
+        Assert.Equal("ConditionNotMet", wrongEtag.ErrorCode);
+
+        var sealUri = AppendQuery(
+            append.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=seal");
+        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        using (var bodyRequest = new HttpRequestMessage(HttpMethod.Put, sealUri)
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            bodyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var bodyResponse = await transport.SendAsync(bodyRequest);
+            Assert.Equal(HttpStatusCode.BadRequest, bodyResponse.StatusCode);
+            Assert.Equal("InvalidHeaderValue", bodyResponse.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        await append.SealAsync(new AppendBlobRequestConditions
+        {
+            IfAppendPositionEqual = beforeSeal.ContentLength
+        });
+        Assert.True((await append.GetPropertiesAsync()).Value.IsSealed);
     }
 
     [Fact]
@@ -6957,6 +6995,112 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.False(response.Headers.Contains("x-ms-blob-sealed"));
         }
+
+        var expiring = container.GetBlobClient("expiring.bin");
+        await expiring.UploadAsync(BinaryData.FromString("expiry payload"));
+        var expiryUri = AppendQuery(
+            expiring.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=expiry");
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "60000");
+            await AssertFeatureVersionMismatchAsync(transport, request);
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "60000");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "Absolute");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", DateTimeOffset.UtcNow.AddMinutes(5).ToString("O"));
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var absoluteExpiry = DateTimeOffset.UtcNow.AddMinutes(5);
+        absoluteExpiry = new DateTimeOffset(
+            absoluteExpiry.Year,
+            absoluteExpiry.Month,
+            absoluteExpiry.Day,
+            absoluteExpiry.Hour,
+            absoluteExpiry.Minute,
+            absoluteExpiry.Second,
+            TimeSpan.Zero);
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "Absolute");
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-expiry-time",
+                absoluteExpiry.ToString("R", CultureInfo.InvariantCulture));
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.True(response.Headers.Contains("ETag"));
+            Assert.True(response.Content.Headers.Contains("Last-Modified"));
+        }
+        var expiringRecord = await factory.Services.GetRequiredService<BlobService>().GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            expiring.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.Equal(absoluteExpiry, expiringRecord.ExpiresAt);
+
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "NeverExpire");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "1");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "NeverExpire");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+        expiringRecord = await factory.Services.GetRequiredService<BlobService>().GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            expiring.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.Null(expiringRecord.ExpiresAt);
 
         var mutable = container.GetBlobClient("mutable.bin");
         await mutable.UploadAsync(BinaryData.FromString("mutable payload"));
