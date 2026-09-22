@@ -266,8 +266,13 @@ verify a representative full read and a backup. Only then replace the Shared
 Key credential while retaining the same data key. Never replace or remove a
 data key while chunks in its domain are reachable: old content would become
 unreadable. Backups fingerprint the effective data key and reject restore with
-the wrong key, but a live-root startup key-continuity guard and online data-key
-rotation are still outstanding. Preserve data keys separately from backups.
+the wrong key. The live root records the effective key fingerprint for each
+account or cross-account sharing domain with reachable chunks and rejects a
+mismatch at startup, before accepting requests. On the first start after an
+older metadata schema, it verifies one encrypted chunk per distinct domain
+before recording the fingerprints. This migration check is not a full
+integrity scan, and online data-key rotation is still outstanding. Preserve
+data keys separately from backups.
 
 `AllowSharedKeyAccessForServices:Blob:Enabled` mirrors Azure's Blob-specific
 management setting. When set to `false`, it denies Blob Shared Key, Shared Key
@@ -581,10 +586,11 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 5 and the backup container format is version 1. Schema 2 adds
+version 6 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
 schema 3 adds a transactional blob-tag search index; schema 4 adds authoritative
-pack and packed-chunk locator tables; schema 5 adds object-replication state.
+pack and packed-chunk locator tables; schema 5 adds object-replication state;
+schema 6 adds durable data-key fingerprints for reachable encryption domains.
 The JSON blob/block manifests remain
 authoritative and startup and backup validation check the derived indexes against
 them. The service migrates schema 1, 2, or 3 on startup and can validate or
