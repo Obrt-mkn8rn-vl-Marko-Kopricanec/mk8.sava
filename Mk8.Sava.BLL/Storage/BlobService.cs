@@ -37,6 +37,11 @@ public sealed class BlobService(
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         capabilities.HierarchicalNamespaceEnabled;
 
+    public bool SupportsBlobIndexTags(string account) =>
+        !IsHierarchicalNamespaceEnabled(account) ||
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.HierarchicalNamespaceBlobIndexTagsEnabled;
+
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,

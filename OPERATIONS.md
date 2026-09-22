@@ -19,7 +19,8 @@ before clients write data:
   "Sava": {
     "AccountCapabilities": {
       "datalakeaccount": {
-        "HierarchicalNamespaceEnabled": true
+        "HierarchicalNamespaceEnabled": true,
+        "HierarchicalNamespaceBlobIndexTagsEnabled": false
       }
     }
   }
@@ -30,6 +31,13 @@ Every capability entry must name an account in `Sava:Accounts`. The Blob endpoin
 reports the setting through Get Account Information and applies the corresponding
 Blob API restrictions and hierarchical listing/property shape. The separate Data
 Lake `dfs` protocol is outside this service's endpoint boundary.
+
+Blob index tags on HNS accounts remain an Azure preview that requires the
+`Microsoft.Storage/BlobIndexForHns` feature registration. Set
+`HierarchicalNamespaceBlobIndexTagsEnabled` only for an account on which that
+preview behavior is intended; its REST surface additionally requires service
+version 2024-11-04 or later. Flat-namespace accounts always retain normal blob
+index tag support.
 
 ## Health and metrics
 

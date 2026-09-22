@@ -1698,6 +1698,119 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceBlobIndexTagsRequireTheExplicitPreviewCapability()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-tags-disabled-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("plain.bin");
+        await blob.UploadAsync(BinaryData.FromString("untagged"));
+
+        static void AssertUnsupported(RequestFailedException exception)
+        {
+            Assert.Equal(StatusCodes.Status400BadRequest, exception.Status);
+            Assert.Equal("BlobTagsNotSupportedForAccountType", exception.ErrorCode);
+        }
+
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() => blob.GetTagsAsync()));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetTagsAsync(new Dictionary<string, string> { ["state"] = "blocked" })));
+
+        var taggedUpload = container.GetBlobClient("tagged-upload.bin");
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() =>
+            taggedUpload.UploadAsync(
+                BinaryData.FromString("must remain unpublished"),
+                new BlobUploadOptions
+                {
+                    Tags = new Dictionary<string, string> { ["state"] = "blocked" }
+                })));
+        Assert.False((await taggedUpload.ExistsAsync()).Value);
+
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            await foreach (var _ in container.GetBlobsAsync(new GetBlobsOptions { Traits = BlobTraits.Tags }))
+            {
+            }
+        }));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            await foreach (var _ in service.FindBlobsByTagsAsync("\"state\" = 'blocked'"))
+            {
+            }
+        }));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DownloadContentAsync(new BlobDownloadOptions
+            {
+                Conditions = new BlobRequestConditions { TagConditions = "\"state\" = 'blocked'" }
+            })));
+    }
+
+    [Fact]
+    public async Task HierarchicalNamespaceBlobIndexTagPreviewMatchesTheBlobApiFromVersion20241104()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceBlobIndexTagsEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-tags-preview-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/tagged.bin");
+        await blob.UploadAsync(
+            BinaryData.FromString("preview tags"),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string> { ["state"] = "initial" }
+            });
+
+        Assert.Equal("initial", (await blob.GetTagsAsync()).Value.Tags["state"]);
+        await blob.SetTagsAsync(new Dictionary<string, string> { ["state"] = "updated" });
+        Assert.Equal("updated", (await blob.GetTagsAsync()).Value.Tags["state"]);
+
+        var listed = await container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Traits = BlobTraits.Tags,
+            Prefix = blob.Name
+        }).SingleAsync();
+        Assert.Equal("updated", listed.Tags["state"]);
+        var found = await service.FindBlobsByTagsAsync("\"state\" = 'updated'").ToListAsync();
+        Assert.Contains(found, item => item.BlobContainerName == container.Name && item.BlobName == blob.Name);
+
+        var tagSas = blob.GenerateSasUri(
+            BlobSasPermissions.Tag,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using (var boundaryRequest = new HttpRequestMessage(HttpMethod.Get, AppendQuery(tagSas, "comp=tags")))
+        {
+            boundaryRequest.Headers.TryAddWithoutValidation("x-ms-version", "2024-11-04");
+            using var boundaryResponse = await transport.SendAsync(boundaryRequest);
+            Assert.Equal(HttpStatusCode.OK, boundaryResponse.StatusCode);
+            Assert.Contains("<Key>state</Key><Value>updated</Value>", await boundaryResponse.Content.ReadAsStringAsync());
+        }
+
+        using var legacyRequest = new HttpRequestMessage(HttpMethod.Get, AppendQuery(tagSas, "comp=tags"));
+        legacyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var legacyResponse = await transport.SendAsync(legacyRequest);
+        Assert.Equal(HttpStatusCode.Conflict, legacyResponse.StatusCode);
+        Assert.Equal(
+            "FeatureVersionMismatch",
+            legacyResponse.Headers.GetValues("x-ms-error-code").Single());
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

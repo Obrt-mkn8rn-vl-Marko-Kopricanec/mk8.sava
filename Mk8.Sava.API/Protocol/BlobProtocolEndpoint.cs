@@ -184,6 +184,7 @@ public static class BlobProtocolEndpoint
         if (comp == "blobs" && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'f');
+            RequireBlobIndexTags(request, service, "Find Blobs by Tags");
             await WriteFindByTagsAsync(
                 http,
                 request,
@@ -395,6 +396,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsGet(http.Request.Method) && comp == "blobs")
         {
             Require(request, 'f');
+            RequireBlobIndexTags(request, service, "Find Blobs by Tags");
             _ = await service.GetContainerAsync(
                 request.Account,
                 containerName,
@@ -481,7 +483,8 @@ public static class BlobProtocolEndpoint
                 includes,
                 delimiter,
                 http.Request.Query["showonly"].ToString(),
-                hierarchicalNamespace);
+                hierarchicalNamespace,
+                service.SupportsBlobIndexTags(request.Account));
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -1472,8 +1475,8 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsGet(http.Request.Method) && comp == "tags")
         {
-            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Get Blob Tags");
             Require(request, 't');
+            RequireBlobIndexTags(request, service, "Get Blob Tags");
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
@@ -1503,8 +1506,8 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "tags")
         {
-            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tags");
             Require(request, 't');
+            RequireBlobIndexTags(request, service, "Set Blob Tags");
             EnsureMutableVersion(blob);
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: true);
@@ -2823,18 +2826,6 @@ public static class BlobProtocolEndpoint
         string? scopedContainer,
         CancellationToken cancellationToken)
     {
-        if (!DateOnly.TryParseExact(
-                request.ServiceVersion,
-                "yyyy-MM-dd",
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.None,
-                out var serviceVersion) ||
-            serviceVersion < new DateOnly(2019, 12, 12))
-        {
-            throw AzureStorageException.FeatureVersionMismatch(
-                "Find Blobs by Tags requires service version 2019-12-12 or later.");
-        }
-
         var expression = http.Request.Query["where"].ToString();
         var filter = BlobTagQuery.ParseFindExpression(expression);
         if (scopedContainer is not null)
@@ -2882,7 +2873,7 @@ public static class BlobProtocolEndpoint
                 xml.WriteStartElement("Blob");
                 xml.WriteElementString("Name", blob.Name);
                 xml.WriteElementString("ContainerName", blob.Container);
-                if (serviceVersion >= new DateOnly(2020, 4, 8))
+                if (IsServiceVersionAtLeast(request, new DateOnly(2020, 4, 8)))
                 {
                     xml.WriteStartElement("Tags");
                     xml.WriteStartElement("TagSet");
@@ -3290,11 +3281,12 @@ public static class BlobProtocolEndpoint
     {
         if (request.Headers.ContainsKey("x-ms-tags"))
         {
-            RequireFeatureVersion(
-                StorageRequestContext.Get(request.HttpContext),
-                new DateOnly(2019, 12, 12),
+            var context = StorageRequestContext.Get(request.HttpContext);
+            RequireBlobIndexTags(
+                context,
+                request.HttpContext.RequestServices.GetRequiredService<BlobService>(),
                 "Blob index tags");
-            Require(StorageRequestContext.Get(request.HttpContext), 't');
+            Require(context, 't');
         }
         return ProtocolParsing.ReadTagsHeader(request.Headers);
     }
@@ -3410,7 +3402,8 @@ public static class BlobProtocolEndpoint
         IReadOnlySet<string> includes,
         string delimiter,
         string showOnly,
-        bool hierarchicalNamespace)
+        bool hierarchicalNamespace,
+        bool supportsBlobIndexTags)
     {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -3439,7 +3432,11 @@ public static class BlobProtocolEndpoint
         if (includes.Contains("deleted"))
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Listing deleted blobs");
         if (includes.Contains("tags"))
-            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Listing blob index tags");
+            RequireBlobIndexTags(
+                request,
+                hierarchicalNamespace,
+                supportsBlobIndexTags,
+                "Listing blob index tags");
         if (includes.Contains("versions"))
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Listing blob versions");
         if (includes.Contains("immutabilitypolicy"))
@@ -3879,7 +3876,12 @@ public static class BlobProtocolEndpoint
                 headerName,
                 value);
         }
-        Require(StorageRequestContext.Get(request.HttpContext), 't');
+        var context = StorageRequestContext.Get(request.HttpContext);
+        RequireBlobIndexTags(
+            context,
+            request.HttpContext.RequestServices.GetRequiredService<BlobService>(),
+            "Copy source tags");
+        Require(context, 't');
         return true;
     }
 
@@ -4175,18 +4177,8 @@ public static class BlobProtocolEndpoint
             return;
 
         var context = StorageRequestContext.Get(request.HttpContext);
-        if (!DateOnly.TryParseExact(
-                context.ServiceVersion,
-                "yyyy-MM-dd",
-                CultureInfo.InvariantCulture,
-                DateTimeStyles.None,
-                out var serviceVersion) || serviceVersion < new DateOnly(2019, 12, 12))
-        {
-            throw AzureStorageException.FeatureVersionMismatch(
-                $"The {headerName} condition requires service version 2019-12-12 or later.",
-                headerName,
-                expression);
-        }
+        var service = request.HttpContext.RequestServices.GetRequiredService<BlobService>();
+        RequireBlobIndexTags(context, service, $"The {headerName} condition", blob?.Account);
 
         if (requirePermission && !context.Authorization.Allows('t'))
         {
@@ -4197,6 +4189,35 @@ public static class BlobProtocolEndpoint
         if (BlobTagCondition.Evaluate(expression, blob?.Tags ?? EmptyBlobTags, headerName))
             return;
         throw source ? SourceConditionNotMet() : AzureStorageException.ConditionNotMet();
+    }
+
+    private static void RequireBlobIndexTags(
+        StorageRequestContext request,
+        BlobService service,
+        string feature,
+        string? account = null)
+    {
+        var resolvedAccount = account ?? request.Account;
+        var hierarchicalNamespace = service.IsHierarchicalNamespaceEnabled(resolvedAccount);
+        RequireBlobIndexTags(
+            request,
+            hierarchicalNamespace,
+            service.SupportsBlobIndexTags(resolvedAccount),
+            feature);
+    }
+
+    private static void RequireBlobIndexTags(
+        StorageRequestContext request,
+        bool hierarchicalNamespace,
+        bool supportsBlobIndexTags,
+        string feature)
+    {
+        RequireFeatureVersion(
+            request,
+            hierarchicalNamespace ? new DateOnly(2024, 11, 4) : new DateOnly(2019, 12, 12),
+            feature);
+        if (hierarchicalNamespace && !supportsBlobIndexTags)
+            throw AzureStorageException.BlobTagsNotSupportedForAccountType();
     }
 
     private static AzureStorageException SourceConditionNotMet() =>
