@@ -617,8 +617,8 @@ public sealed class ChunkStore
                         destination.Flush(flushToDisk: true);
                     }
 
-                    Directory.CreateDirectory(Path.GetDirectoryName(replacementPath)!);
-                    File.Move(temporaryPath, replacementPath, overwrite: false);
+                    _paths.EnsureDurableDirectory(Path.GetDirectoryName(replacementPath)!);
+                    StorageDurability.PublishFile(temporaryPath, replacementPath, overwrite: false);
                     // A failure reported after the SQLite commit is ambiguous.
                     // Keep the published pack; orphan recovery can remove it if
                     // the transaction did not commit.
@@ -1019,7 +1019,7 @@ public sealed class ChunkStore
                 return ChunkRecompressionResult.Examined;
             }
 
-            File.Move(temporaryPath, path, overwrite: true);
+            StorageDurability.PublishFile(temporaryPath, path, overwrite: true);
             return new ChunkRecompressionResult(1, 1, bytesSaved);
         }
         finally
@@ -1197,7 +1197,7 @@ public sealed class ChunkStore
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         var baseName = $"{hash}-{bytes.Length}";
         var directory = Path.Combine(_paths.Chunks, domain, hash[..2], hash[2..4]);
-        Directory.CreateDirectory(directory);
+        _paths.EnsureDurableDirectory(directory);
 
         for (var collision = 0; ; collision++)
         {
@@ -1280,7 +1280,7 @@ public sealed class ChunkStore
                         }
                         else if (!File.Exists(finalPath))
                         {
-                            File.Move(temporaryPath, finalPath, overwrite: false);
+                            StorageDurability.PublishFile(temporaryPath, finalPath, overwrite: false);
                             _pins[id] = _pins.GetValueOrDefault(id) + 1;
                             created = true;
                         }
@@ -1385,7 +1385,7 @@ public sealed class ChunkStore
         BinaryPrimitives.WriteUInt64LittleEndian(footer, PackRecordFooterMagic);
 
         var path = GetPackPath(pack.PackId);
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        _paths.EnsureDurableDirectory(Path.GetDirectoryName(path)!);
         await using var output = new FileStream(
             path,
             FileMode.OpenOrCreate,
@@ -1401,6 +1401,8 @@ public sealed class ChunkStore
         await output.WriteAsync(footer, cancellationToken);
         await output.FlushAsync(cancellationToken);
         output.Flush(flushToDisk: true);
+        if (recordOffset == 0)
+            StorageDurability.FlushDirectory(Path.GetDirectoryName(path)!);
         return new PackedChunkLocation(
             id,
             pack.PackId,
