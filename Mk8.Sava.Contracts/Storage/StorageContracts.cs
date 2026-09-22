@@ -30,6 +30,9 @@ public sealed record BlobTierUpdate(BlobRecord Blob, bool Pending);
 
 public sealed record StorageMaintenanceResult(
     int CompletedCopies,
+    int CompletedObjectReplications,
+    int FailedObjectReplications,
+    int RemovedObjectReplicas,
     int CompletedRehydrations,
     int CompletedSmartTierTransitions,
     int ExpiredBlobs,

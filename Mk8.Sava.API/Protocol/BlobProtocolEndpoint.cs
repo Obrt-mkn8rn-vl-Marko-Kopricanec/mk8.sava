@@ -1005,6 +1005,13 @@ public static class BlobProtocolEndpoint
         {
             throw AzureStorageException.AuthorizationPermissionMismatch();
         }
+        if (service.IsObjectReplicationDestinationContainer(request.Account, containerName) &&
+            (HttpMethods.IsPut(http.Request.Method) && comp != "tier" ||
+             HttpMethods.IsPatch(http.Request.Method) ||
+             HttpMethods.IsDelete(http.Request.Method) && !string.IsNullOrEmpty(comp)))
+        {
+            throw AzureStorageException.BlobOperationNotSupported();
+        }
         var versionId = NullIfEmpty(http.Request.Query["versionid"].ToString());
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
         if (snapshot is not null)

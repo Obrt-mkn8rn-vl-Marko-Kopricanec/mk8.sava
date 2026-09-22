@@ -135,6 +135,17 @@ public sealed partial class AzureResponseWriter
             lastAccessTimeTracking ? entry.Blob?.LastAccessedAt : null);
         AddMapColumn(fields, arrays, "Tags", items, entry =>
             includes.Contains("tags") && entry.Blob is { Tags.Count: > 0 } blob ? blob.Tags : null);
+        AddMapColumn(fields, arrays, "OrMetadata", items, entry =>
+            entry.Blob is { Kind: BlobKind.BlockBlob, ObjectReplicationStatuses.Count: > 0 } blob
+                ? blob.ObjectReplicationStatuses.ToDictionary(
+                    pair => $"or-{pair.Key}",
+                    pair => pair.Value.Status,
+                    StringComparer.Ordinal)
+                : null);
+        AddStringColumn(fields, arrays, "OrsPolicySourceBlob", items, entry =>
+            entry.Blob is { Kind: BlobKind.BlockBlob } blob
+                ? blob.ObjectReplicationDestinationPolicyId
+                : null);
         AddUInt64Column(fields, arrays, "TagCount", items, entry =>
             entry.Blob is { Tags.Count: > 0 } blob ? checked((ulong)blob.Tags.Count) : null);
         AddMapColumn(fields, arrays, "Metadata", items, entry =>

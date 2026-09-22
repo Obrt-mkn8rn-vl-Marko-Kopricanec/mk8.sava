@@ -10,9 +10,10 @@ public sealed class MetadataStore(
     IStorageFaultInjector faultInjector,
     TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
     private const int ChunkIndexSchemaVersion = 2;
     private const int TagIndexSchemaVersion = 3;
+    private const int PackIndexSchemaVersion = 4;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -154,6 +155,27 @@ public sealed class MetadataStore(
                 );
                 CREATE INDEX IF NOT EXISTS ix_packed_chunks_pack
                     ON packed_chunks(pack_id, record_offset, chunk_id);
+
+                CREATE TABLE IF NOT EXISTS object_replication_states (
+                    policy_id TEXT NOT NULL,
+                    rule_id TEXT NOT NULL,
+                    source_generation_id TEXT NOT NULL,
+                    source_account TEXT NOT NULL,
+                    source_container TEXT NOT NULL,
+                    source_name TEXT NOT NULL,
+                    destination_account TEXT NOT NULL,
+                    destination_container TEXT NOT NULL,
+                    destination_generation_id TEXT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_ticks INTEGER NOT NULL,
+                    PRIMARY KEY (policy_id, rule_id, source_generation_id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_object_replication_source
+                    ON object_replication_states(source_account, source_container, source_name);
+                CREATE INDEX IF NOT EXISTS ix_object_replication_destination
+                    ON object_replication_states(destination_generation_id)
+                    WHERE destination_generation_id IS NOT NULL;
                 """, cancellationToken);
             if (schemaVersion == 1)
             {
@@ -165,7 +187,7 @@ public sealed class MetadataStore(
                 await MigrateVersion2ToVersion3Async(connection, cancellationToken);
                 schemaVersion = TagIndexSchemaVersion;
             }
-            if (schemaVersion == TagIndexSchemaVersion)
+            if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
@@ -1592,6 +1614,384 @@ public sealed class MetadataStore(
         }
     }
 
+    internal async Task<BlobRecord?> GetBlobByGenerationAsync(
+        string generationId,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        return await GetBlobByGenerationAsync(connection, null, generationId, cancellationToken);
+    }
+
+    internal async Task<ObjectReplicationState?> GetObjectReplicationStateAsync(
+        ObjectReplicationStateKey key,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        return await GetObjectReplicationStateAsync(connection, null, key, cancellationToken);
+    }
+
+    internal async Task<ObjectReplicationStatePage> ListObjectReplicationStatesPageAsync(
+        ObjectReplicationStateKey? cursor,
+        int maximum,
+        CancellationToken cancellationToken)
+    {
+        if (maximum <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximum));
+
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT policy_id, rule_id, source_generation_id,
+                   source_account, source_container, source_name,
+                   destination_account, destination_container, destination_generation_id,
+                   source_fingerprint, status, updated_ticks
+            FROM object_replication_states
+            WHERE $has_cursor = 0
+               OR policy_id > $policy
+               OR (policy_id = $policy AND rule_id > $rule)
+               OR (policy_id = $policy AND rule_id = $rule AND source_generation_id > $generation)
+            ORDER BY policy_id, rule_id, source_generation_id
+            LIMIT $limit;
+            """;
+        command.Parameters.AddWithValue("$has_cursor", cursor.HasValue ? 1 : 0);
+        command.Parameters.AddWithValue("$policy", cursor?.PolicyId ?? string.Empty);
+        command.Parameters.AddWithValue("$rule", cursor?.RuleId ?? string.Empty);
+        command.Parameters.AddWithValue("$generation", cursor?.SourceGenerationId ?? string.Empty);
+        command.Parameters.AddWithValue("$limit", checked(maximum + 1));
+        var states = new List<ObjectReplicationState>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            states.Add(ReadObjectReplicationState(reader));
+        var hasMore = states.Count > maximum;
+        if (hasMore)
+            states.RemoveAt(states.Count - 1);
+        return new ObjectReplicationStatePage(states, hasMore);
+    }
+
+    internal async Task<BlobRecord> ApplyObjectReplicationAsync(
+        BlobRecord expectedSource,
+        BlobRecord proposedDestination,
+        ObjectReplicationState proposedState,
+        string statusKey,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var source = await GetBlobByGenerationAsync(
+                connection,
+                transaction,
+                expectedSource.GenerationId,
+                cancellationToken);
+            if (source is null || !string.Equals(source.Revision, expectedSource.Revision, StringComparison.Ordinal))
+                throw new StorageConcurrencyException();
+
+            var key = new ObjectReplicationStateKey(
+                proposedState.PolicyId,
+                proposedState.RuleId,
+                source.GenerationId);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            var mapped = state?.DestinationGenerationId is { } mappedGeneration
+                ? await GetBlobByGenerationAsync(connection, transaction, mappedGeneration, cancellationToken)
+                : null;
+            var current = await GetCurrentBlobAsync(
+                connection,
+                transaction,
+                proposedDestination.Account,
+                proposedDestination.Container,
+                proposedDestination.Name,
+                cancellationToken);
+            var now = _timeProvider.GetUtcNow();
+
+            BlobRecord replicated;
+            if (source.IsCurrent && mapped?.IsCurrent != true)
+            {
+                if (current is not null)
+                {
+                    EnsureObjectReplicationTargetMutable(current, now);
+                    var historical = current with
+                    {
+                        IsCurrent = false,
+                        VersionId = current.VersionId ?? await CreateUniqueVersionIdAsync(
+                            connection,
+                            transaction,
+                            current.Account,
+                            current.Container,
+                            current.Name,
+                            current.LastModified,
+                            cancellationToken),
+                        Lease = LeaseRecord.Available,
+                        Revision = NewRevision()
+                    };
+                    await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                }
+
+                replicated = proposedDestination with
+                {
+                    IsCurrent = true,
+                    IsDeleted = false,
+                    VersionId = await CreateUniqueVersionIdAsync(
+                        connection,
+                        transaction,
+                        proposedDestination.Account,
+                        proposedDestination.Container,
+                        proposedDestination.Name,
+                        proposedDestination.LastModified,
+                        cancellationToken),
+                    Snapshot = null,
+                    Lease = LeaseRecord.Available
+                };
+                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken);
+            }
+            else if (mapped is null)
+            {
+                replicated = proposedDestination with
+                {
+                    IsCurrent = false,
+                    IsDeleted = false,
+                    VersionId = await CreateUniqueVersionIdAsync(
+                        connection,
+                        transaction,
+                        proposedDestination.Account,
+                        proposedDestination.Container,
+                        proposedDestination.Name,
+                        proposedDestination.LastModified,
+                        cancellationToken),
+                    Snapshot = null,
+                    Lease = LeaseRecord.Available
+                };
+                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken);
+            }
+            else
+            {
+                EnsureObjectReplicationTargetMutable(mapped, now);
+                replicated = proposedDestination with
+                {
+                    GenerationId = mapped.GenerationId,
+                    CreatedAt = mapped.CreatedAt,
+                    VersionId = mapped.VersionId ?? await CreateUniqueVersionIdAsync(
+                        connection,
+                        transaction,
+                        mapped.Account,
+                        mapped.Container,
+                        mapped.Name,
+                        mapped.LastModified,
+                        cancellationToken),
+                    Snapshot = null,
+                    IsCurrent = source.IsCurrent,
+                    IsDeleted = false,
+                    AccessTier = mapped.AccessTier,
+                    AccessTierInferred = mapped.AccessTierInferred,
+                    SmartAccessTier = mapped.SmartAccessTier,
+                    SmartTierLastAccessedAt = mapped.SmartTierLastAccessedAt,
+                    AccessTierChangedAt = mapped.AccessTierChangedAt,
+                    ArchiveStatus = mapped.ArchiveStatus,
+                    RehydratePriority = mapped.RehydratePriority,
+                    RehydrateCompleteAt = mapped.RehydrateCompleteAt,
+                    Lease = LeaseRecord.Available
+                };
+                await UpdateBlobRowAsync(connection, transaction, replicated, cancellationToken);
+            }
+
+            var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
+                source.ObjectReplicationStatuses,
+                StringComparer.Ordinal)
+            {
+                [statusKey] = new ObjectReplicationStatusRecord
+                {
+                    Status = "complete",
+                    SourceFingerprint = proposedState.SourceFingerprint
+                }
+            };
+            var updatedSource = source with
+            {
+                Revision = NewRevision(),
+                ObjectReplicationStatuses = statuses
+            };
+            await UpdateBlobRowAsync(connection, transaction, updatedSource, cancellationToken);
+            await UpsertObjectReplicationStateAsync(
+                connection,
+                transaction,
+                proposedState with
+                {
+                    DestinationGenerationId = replicated.GenerationId,
+                    Status = "complete",
+                    UpdatedAt = now
+                },
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return replicated;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> MarkObjectReplicationFailureAsync(
+        BlobRecord expectedSource,
+        ObjectReplicationState proposedState,
+        string statusKey,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var source = await GetBlobByGenerationAsync(
+                connection,
+                transaction,
+                expectedSource.GenerationId,
+                cancellationToken);
+            if (source is null || !string.Equals(source.Revision, expectedSource.Revision, StringComparison.Ordinal))
+                throw new StorageConcurrencyException();
+
+            var key = new ObjectReplicationStateKey(
+                proposedState.PolicyId,
+                proposedState.RuleId,
+                source.GenerationId);
+            var existing = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            if (source.ObjectReplicationStatuses.TryGetValue(statusKey, out var status) &&
+                string.Equals(status.Status, "failed", StringComparison.Ordinal) &&
+                string.Equals(status.SourceFingerprint, proposedState.SourceFingerprint, StringComparison.Ordinal) &&
+                existing is { Status: "failed" } &&
+                string.Equals(existing.SourceFingerprint, proposedState.SourceFingerprint, StringComparison.Ordinal))
+            {
+                await UpsertObjectReplicationStateAsync(
+                    connection,
+                    transaction,
+                    existing with { UpdatedAt = _timeProvider.GetUtcNow() },
+                    cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return false;
+            }
+
+            var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
+                source.ObjectReplicationStatuses,
+                StringComparer.Ordinal)
+            {
+                [statusKey] = new ObjectReplicationStatusRecord
+                {
+                    Status = "failed",
+                    SourceFingerprint = proposedState.SourceFingerprint
+                }
+            };
+            await UpdateBlobRowAsync(
+                connection,
+                transaction,
+                source with
+                {
+                    Revision = NewRevision(),
+                    ObjectReplicationStatuses = statuses
+                },
+                cancellationToken);
+            await UpsertObjectReplicationStateAsync(
+                connection,
+                transaction,
+                proposedState with
+                {
+                    DestinationGenerationId = existing?.DestinationGenerationId,
+                    Status = "failed",
+                    UpdatedAt = _timeProvider.GetUtcNow()
+                },
+                cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> RemoveObjectReplicaForMissingSourceAsync(
+        ObjectReplicationState expectedState,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var key = new ObjectReplicationStateKey(
+                expectedState.PolicyId,
+                expectedState.RuleId,
+                expectedState.SourceGenerationId);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            if (state is null ||
+                !string.Equals(state.SourceFingerprint, expectedState.SourceFingerprint, StringComparison.Ordinal) ||
+                await GetBlobByGenerationAsync(
+                    connection,
+                    transaction,
+                    state.SourceGenerationId,
+                    cancellationToken) is not null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return false;
+            }
+
+            if (state.DestinationGenerationId is { } destinationGeneration)
+            {
+                var destination = await GetBlobByGenerationAsync(
+                    connection,
+                    transaction,
+                    destinationGeneration,
+                    cancellationToken);
+                if (destination is not null)
+                {
+                    EnsureObjectReplicationTargetMutable(destination, _timeProvider.GetUtcNow());
+                    await DeleteBlobRowAsync(connection, transaction, destination.GenerationId, cancellationToken);
+                }
+            }
+
+            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> ForgetObjectReplicationStateAsync(
+        ObjectReplicationState expectedState,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var key = new ObjectReplicationStateKey(
+                expectedState.PolicyId,
+                expectedState.RuleId,
+                expectedState.SourceGenerationId);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            if (state is null ||
+                !string.Equals(state.SourceFingerprint, expectedState.SourceFingerprint, StringComparison.Ordinal) ||
+                !string.Equals(
+                    state.DestinationGenerationId,
+                    expectedState.DestinationGenerationId,
+                    StringComparison.Ordinal))
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return false;
+            }
+
+            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return true;
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
     internal async Task ApplyBlobRecordMutationsAsync(
         IReadOnlyList<BlobRecordMutation> mutations,
         CancellationToken cancellationToken,
@@ -2739,6 +3139,116 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$deleted", container.DeletedAt.HasValue ? 1 : 0);
         command.Parameters.AddWithValue("$modified", container.LastModified.UtcTicks);
         command.Parameters.AddWithValue("$data", Serialize(container));
+    }
+
+    private static async Task<ObjectReplicationState?> GetObjectReplicationStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        ObjectReplicationStateKey key,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT policy_id, rule_id, source_generation_id,
+                   source_account, source_container, source_name,
+                   destination_account, destination_container, destination_generation_id,
+                   source_fingerprint, status, updated_ticks
+            FROM object_replication_states
+            WHERE policy_id = $policy AND rule_id = $rule AND source_generation_id = $generation;
+            """;
+        command.Parameters.AddWithValue("$policy", key.PolicyId);
+        command.Parameters.AddWithValue("$rule", key.RuleId);
+        command.Parameters.AddWithValue("$generation", key.SourceGenerationId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadObjectReplicationState(reader) : null;
+    }
+
+    private static async Task UpsertObjectReplicationStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ObjectReplicationState state,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO object_replication_states(
+                policy_id, rule_id, source_generation_id,
+                source_account, source_container, source_name,
+                destination_account, destination_container, destination_generation_id,
+                source_fingerprint, status, updated_ticks)
+            VALUES (
+                $policy, $rule, $source_generation,
+                $source_account, $source_container, $source_name,
+                $destination_account, $destination_container, $destination_generation,
+                $fingerprint, $status, $updated)
+            ON CONFLICT(policy_id, rule_id, source_generation_id) DO UPDATE SET
+                source_account = excluded.source_account,
+                source_container = excluded.source_container,
+                source_name = excluded.source_name,
+                destination_account = excluded.destination_account,
+                destination_container = excluded.destination_container,
+                destination_generation_id = excluded.destination_generation_id,
+                source_fingerprint = excluded.source_fingerprint,
+                status = excluded.status,
+                updated_ticks = excluded.updated_ticks;
+            """;
+        command.Parameters.AddWithValue("$policy", state.PolicyId);
+        command.Parameters.AddWithValue("$rule", state.RuleId);
+        command.Parameters.AddWithValue("$source_generation", state.SourceGenerationId);
+        command.Parameters.AddWithValue("$source_account", state.SourceAccount);
+        command.Parameters.AddWithValue("$source_container", state.SourceContainer);
+        command.Parameters.AddWithValue("$source_name", state.SourceName);
+        command.Parameters.AddWithValue("$destination_account", state.DestinationAccount);
+        command.Parameters.AddWithValue("$destination_container", state.DestinationContainer);
+        command.Parameters.AddWithValue(
+            "$destination_generation",
+            (object?)state.DestinationGenerationId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$fingerprint", state.SourceFingerprint);
+        command.Parameters.AddWithValue("$status", state.Status);
+        command.Parameters.AddWithValue("$updated", state.UpdatedAt.UtcTicks);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task DeleteObjectReplicationStateAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        ObjectReplicationStateKey key,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DELETE FROM object_replication_states
+            WHERE policy_id = $policy AND rule_id = $rule AND source_generation_id = $generation;
+            """;
+        command.Parameters.AddWithValue("$policy", key.PolicyId);
+        command.Parameters.AddWithValue("$rule", key.RuleId);
+        command.Parameters.AddWithValue("$generation", key.SourceGenerationId);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static ObjectReplicationState ReadObjectReplicationState(SqliteDataReader reader) => new()
+    {
+        PolicyId = reader.GetString(0),
+        RuleId = reader.GetString(1),
+        SourceGenerationId = reader.GetString(2),
+        SourceAccount = reader.GetString(3),
+        SourceContainer = reader.GetString(4),
+        SourceName = reader.GetString(5),
+        DestinationAccount = reader.GetString(6),
+        DestinationContainer = reader.GetString(7),
+        DestinationGenerationId = reader.IsDBNull(8) ? null : reader.GetString(8),
+        SourceFingerprint = reader.GetString(9),
+        Status = reader.GetString(10),
+        UpdatedAt = new DateTimeOffset(reader.GetInt64(11), TimeSpan.Zero)
+    };
+
+    private static void EnsureObjectReplicationTargetMutable(BlobRecord blob, DateTimeOffset now)
+    {
+        if (blob.HasLegalHold || blob.ImmutabilityUntil > now)
+            throw new StorageImmutabilityException(blob.HasLegalHold);
     }
 
     private static async Task<BlobRecord?> GetCurrentBlobAsync(

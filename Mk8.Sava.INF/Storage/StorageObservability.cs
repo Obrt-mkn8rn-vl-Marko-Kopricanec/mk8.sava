@@ -12,6 +12,9 @@ public sealed class StorageTelemetry : IStorageTelemetry
     private long _maintenancePasses;
     private long _maintenanceFailures;
     private long _completedCopies;
+    private long _completedObjectReplications;
+    private long _failedObjectReplications;
+    private long _removedObjectReplicas;
     private long _completedRehydrations;
     private long _completedSmartTierTransitions;
     private long _expiredBlobs;
@@ -44,6 +47,9 @@ public sealed class StorageTelemetry : IStorageTelemetry
     {
         Interlocked.Increment(ref _maintenancePasses);
         Interlocked.Add(ref _completedCopies, result.CompletedCopies);
+        Interlocked.Add(ref _completedObjectReplications, result.CompletedObjectReplications);
+        Interlocked.Add(ref _failedObjectReplications, result.FailedObjectReplications);
+        Interlocked.Add(ref _removedObjectReplicas, result.RemovedObjectReplicas);
         Interlocked.Add(ref _completedRehydrations, result.CompletedRehydrations);
         Interlocked.Add(ref _completedSmartTierTransitions, result.CompletedSmartTierTransitions);
         Interlocked.Add(ref _expiredBlobs, result.ExpiredBlobs);
@@ -92,6 +98,9 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_maintenance_passes_total", "Completed maintenance passes.", Interlocked.Read(ref _maintenancePasses));
         AppendMetric(builder, "mk8_sava_maintenance_failures_total", "Failed maintenance passes.", Interlocked.Read(ref _maintenanceFailures));
         AppendMetric(builder, "mk8_sava_maintenance_completed_copies_total", "Asynchronous copies completed by maintenance.", Interlocked.Read(ref _completedCopies));
+        AppendMetric(builder, "mk8_sava_maintenance_completed_object_replications_total", "Object-replication copies completed by maintenance.", Interlocked.Read(ref _completedObjectReplications));
+        AppendMetric(builder, "mk8_sava_maintenance_failed_object_replications_total", "Object-replication source states first marked failed by maintenance.", Interlocked.Read(ref _failedObjectReplications));
+        AppendMetric(builder, "mk8_sava_maintenance_removed_object_replicas_total", "Object replicas removed after their source versions were permanently deleted.", Interlocked.Read(ref _removedObjectReplicas));
         AppendMetric(builder, "mk8_sava_maintenance_completed_rehydrations_total", "Archive rehydrations completed by maintenance.", Interlocked.Read(ref _completedRehydrations));
         AppendMetric(builder, "mk8_sava_maintenance_smart_tier_transitions_total", "Smart-tier capacity transitions completed by maintenance.", Interlocked.Read(ref _completedSmartTierTransitions));
         AppendMetric(builder, "mk8_sava_maintenance_expired_blobs_total", "Expired blobs removed by maintenance.", Interlocked.Read(ref _expiredBlobs));

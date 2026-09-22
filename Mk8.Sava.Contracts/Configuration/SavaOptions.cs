@@ -5,6 +5,8 @@ namespace Mk8.Sava.Configuration;
 public sealed class SavaOptions : IValidatableObject
 {
     public const string SectionName = "Sava";
+    private static readonly DateTimeOffset EarliestObjectReplicationTime =
+        new(1601, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     [Required]
     public string DataPath { get; init; } = "data";
@@ -16,6 +18,7 @@ public sealed class SavaOptions : IValidatableObject
     public Dictionary<string, string> Accounts { get; init; } = new(StringComparer.Ordinal);
 
     public Dictionary<string, StorageAccountCapabilities> AccountCapabilities { get; init; } = new(StringComparer.Ordinal);
+    public List<ObjectReplicationPolicyOptions> ObjectReplicationPolicies { get; init; } = [];
 
     public bool AllowAnonymousPublicAccess { get; init; }
     public int MinimumChunkBytes { get; init; } = 64 * 1024;
@@ -119,6 +122,155 @@ public sealed class SavaOptions : IValidatableObject
                 yield return new ValidationResult(
                     $"AccountCapabilities for '{accountName}' contains a blank immutable-storage container name.",
                     [nameof(AccountCapabilities)]);
+            }
+        }
+
+        var replicationPolicyIds = new HashSet<Guid>();
+        var replicationAccountPairs = new HashSet<string>(StringComparer.Ordinal);
+        var replicationDestinationContainers = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var policy in ObjectReplicationPolicies)
+        {
+            if (!Guid.TryParseExact(policy.PolicyId, "D", out var policyId) || !replicationPolicyIds.Add(policyId))
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy ID '{policy.PolicyId}' must be a unique GUID.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (!Accounts.ContainsKey(policy.SourceAccount) || !Accounts.ContainsKey(policy.DestinationAccount))
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' references an unknown account.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (string.Equals(policy.SourceAccount, policy.DestinationAccount, StringComparison.Ordinal))
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' must use different source and destination accounts.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (!replicationAccountPairs.Add($"{policy.SourceAccount}\n{policy.DestinationAccount}"))
+            {
+                yield return new ValidationResult(
+                    $"Only one object replication policy is allowed for the account pair '{policy.SourceAccount}' and '{policy.DestinationAccount}'.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (!policy.EnabledAt.HasValue)
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' requires its durable control-plane enablement time.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            else if (policy.EnabledAt.Value < EarliestObjectReplicationTime)
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' has an enablement time before 1601-01-01T00:00:00Z.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (policy.Rules.Count is 0 or > 1000)
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' must contain between one and 1,000 rules.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+
+            var sourceCapabilities = AccountCapabilities.GetValueOrDefault(policy.SourceAccount);
+            var destinationCapabilities = AccountCapabilities.GetValueOrDefault(policy.DestinationAccount);
+            if (sourceCapabilities is null ||
+                !sourceCapabilities.VersioningEnabled ||
+                !sourceCapabilities.ChangeFeedEnabled ||
+                destinationCapabilities is null ||
+                !destinationCapabilities.VersioningEnabled)
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' requires source change feed and blob versioning on both accounts.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+            if (sourceCapabilities?.HierarchicalNamespaceEnabled == true ||
+                destinationCapabilities?.HierarchicalNamespaceEnabled == true)
+            {
+                yield return new ValidationResult(
+                    $"Object replication policy '{policy.PolicyId}' cannot use a hierarchical-namespace account.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+
+            var ruleIds = new HashSet<Guid>();
+            var sourceContainers = new HashSet<string>(StringComparer.Ordinal);
+            var destinationContainers = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var rule in policy.Rules)
+            {
+                if (!Guid.TryParseExact(rule.RuleId, "D", out var ruleId) || !ruleIds.Add(ruleId))
+                {
+                    yield return new ValidationResult(
+                        $"Object replication rule ID '{rule.RuleId}' in policy '{policy.PolicyId}' must be a unique GUID.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (string.IsNullOrWhiteSpace(rule.SourceContainer) ||
+                    string.IsNullOrWhiteSpace(rule.DestinationContainer))
+                {
+                    yield return new ValidationResult(
+                        $"Object replication policy '{policy.PolicyId}' contains a rule with a blank container name.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                var uniqueSourceContainer = sourceContainers.Add(rule.SourceContainer);
+                var uniqueDestinationContainer = destinationContainers.Add(rule.DestinationContainer);
+                if (!uniqueSourceContainer || !uniqueDestinationContainer)
+                {
+                    yield return new ValidationResult(
+                        $"Object replication policy '{policy.PolicyId}' uses a source or destination container in more than one rule.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (uniqueDestinationContainer &&
+                    !replicationDestinationContainers.Add(
+                        $"{policy.DestinationAccount}\n{rule.DestinationContainer}"))
+                {
+                    yield return new ValidationResult(
+                        $"Object replication destination container '{rule.DestinationContainer}' in account '{policy.DestinationAccount}' participates in more than one policy.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (rule.PrefixMatch.Count > 10)
+                {
+                    yield return new ValidationResult(
+                        $"Object replication rule '{rule.RuleId}' contains more than 10 prefix filters.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (rule.PrefixMatch.Any(string.IsNullOrEmpty))
+                {
+                    yield return new ValidationResult(
+                        $"Object replication rule '{rule.RuleId}' contains an empty prefix filter.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (rule.PrefixMatch.Distinct(StringComparer.Ordinal).Count() != rule.PrefixMatch.Count)
+                {
+                    yield return new ValidationResult(
+                        $"Object replication rule '{rule.RuleId}' contains duplicate prefix filters.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+                if (rule.MinimumCreationTime is { } minimumCreationTime &&
+                    minimumCreationTime < EarliestObjectReplicationTime)
+                {
+                    yield return new ValidationResult(
+                        $"Object replication rule '{rule.RuleId}' has a minimum creation time before 1601-01-01T00:00:00Z.",
+                        [nameof(ObjectReplicationPolicies)]);
+                }
+            }
+        }
+
+        foreach (var source in ObjectReplicationPolicies.GroupBy(policy => policy.SourceAccount, StringComparer.Ordinal))
+        {
+            if (source.Count() > 2)
+            {
+                yield return new ValidationResult(
+                    $"Object replication source account '{source.Key}' participates in more than two policies.",
+                    [nameof(ObjectReplicationPolicies)]);
+            }
+        }
+        foreach (var destination in ObjectReplicationPolicies.GroupBy(policy => policy.DestinationAccount, StringComparer.Ordinal))
+        {
+            if (destination.Count() > 2)
+            {
+                yield return new ValidationResult(
+                    $"Object replication destination account '{destination.Key}' participates in more than two policies.",
+                    [nameof(ObjectReplicationPolicies)]);
             }
         }
 
@@ -308,8 +460,28 @@ public sealed class StorageAccountCapabilities
     public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }
     public bool LastAccessTimeTrackingEnabled { get; init; }
     public bool VersioningEnabled { get; init; }
+    public bool ChangeFeedEnabled { get; init; }
     public bool ImmutableStorageWithVersioningEnabled { get; init; }
     public HashSet<string> ImmutableStorageWithVersioningContainers { get; init; } = new(StringComparer.Ordinal);
+}
+
+public sealed class ObjectReplicationPolicyOptions
+{
+    public string PolicyId { get; init; } = string.Empty;
+    public string SourceAccount { get; init; } = string.Empty;
+    public string DestinationAccount { get; init; } = string.Empty;
+    public DateTimeOffset? EnabledAt { get; init; }
+    public List<ObjectReplicationRuleOptions> Rules { get; init; } = [];
+}
+
+public sealed class ObjectReplicationRuleOptions
+{
+    public string RuleId { get; init; } = string.Empty;
+    public string SourceContainer { get; init; } = string.Empty;
+    public string DestinationContainer { get; init; } = string.Empty;
+    public List<string> PrefixMatch { get; init; } = [];
+    public DateTimeOffset? MinimumCreationTime { get; init; }
+    public bool ReplicateBlobTags { get; init; }
 }
 
 public sealed class BearerAuthenticationOptions

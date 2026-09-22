@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
@@ -31,6 +32,7 @@ public sealed class BlobService(
     private string? _garbageCollectionCursor;
     private string? _recompressionCursor;
     private string? _packCompactionCursor;
+    private ObjectReplicationStateKey? _objectReplicationStateCursor;
 
     public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
 
@@ -56,6 +58,12 @@ public sealed class BlobService(
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         (capabilities.ImmutableStorageWithVersioningEnabled ||
          capabilities.ImmutableStorageWithVersioningContainers.Contains(container));
+
+    public bool IsObjectReplicationDestinationContainer(string account, string container) =>
+        _options.ObjectReplicationPolicies.Any(policy =>
+            string.Equals(policy.DestinationAccount, account, StringComparison.Ordinal) &&
+            policy.Rules.Any(rule =>
+                string.Equals(rule.DestinationContainer, container, StringComparison.Ordinal)));
 
     public async Task ApplyConfiguredAccountCapabilitiesAsync(CancellationToken cancellationToken = default)
     {
@@ -2345,6 +2353,16 @@ public sealed class BlobService(
         ServiceProperties properties,
         CancellationToken cancellationToken)
     {
+        if (!properties.VersioningEnabled &&
+            _options.ObjectReplicationPolicies.Any(policy =>
+                string.Equals(policy.SourceAccount, account, StringComparison.Ordinal) ||
+                string.Equals(policy.DestinationAccount, account, StringComparison.Ordinal)))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOperationNotSupported",
+                "Blob versioning cannot be disabled while an object replication policy is active.");
+        }
         await analytics.EnsureContainerAsync(account, cancellationToken);
         if (properties.StaticWebsite.Enabled)
         {
@@ -2391,6 +2409,9 @@ public sealed class BlobService(
     private async Task<StorageMaintenanceResult> RunMaintenanceCoreAsync(CancellationToken cancellationToken)
     {
         var completedCopies = 0;
+        var completedObjectReplications = 0;
+        var failedObjectReplications = 0;
+        var removedObjectReplicas = 0;
         var completedRehydrations = 0;
         var completedSmartTierTransitions = 0;
         var expiredBlobs = 0;
@@ -2471,7 +2492,12 @@ public sealed class BlobService(
                     await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
                 {
                     expiredBlobs++;
+                    continue;
                 }
+
+                var replication = await ReplicateObjectIfConfiguredAsync(blob, now, cancellationToken);
+                completedObjectReplications += replication.Completed;
+                failedObjectReplications += replication.Failed;
             }
             catch (StorageConcurrencyException)
             {
@@ -2480,6 +2506,41 @@ public sealed class BlobService(
         }
         _blobMaintenanceCursor = blobPage.HasMore && blobPage.Items.Count > 0
             ? blobPage.Items[^1].GenerationId
+            : null;
+
+        var replicationStatePage = await metadata.ListObjectReplicationStatesPageAsync(
+            _objectReplicationStateCursor,
+            _options.BlobRecordsPerMaintenancePass,
+            cancellationToken);
+        foreach (var state in replicationStatePage.Items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsConfiguredObjectReplicationState(state))
+            {
+                _ = await metadata.ForgetObjectReplicationStateAsync(state, cancellationToken);
+                continue;
+            }
+            if (await metadata.GetBlobByGenerationAsync(state.SourceGenerationId, cancellationToken) is not null)
+                continue;
+            try
+            {
+                if (await metadata.RemoveObjectReplicaForMissingSourceAsync(state, cancellationToken))
+                    removedObjectReplicas++;
+            }
+            catch (StorageConcurrencyException)
+            {
+                // A request changed the replica while maintenance was evaluating it.
+            }
+            catch (StorageImmutabilityException)
+            {
+                // Retention on a destination version defers cleanup until a later pass.
+            }
+        }
+        _objectReplicationStateCursor = replicationStatePage.HasMore && replicationStatePage.Items.Count > 0
+            ? new ObjectReplicationStateKey(
+                replicationStatePage.Items[^1].PolicyId,
+                replicationStatePage.Items[^1].RuleId,
+                replicationStatePage.Items[^1].SourceGenerationId)
             : null;
 
         var containerPage = await metadata.ListContainerMaintenancePageAsync(
@@ -2556,6 +2617,9 @@ public sealed class BlobService(
             summary.ReachableChunkCount);
         var result = new StorageMaintenanceResult(
             completedCopies,
+            completedObjectReplications,
+            failedObjectReplications,
+            removedObjectReplicas,
             completedRehydrations,
             completedSmartTierTransitions,
             expiredBlobs,
@@ -2571,6 +2635,179 @@ public sealed class BlobService(
         telemetry.RecordMaintenance(result, usage);
         return result;
     }
+
+    private async Task<ObjectReplicationPassResult> ReplicateObjectIfConfiguredAsync(
+        BlobRecord candidate,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (candidate.Kind != BlobKind.BlockBlob ||
+            candidate.Snapshot is not null ||
+            candidate.IsDeleted ||
+            candidate.Copy?.Status == "pending")
+        {
+            return default;
+        }
+
+        var matchingRules = _options.ObjectReplicationPolicies
+            .Where(policy => string.Equals(policy.SourceAccount, candidate.Account, StringComparison.Ordinal))
+            .SelectMany(policy => policy.Rules
+                .Where(rule => string.Equals(rule.SourceContainer, candidate.Container, StringComparison.Ordinal))
+                .Where(rule => candidate.CreatedAt >=
+                               (rule.MinimumCreationTime ?? policy.EnabledAt ?? DateTimeOffset.MinValue))
+                .Where(rule => rule.PrefixMatch.Count == 0 ||
+                               rule.PrefixMatch.Any(prefix => candidate.Name.StartsWith(prefix, StringComparison.Ordinal)))
+                .Select(rule => (Policy: policy, Rule: rule)))
+            .ToArray();
+        if (matchingRules.Length == 0)
+            return default;
+
+        var source = candidate;
+        var completed = 0;
+        var failed = 0;
+        foreach (var (policy, rule) in matchingRules)
+        {
+            var fingerprint = ObjectReplicationFingerprint(source);
+            var statusKey = $"{policy.PolicyId}_{rule.RuleId}";
+            var stateKey = new ObjectReplicationStateKey(policy.PolicyId, rule.RuleId, source.GenerationId);
+            var existingState = await metadata.GetObjectReplicationStateAsync(stateKey, cancellationToken);
+            if (existingState is not null && !ObjectReplicationStateMatches(policy, rule, source, existingState))
+            {
+                _ = await metadata.ForgetObjectReplicationStateAsync(existingState, cancellationToken);
+                existingState = null;
+            }
+            var sourceCannotReplicate = source.CustomerProvidedKeySha256 is not null ||
+                                        string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal) ||
+                                        source.ArchiveStatus is not null;
+            if (existingState is not null &&
+                string.Equals(existingState.SourceFingerprint, fingerprint, StringComparison.Ordinal))
+            {
+                if (string.Equals(existingState.Status, "failed", StringComparison.Ordinal) ||
+                    !sourceCannotReplicate)
+                    continue;
+            }
+
+            var proposedState = new ObjectReplicationState
+            {
+                PolicyId = policy.PolicyId,
+                RuleId = rule.RuleId,
+                SourceGenerationId = source.GenerationId,
+                SourceAccount = source.Account,
+                SourceContainer = source.Container,
+                SourceName = source.Name,
+                DestinationAccount = policy.DestinationAccount,
+                DestinationContainer = rule.DestinationContainer,
+                DestinationGenerationId = existingState?.DestinationGenerationId,
+                SourceFingerprint = fingerprint,
+                Status = "pending",
+                UpdatedAt = now
+            };
+
+            try
+            {
+                if (sourceCannotReplicate)
+                    throw AzureStorageException.BlobOperationNotSupported();
+
+                var mappedDestination = existingState?.DestinationGenerationId is { } destinationGeneration
+                    ? await metadata.GetBlobByGenerationAsync(destinationGeneration, cancellationToken)
+                    : null;
+                var currentDestination = await metadata.GetBlobAsync(
+                    policy.DestinationAccount,
+                    rule.DestinationContainer,
+                    source.Name,
+                    versionId: null,
+                    snapshot: null,
+                    includeDeleted: false,
+                    cancellationToken);
+                if (IsArchivedObjectReplicationTarget(mappedDestination) ||
+                    IsArchivedObjectReplicationTarget(currentDestination))
+                {
+                    throw AzureStorageException.BlobOperationNotSupported();
+                }
+
+                var options = await ApplyContainerEncryptionPolicyAsync(
+                    policy.DestinationAccount,
+                    rule.DestinationContainer,
+                    new BlobWriteOptions(
+                        source.Http,
+                        new Dictionary<string, string>(source.Metadata, StringComparer.OrdinalIgnoreCase),
+                        rule.ReplicateBlobTags
+                            ? new Dictionary<string, string>(source.Tags, StringComparer.Ordinal)
+                            : new Dictionary<string, string>(StringComparer.Ordinal)),
+                    cancellationToken);
+                using var prepared = await PrepareCopyContentAsync(
+                    policy.DestinationAccount,
+                    source,
+                    EncryptionOf(options),
+                    preserveCommittedBlocks: true,
+                    cancellationToken);
+                var proposedDestination = NewBlob(
+                    policy.DestinationAccount,
+                    rule.DestinationContainer,
+                    source.Name,
+                    BlobKind.BlockBlob,
+                    prepared.Content,
+                    options,
+                    now) with
+                {
+                    CommittedBlocks = prepared.CommittedBlocks.ToList(),
+                    ObjectReplicationDestinationPolicyId = policy.PolicyId
+                };
+                _ = await metadata.ApplyObjectReplicationAsync(
+                    source,
+                    proposedDestination,
+                    proposedState,
+                    statusKey,
+                    cancellationToken);
+                completed++;
+            }
+            catch (StorageConcurrencyException)
+            {
+                continue;
+            }
+            catch (Exception exception) when (exception is AzureStorageException or StorageImmutabilityException)
+            {
+                if (await metadata.MarkObjectReplicationFailureAsync(
+                        source,
+                        proposedState,
+                        statusKey,
+                        cancellationToken))
+                {
+                    failed++;
+                }
+            }
+
+            source = await metadata.GetBlobByGenerationAsync(source.GenerationId, cancellationToken)
+                     ?? source;
+        }
+
+        return new ObjectReplicationPassResult(completed, failed);
+    }
+
+    private bool IsConfiguredObjectReplicationState(ObjectReplicationState state) =>
+        _options.ObjectReplicationPolicies.Any(policy =>
+            string.Equals(policy.PolicyId, state.PolicyId, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(policy.SourceAccount, state.SourceAccount, StringComparison.Ordinal) &&
+            string.Equals(policy.DestinationAccount, state.DestinationAccount, StringComparison.Ordinal) &&
+            policy.Rules.Any(rule =>
+                string.Equals(rule.RuleId, state.RuleId, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(rule.SourceContainer, state.SourceContainer, StringComparison.Ordinal) &&
+                string.Equals(rule.DestinationContainer, state.DestinationContainer, StringComparison.Ordinal)));
+
+    private static bool ObjectReplicationStateMatches(
+        ObjectReplicationPolicyOptions policy,
+        ObjectReplicationRuleOptions rule,
+        BlobRecord source,
+        ObjectReplicationState state) =>
+        string.Equals(state.SourceAccount, source.Account, StringComparison.Ordinal) &&
+        string.Equals(state.SourceContainer, source.Container, StringComparison.Ordinal) &&
+        string.Equals(state.SourceName, source.Name, StringComparison.Ordinal) &&
+        string.Equals(state.DestinationAccount, policy.DestinationAccount, StringComparison.Ordinal) &&
+        string.Equals(state.DestinationContainer, rule.DestinationContainer, StringComparison.Ordinal);
+
+    private static bool IsArchivedObjectReplicationTarget(BlobRecord? blob) =>
+        blob is not null &&
+        (string.Equals(blob.AccessTier, "Archive", StringComparison.Ordinal) || blob.ArchiveStatus is not null);
 
     public async Task<int> CollectGarbageAsync(CancellationToken cancellationToken)
     {
@@ -3268,15 +3505,65 @@ public sealed class BlobService(
                 IsImmutableStorageWithVersioningEnabled(container.Account, container.Name)
         };
 
-    private BlobRecord EffectiveBlob(BlobRecord blob) =>
-        blob with
+    private BlobRecord EffectiveBlob(BlobRecord blob)
+    {
+        var fingerprint = ObjectReplicationFingerprint(blob);
+        return blob with
         {
             Lease = leases.GetEffective(blob.Lease),
-            VersionId = IsHierarchicalNamespaceEnabled(blob.Account) ? null : blob.VersionId
+            VersionId = IsHierarchicalNamespaceEnabled(blob.Account) ? null : blob.VersionId,
+            ObjectReplicationStatuses = blob.ObjectReplicationStatuses
+                .Where(pair => string.Equals(
+                    pair.Value.SourceFingerprint,
+                    fingerprint,
+                    StringComparison.Ordinal))
+                .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal)
         };
+    }
+
+    private static string ObjectReplicationFingerprint(BlobRecord blob)
+    {
+        var builder = new StringBuilder(512);
+        AppendFingerprintValue(builder, blob.GenerationId);
+        AppendFingerprintValue(builder, blob.Kind.ToString());
+        AppendFingerprintValue(builder, blob.IsCurrent ? "1" : "0");
+        AppendFingerprintValue(builder, blob.IsDeleted ? "1" : "0");
+        AppendFingerprintValue(builder, blob.ETag);
+        AppendFingerprintValue(builder, blob.Content.Domain);
+        AppendFingerprintValue(builder, blob.Content.Length.ToString(CultureInfo.InvariantCulture));
+        AppendFingerprintValue(builder, blob.Content.Sha256);
+        AppendFingerprintValue(builder, blob.Http.ContentType);
+        AppendFingerprintValue(builder, blob.Http.ContentEncoding);
+        AppendFingerprintValue(builder, blob.Http.ContentLanguage);
+        AppendFingerprintValue(builder, blob.Http.CacheControl);
+        AppendFingerprintValue(builder, blob.Http.ContentDisposition);
+        AppendFingerprintValue(builder, blob.Http.ContentMd5);
+        AppendFingerprintValue(builder, blob.CustomerProvidedKeySha256);
+        foreach (var pair in blob.Metadata.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            AppendFingerprintValue(builder, pair.Key.ToUpperInvariant());
+            AppendFingerprintValue(builder, pair.Value);
+        }
+        foreach (var pair in blob.Tags.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            AppendFingerprintValue(builder, pair.Key);
+            AppendFingerprintValue(builder, pair.Value);
+        }
+        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString())));
+    }
+
+    private static void AppendFingerprintValue(StringBuilder builder, string? value)
+    {
+        builder.Append(value?.Length ?? -1)
+            .Append(':')
+            .Append(value)
+            .Append(';');
+    }
 
     private BlobRecord PrepareBlobWrite(BlobRecord blob) =>
         blob with { Lease = leases.ResetAfterBlobWrite(blob.Lease) };
+
+    private readonly record struct ObjectReplicationPassResult(int Completed, int Failed);
 
     private async Task EnsureHierarchicalDirectoryIndexAsync(
         string account,
