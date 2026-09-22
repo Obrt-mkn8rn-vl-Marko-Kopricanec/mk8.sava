@@ -273,15 +273,26 @@ internal static class ProtocolParsing
         using var reader = CreateXmlReader(body);
         var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
         var policies = new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal);
-        if (document.Root?.Name.LocalName != "SignedIdentifiers")
-            throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified access policy XML is invalid.");
-        foreach (var identifier in document.Root.Elements().Where(element => element.Name.LocalName == "SignedIdentifier"))
+        var root = document.Root;
+        if (root?.Name.LocalName != "SignedIdentifiers" ||
+            root.Elements().Any(element => element.Name.LocalName != "SignedIdentifier"))
         {
+            throw InvalidAclXml();
+        }
+
+        foreach (var identifier in root.Elements())
+        {
+            ValidateUniqueChildren(identifier);
+            ValidateKnownChildren(identifier, "Id", "AccessPolicy");
             var id = ChildValue(identifier, "Id");
-            var accessPolicy = identifier.Elements().FirstOrDefault(element => element.Name.LocalName == "AccessPolicy");
-            var permission = accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Permission") ?? string.Empty;
-            var start = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Start") ?? string.Empty, "Start");
-            var expiry = ParseDate(accessPolicy is null ? string.Empty : ChildValue(accessPolicy, "Expiry") ?? string.Empty, "Expiry");
+            var accessPolicy = Child(identifier, "AccessPolicy");
+            if (accessPolicy is null)
+                throw InvalidAclXml();
+            ValidateUniqueChildren(accessPolicy);
+            ValidateKnownChildren(accessPolicy, "Start", "Expiry", "Permission");
+            var permission = ChildValue(accessPolicy, "Permission") ?? string.Empty;
+            var start = ParseDate(ChildValue(accessPolicy, "Start") ?? string.Empty, "Start");
+            var expiry = ParseDate(ChildValue(accessPolicy, "Expiry") ?? string.Empty, "Expiry");
             if (string.IsNullOrEmpty(id) || id.Length > 64 || !policies.TryAdd(id, new StoredAccessPolicy
             {
                 StartsAt = start,
@@ -289,7 +300,7 @@ internal static class ProtocolParsing
                 Permission = permission
             }))
             {
-                throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified access policy XML is invalid.");
+                throw InvalidAclXml();
             }
         }
         if (policies.Count > 5)
@@ -625,9 +636,27 @@ internal static class ProtocolParsing
     private static DateTimeOffset? ParseDate(string value, string field) =>
         string.IsNullOrEmpty(value)
             ? null
-            : DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed)
-                ? parsed
+            : DateTimeOffset.TryParseExact(
+                value,
+                [
+                    "yyyy-MM-dd",
+                    "yyyy-MM-dd'T'HH:mm'Z'",
+                    "yyyy-MM-dd'T'HH:mm:ss'Z'",
+                    "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF'Z'",
+                    "yyyy-MM-dd'T'HH:mmzzz",
+                    "yyyy-MM-dd'T'HH:mm:sszzz",
+                    "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFzzz"
+                ],
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var parsed)
+                ? parsed.ToUniversalTime()
                 : throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", $"The {field} value is invalid.");
+
+    private static AzureStorageException InvalidAclXml() => new(
+        StatusCodes.Status400BadRequest,
+        "InvalidXmlDocument",
+        "The specified access policy XML is invalid.");
 
     private static DateTimeOffset ParseRequiredDate(string? value, string field) =>
         !string.IsNullOrEmpty(value) && DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed)

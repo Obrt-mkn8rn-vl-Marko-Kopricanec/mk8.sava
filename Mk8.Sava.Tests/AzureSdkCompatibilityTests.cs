@@ -156,7 +156,62 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidMetadata", response.Headers.GetValues("x-ms-error-code").Single());
         }
+
+        using (var nonemptyMetadata = new HttpRequestMessage(HttpMethod.Put, metadataUri)
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            nonemptyMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            nonemptyMetadata.Headers.TryAddWithoutValidation("x-ms-meta-k", "must-not-publish");
+            using var response = await transport.SendAsync(nonemptyMetadata);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var propertiesUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=properties");
+        using (var nonemptyProperties = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            nonemptyProperties.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(nonemptyProperties);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var containerMetadataUri = AppendQuery(
+            container.GenerateSasUri(
+                BlobContainerSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "restype=container&comp=metadata");
+        using (var nonemptyContainerMetadata = new HttpRequestMessage(HttpMethod.Put, containerMetadataUri)
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            nonemptyContainerMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            nonemptyContainerMetadata.Headers.TryAddWithoutValidation("x-ms-meta-k", "must-not-publish");
+            using var response = await transport.SendAsync(nonemptyContainerMetadata);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var validContainerMetadata = new HttpRequestMessage(HttpMethod.Put, containerMetadataUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            validContainerMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            validContainerMetadata.Headers.TryAddWithoutValidation("x-ms-meta-fromsas", "allowed");
+            using var response = await transport.SendAsync(validContainerMetadata);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
         Assert.Equal(maximumProperties.ETag, (await blob.GetPropertiesAsync()).Value.ETag);
+        Assert.False((await container.GetPropertiesAsync()).Value.Metadata.ContainsKey("k"));
+        Assert.Equal("allowed", (await container.GetPropertiesAsync()).Value.Metadata["fromsas"]);
 
         var invalidContainer = service.GetBlobContainerClient($"metadata-invalid-{Guid.NewGuid():N}");
         var invalidContainerCreate = await Assert.ThrowsAsync<RequestFailedException>(() =>
@@ -3212,6 +3267,34 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("base", unchangedBase.Metadata["owner"]);
             Assert.Equal("base-only", unchangedBase.Metadata["retained"]);
 
+            var lease = blob.GetBlobLeaseClient();
+            await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+            var createOnlySnapshotUri = AppendQuery(
+                blob.GenerateSasUri(BlobSasPermissions.Create, DateTimeOffset.UtcNow.AddMinutes(10)),
+                "comp=snapshot");
+            using (var createOnly = new HttpRequestMessage(HttpMethod.Put, createOnlySnapshotUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(createOnly);
+                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+                Assert.Equal("true", response.Headers.GetValues("x-ms-request-server-encrypted").Single());
+            }
+            using (var wrongLease = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                wrongLease.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                wrongLease.Headers.TryAddWithoutValidation("x-ms-lease-id", Guid.NewGuid().ToString());
+                using var response = await transport.SendAsync(wrongLease);
+                Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+                Assert.Equal("LeaseIdMismatchWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+            await lease.ReleaseAsync();
+
             var archived = container.GetBlobClient("archived.bin");
             await archived.UploadAsync(BinaryData.FromString("offline payload"));
             await archived.SetAccessTierAsync(AccessTier.Archive);
@@ -3391,7 +3474,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             var aclUri = AppendQuery(
                 container.Uri,
-                $"restype=container&comp=acl&{accountSasQuery}");
+                "restype=container&comp=acl");
             using (var acl = new HttpRequestMessage(HttpMethod.Put, aclUri)
             {
                 Content = new ByteArrayContent([])
@@ -3399,6 +3482,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 acl.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
                 acl.Headers.TryAddWithoutValidation("x-ms-blob-public-access", "blob");
+                AddSharedKeyLiteAuthorization(acl);
                 using var response = await transport.SendAsync(acl);
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
                 Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
@@ -3518,6 +3602,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await container.SetAccessPolicyAsync(PublicAccessType.None, []);
         var revoked = await Assert.ThrowsAsync<RequestFailedException>(() => policyBlob.DownloadContentAsync());
         Assert.Equal(403, revoked.Status);
+
+        var aclUri = AppendQuery(
+            container.GenerateSasUri(
+                BlobContainerSasPermissions.All,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "restype=container&comp=acl");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using (var getAcl = new HttpRequestMessage(HttpMethod.Get, aclUri))
+        {
+            getAcl.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(getAcl);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var setAcl = new HttpRequestMessage(HttpMethod.Put, aclUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            setAcl.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(setAcl);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
     }
 
     [Fact]
@@ -7854,8 +7962,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     {
         var requestUri = request.RequestUri
                          ?? throw new InvalidOperationException("A request URI is required for Shared Key Lite signing.");
-        if (!string.IsNullOrEmpty(requestUri.Query))
-            throw new InvalidOperationException("This test signer only supports requests without query parameters.");
         if (!request.Headers.Contains("x-ms-date"))
         {
             request.Headers.TryAddWithoutValidation(
@@ -7877,8 +7983,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 .Append('\n');
         }
 
-        var stringToSign = "\n" + canonicalHeaders +
-                           $"/{SavaWebApplicationFactory.AccountName}{requestUri.AbsolutePath}";
+        var canonicalResource = new StringBuilder()
+            .Append('/')
+            .Append(SavaWebApplicationFactory.AccountName)
+            .Append(requestUri.AbsolutePath);
+        foreach (var parameter in Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(requestUri.Query)
+                     .OrderBy(parameter => parameter.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            canonicalResource
+                .Append('\n')
+                .Append(parameter.Key.ToLowerInvariant())
+                .Append(':')
+                .AppendJoin(',', parameter.Value.OrderBy(value => value, StringComparer.Ordinal));
+        }
+        var stringToSign = "\n" + canonicalHeaders + canonicalResource;
         using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
         var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
         request.Headers.TryAddWithoutValidation(

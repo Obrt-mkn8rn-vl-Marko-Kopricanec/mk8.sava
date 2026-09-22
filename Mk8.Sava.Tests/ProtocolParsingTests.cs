@@ -57,4 +57,53 @@ public sealed class ProtocolParsingTests
                 () => ProtocolParsing.ReadBlockListAsync(body, CancellationToken.None));
         }
     }
+
+    [Theory]
+    [InlineData("<SignedIdentifiers><Unknown /></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><Unknown /></SignedIdentifier></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><Id>b</Id><AccessPolicy /></SignedIdentifier></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id></SignedIdentifier></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><AccessPolicy><Permission>r</Permission><Permission>w</Permission></AccessPolicy></SignedIdentifier></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><AccessPolicy><Unknown /></AccessPolicy></SignedIdentifier></SignedIdentifiers>")]
+    [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><AccessPolicy><Start>September 22, 2026</Start></AccessPolicy></SignedIdentifier></SignedIdentifiers>")]
+    public async Task AccessPolicyParserRejectsUnknownDuplicateAndNonIsoContent(string xml)
+    {
+        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        var exception = await Assert.ThrowsAsync<AzureStorageException>(
+            () => ProtocolParsing.ReadAclAsync(body, CancellationToken.None));
+
+        Assert.Equal((int)HttpStatusCode.BadRequest, exception.StatusCode);
+        Assert.Equal("InvalidXmlDocument", exception.ErrorCode);
+    }
+
+    [Fact]
+    public async Task AccessPolicyParserAcceptsDocumentedIsoDateShapesAndEmptyFields()
+    {
+        const string xml = """
+            <SignedIdentifiers>
+              <SignedIdentifier>
+                <Id>complete</Id>
+                <AccessPolicy>
+                  <Start>2026-09-22T08:30:00.1234567Z</Start>
+                  <Expiry>2026-09-23T08:30+00:00</Expiry>
+                  <Permission>racwdl</Permission>
+                </AccessPolicy>
+              </SignedIdentifier>
+              <SignedIdentifier>
+                <Id>partial</Id>
+                <AccessPolicy />
+              </SignedIdentifier>
+            </SignedIdentifiers>
+            """;
+        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+
+        var policies = await ProtocolParsing.ReadAclAsync(body, CancellationToken.None);
+
+        Assert.Equal(new DateTimeOffset(2026, 9, 22, 8, 30, 0, 123, TimeSpan.Zero).AddTicks(4567), policies["complete"].StartsAt);
+        Assert.Equal(new DateTimeOffset(2026, 9, 23, 8, 30, 0, TimeSpan.Zero), policies["complete"].ExpiresAt);
+        Assert.Equal("racwdl", policies["complete"].Permission);
+        Assert.Null(policies["partial"].StartsAt);
+        Assert.Null(policies["partial"].ExpiresAt);
+        Assert.Empty(policies["partial"].Permission);
+    }
 }
