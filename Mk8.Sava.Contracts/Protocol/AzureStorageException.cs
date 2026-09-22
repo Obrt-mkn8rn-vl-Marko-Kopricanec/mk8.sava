@@ -118,6 +118,11 @@ public sealed class AzureStorageException : Exception
         "BlobNotFound",
         "The specified blob does not exist.");
 
+    public static AzureStorageException PathAlreadyExists() => new(
+        (int)HttpStatusCode.Conflict,
+        "PathAlreadyExists",
+        "The specified path already exists.");
+
     public static AzureStorageException ConditionNotMet() => new(
         (int)HttpStatusCode.PreconditionFailed,
         "ConditionNotMet",

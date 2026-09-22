@@ -97,6 +97,7 @@ public sealed record BlobRecord
     public string? Snapshot { get; init; }
     public bool IsCurrent { get; init; }
     public bool IsDeleted { get; init; }
+    public ulong? DeletionId { get; init; }
     public DateTimeOffset? DeletedAt { get; init; }
     public DateTimeOffset? DeleteRetentionUntil { get; init; }
     public required BlobKind Kind { get; init; }
@@ -218,6 +219,14 @@ internal sealed record BlobListCursor(
     string GenerationId);
 
 internal sealed record BlobListingMarker(BlobListCursor? Cursor, int LegacyOffset);
+
+internal enum BlobListShowOnly
+{
+    None,
+    Deleted,
+    Files,
+    Directories
+}
 
 internal sealed record BlobListEntry(BlobRecord? Blob, string? Prefix, string? UncommittedBlobName = null)
 {

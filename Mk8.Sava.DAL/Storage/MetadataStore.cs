@@ -956,6 +956,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
     internal async Task<BlobListPage> ListBlobsPageAsync(
         string account,
         string container,
+        bool hierarchicalNamespace,
+        BlobListShowOnly showOnly,
         bool includeVersions,
         bool includeSnapshots,
         bool includeDeleted,
@@ -982,14 +984,25 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             "name >= $start_from",
             "substr(name, 1, length($prefix)) = $prefix"
         };
-        if (!includeVersions && !includeSnapshots)
-            predicates.Add("is_current = 1");
-        else if (!includeVersions)
-            predicates.Add("(is_current = 1 OR snapshot IS NOT NULL)");
-        else if (!includeSnapshots)
-            predicates.Add("snapshot IS NULL");
-        if (!includeDeleted)
-            predicates.Add("is_deleted = 0");
+        if (hierarchicalNamespace)
+        {
+            predicates.Add(showOnly == BlobListShowOnly.Deleted
+                ? "is_deleted = 1"
+                : includeDeleted
+                    ? "((is_current = 1 AND is_deleted = 0) OR is_deleted = 1)"
+                    : "is_current = 1 AND is_deleted = 0");
+        }
+        else
+        {
+            if (!includeVersions && !includeSnapshots)
+                predicates.Add("is_current = 1");
+            else if (!includeVersions)
+                predicates.Add("(is_current = 1 OR snapshot IS NOT NULL)");
+            else if (!includeSnapshots)
+                predicates.Add("snapshot IS NULL");
+            if (!includeDeleted)
+                predicates.Add("is_deleted = 0");
+        }
         if (!string.IsNullOrEmpty(endBefore))
             predicates.Add("name < $end_before");
 
@@ -1282,12 +1295,14 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken) =>
         await PublishBlobCoreAsync(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
             stagedBlockSnapshot: null,
+            hierarchicalNamespace,
             cancellationToken);
 
     public async Task<BlobRecord> PublishBlockListAsync(
@@ -1295,12 +1310,14 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
         IReadOnlyList<StagedBlockRecord> stagedBlockSnapshot,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken) =>
         await PublishBlobCoreAsync(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
             stagedBlockSnapshot,
+            hierarchicalNamespace,
             cancellationToken);
 
     private async Task<BlobRecord> PublishBlobCoreAsync(
@@ -1308,6 +1325,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
         IReadOnlyList<StagedBlockRecord>? stagedBlockSnapshot,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken);
@@ -1340,7 +1358,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 if (!current.IsDeleted && current.Copy?.Status == "pending")
                     throw new StoragePendingCopyException();
                 var now = _timeProvider.GetUtcNow();
-                if (current.IsDeleted)
+                if (current.IsDeleted && !hierarchicalNamespace)
                 {
                     if (current.Kind == proposed.Kind)
                     {
@@ -1374,7 +1392,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 }
                 else
                 {
-                    var createsHistoricalVersion = serviceProperties.VersioningEnabled;
+                    var createsHistoricalVersion = serviceProperties.VersioningEnabled && !hierarchicalNamespace;
                     var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > now;
                     if (protectedByRetention && !createsHistoricalVersion)
                         throw new StorageImmutabilityException(current.HasLegalHold);
@@ -1390,7 +1408,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                         };
                         await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
                     }
-                    else if (serviceProperties.BlobSoftDeleteEnabled)
+                    else if (serviceProperties.BlobSoftDeleteEnabled && !hierarchicalNamespace)
                     {
                         var historical = current with
                         {
@@ -1422,7 +1440,11 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             var published = proposed with
             {
                 IsCurrent = true,
-                VersionId = serviceProperties.VersioningEnabled
+                IsDeleted = false,
+                DeletionId = null,
+                DeletedAt = null,
+                DeleteRetentionUntil = null,
+                VersionId = serviceProperties.VersioningEnabled && !hierarchicalNamespace
                     ? proposed.VersionId ?? CreateVersionId(proposed.LastModified)
                     : null,
                 Snapshot = null
@@ -1539,6 +1561,52 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 }
             }
             await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> TryRestoreDeletedBlobAsync(
+        BlobRecord restored,
+        string expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var source = await GetBlobByGenerationAsync(
+                connection,
+                transaction,
+                restored.GenerationId,
+                cancellationToken);
+            if (source is null ||
+                !source.IsDeleted ||
+                !string.Equals(source.Revision, expectedRevision, StringComparison.Ordinal))
+            {
+                throw new StorageConcurrencyException();
+            }
+
+            var destination = await GetCurrentBlobAsync(
+                connection,
+                transaction,
+                restored.Account,
+                restored.Container,
+                restored.Name,
+                cancellationToken);
+            if (destination is not null &&
+                !string.Equals(destination.GenerationId, restored.GenerationId, StringComparison.Ordinal))
+            {
+                await transaction.RollbackAsync(cancellationToken);
+                return false;
+            }
+
+            await UpdateBlobRowAsync(connection, transaction, restored, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return true;
         }
         finally
         {
@@ -2330,6 +2398,17 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
     public static string NewETag() => $"\"0x{Convert.ToHexString(RandomNumberGenerator.GetBytes(8))}\"";
 
     public static string NewRevision() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16));
+
+    public static ulong NewDeletionId()
+    {
+        ulong value;
+        do
+        {
+            value = BitConverter.ToUInt64(RandomNumberGenerator.GetBytes(sizeof(ulong)));
+        }
+        while (value == 0);
+        return value;
+    }
 
     public static string CreateVersionId(DateTimeOffset time) =>
         time.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ss.fffffffZ", CultureInfo.InvariantCulture);

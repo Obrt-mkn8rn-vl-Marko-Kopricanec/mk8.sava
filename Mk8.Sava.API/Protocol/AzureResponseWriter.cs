@@ -246,9 +246,20 @@ public sealed partial class AzureResponseWriter
                     writer.WriteElementString("IsCurrentVersion", blob.IsCurrent ? "true" : "false");
                 }
                 if (blob.IsDeleted &&
-                    (includes.Contains("deleted") || includes.Contains("deletedwithversions")))
+                    (hierarchicalNamespace ||
+                     includes.Contains("deleted") ||
+                     includes.Contains("deletedwithversions")))
                 {
                     writer.WriteElementString("Deleted", "true");
+                }
+                if (hierarchicalNamespace &&
+                    blob.IsDeleted &&
+                    blob.DeletionId.HasValue &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2020, 8, 4)))
+                {
+                    writer.WriteElementString(
+                        "DeletionId",
+                        blob.DeletionId.Value.ToString(CultureInfo.InvariantCulture));
                 }
                 if (!usesModernPropertyShape)
                 {

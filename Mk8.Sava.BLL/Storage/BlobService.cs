@@ -299,6 +299,7 @@ public sealed class BlobService(
     internal async Task<BlobListPage> ListBlobsPageAsync(
         string account,
         string container,
+        BlobListShowOnly showOnly,
         bool includeVersions,
         bool includeSnapshots,
         bool includeDeleted,
@@ -315,6 +316,8 @@ public sealed class BlobService(
         var page = await metadata.ListBlobsPageAsync(
             account,
             container,
+            IsHierarchicalNamespaceEnabled(account),
+            showOnly,
             includeVersions,
             includeSnapshots,
             includeDeleted,
@@ -461,7 +464,12 @@ public sealed class BlobService(
         {
             Lease = leases.ResetAfterBlobWrite(destinationLease)
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     public async Task<BlobRecord> CreateAppendBlobAsync(
@@ -481,7 +489,12 @@ public sealed class BlobService(
         {
             Lease = leases.ResetAfterBlobWrite(destinationLease)
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     public async Task<BlobRecord> CreatePageBlobAsync(
@@ -512,7 +525,12 @@ public sealed class BlobService(
             Lease = leases.ResetAfterBlobWrite(destinationLease),
             SequenceNumber = sequenceNumber
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     public async Task<BlobEncryption> StageBlockAsync(
@@ -643,6 +661,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             staged,
+            IsHierarchicalNamespaceEnabled(account),
             cancellationToken);
     }
 
@@ -693,7 +712,12 @@ public sealed class BlobService(
             AppendBlockCount = checked(current.AppendBlockCount + 1),
             Copy = null
         };
-        return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            updated,
+            current.GenerationId,
+            current.Revision,
+            IsHierarchicalNamespaceEnabled(current.Account),
+            cancellationToken);
     }
 
     public async Task<BlobRecord> PutPageAsync(
@@ -748,7 +772,12 @@ public sealed class BlobService(
                 ETag = MetadataStore.NewETag(),
                 LastModified = metadata.GetUtcNow()
             };
-            return await metadata.PublishBlobAsync(updated, current.GenerationId, current.Revision, cancellationToken);
+            return await metadata.PublishBlobAsync(
+                updated,
+                current.GenerationId,
+                current.Revision,
+                IsHierarchicalNamespaceEnabled(current.Account),
+                cancellationToken);
         }
     }
 
@@ -863,7 +892,7 @@ public sealed class BlobService(
             Copy = null
         };
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
-        if (properties.VersioningEnabled)
+        if (properties.VersioningEnabled && !IsHierarchicalNamespaceEnabled(current.Account))
         {
             return await metadata.PublishBlobAsync(
                 updated with
@@ -874,6 +903,7 @@ public sealed class BlobService(
                 },
                 current.GenerationId,
                 current.Revision,
+                hierarchicalNamespace: false,
                 cancellationToken);
         }
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
@@ -1218,6 +1248,11 @@ public sealed class BlobService(
             EnsureBlobMutable(target);
 
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        var hierarchicalNamespace = IsHierarchicalNamespaceEnabled(current.Account);
+        var deletionIds = records
+            .Where(item => item.DeletionId.HasValue)
+            .Select(item => item.DeletionId!.Value)
+            .ToHashSet();
         var mutations = new List<BlobRecordMutation>(targets.Count);
         foreach (var target in targets)
         {
@@ -1225,7 +1260,8 @@ public sealed class BlobService(
             if (!hasExplicitSnapshotOrVersion &&
                 target.IsCurrent &&
                 target.Snapshot is null &&
-                properties.VersioningEnabled)
+                properties.VersioningEnabled &&
+                !hierarchicalNamespace)
             {
                 replacement = target with
                 {
@@ -1241,12 +1277,24 @@ public sealed class BlobService(
             else if (properties.BlobSoftDeleteEnabled)
             {
                 var deletedAt = metadata.GetUtcNow();
+                ulong? deletionId = null;
+                if (hierarchicalNamespace)
+                {
+                    do
+                    {
+                        deletionId = MetadataStore.NewDeletionId();
+                    }
+                    while (!deletionIds.Add(deletionId.Value));
+                }
                 replacement = target with
                 {
                     IsDeleted = true,
+                    DeletionId = deletionId,
                     DeletedAt = deletedAt,
                     DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
-                    IsCurrent = target.IsCurrent,
+                    IsCurrent = !hierarchicalNamespace && target.IsCurrent,
+                    VersionId = hierarchicalNamespace ? null : target.VersionId,
+                    Snapshot = hierarchicalNamespace ? null : target.Snapshot,
                     Lease = LeaseRecord.Available,
                     Revision = MetadataStore.NewRevision()
                 };
@@ -1328,6 +1376,46 @@ public sealed class BlobService(
         if (mutations.Count == 0)
             throw AzureStorageException.BlobNotFound();
         await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken);
+    }
+
+    public async Task UndeleteHierarchicalBlobAsync(
+        string account,
+        string container,
+        string sourceName,
+        string destinationName,
+        ulong deletionId,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobName(sourceName);
+        ValidateBlobName(destinationName);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var records = await metadata.ListBlobFamilyAsync(
+            account,
+            container,
+            sourceName,
+            includeDeleted: true,
+            cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        var now = metadata.GetUtcNow();
+        var source = records.FirstOrDefault(item =>
+            item.IsDeleted &&
+            item.DeletionId == deletionId &&
+            item.DeletedAt.HasValue &&
+            (item.DeleteRetentionUntil ??
+             item.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays)) > now)
+                     ?? throw AzureStorageException.BlobNotFound();
+        var restored = source with
+        {
+            Name = destinationName,
+            IsCurrent = true,
+            IsDeleted = false,
+            DeletionId = null,
+            DeletedAt = null,
+            DeleteRetentionUntil = null,
+            Revision = MetadataStore.NewRevision()
+        };
+        if (!await metadata.TryRestoreDeletedBlobAsync(restored, source.Revision, cancellationToken))
+            throw AzureStorageException.PathAlreadyExists();
     }
 
     public async Task<BlobRecord> BeginCopyFromBlobAsync(
@@ -1440,7 +1528,12 @@ public sealed class BlobService(
             CommittedBlocks = [.. prepared.CommittedBlocks],
             PageRanges = [.. source.PageRanges]
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     public async Task<BlobRecord> CopyBlockBlobFromStreamAsync(
@@ -1508,7 +1601,12 @@ public sealed class BlobService(
                 CompletedAt = now
             }
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     public async Task<BlobRecord> BeginIncrementalCopyAsync(
@@ -1609,7 +1707,12 @@ public sealed class BlobService(
         };
 
         if (current is null)
-            return await metadata.PublishBlobAsync(pending, null, null, cancellationToken);
+            return await metadata.PublishBlobAsync(
+                pending,
+                null,
+                null,
+                IsHierarchicalNamespaceEnabled(account),
+                cancellationToken);
         await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken);
         return pending;
     }
@@ -1738,7 +1841,12 @@ public sealed class BlobService(
                 ExpiresAt = now.AddDays(14)
             }
         };
-        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+        return await metadata.PublishBlobAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken);
     }
 
     private static async Task EnsureSourceExhaustedAsync(Stream source, CancellationToken cancellationToken)

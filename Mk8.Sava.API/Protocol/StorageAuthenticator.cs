@@ -255,7 +255,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             var resourceTypes = query["srt"].ToString();
             if (!services.Contains('b'))
                 throw AzureStorageException.AuthorizationServiceMismatch();
-            if (!AccountSasCoversRequest(resourceTypes, request))
+            if (!AccountSasCoversRequest(resourceTypes, request, context.Request))
                 throw AzureStorageException.AuthorizationResourceTypeMismatch();
             var fields = new List<string>
             {
@@ -590,11 +590,18 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             : throw AzureStorageException.AuthenticationFailed("The signed time is invalid.");
     }
 
-    private static bool AccountSasCoversRequest(string resourceTypes, StorageRequestContext request) =>
+    private static bool AccountSasCoversRequest(
+        string resourceTypes,
+        StorageRequestContext request,
+        HttpRequest httpRequest) =>
         request.ResourceKind switch
         {
             StorageResourceKind.Service => resourceTypes.Contains('s'),
             StorageResourceKind.Container => resourceTypes.Contains('c'),
+            StorageResourceKind.Blob when
+                HttpMethods.IsPut(httpRequest.Method) &&
+                string.Equals(httpRequest.Query["comp"], "undelete", StringComparison.OrdinalIgnoreCase) =>
+                resourceTypes.Contains('c'),
             StorageResourceKind.Blob => resourceTypes.Contains('o'),
             _ => false
         };
