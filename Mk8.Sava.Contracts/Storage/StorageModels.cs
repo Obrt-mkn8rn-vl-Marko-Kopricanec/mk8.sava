@@ -68,6 +68,8 @@ public sealed record ContainerRecord
     public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, StoredAccessPolicy> AccessPolicies { get; init; } = new(StringComparer.Ordinal);
     public string? PublicAccess { get; init; }
+    public string? DefaultEncryptionScope { get; init; }
+    public bool PreventEncryptionScopeOverride { get; init; }
     public LeaseRecord Lease { get; init; } = LeaseRecord.Available;
     public DateTimeOffset? DeletedAt { get; init; }
     public DateTimeOffset? DeleteRetentionUntil { get; init; }

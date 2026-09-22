@@ -4907,6 +4907,150 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task ContainerEncryptionScopePoliciesDefaultWritesAndRejectOverrides()
+    {
+        const string defaultScope = "tenant-default-scope";
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"scope-policy-{Guid.NewGuid():N}");
+        await container.CreateAsync(
+            PublicAccessType.None,
+            metadata: null,
+            new BlobContainerEncryptionScopeOptions
+            {
+                DefaultEncryptionScope = defaultScope,
+                PreventEncryptionScopeOverride = true
+            });
+
+        var containerProperties = (await container.GetPropertiesAsync()).Value;
+        Assert.Equal(defaultScope, containerProperties.DefaultEncryptionScope);
+        Assert.True(containerProperties.PreventEncryptionScopeOverride);
+
+        BlobContainerItem? listedContainer = null;
+        await foreach (var item in service.GetBlobContainersAsync(prefix: container.Name))
+        {
+            if (item.Name == container.Name)
+                listedContainer = item;
+        }
+        Assert.NotNull(listedContainer);
+        Assert.Equal(defaultScope, listedContainer.Properties.DefaultEncryptionScope);
+        Assert.True(listedContainer.Properties.PreventEncryptionScopeOverride);
+
+        var defaultBlob = container.GetBlobClient("default.bin");
+        await defaultBlob.UploadAsync(BinaryData.FromString("default encryption scope"));
+        Assert.Equal(defaultScope, (await defaultBlob.GetPropertiesAsync()).Value.EncryptionScope);
+        var tierChange = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            defaultBlob.SetAccessTierAsync(AccessTier.Cool));
+        Assert.Equal(StatusCodes.Status409Conflict, tierChange.Status);
+        Assert.Equal("BlobOperationNotSupported", tierChange.ErrorCode);
+        var explicitTier = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("explicit-tier.bin").UploadAsync(
+                BinaryData.FromString("scope with explicit tier"),
+                new BlobUploadOptions { AccessTier = AccessTier.Cool }));
+        Assert.Equal(StatusCodes.Status409Conflict, explicitTier.Status);
+        Assert.Equal("BlobOperationNotSupported", explicitTier.ErrorCode);
+
+        var block = container.GetBlockBlobClient("staged.bin");
+        var blockId = Convert.ToBase64String("block-0001"u8);
+        var staged = await block.StageBlockAsync(blockId, BinaryData.FromString("staged scope").ToStream());
+        Assert.Equal(defaultScope, staged.Value.EncryptionScope);
+        await block.CommitBlockListAsync([blockId]);
+        Assert.Equal(defaultScope, (await block.GetPropertiesAsync()).Value.EncryptionScope);
+
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync();
+        await append.AppendBlockAsync(BinaryData.FromString("append scope").ToStream());
+        Assert.Equal(defaultScope, (await append.GetPropertiesAsync()).Value.EncryptionScope);
+
+        var page = container.GetPageBlobClient("page.bin");
+        await page.CreateAsync(512);
+        await page.UploadPagesAsync(new MemoryStream(new byte[512]), 0);
+        Assert.Equal(defaultScope, (await page.GetPropertiesAsync()).Value.EncryptionScope);
+
+        var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, defaultScope);
+        var matchingBlob = scopedService.GetBlobContainerClient(container.Name).GetBlobClient("matching.bin");
+        await matchingBlob.UploadAsync(BinaryData.FromString("matching encryption scope"));
+        Assert.Equal(defaultScope, (await matchingBlob.GetPropertiesAsync()).Value.EncryptionScope);
+
+        var otherScopeService = CreateEncryptedClient(factory, customerProvidedKey: null, "other-scope");
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            otherScopeService.GetBlobContainerClient(container.Name)
+                .GetBlobClient("rejected.bin")
+                .UploadAsync(BinaryData.FromString("rejected encryption scope")));
+        Assert.Equal(StatusCodes.Status403Forbidden, rejected.Status);
+        Assert.Equal("RequestForbiddenByContainerEncryptionPolicy", rejected.ErrorCode);
+
+        var permissive = service.GetBlobContainerClient($"scope-override-{Guid.NewGuid():N}");
+        await permissive.CreateAsync(
+            PublicAccessType.None,
+            metadata: null,
+            new BlobContainerEncryptionScopeOptions
+            {
+                DefaultEncryptionScope = defaultScope,
+                PreventEncryptionScopeOverride = false
+            });
+        var overridden = otherScopeService.GetBlobContainerClient(permissive.Name).GetBlobClient("override.bin");
+        await overridden.UploadAsync(BinaryData.FromString("overridden encryption scope"));
+        Assert.Equal("other-scope", (await overridden.GetPropertiesAsync()).Value.EncryptionScope);
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Create | AccountSasPermissions.Write);
+        var sas = accountSas.ToSasQueryParameters(credential);
+        Uri RawContainerUri(string name) => new(
+            $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}?restype=container&{sas}");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        var oldName = $"scope-old-{Guid.NewGuid():N}";
+        using (var oldVersion = new HttpRequestMessage(HttpMethod.Put, RawContainerUri(oldName))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            oldVersion.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
+            oldVersion.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
+            oldVersion.Headers.TryAddWithoutValidation("x-ms-deny-encryption-scope-override", "true");
+            using var response = await transport.SendAsync(oldVersion);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var incompleteName = $"scope-incomplete-{Guid.NewGuid():N}";
+        using (var incomplete = new HttpRequestMessage(HttpMethod.Put, RawContainerUri(incompleteName))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            incomplete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            incomplete.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
+            using var response = await transport.SendAsync(incomplete);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var bodyName = $"scope-body-{Guid.NewGuid():N}";
+        using (var body = new HttpRequestMessage(HttpMethod.Put, RawContainerUri(bodyName))
+        {
+            Content = new ByteArrayContent([1])
+        })
+        {
+            body.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            body.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
+            body.Headers.TryAddWithoutValidation("x-ms-deny-encryption-scope-override", "true");
+            using var response = await transport.SendAsync(body);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    [Fact]
     public async Task CustomerProvidedKeysFlowThroughSpecializedBlobOperations()
     {
         var key = RandomNumberGenerator.GetBytes(32);

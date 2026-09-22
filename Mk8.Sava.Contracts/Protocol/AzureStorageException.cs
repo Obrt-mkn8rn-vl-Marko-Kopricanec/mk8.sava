@@ -138,6 +138,11 @@ public sealed class AzureStorageException : Exception
         resource == "container" ? "LeaseNotPresentWithContainerOperation" : "LeaseNotPresentWithBlobOperation",
         $"A lease ID was specified, but there is currently no active lease on the {resource}.");
 
+    public static AzureStorageException RequestForbiddenByContainerEncryptionPolicy() => new(
+        (int)HttpStatusCode.Forbidden,
+        "RequestForbiddenByContainerEncryptionPolicy",
+        "The request is forbidden by the container encryption policy.");
+
     public static AzureStorageException InfiniteLeaseDurationRequired() => new(
         (int)HttpStatusCode.PreconditionFailed,
         "InfiniteLeaseDurationRequired",
