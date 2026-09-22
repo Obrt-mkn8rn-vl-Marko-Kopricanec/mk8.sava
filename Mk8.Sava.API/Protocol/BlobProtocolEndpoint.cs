@@ -1648,6 +1648,7 @@ public static class BlobProtocolEndpoint
             {
                 RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
                 ValidateSynchronousCopyEncryption(http.Request);
+                ValidateCopyDestinationType(current, BlobKind.BlockBlob);
                 RequireZeroContentLength(http.Request);
                 if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
                     throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
@@ -1712,6 +1713,8 @@ public static class BlobProtocolEndpoint
                                 containerName,
                                 blobName,
                                 source.Content,
+                                source.ContentLength!.Value,
+                                source.CommittedBlocks,
                                 ReadUrlCopyWriteOptions(
                                     http.Request,
                                     source,
@@ -1725,7 +1728,8 @@ public static class BlobProtocolEndpoint
                                 cancellationToken);
                         },
                         cancellationToken,
-                        copySourceTags);
+                        copySourceTags,
+                        preserveSourceShape: true);
                     synchronousCopy = transfer.Value;
                 }
                 AzureResponseWriter.AddBlobCopyHeaders(http.Response, synchronousCopy, includeVersion: false);
@@ -1760,6 +1764,7 @@ public static class BlobProtocolEndpoint
                     cancellationToken);
                 EvaluateCopySourceConditions(http.Request, source);
                 ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
+                ValidateCopyDestinationType(current, source.Kind);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
                     containerName,
@@ -1783,23 +1788,36 @@ public static class BlobProtocolEndpoint
                     allowSourceCustomerProvidedKey: false,
                     long.MaxValue,
                     sourceLengthConflict: false,
-                    async source => await service.BeginCopyFromStreamAsync(
-                        request.Account,
-                        containerName,
-                        blobName,
-                        source.Content,
-                        ReadUrlCopyWriteOptions(
-                            http.Request,
-                            source,
-                            copySourceTags: false,
-                            current,
-                            synchronous: false),
-                        publicSource,
-                        current?.Lease ?? LeaseRecord.Available,
-                        current?.GenerationId,
-                        current?.Revision,
-                        cancellationToken),
-                    cancellationToken);
+                    async source =>
+                    {
+                        var sourceKind = source.Kind ?? BlobKind.BlockBlob;
+                        ValidateCopyDestinationType(current, sourceKind);
+                        return await service.BeginCopyFromStreamAsync(
+                            request.Account,
+                            containerName,
+                            blobName,
+                            source.Content,
+                            source.ContentLength!.Value,
+                            sourceKind,
+                            source.SequenceNumber,
+                            source.IsSealed,
+                            source.AppendBlockCount,
+                            source.CommittedBlocks,
+                            source.PageRanges,
+                            ReadUrlCopyWriteOptions(
+                                http.Request,
+                                source,
+                                copySourceTags: false,
+                                current,
+                                synchronous: false),
+                            publicSource,
+                            current?.Lease ?? LeaseRecord.Available,
+                            current?.GenerationId,
+                            current?.Revision,
+                            cancellationToken);
+                    },
+                    cancellationToken,
+                    preserveSourceShape: true);
                 copied = transfer.Value;
             }
             AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: true);
@@ -3145,6 +3163,16 @@ public static class BlobProtocolEndpoint
             StatusCodes.Status409Conflict,
             "BlobArchived",
             "An archived copy source requires an explicit online destination access tier.");
+    }
+
+    private static void ValidateCopyDestinationType(BlobRecord? destination, BlobKind sourceKind)
+    {
+        if (destination is null || destination.Kind == sourceKind)
+            return;
+        throw new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "InvalidBlobType",
+            "The destination blob type does not match the copy source blob type.");
     }
 
     private static bool ReadCopySourceTags(HttpRequest request)

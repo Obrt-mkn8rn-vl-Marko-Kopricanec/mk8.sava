@@ -1351,6 +1351,8 @@ public sealed class BlobService(
         string container,
         string name,
         Stream source,
+        long contentLength,
+        IReadOnlyList<CopySourceBlock> sourceBlocks,
         BlobWriteOptions options,
         string sourceUri,
         LeaseRecord destinationLease,
@@ -1358,13 +1360,19 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        using var content = await chunks.StorePinnedAsync(account, EncryptionOf(options), source, cancellationToken);
+        using var content = await StoreRemoteBlockBlobAsync(
+            account,
+            source,
+            contentLength,
+            sourceBlocks,
+            EncryptionOf(options),
+            cancellationToken);
         return await PublishSynchronousBlockCopyAsync(
             account,
             container,
             name,
-            content.Manifest,
-            [],
+            content.Content,
+            content.CommittedBlocks,
             options,
             sourceUri,
             destinationLease,
@@ -1507,6 +1515,13 @@ public sealed class BlobService(
         string container,
         string name,
         Stream source,
+        long contentLength,
+        BlobKind sourceKind,
+        long sequenceNumber,
+        bool isSealed,
+        int appendBlockCount,
+        IReadOnlyList<CopySourceBlock> sourceBlocks,
+        IReadOnlyList<PageRange> pageRanges,
         BlobWriteOptions options,
         string sourceUri,
         LeaseRecord destinationLease,
@@ -1514,18 +1529,48 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        using var content = await chunks.StorePinnedAsync(account, EncryptionOf(options), source, cancellationToken);
+        var encryption = EncryptionOf(options);
+        if (sourceKind == BlobKind.BlockBlob)
+        {
+            using var content = await StoreRemoteBlockBlobAsync(
+                account,
+                source,
+                contentLength,
+                sourceBlocks,
+                encryption,
+                cancellationToken);
+            return await BeginCopyAsync(
+                account,
+                container,
+                name,
+                sourceKind,
+                content.Content,
+                sequenceNumber,
+                isSealed,
+                appendBlockCount,
+                content.CommittedBlocks,
+                pageRanges,
+                options,
+                sourceUri,
+                destinationLease,
+                expectedGeneration,
+                expectedRevision,
+                cancellationToken);
+        }
+        using var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+        if (stored.Manifest.Length != contentLength)
+            throw CannotVerifyCopySource("The copy source length did not match its Content-Length value.");
         return await BeginCopyAsync(
             account,
             container,
             name,
-            BlobKind.BlockBlob,
-            content.Manifest,
-            sequenceNumber: 0,
-            isSealed: false,
-            appendBlockCount: 0,
+            sourceKind,
+            stored.Manifest,
+            sequenceNumber,
+            isSealed,
+            appendBlockCount,
             committedBlocks: [],
-            pageRanges: [],
+            pageRanges,
             options,
             sourceUri,
             destinationLease,
@@ -1560,14 +1605,18 @@ public sealed class BlobService(
         using var sourcePin = chunks.Pin(sourceContent);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
-        var proposed = NewBlob(account, container, name, sourceKind, chunks.Empty(account, encryption), options, now) with
+        var visibleContent = sourceKind == BlobKind.PageBlob
+            ? chunks.Sparse(account, encryption, sourceContent.Length)
+            : chunks.Empty(account, encryption);
+        var proposed = NewBlob(account, container, name, sourceKind, visibleContent, options, now) with
         {
             Lease = leases.ResetAfterBlobWrite(destinationLease),
             SequenceNumber = sequenceNumber,
             IsSealed = isSealed,
             AppendBlockCount = appendBlockCount,
             CommittedBlocks = [.. committedBlocks],
-            PageRanges = [.. pageRanges],
+            PageRanges = [],
+            PendingCopyPageRanges = sourceKind == BlobKind.PageBlob ? [.. pageRanges] : null,
             PendingCopyContent = sourceContent,
             Copy = new CopyState
             {
@@ -1580,6 +1629,136 @@ public sealed class BlobService(
             }
         };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+    }
+
+    private static async Task EnsureSourceExhaustedAsync(Stream source, CancellationToken cancellationToken)
+    {
+        var probe = new byte[1];
+        if (await source.ReadAsync(probe, cancellationToken) != 0)
+            throw CannotVerifyCopySource("The copy source contained more data than its committed block list.");
+    }
+
+    private async Task<PreparedCopyContent> StoreRemoteBlockBlobAsync(
+        string account,
+        Stream source,
+        long contentLength,
+        IReadOnlyList<CopySourceBlock> sourceBlocks,
+        BlobEncryption encryption,
+        CancellationToken cancellationToken)
+    {
+        var leases = new List<IDisposable>();
+        try
+        {
+            if (sourceBlocks.Count == 0)
+            {
+                var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+                leases.Add(stored);
+                if (stored.Manifest.Length != contentLength)
+                    throw CannotVerifyCopySource("The copy source length did not match its Content-Length value.");
+                return new PreparedCopyContent(stored.Manifest, [], leases);
+            }
+
+            var copiedBlocks = new List<CommittedBlockRecord>(sourceBlocks.Count);
+            foreach (var sourceBlock in sourceBlocks)
+            {
+                using var blockSource = new ExactLengthReadStream(source, sourceBlock.Length);
+                StoredContent storedBlock;
+                try
+                {
+                    storedBlock = await chunks.StorePinnedAsync(account, encryption, blockSource, cancellationToken);
+                }
+                catch (EndOfStreamException)
+                {
+                    throw CannotVerifyCopySource("The copy source ended before its committed block did.");
+                }
+                leases.Add(storedBlock);
+                copiedBlocks.Add(new CommittedBlockRecord(sourceBlock.Id, storedBlock.Manifest));
+            }
+            await EnsureSourceExhaustedAsync(source, cancellationToken);
+            var content = await chunks.ComposeAsync(
+                account,
+                encryption,
+                copiedBlocks.Select(block => block.Content).ToArray(),
+                cancellationToken);
+            if (content.Length != contentLength)
+                throw CannotVerifyCopySource("The copy source length did not match its committed block list.");
+            return new PreparedCopyContent(content, copiedBlocks, leases);
+        }
+        catch
+        {
+            foreach (var lease in leases)
+                lease.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class ExactLengthReadStream(Stream inner, long length) : Stream
+    {
+        private long _remaining = length >= 0 ? length : throw new ArgumentOutOfRangeException(nameof(length));
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => length;
+        public override long Position
+        {
+            get => length - _remaining;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            Read(buffer.AsSpan(offset, count));
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (buffer.IsEmpty)
+                return 0;
+            if (_remaining == 0)
+                return 0;
+            var read = inner.Read(buffer[..(int)Math.Min(buffer.Length, _remaining)]);
+            Record(read);
+            return read;
+        }
+
+        public override async ValueTask<int> ReadAsync(
+            Memory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            if (buffer.IsEmpty)
+                return 0;
+            if (_remaining == 0)
+                return 0;
+            var read = await inner.ReadAsync(
+                buffer[..(int)Math.Min(buffer.Length, _remaining)],
+                cancellationToken);
+            Record(read);
+            return read;
+        }
+
+        public override Task<int> ReadAsync(
+            byte[] buffer,
+            int offset,
+            int count,
+            CancellationToken cancellationToken) =>
+            ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override void Flush() => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The outer transfer owns the source stream.
+            base.Dispose(disposing);
+        }
+
+        private void Record(int read)
+        {
+            if (read == 0)
+                throw new EndOfStreamException("The copy source ended before its committed block did.");
+            _remaining -= read;
+        }
     }
 
     private async Task<PreparedCopyContent> PrepareCopyContentAsync(
@@ -2349,6 +2528,11 @@ public sealed class BlobService(
         StatusCodes.Status409Conflict,
         "BlobOperationNotSupported",
         "The copy source and destination use different request-level encryption settings.");
+
+    private static AzureStorageException CannotVerifyCopySource(string message) => new(
+        StatusCodes.Status500InternalServerError,
+        "CannotVerifyCopySource",
+        message);
 
     private static List<PageRange> UpdatePageRanges(
         IReadOnlyList<PageRange> current,
