@@ -33,6 +33,36 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     : IClassFixture<SavaWebApplicationFactory>
 {
     [Fact]
+    public async Task PathStyleServiceEndpointAcceptsTerminalAccountSeparator()
+    {
+        var endpoint = new Uri($"http://localhost/{SavaWebApplicationFactory.AccountName}");
+        var options = new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(new HttpClient(factory.Server.CreateHandler())
+            {
+                BaseAddress = endpoint
+            }),
+            Retry = { MaxRetries = 0 }
+        };
+        var service = new BlobServiceClient(
+            endpoint,
+            new StorageSharedKeyCredential(
+                SavaWebApplicationFactory.AccountName,
+                SavaWebApplicationFactory.AccountKey),
+            options);
+        var containerName = $"path-style-{Guid.NewGuid():N}";
+        var container = service.GetBlobContainerClient(containerName);
+
+        await container.CreateAsync();
+        var names = new List<string>();
+        await foreach (var item in service.GetBlobContainersAsync(prefix: containerName))
+            names.Add(item.Name);
+
+        Assert.Equal([containerName], names);
+        await container.DeleteAsync();
+    }
+
+    [Fact]
     public async Task BlockBlobRoundTripPreservesBytesPropertiesMetadataTagsRangesAndListings()
     {
         var service = CreateClient(factory);

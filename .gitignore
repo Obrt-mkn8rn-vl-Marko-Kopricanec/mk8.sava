@@ -1,6 +1,7 @@
 /docs/internal
 **/bin/
 **/obj/
+**/node_modules/
 .idea/
 .vs/
 .vscode/
