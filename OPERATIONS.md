@@ -82,6 +82,11 @@ as bounded record batches inside Azure's Avro query envelope; the service does
 not retain or buffer the complete result set. The normal .NET compatibility
 suite exercises multiple Parquet row groups and all six Azure Arrow field types,
 including null and empty-result stream shapes, through the official SDK.
+The SQL evaluator supports Azure's row-wise arithmetic and comparison
+precedence, typed `CAST`, `BETWEEN`, `IN`, `NULLIF`, `COALESCE`,
+`CHAR_LENGTH`/`CHARACTER_LENGTH`, `LOWER`, `UPPER`, `SUBSTRING`, and `LIMIT`.
+Once a `LIMIT` is satisfied, input enumeration and its underlying blob read are
+cancelled instead of scanning the remainder of the object.
 
 ## Account capabilities
 

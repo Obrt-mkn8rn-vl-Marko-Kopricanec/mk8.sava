@@ -120,7 +120,7 @@ internal static class BlobQueryProtocol
             }
 
             var wroteHeader = false;
-            while (await enumerator.MoveNextAsync())
+            while (!plan.LimitReached && await enumerator.MoveNextAsync())
             {
                 var selected = plan.Select(enumerator.Current);
                 if (selected is null)
@@ -276,7 +276,7 @@ internal static class BlobQueryProtocol
         await writer.WriteStartAsync(cancellationToken);
 
         var batch = new List<QuerySelection>(ArrowRecordBatchSize);
-        while (await rows.MoveNextAsync())
+        while (!plan.LimitReached && await rows.MoveNextAsync())
         {
             var selected = plan.Select(rows.Current);
             if (selected is null)
@@ -1268,7 +1268,7 @@ internal sealed record QueryCell(object? Value)
 
 internal sealed record QueryRow(IReadOnlyList<string> Names, IReadOnlyList<QueryCell> Values)
 {
-    public QueryCell Resolve(string name)
+    public QueryCell Resolve(string name, bool caseSensitive = false)
     {
         if (name.Length > 1 && name[0] == '_' &&
             int.TryParse(name.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture, out var ordinal) &&
@@ -1279,7 +1279,10 @@ internal sealed record QueryRow(IReadOnlyList<string> Names, IReadOnlyList<Query
 
         for (var index = 0; index < Names.Count; index++)
         {
-            if (string.Equals(Names[index], name, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(
+                    Names[index],
+                    name,
+                    caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase))
                 return Values[index];
         }
         return new QueryCell(null);
@@ -1292,31 +1295,98 @@ internal sealed class BlobQueryPlan
 {
     private readonly IReadOnlyList<QueryProjection> _projections;
     private readonly QueryPredicate? _predicate;
+    private readonly long? _limit;
+    private long _selectedRows;
 
-    private BlobQueryPlan(IReadOnlyList<QueryProjection> projections, QueryPredicate? predicate)
+    private BlobQueryPlan(
+        IReadOnlyList<QueryProjection> projections,
+        QueryPredicate? predicate,
+        long? limit)
     {
         _projections = projections;
         _predicate = predicate;
+        _limit = limit;
     }
 
     public static BlobQueryPlan Parse(string expression) => new QueryParser(expression).Parse();
 
+    public bool LimitReached => _limit.HasValue && _selectedRows >= _limit.Value;
+
     public QuerySelection? Select(QueryRow row)
     {
+        if (LimitReached)
+            return null;
         if (_predicate is not null && !_predicate.Evaluate(row))
             return null;
+        _selectedRows++;
         if (_projections is [{ Star: true }])
             return new QuerySelection(row.Names, row.Values);
         return new QuerySelection(
             _projections.Select(projection => projection.Name).ToArray(),
-            _projections.Select(projection => projection.Operand!.Resolve(row)).ToArray());
+            _projections.Select(projection => projection.Expression!.Evaluate(row)).ToArray());
     }
 
-    private sealed record QueryProjection(bool Star, QueryOperand? Operand, string Name);
+    private sealed record QueryProjection(bool Star, QueryExpression? Expression, string Name);
 
-    private sealed record QueryOperand(string? Field, QueryCell? Literal)
+    private abstract record QueryExpression
     {
-        public QueryCell Resolve(QueryRow row) => Field is null ? Literal! : row.Resolve(Field);
+        public abstract QueryCell Evaluate(QueryRow row);
+    }
+
+    private sealed record QueryOperand(
+        string? Field,
+        bool FieldCaseSensitive,
+        QueryCell? Literal) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) =>
+            Field is null ? Literal! : row.Resolve(Field, FieldCaseSensitive);
+    }
+
+    private sealed record QueryBinaryExpression(
+        QueryExpression Left,
+        QueryExpression Right,
+        string Operator) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) =>
+            EvaluateBinary(Left.Evaluate(row), Right.Evaluate(row), Operator);
+    }
+
+    private sealed record QueryUnaryExpression(
+        QueryExpression Operand,
+        bool Negate) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row)
+        {
+            var value = Operand.Evaluate(row);
+            if (value.Value is null || !Negate)
+                return value;
+            try
+            {
+                if (value.Value is long integer)
+                    return new QueryCell(checked(-integer));
+                if (TryDouble(value, out var number))
+                    return new QueryCell(-number);
+                throw InvalidType("A unary numeric operator requires a numeric value.");
+            }
+            catch (OverflowException)
+            {
+                throw InvalidType("The unary numeric result is outside the supported range.");
+            }
+        }
+    }
+
+    private sealed record QueryCastExpression(
+        QueryExpression Operand,
+        QueryValueType Type) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) => Cast(Operand.Evaluate(row), Type);
+    }
+
+    private sealed record QueryFunctionExpression(
+        string Name,
+        IReadOnlyList<QueryExpression> Arguments) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) => EvaluateFunction(Name, Arguments, row);
     }
 
     private abstract record QueryPredicate
@@ -1336,34 +1406,38 @@ internal sealed class BlobQueryPlan
         public override bool Evaluate(QueryRow row) => !Inner.Evaluate(row);
     }
 
-    private sealed record NullPredicate(QueryOperand Operand, bool Negated) : QueryPredicate
+    private sealed record NullPredicate(QueryExpression Operand, bool Negated) : QueryPredicate
     {
-        public override bool Evaluate(QueryRow row) => (Operand.Resolve(row).Value is null) != Negated;
+        public override bool Evaluate(QueryRow row) => (Operand.Evaluate(row).Value is null) != Negated;
     }
 
-    private sealed record TruthPredicate(QueryOperand Operand) : QueryPredicate
+    private sealed record TruthPredicate(QueryExpression Operand) : QueryPredicate
     {
-        public override bool Evaluate(QueryRow row) => Operand.Resolve(row).Value switch
+        public override bool Evaluate(QueryRow row) => Operand.Evaluate(row).Value switch
         {
             null => false,
             bool boolean => boolean,
             string text => !string.IsNullOrEmpty(text),
             long integer => integer != 0,
             decimal number => number != 0,
+            double number => number != 0,
             _ => true
         };
     }
 
-    private sealed record ComparisonPredicate(QueryOperand Left, QueryOperand Right, string Operator) : QueryPredicate
+    private sealed record ComparisonPredicate(
+        QueryExpression Left,
+        QueryExpression Right,
+        string Operator) : QueryPredicate
     {
         public override bool Evaluate(QueryRow row)
         {
-            var left = Left.Resolve(row);
-            var right = Right.Resolve(row);
+            var left = Left.Evaluate(row);
+            var right = Right.Evaluate(row);
             if (left.Value is null || right.Value is null)
-                return Operator is "!=" or "<>" && left.Value is not null != (right.Value is not null);
+                return false;
 
-            var comparison = Compare(left, right);
+            var comparison = CompareValues(left, right);
             return Operator switch
             {
                 "=" or "==" => comparison == 0,
@@ -1375,17 +1449,290 @@ internal sealed class BlobQueryPlan
                 _ => false
             };
         }
+    }
 
-        private static int Compare(QueryCell left, QueryCell right)
+    private sealed record BetweenPredicate(
+        QueryExpression Value,
+        QueryExpression Lower,
+        QueryExpression Upper,
+        bool Negated) : QueryPredicate
+    {
+        public override bool Evaluate(QueryRow row)
         {
-            if (decimal.TryParse(left.ToText(), NumberStyles.Number | NumberStyles.AllowExponent, CultureInfo.InvariantCulture, out var leftNumber) &&
-                decimal.TryParse(right.ToText(), NumberStyles.Number | NumberStyles.AllowExponent, CultureInfo.InvariantCulture, out var rightNumber))
-            {
-                return leftNumber.CompareTo(rightNumber);
-            }
-            return string.Compare(left.ToText(), right.ToText(), StringComparison.Ordinal);
+            var value = Value.Evaluate(row);
+            var lower = Lower.Evaluate(row);
+            var upper = Upper.Evaluate(row);
+            if (value.Value is null || lower.Value is null || upper.Value is null)
+                return false;
+            var matches = CompareValues(value, lower) >= 0 && CompareValues(value, upper) <= 0;
+            return matches != Negated;
         }
     }
+
+    private sealed record InPredicate(
+        QueryExpression Value,
+        IReadOnlyList<QueryExpression> Candidates,
+        bool Negated) : QueryPredicate
+    {
+        public override bool Evaluate(QueryRow row)
+        {
+            var value = Value.Evaluate(row);
+            if (value.Value is null)
+                return false;
+            var matches = Candidates
+                .Select(candidate => candidate.Evaluate(row))
+                .Any(candidate => candidate.Value is not null && CompareValues(value, candidate) == 0);
+            return matches != Negated;
+        }
+    }
+
+    private enum QueryValueType
+    {
+        Int,
+        Float,
+        String,
+        Timestamp,
+        Boolean
+    }
+
+    private static QueryCell EvaluateBinary(QueryCell left, QueryCell right, string operation)
+    {
+        if (left.Value is null || right.Value is null)
+            return new QueryCell(null);
+
+        try
+        {
+            if (operation == "+" && IsTimestamp(left) && TryTimestamp(left, out var leftTimestamp) && TryDouble(right, out var rightDays))
+                return new QueryCell(leftTimestamp.AddDays(rightDays));
+            if (operation == "+" && TryDouble(left, out var leftDays) && IsTimestamp(right) && TryTimestamp(right, out var rightTimestamp))
+                return new QueryCell(rightTimestamp.AddDays(leftDays));
+            if (operation == "-" && IsTimestamp(left) && TryTimestamp(left, out leftTimestamp) && TryDouble(right, out rightDays))
+                return new QueryCell(leftTimestamp.AddDays(-rightDays));
+
+            if (left.Value is long leftInteger && right.Value is long rightInteger && operation != "/")
+            {
+                return operation switch
+                {
+                    "+" => new QueryCell(checked(leftInteger + rightInteger)),
+                    "-" => new QueryCell(checked(leftInteger - rightInteger)),
+                    "*" => new QueryCell(checked(leftInteger * rightInteger)),
+                    "%" when rightInteger != 0 => new QueryCell(leftInteger % rightInteger),
+                    "%" => throw InvalidType("The remainder divisor cannot be zero."),
+                    _ => throw InvalidType($"The arithmetic operator '{operation}' is not supported.")
+                };
+            }
+
+            if (!TryDouble(left, out var leftNumber) || !TryDouble(right, out var rightNumber))
+                throw InvalidType($"The arithmetic operator '{operation}' requires numeric values.");
+            var result = operation switch
+            {
+                "+" => leftNumber + rightNumber,
+                "-" => leftNumber - rightNumber,
+                "*" => leftNumber * rightNumber,
+                "/" when rightNumber != 0 => leftNumber / rightNumber,
+                "/" => throw InvalidType("The divisor cannot be zero."),
+                "%" when rightNumber != 0 => leftNumber % rightNumber,
+                "%" => throw InvalidType("The remainder divisor cannot be zero."),
+                _ => throw InvalidType($"The arithmetic operator '{operation}' is not supported.")
+            };
+            if (!double.IsFinite(result))
+                throw InvalidType("The arithmetic result is outside the supported numeric range.");
+            return new QueryCell(result);
+        }
+        catch (OverflowException)
+        {
+            throw InvalidType("The arithmetic result is outside the supported numeric range.");
+        }
+    }
+
+    private static QueryCell Cast(QueryCell value, QueryValueType type)
+    {
+        if (value.Value is null)
+            return value;
+
+        try
+        {
+            return type switch
+            {
+                QueryValueType.Int when value.Value is long integer => new QueryCell(integer),
+                QueryValueType.Int when value.Value is bool boolean => new QueryCell(boolean ? 1L : 0L),
+                QueryValueType.Int when TryDouble(value, out var number) => new QueryCell(checked((long)Math.Truncate(number))),
+                QueryValueType.Float when TryDouble(value, out var number) => new QueryCell(number),
+                QueryValueType.String => new QueryCell(value.ToText()),
+                QueryValueType.Timestamp when TryTimestamp(value, out var timestamp) => new QueryCell(timestamp),
+                QueryValueType.Boolean when value.Value is bool boolean => new QueryCell(boolean),
+                QueryValueType.Boolean when bool.TryParse(value.ToText(), out var boolean) => new QueryCell(boolean),
+                QueryValueType.Boolean when TryDouble(value, out var number) => new QueryCell(number != 0),
+                _ => throw InvalidType($"The value '{value.ToText()}' cannot be cast to {type.ToString().ToUpperInvariant()}.")
+            };
+        }
+        catch (OverflowException)
+        {
+            throw InvalidType($"The value '{value.ToText()}' is outside the range of {type.ToString().ToUpperInvariant()}.");
+        }
+    }
+
+    private static QueryCell EvaluateFunction(
+        string name,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        if (name == "COALESCE")
+        {
+            foreach (var argument in arguments)
+            {
+                var candidate = argument.Evaluate(row);
+                if (candidate.Value is not null)
+                    return candidate;
+            }
+            return new QueryCell(null);
+        }
+
+        if (name == "UTCNOW")
+            return new QueryCell(DateTimeOffset.UtcNow);
+
+        var first = arguments[0].Evaluate(row);
+        if (name == "NULLIF")
+        {
+            var second = arguments[1].Evaluate(row);
+            return first.Value is not null && second.Value is not null && CompareValues(first, second) == 0
+                ? new QueryCell(null)
+                : first;
+        }
+        if (first.Value is null)
+            return first;
+
+        return name switch
+        {
+            "CHAR_LENGTH" or "CHARACTER_LENGTH" =>
+                new QueryCell((long)first.ToText().EnumerateRunes().Count()),
+            "LOWER" => new QueryCell(first.ToText().ToLowerInvariant()),
+            "UPPER" => new QueryCell(first.ToText().ToUpperInvariant()),
+            "SUBSTRING" => EvaluateSubstring(first, arguments, row),
+            _ => throw InvalidType($"The function '{name}' is not supported.")
+        };
+    }
+
+    private static QueryCell EvaluateSubstring(
+        QueryCell value,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        var characters = value.ToText().EnumerateRunes().ToArray();
+        var start = ToNonNegativeInt(arguments[1].Evaluate(row), "SUBSTRING start");
+        if (start >= characters.Length)
+            return new QueryCell(string.Empty);
+        var length = arguments.Count == 2
+            ? characters.Length - start
+            : Math.Min(
+                ToNonNegativeInt(arguments[2].Evaluate(row), "SUBSTRING length"),
+                characters.Length - start);
+        var result = new StringBuilder(length);
+        for (var index = start; index < start + length; index++)
+            result.Append(characters[index]);
+        return new QueryCell(result.ToString());
+    }
+
+    private static int ToNonNegativeInt(QueryCell value, string description)
+    {
+        var converted = Cast(value, QueryValueType.Int);
+        if (converted.Value is not long integer || integer is < 0 or > int.MaxValue)
+            throw InvalidType($"{description} must be a non-negative integer.");
+        return (int)integer;
+    }
+
+    private static int CompareValues(QueryCell left, QueryCell right)
+    {
+        if (TryDecimal(left, out var leftDecimal) && TryDecimal(right, out var rightDecimal))
+            return leftDecimal.CompareTo(rightDecimal);
+        if (TryTimestamp(left, out var leftTimestamp) && TryTimestamp(right, out var rightTimestamp))
+            return leftTimestamp.CompareTo(rightTimestamp);
+        if (left.Value is bool leftBoolean && right.Value is bool rightBoolean)
+            return leftBoolean.CompareTo(rightBoolean);
+        return string.Compare(left.ToText(), right.ToText(), StringComparison.Ordinal);
+    }
+
+    private static bool TryDecimal(QueryCell value, out decimal number)
+    {
+        switch (value.Value)
+        {
+            case long integer:
+                number = integer;
+                return true;
+            case decimal exact:
+                number = exact;
+                return true;
+            case double floating when double.IsFinite(floating):
+                try
+                {
+                    number = (decimal)floating;
+                    return true;
+                }
+                catch (OverflowException)
+                {
+                    break;
+                }
+            case string text when decimal.TryParse(
+                text,
+                NumberStyles.Number | NumberStyles.AllowExponent,
+                CultureInfo.InvariantCulture,
+                out number):
+                return true;
+        }
+        number = 0;
+        return false;
+    }
+
+    private static bool TryDouble(QueryCell value, out double number)
+    {
+        switch (value.Value)
+        {
+            case long integer:
+                number = integer;
+                return true;
+            case decimal exact:
+                number = (double)exact;
+                return double.IsFinite(number);
+            case double floating when double.IsFinite(floating):
+                number = floating;
+                return true;
+            default:
+                return double.TryParse(
+                           value.ToText(),
+                           NumberStyles.Float,
+                           CultureInfo.InvariantCulture,
+                           out number) &&
+                       double.IsFinite(number);
+        }
+    }
+
+    private static bool TryTimestamp(QueryCell value, out DateTimeOffset timestamp)
+    {
+        switch (value.Value)
+        {
+            case DateTimeOffset offset:
+                timestamp = offset;
+                return true;
+            case DateTime dateTime:
+                timestamp = dateTime.Kind == DateTimeKind.Unspecified
+                    ? new DateTimeOffset(dateTime, TimeSpan.Zero)
+                    : new DateTimeOffset(dateTime);
+                return true;
+            default:
+                return DateTimeOffset.TryParse(
+                    value.ToText(),
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
+                    out timestamp);
+        }
+    }
+
+    private static bool IsTimestamp(QueryCell value) => value.Value is DateTimeOffset or DateTime;
+
+    private static BlobQueryDataException InvalidType(string message) => new(
+        "InvalidType",
+        message,
+        0);
 
     private enum QueryTokenKind
     {
@@ -1396,7 +1743,11 @@ internal sealed class BlobQueryPlan
         End
     }
 
-    private readonly record struct QueryToken(QueryTokenKind Kind, string Text, int Position);
+    private readonly record struct QueryToken(
+        QueryTokenKind Kind,
+        string Text,
+        int Position,
+        bool Quoted = false);
 
     private sealed class QueryParser
     {
@@ -1419,16 +1770,24 @@ internal sealed class BlobQueryPlan
 
             if (MatchKeyword("AS"))
                 _ = Expect(QueryTokenKind.Identifier, "alias");
-            else if (Current.Kind == QueryTokenKind.Identifier && !IsKeyword(Current, "WHERE"))
+            else if (Current.Kind == QueryTokenKind.Identifier && !IsClauseKeyword(Current))
                 _position++;
 
             QueryPredicate? predicate = null;
             if (MatchKeyword("WHERE"))
                 predicate = ParseOr();
+            long? limit = null;
+            if (MatchKeyword("LIMIT"))
+            {
+                var token = Expect(QueryTokenKind.Number, "LIMIT value");
+                if (!long.TryParse(token.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedLimit))
+                    throw InvalidQuery(token.Position, "LIMIT must be a non-negative 64-bit integer.");
+                limit = parsedLimit;
+            }
             _ = MatchSymbol(";");
             if (Current.Kind != QueryTokenKind.End)
                 throw InvalidQuery(Current.Position, $"Unexpected token '{Current.Text}'.");
-            return new BlobQueryPlan(projections, predicate);
+            return new BlobQueryPlan(projections, predicate, limit);
         }
 
         private IReadOnlyList<QueryProjection> ParseProjections()
@@ -1441,18 +1800,18 @@ internal sealed class BlobQueryPlan
                     projections.Add(new QueryProjection(true, null, "*"));
                     continue;
                 }
-                var operand = ParseOperand();
+                var expression = ParseExpression();
                 var defaultName = $"_{projections.Count + 1}";
                 var name = MatchKeyword("AS")
                     ? Expect(QueryTokenKind.Identifier, "alias").Text
-                    : Current.Kind == QueryTokenKind.Identifier && !IsKeyword(Current, "FROM")
+                    : Current.Kind == QueryTokenKind.Identifier && !IsClauseKeyword(Current)
                         ? _tokens[_position++].Text
                         : defaultName;
-                projections.Add(new QueryProjection(false, operand, name));
+                projections.Add(new QueryProjection(false, expression, name));
             }
             while (MatchSymbol(","));
 
-            if (projections.Count == 0 || projections.Count > 256 ||
+            if (projections.Count == 0 || projections.Count > 49 ||
                 projections.Any(projection => projection.Star) && projections.Count != 1)
             {
                 throw InvalidQuery(Current.Position, "The SELECT projection is invalid.");
@@ -1487,22 +1846,79 @@ internal sealed class BlobQueryPlan
                 return nested;
             }
 
-            var left = ParseOperand();
+            var left = ParseExpression();
             if (MatchKeyword("IS"))
             {
                 var negated = MatchKeyword("NOT");
                 ExpectKeyword("NULL");
                 return new NullPredicate(left, negated);
             }
+            var negatedSet = MatchKeyword("NOT");
+            if (MatchKeyword("BETWEEN"))
+            {
+                var lower = ParseExpression();
+                ExpectKeyword("AND");
+                var upper = ParseExpression();
+                return new BetweenPredicate(left, lower, upper, negatedSet);
+            }
+            if (MatchKeyword("IN"))
+            {
+                ExpectSymbol("(");
+                var candidates = new List<QueryExpression>();
+                do
+                {
+                    candidates.Add(ParseExpression());
+                }
+                while (MatchSymbol(","));
+                ExpectSymbol(")");
+                if (candidates.Count == 0)
+                    throw InvalidQuery(Current.Position, "IN requires at least one value.");
+                return new InPredicate(left, candidates, negatedSet);
+            }
+            if (negatedSet)
+                throw InvalidQuery(Current.Position, "Expected BETWEEN or IN after NOT.");
             if (Current.Kind == QueryTokenKind.Symbol && Current.Text is "=" or "==" or "!=" or "<>" or "<" or "<=" or ">" or ">=")
             {
                 var operation = _tokens[_position++].Text;
-                return new ComparisonPredicate(left, ParseOperand(), operation);
+                return new ComparisonPredicate(left, ParseExpression(), operation);
             }
             return new TruthPredicate(left);
         }
 
-        private QueryOperand ParseOperand()
+        private QueryExpression ParseExpression() => ParseAdditive();
+
+        private QueryExpression ParseAdditive()
+        {
+            var expression = ParseMultiplicative();
+            while (Current.Kind == QueryTokenKind.Symbol && Current.Text is "+" or "-")
+            {
+                var operation = _tokens[_position++].Text;
+                expression = new QueryBinaryExpression(expression, ParseMultiplicative(), operation);
+            }
+            return expression;
+        }
+
+        private QueryExpression ParseMultiplicative()
+        {
+            var expression = ParseUnary();
+            while (Current.Kind == QueryTokenKind.Symbol && Current.Text is "*" or "/" or "%")
+            {
+                var operation = _tokens[_position++].Text;
+                expression = new QueryBinaryExpression(expression, ParseUnary(), operation);
+            }
+            return expression;
+        }
+
+        private QueryExpression ParseUnary()
+        {
+            if (MatchSymbol("+"))
+                return new QueryUnaryExpression(ParseUnary(), Negate: false);
+            if (MatchSymbol("-"))
+                return new QueryUnaryExpression(ParseUnary(), Negate: true);
+            return ParsePrimary();
+        }
+
+        private QueryExpression ParsePrimary()
         {
             var token = Current;
             _position++;
@@ -1510,23 +1926,55 @@ internal sealed class BlobQueryPlan
             {
                 case QueryTokenKind.Identifier:
                     if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(null));
+                        return new QueryOperand(null, false, new QueryCell(null));
                     if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(true));
+                        return new QueryOperand(null, false, new QueryCell(true));
                     if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(false));
+                        return new QueryOperand(null, false, new QueryCell(false));
+                    if (string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) && MatchSymbol("("))
+                    {
+                        var operand = ParseExpression();
+                        ExpectKeyword("AS");
+                        var type = ParseValueType(Expect(QueryTokenKind.Identifier, "CAST type"));
+                        ExpectSymbol(")");
+                        return new QueryCastExpression(operand, type);
+                    }
+                    if (MatchSymbol("("))
+                    {
+                        var arguments = new List<QueryExpression>();
+                        if (!MatchSymbol(")"))
+                        {
+                            do
+                            {
+                                arguments.Add(ParseExpression());
+                            }
+                            while (MatchSymbol(","));
+                            ExpectSymbol(")");
+                        }
+                        ValidateFunction(token, arguments.Count);
+                        return new QueryFunctionExpression(token.Text.ToUpperInvariant(), arguments);
+                    }
                     var field = token.Text;
+                    var caseSensitive = token.Quoted;
                     if (MatchSymbol("."))
-                        field = Expect(QueryTokenKind.Identifier, "field name").Text;
-                    return new QueryOperand(field, null);
+                    {
+                        var fieldToken = Expect(QueryTokenKind.Identifier, "field name");
+                        field = fieldToken.Text;
+                        caseSensitive = fieldToken.Quoted;
+                    }
+                    return new QueryOperand(field, caseSensitive, null);
                 case QueryTokenKind.String:
-                    return new QueryOperand(null, new QueryCell(token.Text));
+                    return new QueryOperand(null, false, new QueryCell(token.Text));
                 case QueryTokenKind.Number:
                     if (long.TryParse(token.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer))
-                        return new QueryOperand(null, new QueryCell(integer));
-                    if (decimal.TryParse(token.Text, NumberStyles.Number | NumberStyles.AllowExponent, CultureInfo.InvariantCulture, out var number))
-                        return new QueryOperand(null, new QueryCell(number));
+                        return new QueryOperand(null, false, new QueryCell(integer));
+                    if (double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && double.IsFinite(number))
+                        return new QueryOperand(null, false, new QueryCell(number));
                     throw InvalidQuery(token.Position, $"The numeric literal '{token.Text}' is invalid.");
+                case QueryTokenKind.Symbol when token.Text == "(":
+                    var nested = ParseExpression();
+                    ExpectSymbol(")");
+                    return nested;
                 default:
                     throw InvalidQuery(token.Position, $"Expected an expression, found '{token.Text}'.");
             }
@@ -1571,8 +2019,41 @@ internal sealed class BlobQueryPlan
             return token;
         }
 
+        private static QueryValueType ParseValueType(QueryToken token) => token.Text.ToUpperInvariant() switch
+        {
+            "INT" => QueryValueType.Int,
+            "FLOAT" => QueryValueType.Float,
+            "STRING" => QueryValueType.String,
+            "TIMESTAMP" => QueryValueType.Timestamp,
+            "BOOLEAN" => QueryValueType.Boolean,
+            _ => throw InvalidQuery(token.Position, $"The CAST type '{token.Text}' is not supported.")
+        };
+
+        private static void ValidateFunction(QueryToken token, int argumentCount)
+        {
+            var expected = token.Text.ToUpperInvariant() switch
+            {
+                "CHAR_LENGTH" or "CHARACTER_LENGTH" or "LOWER" or "UPPER" => (Minimum: 1, Maximum: 1),
+                "SUBSTRING" => (Minimum: 2, Maximum: 3),
+                "NULLIF" => (Minimum: 2, Maximum: 2),
+                "COALESCE" => (Minimum: 1, Maximum: int.MaxValue),
+                "UTCNOW" => (Minimum: 0, Maximum: 0),
+                _ => throw InvalidQuery(token.Position, $"The function '{token.Text}' is not supported.")
+            };
+            if (argumentCount < expected.Minimum || argumentCount > expected.Maximum)
+            {
+                throw InvalidQuery(
+                    token.Position,
+                    $"The function '{token.Text}' received an invalid number of arguments.");
+            }
+        }
+
         private static bool IsKeyword(QueryToken token, string value) =>
-            token.Kind == QueryTokenKind.Identifier && string.Equals(token.Text, value, StringComparison.OrdinalIgnoreCase);
+            token.Kind == QueryTokenKind.Identifier && !token.Quoted &&
+            string.Equals(token.Text, value, StringComparison.OrdinalIgnoreCase);
+
+        private static bool IsClauseKeyword(QueryToken token) =>
+            IsKeyword(token, "FROM") || IsKeyword(token, "WHERE") || IsKeyword(token, "LIMIT");
 
         private static IReadOnlyList<QueryToken> Tokenize(string expression)
         {
@@ -1615,7 +2096,8 @@ internal sealed class BlobQueryPlan
                     tokens.Add(new QueryToken(
                         delimiter == '\'' ? QueryTokenKind.String : QueryTokenKind.Identifier,
                         value.ToString(),
-                        start));
+                        start,
+                        Quoted: delimiter == '"'));
                     continue;
                 }
 
@@ -1628,11 +2110,28 @@ internal sealed class BlobQueryPlan
                     continue;
                 }
 
-                if (char.IsDigit(character) || character is '+' or '-' && index + 1 < expression.Length && char.IsDigit(expression[index + 1]))
+                if (char.IsDigit(character))
                 {
                     index++;
-                    while (index < expression.Length && (char.IsDigit(expression[index]) || expression[index] is '.' or 'e' or 'E' or '+' or '-'))
+                    while (index < expression.Length && char.IsDigit(expression[index]))
                         index++;
+                    if (index < expression.Length && expression[index] == '.')
+                    {
+                        index++;
+                        while (index < expression.Length && char.IsDigit(expression[index]))
+                            index++;
+                    }
+                    if (index < expression.Length && expression[index] is 'e' or 'E')
+                    {
+                        index++;
+                        if (index < expression.Length && expression[index] is '+' or '-')
+                            index++;
+                        var exponentStart = index;
+                        while (index < expression.Length && char.IsDigit(expression[index]))
+                            index++;
+                        if (index == exponentStart)
+                            throw InvalidQuery(start, "A numeric exponent requires at least one digit.");
+                    }
                     tokens.Add(new QueryToken(QueryTokenKind.Number, expression[start..index], start));
                     continue;
                 }
@@ -1643,7 +2142,7 @@ internal sealed class BlobQueryPlan
                     index += 2;
                     continue;
                 }
-                if (character is '*' or ',' or '.' or '(' or ')' or ';' or '=' or '<' or '>')
+                if (character is '*' or '/' or '%' or '+' or '-' or ',' or '.' or '(' or ')' or ';' or '=' or '<' or '>')
                 {
                     tokens.Add(new QueryToken(QueryTokenKind.Symbol, character.ToString(), start));
                     index++;

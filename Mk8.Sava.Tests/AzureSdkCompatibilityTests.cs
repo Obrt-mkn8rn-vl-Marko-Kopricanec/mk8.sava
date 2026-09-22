@@ -9838,6 +9838,44 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(JsonValueKind.Null, third.RootElement.GetProperty("maybe").ValueKind);
     }
 
+    [Fact]
+    public async Task QueryBlobContentsEvaluatesScalarSqlAndStopsAtLimit()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"scalar-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.csv");
+        await blob.UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(
+            "name,quantity,price,category\n" +
+            "Apple,2,3.5,Fruit\n" +
+            "\"unterminated,record,that,must-not-be-scanned")));
+
+        var response = await blob.QueryAsync(
+            "SELECT UPPER(name) AS product, " +
+            "CAST(quantity AS INT) * CAST(price AS FLOAT) AS total, " +
+            "COALESCE(NULLIF(category, 'Fruit'), 'produce') AS bucket, " +
+            "SUBSTRING(name, 1, 3) AS fragment, CHAR_LENGTH(name) AS length " +
+            "FROM BlobStorage WHERE CAST(quantity AS INT) BETWEEN 2 AND 5 " +
+            "AND LOWER(name) IN ('apple', 'pear') LIMIT 1;",
+            new BlobQueryOptions
+            {
+                InputTextConfiguration = new BlobQueryCsvTextOptions
+                {
+                    HasHeaders = true,
+                    RecordSeparator = "\n"
+                },
+                OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+            });
+        using var reader = new StreamReader(response.Value.Content);
+        using var result = JsonDocument.Parse((await reader.ReadToEndAsync()).Trim());
+
+        Assert.Equal("APPLE", result.RootElement.GetProperty("product").GetString());
+        Assert.Equal(7D, result.RootElement.GetProperty("total").GetDouble());
+        Assert.Equal("produce", result.RootElement.GetProperty("bucket").GetString());
+        Assert.Equal("ppl", result.RootElement.GetProperty("fragment").GetString());
+        Assert.Equal(5, result.RootElement.GetProperty("length").GetInt64());
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 
