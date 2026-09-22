@@ -5943,7 +5943,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             StartsOn = startsOn,
             ExpiresOn = expiresOn,
             Protocol = SasProtocol.HttpsAndHttp,
-            PreauthorizedAgentObjectId = Guid.NewGuid().ToString(),
             CorrelationId = Guid.NewGuid().ToString()
         };
         delegatedBuilder.SetPermissions(BlobContainerSasPermissions.Read);
@@ -5963,6 +5962,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var deniedDelegatedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
             GetDelegatedBlob("signed/sibling.txt").DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedDelegatedSibling.Status);
+
+        delegatedBuilder.PreauthorizedAgentObjectId = Guid.NewGuid().ToString();
+        var impersonationSas = delegatedBuilder.ToSasQueryParameters(
+            key.Value,
+            SavaWebApplicationFactory.AccountName);
+        var impersonationBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/signed/directory/child.txt" +
+                $"?{impersonationSas}"));
+        var deniedImpersonation = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            impersonationBlob.DownloadContentAsync());
+        Assert.Equal("AuthorizationFailure", deniedImpersonation.ErrorCode);
 
         var flatOwner = CreateClient(factory);
         var flatContainer = flatOwner.GetBlobContainerClient($"flat-directory-sas-{Guid.NewGuid():N}");

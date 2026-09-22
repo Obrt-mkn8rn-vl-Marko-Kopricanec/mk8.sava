@@ -153,10 +153,11 @@ only from version `2020-12-06`, is applied when the caller omits the matching
 header, and rejects a conflicting `x-ms-encryption-scope` header. Adding `ses`
 to an older token cannot inject an unsigned storage policy.
 
-User-delegation `saoid` and `scid` fields are signature-validated from version
-`2020-02-10`; `saoid` is restricted to HNS accounts as it is in Azure. The
-`suoid` form remains fail-closed because it requires a POSIX ACL authorization
-decision. It must not be enabled by trusting the signed object identifier alone.
+User-delegation `scid` is signature-validated from version `2020-02-10`.
+`saoid` and `suoid` are restricted to HNS accounts but currently fail closed:
+`saoid` requires an ownership/superuser grant for the delegation-key owner and
+changes the effective file owner, while `suoid` requires a POSIX ACL decision.
+Neither is implemented by trusting the signed object identifier alone.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,
