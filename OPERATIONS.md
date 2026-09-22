@@ -90,6 +90,9 @@ cancelled instead of scanning the remainder of the object.
 Date expressions include `DATE_ADD`, `DATE_DIFF`, `EXTRACT`, `TO_STRING`,
 `TO_TIMESTAMP`, and `UTCNOW`; `TRIM` accepts Azure's `BOTH`, `LEADING`, and
 `TRAILING` forms with caller-selected characters.
+`COUNT(*)`, `COUNT(expression)`, `SUM`, `AVG`, `MIN`, and `MAX` retain only
+constant accumulator state as input streams through the evaluator; matching
+rows are never collected in memory.
 
 ## Account capabilities
 
