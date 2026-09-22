@@ -289,9 +289,8 @@ public sealed class StorageBackupService(
                 continue;
 
             var account = domain.Split('/', 2)[0];
-            if (!options.Accounts.TryGetValue(account, out var accountKey))
-                throw new InvalidDataException($"The backup needs the configured key for account '{account}'.");
-            requirements[$"account:{account}"] = FingerprintKey(accountKey, $"account '{account}' key");
+            var dataKey = options.ResolveAccountDataEncryptionKey(account);
+            requirements[$"account:{account}"] = FingerprintKey(dataKey, $"account '{account}' data encryption key");
         }
         return requirements;
     }

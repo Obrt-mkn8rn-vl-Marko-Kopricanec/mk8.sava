@@ -1682,8 +1682,8 @@ public sealed class ChunkStore
         string encodedRoot;
         if (domain == "$global")
             encodedRoot = _options.CrossAccountEncryptionKey ?? throw new InvalidOperationException("The cross-account encryption key is not configured.");
-        else if (!_options.Accounts.TryGetValue(domain.Split('/', 2)[0], out encodedRoot!))
-            throw new InvalidDataException("The chunk encryption domain is not configured.");
+        else
+            encodedRoot = _options.ResolveAccountDataEncryptionKey(domain.Split('/', 2)[0]);
         using var hmac = new HMACSHA256(Convert.FromBase64String(encodedRoot));
         return hmac.ComputeHash(Encoding.UTF8.GetBytes($"mk8.sava/chunk-encryption/v1/{domain}"));
     }
