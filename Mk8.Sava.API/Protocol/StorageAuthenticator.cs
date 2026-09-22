@@ -748,8 +748,22 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
     private static bool AccountSasCoversRequest(
         string resourceTypes,
         StorageRequestContext request,
-        HttpRequest httpRequest) =>
-        request.ResourceKind switch
+        HttpRequest httpRequest)
+    {
+        var component = httpRequest.Query["comp"].ToString();
+        if (HttpMethods.IsPost(httpRequest.Method) &&
+            string.Equals(component, "batch", StringComparison.OrdinalIgnoreCase))
+        {
+            return resourceTypes.Contains('o');
+        }
+        if (request.ResourceKind == StorageResourceKind.Service &&
+            HttpMethods.IsGet(httpRequest.Method) &&
+            string.Equals(component, "blobs", StringComparison.OrdinalIgnoreCase))
+        {
+            return resourceTypes.Contains('o');
+        }
+
+        return request.ResourceKind switch
         {
             StorageResourceKind.Service => resourceTypes.Contains('s'),
             StorageResourceKind.Container => resourceTypes.Contains('c'),
@@ -760,6 +774,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             StorageResourceKind.Blob => resourceTypes.Contains('o'),
             _ => false
         };
+    }
 
     private static bool ServiceSasCoversRequest(
         string resourceType,
