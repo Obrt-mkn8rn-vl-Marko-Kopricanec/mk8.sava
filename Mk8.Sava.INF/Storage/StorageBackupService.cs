@@ -32,9 +32,9 @@ public sealed class StorageBackupService(
 
         var parent = Directory.GetParent(destination)?.FullName
             ?? throw new InvalidOperationException("The backup destination has no parent directory.");
-        Directory.CreateDirectory(parent);
+        StorageDurability.EnsureDirectory(parent);
         var temporary = Path.Combine(parent, $".{Path.GetFileName(destination)}.creating-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(Path.Combine(temporary, "chunks"));
+        StorageDurability.EnsureDirectory(Path.Combine(temporary, "chunks"));
         try
         {
             var metadataPath = Path.Combine(temporary, MetadataFileName);
@@ -46,6 +46,7 @@ public sealed class StorageBackupService(
                 metadataPath,
                 cancellationToken);
             FlushFileToDisk(metadataPath);
+            StorageDurability.FlushDirectory(temporary);
             var chunkEntries = new List<BackupChunkEntry>();
             foreach (var id in snapshot.Inventory.ReachableChunkIds
                          .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
@@ -57,8 +58,9 @@ public sealed class StorageBackupService(
                     throw new InvalidDataException($"Cannot back up chunk '{id}' because its integrity status is {status}.");
 
                 var destinationChunk = GetChunkPath(Path.Combine(temporary, "chunks"), id);
-                Directory.CreateDirectory(Path.GetDirectoryName(destinationChunk)!);
+                StorageDurability.EnsureDirectory(Path.GetDirectoryName(destinationChunk)!);
                 await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken);
+                StorageDurability.FlushDirectory(Path.GetDirectoryName(destinationChunk)!);
                 var copied = await HashFileAsync(destinationChunk, cancellationToken);
                 chunkEntries.Add(new BackupChunkEntry(id, copied.Length, copied.Sha256));
             }
@@ -79,8 +81,10 @@ public sealed class StorageBackupService(
                 Chunks = chunkEntries
             };
             await WriteManifestAsync(Path.Combine(temporary, ManifestFileName), manifest, cancellationToken);
+            StorageDurability.FlushDirectory(temporary);
             var validation = await ValidateCoreAsync(temporary, _options, cancellationToken);
             Directory.Move(temporary, destination);
+            StorageDurability.FlushDirectory(parent);
             return validation with { BackupPath = destination };
         }
         catch
@@ -119,10 +123,10 @@ public sealed class StorageBackupService(
         var manifest = await ReadManifestAsync(backup, cancellationToken);
         var parent = Directory.GetParent(target)?.FullName
             ?? throw new InvalidOperationException("The restore target has no parent directory.");
-        Directory.CreateDirectory(parent);
+        StorageDurability.EnsureDirectory(parent);
         var temporary = Path.Combine(parent, $".{Path.GetFileName(target)}.restoring-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(Path.Combine(temporary, "chunks"));
-        Directory.CreateDirectory(Path.Combine(temporary, "staging"));
+        StorageDurability.EnsureDirectory(Path.Combine(temporary, "chunks"));
+        StorageDurability.EnsureDirectory(Path.Combine(temporary, "staging"));
         try
         {
             var metadataCopy = await CopyAndHashAsync(
@@ -135,7 +139,7 @@ public sealed class StorageBackupService(
                 cancellationToken.ThrowIfCancellationRequested();
                 var source = GetChunkPath(Path.Combine(backup, "chunks"), chunk.Id);
                 var destination = GetChunkPath(Path.Combine(temporary, "chunks"), chunk.Id);
-                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                StorageDurability.EnsureDirectory(Path.GetDirectoryName(destination)!);
                 var copied = await CopyAndHashAsync(source, destination, cancellationToken);
                 EnsureFileMatches($"chunk '{chunk.Id}'", new BackupFileEntry(chunk.Length, chunk.Sha256), copied);
             }
@@ -146,6 +150,7 @@ public sealed class StorageBackupService(
             if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
                 throw new InvalidDataException("The restored metadata schema version changed while copying the backup.");
             Directory.Move(temporary, target);
+            StorageDurability.FlushDirectory(parent);
             return validation with { BackupPath = backup };
         }
         catch
@@ -391,6 +396,7 @@ public sealed class StorageBackupService(
         }
         await output.FlushAsync(cancellationToken);
         output.Flush(flushToDisk: true);
+        StorageDurability.FlushDirectory(Path.GetDirectoryName(destination)!);
         return new BackupFileEntry(length, Convert.ToHexStringLower(hash.GetHashAndReset()));
     }
 

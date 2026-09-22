@@ -508,7 +508,10 @@ The backup command runs without starting the HTTP listener. It takes a
 transactionally consistent SQLite snapshot while all reachable immutable
 chunks are pinned against garbage collection, verifies their storage integrity,
 copies exactly that root set, and publishes the backup directory only after a
-versioned manifest and all file hashes are durable.
+versioned manifest and all file hashes are durable. On Unix, each newly created
+backup directory and copied file entry is also flushed before the final backup
+or restored-root rename is published and its parent directory flushed. Windows
+directory-entry durability remains unverified, as it does for live chunks.
 
 ```bash
 dotnet Mk8.Sava.API.dll --backup-create /srv/backups/mk8-sava-2026-09-21

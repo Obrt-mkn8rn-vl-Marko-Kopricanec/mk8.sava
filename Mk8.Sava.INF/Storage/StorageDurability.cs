@@ -37,4 +37,22 @@ internal static class StorageDurability
         if (!string.Equals(sourceDirectory, destinationDirectory, StringComparison.Ordinal))
             FlushDirectory(sourceDirectory);
     }
+
+    public static void EnsureDirectory(string directory)
+    {
+        var pending = new Stack<string>();
+        var current = Path.GetFullPath(directory);
+        while (!Directory.Exists(current))
+        {
+            pending.Push(current);
+            current = Directory.GetParent(current)?.FullName
+                ?? throw new DirectoryNotFoundException($"No existing ancestor of '{directory}' was found.");
+        }
+
+        while (pending.TryPop(out var path))
+        {
+            Directory.CreateDirectory(path);
+            FlushDirectory(Directory.GetParent(path)!.FullName);
+        }
+    }
 }
