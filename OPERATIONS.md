@@ -24,6 +24,14 @@ dead duplicate to the pack.
 Pack compaction still removes records left by interrupted publication or other
 historical failures.
 
+Only one mk8.sava process may open a data root at a time. The service holds an
+exclusive `.mk8-sava.lock` file handle for its lifetime and fails startup if
+another instance holds it. Leave the file in place: a process crash releases the
+operating-system lock, so the next instance can reopen the root and recover.
+Do not use a filesystem that does not reliably propagate exclusive file locks
+between hosts for a shared data root; multi-writer shared-root deployment is
+not supported.
+
 Pack compaction publishes its replacement file before switching SQLite's chunk
 locations. If the metadata operation fails or the process exits near commit, it
 keeps both pack files until the authoritative locations are known. A subsequent
