@@ -83,6 +83,11 @@ public sealed class AzureStorageException : Exception
         "KeyBasedAuthenticationNotPermitted",
         "Key based authentication is not permitted on this storage account.");
 
+    public static AzureStorageException AccountRequiresHttps() => new(
+        (int)HttpStatusCode.BadRequest,
+        "AccountRequiresHttps",
+        "The account being accessed does not support http.");
+
     public static AzureStorageException AuthorizationFailure() => new(
         (int)HttpStatusCode.Forbidden,
         "AuthorizationFailure",
