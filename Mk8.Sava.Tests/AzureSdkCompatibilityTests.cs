@@ -4470,6 +4470,81 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task VersionedReadsExposeCurrentVersionHeaders()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var container = service.GetBlobContainerClient($"version-headers-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        try
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with { VersioningEnabled = true },
+                CancellationToken.None);
+            var blob = container.GetBlobClient("versioned.txt");
+            var historicalVersionId = (await blob.UploadAsync(BinaryData.FromString("first"))).Value.VersionId;
+            var currentVersionId = (await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true)).Value.VersionId;
+            Assert.False(string.IsNullOrEmpty(historicalVersionId));
+            Assert.False(string.IsNullOrEmpty(currentVersionId));
+
+            var currentProperties = (await blob.GetPropertiesAsync()).Value;
+            Assert.Equal(currentVersionId, currentProperties.VersionId);
+            Assert.True(currentProperties.IsLatestVersion);
+
+            var historical = blob.WithVersion(historicalVersionId);
+            var historicalProperties = (await historical.GetPropertiesAsync()).Value;
+            Assert.Equal(historicalVersionId, historicalProperties.VersionId);
+            Assert.False(historicalProperties.IsLatestVersion);
+
+            using var transport = new HttpClient(factory.Server.CreateHandler());
+            using (var currentRequest = new HttpRequestMessage(
+                       HttpMethod.Get,
+                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                currentRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(currentRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal(currentVersionId, response.Headers.GetValues("x-ms-version-id").Single());
+                Assert.Equal("true", response.Headers.GetValues("x-ms-is-current-version").Single());
+            }
+
+            using (var historicalRequest = new HttpRequestMessage(
+                       HttpMethod.Get,
+                       historical.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                historicalRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+                using var response = await transport.SendAsync(historicalRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.Equal(historicalVersionId, response.Headers.GetValues("x-ms-version-id").Single());
+                Assert.Equal("false", response.Headers.GetValues("x-ms-is-current-version").Single());
+            }
+
+            using (var legacyRequest = new HttpRequestMessage(
+                       HttpMethod.Head,
+                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+            {
+                legacyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
+                using var response = await transport.SendAsync(legacyRequest);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                Assert.False(response.Headers.Contains("x-ms-version-id"));
+                Assert.False(response.Headers.Contains("x-ms-is-current-version"));
+            }
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task BlobFamilyMutationsAreIndexedAndAtomic()
     {
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>

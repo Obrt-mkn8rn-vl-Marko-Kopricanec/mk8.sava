@@ -810,7 +810,10 @@ public sealed partial class AzureResponseWriter
         if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             response.Headers["x-ms-tag-count"] = blob.Tags.Count.ToString(CultureInfo.InvariantCulture);
         if (blob.VersionId is not null && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+        {
             response.Headers["x-ms-version-id"] = blob.VersionId;
+            response.Headers["x-ms-is-current-version"] = blob.IsCurrent ? "true" : "false";
+        }
         if (blob.Snapshot is not null)
             response.Headers["x-ms-snapshot"] = blob.Snapshot;
         if (blob.Kind == Storage.BlobKind.PageBlob)

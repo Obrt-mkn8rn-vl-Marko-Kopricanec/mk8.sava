@@ -89,6 +89,11 @@ sources and for bearer-authenticated non-File URLs; asynchronous and incremental
 Copy Blob reject it because Azure exposes the header only on Put Blob, synchronous
 Copy Blob, Put Block, Put Page, and Append Block from URL.
 
+Version-aware Get Blob and Get Blob Properties responses expose both
+`x-ms-version-id` and `x-ms-is-current-version` from service version
+`2019-12-12`. Current reads report `true`, explicit historical-version reads
+report `false`, and snapshots and non-versioned blobs omit both headers.
+
 Query Blob Contents accepts Azure's `delimited`/`csv`, JSON, and Parquet input
 forms and its delimited/CSV, JSON, and Arrow result forms. Parquet input is read
 through authenticated seeks over the deduplicated chunk store and retains at
