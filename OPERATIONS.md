@@ -202,6 +202,16 @@ Shared Key Lite headers plus service and account SAS tokens with
 SAS remain available, as do anonymous reads from containers already configured
 for public access.
 
+Cross-tenant user-bound user-delegation SAS is denied by default. Set
+`AllowCrossTenantDelegationSas` on the account only when the delegated user's
+tenant is intentionally different from the delegation-key tenant. The setting
+is enforced both when `DelegatedUserTid` is requested and whenever the resulting
+SAS is used. `RequireUserBoundUserDelegationSas` can additionally audit or deny
+every valid SAS that lacks a signed delegated-user object ID. Its companion
+`RequireUserBoundUserDelegationSasAction` accepts `None`, `Log` (the default),
+or `Block`; log records identify the request and account without recording the
+SAS secret.
+
 Blob index tags on HNS accounts remain an Azure preview that requires the
 `Microsoft.Storage/BlobIndexForHns` feature registration. Set
 `HierarchicalNamespaceBlobIndexTagsEnabled` only for an account on which that

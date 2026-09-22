@@ -453,9 +453,20 @@ public sealed class SavaOptions : IValidatableObject
     }
 }
 
+public enum SasPolicyViolationAction
+{
+    None,
+    Log,
+    Block
+}
+
 public sealed class StorageAccountCapabilities
 {
     public bool AllowSharedKeyAccess { get; init; } = true;
+    public bool AllowCrossTenantDelegationSas { get; init; }
+    public bool RequireUserBoundUserDelegationSas { get; init; }
+    public SasPolicyViolationAction RequireUserBoundUserDelegationSasAction { get; init; } =
+        SasPolicyViolationAction.Log;
     public bool HierarchicalNamespaceEnabled { get; init; }
     public bool HierarchicalNamespaceBlobIndexTagsEnabled { get; init; }
     public bool HierarchicalNamespaceBlobSnapshotsEnabled { get; init; }
