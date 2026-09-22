@@ -1049,6 +1049,7 @@ public sealed class BlobService(
         string tier,
         string? rehydratePriority,
         bool allowRehydratePriorityUpdate,
+        bool supportsCustomerProvidedKey,
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
@@ -1057,6 +1058,8 @@ public sealed class BlobService(
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.EncryptionScope is not null)
             throw EncryptionScopeTierChangeNotSupported();
+        if (current.CustomerProvidedKeySha256 is not null && !supportsCustomerProvidedKey)
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
         if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", tier);
         if (rehydratePriority is not null && rehydratePriority is not ("Standard" or "High"))

@@ -832,6 +832,7 @@ public static class BlobProtocolEndpoint
                         tier,
                         rehydratePriority,
                         IsServiceVersionAtLeast(subrequestContext, new DateOnly(2020, 6, 12)),
+                        IsServiceVersionAtLeast(subrequestContext, new DateOnly(2023, 8, 3)),
                         cancellationToken);
                     return new BlobBatchSubresponse(
                         tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
@@ -1650,6 +1651,7 @@ public static class BlobProtocolEndpoint
                 tier,
                 rehydratePriority,
                 IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)),
+                IsServiceVersionAtLeast(request, new DateOnly(2023, 8, 3)),
                 cancellationToken);
             http.Response.StatusCode = updated.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK;
             return;
