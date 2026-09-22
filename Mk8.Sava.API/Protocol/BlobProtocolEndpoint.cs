@@ -114,6 +114,7 @@ public static class BlobProtocolEndpoint
             var marker = http.Request.Query["marker"].ToString();
             var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
+            ValidateContainerListFeatures(request, includes);
             var containers = await service.ListContainersPageAsync(
                 request.Account,
                 includes.Contains("deleted"),
@@ -2648,7 +2649,7 @@ public static class BlobProtocolEndpoint
                     page.Items[^1].Name,
                     page.Items[^1].GenerationId))
             : string.Empty;
-        var endpoint = $"{http.Request.Scheme}://{http.Request.Host}/{request.Account}";
+        var endpoint = StorageResourcePath.GetServiceEndpoint(http.Request, request.Account);
         await writer.WriteXmlAsync(http, xml =>
         {
             xml.WriteStartElement("EnumerationResults");
@@ -3120,6 +3121,30 @@ public static class BlobProtocolEndpoint
         IReadOnlySet<string> includes,
         string delimiter)
     {
+        var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "snapshots",
+            "metadata",
+            "uncommittedblobs",
+            "copy",
+            "deleted",
+            "tags",
+            "versions",
+            "deletedwithversions",
+            "immutabilitypolicy",
+            "legalhold",
+            "permissions"
+        };
+        if (includes.Any(include => !supported.Contains(include)))
+            throw AzureStorageException.InvalidQuery("include");
+        if (!IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)) &&
+            includes.Overlaps(["snapshots", "metadata", "uncommittedblobs"]))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "The requested listing details require service version 2009-09-19 or later.");
+        }
+        if (includes.Contains("copy"))
+            RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Listing copy properties");
         if (includes.Contains("deleted"))
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Listing deleted blobs");
         if (includes.Contains("tags"))
@@ -3132,12 +3157,37 @@ public static class BlobProtocolEndpoint
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Listing blob legal holds");
         if (includes.Contains("deletedwithversions"))
             RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Listing deleted blobs with versions");
+        if (includes.Contains("permissions"))
+        {
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Listing hierarchical namespace permissions");
+            throw AzureStorageException.InvalidQuery("include");
+        }
         if (!string.IsNullOrEmpty(delimiter) &&
             includes.Contains("snapshots") &&
             !IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
         {
             throw AzureStorageException.InvalidQuery("include");
         }
+    }
+
+    private static void ValidateContainerListFeatures(
+        StorageRequestContext request,
+        IReadOnlySet<string> includes)
+    {
+        var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "metadata",
+            "deleted",
+            "system"
+        };
+        if (includes.Any(include => !supported.Contains(include)))
+            throw AzureStorageException.InvalidQuery("include");
+        if (includes.Contains("metadata"))
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Listing container metadata");
+        if (includes.Contains("deleted"))
+            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Listing deleted containers");
+        if (includes.Contains("system"))
+            RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Listing system containers");
     }
 
     private static void ValidateListedBlobTypes(
@@ -4049,9 +4099,9 @@ public static class BlobProtocolEndpoint
     {
         if (string.IsNullOrEmpty(value))
             return defaultValue;
-        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed is < 1 or > 5000)
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed < 1)
             throw AzureStorageException.InvalidQuery("maxresults");
-        return parsed;
+        return Math.Min(parsed, 5000);
     }
 
     private static int ParsePageRangeMaxResults(string value, bool specified)
