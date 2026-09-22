@@ -129,6 +129,7 @@ public static class BlobProtocolEndpoint
             var containers = await service.ListContainersPageAsync(
                 request.Account,
                 includes.Contains("deleted"),
+                includes.Contains("system"),
                 prefix,
                 marker,
                 maxResults,
@@ -366,6 +367,20 @@ public static class BlobProtocolEndpoint
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (containerName == StorageAnalyticsService.LogsContainerName &&
+            !HttpMethods.IsGet(http.Request.Method) &&
+            !HttpMethods.IsHead(http.Request.Method) &&
+            !(HttpMethods.IsPost(http.Request.Method) && comp == "batch"))
+        {
+            if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status403Forbidden,
+                    "ContainerOperationFailure",
+                    "The account being accessed does not have sufficient permissions to execute this operation.");
+            }
+            throw AzureStorageException.AuthorizationPermissionMismatch();
+        }
         if (comp == "batch" && HttpMethods.IsPost(http.Request.Method))
         {
             Require(request, 'w');
@@ -706,6 +721,11 @@ public static class BlobProtocolEndpoint
             ValidateBlobVersionRequest(subrequestContext);
             var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
             subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken);
+            if (resolved.Container == StorageAnalyticsService.LogsContainerName &&
+                resolved.Request.Kind != BlobBatchOperationKind.Delete)
+            {
+                throw AzureStorageException.AuthorizationPermissionMismatch();
+            }
             var permanentDelete = resolved.DeleteType is not null;
             if (permanentDelete)
             {
@@ -915,6 +935,13 @@ public static class BlobProtocolEndpoint
         if (request.Blob is null)
             containerName = "$root";
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        if (containerName == StorageAnalyticsService.LogsContainerName &&
+            !HttpMethods.IsGet(http.Request.Method) &&
+            !HttpMethods.IsHead(http.Request.Method) &&
+            !(HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp)))
+        {
+            throw AzureStorageException.AuthorizationPermissionMismatch();
+        }
         var versionId = NullIfEmpty(http.Request.Query["versionid"].ToString());
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
         var permanentDelete = HttpMethods.IsDelete(http.Request.Method) &&

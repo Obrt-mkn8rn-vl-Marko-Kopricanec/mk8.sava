@@ -66,6 +66,11 @@ public interface IStorageTelemetry
     string RenderPrometheus();
 }
 
+public interface IStorageAnalyticsSink
+{
+    Task RecordAsync(StorageAnalyticsRequest request, CancellationToken cancellationToken);
+}
+
 public interface IStoragePaths
 {
     string Root { get; }

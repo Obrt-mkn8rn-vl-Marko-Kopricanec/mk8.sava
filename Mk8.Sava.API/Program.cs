@@ -51,6 +51,9 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<ChunkStore>();
 builder.Services.AddSingleton<MetadataStore>();
 builder.Services.AddSingleton<LeaseService>();
+builder.Services.AddSingleton<StorageAnalyticsService>();
+builder.Services.AddSingleton<IStorageAnalyticsSink>(services =>
+    services.GetRequiredService<StorageAnalyticsService>());
 builder.Services.AddSingleton<BlobService>();
 builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddHostedService<StorageMaintenanceService>();

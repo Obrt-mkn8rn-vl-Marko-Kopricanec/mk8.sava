@@ -1525,6 +1525,142 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task StorageAnalyticsLoggingMaterializesProtectedAzureFormatSystemBlobs()
+    {
+        await using var application = new SavaWebApplicationFactory();
+        var service = CreateClient(application);
+        var configured = (await service.GetPropertiesAsync()).Value;
+        configured.Logging = new BlobAnalyticsLogging
+        {
+            Version = "2.0",
+            Delete = true,
+            Read = true,
+            Write = true,
+            RetentionPolicy = new BlobRetentionPolicy { Enabled = true, Days = 7 }
+        };
+        await service.SetPropertiesAsync(configured);
+
+        var container = service.GetBlobContainerClient($"analytics-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("payload.txt");
+        await blob.UploadAsync(BinaryData.FromString("analytics payload"));
+        Assert.Equal("analytics payload", (await blob.DownloadContentAsync()).Value.Content.ToString());
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(index =>
+            container.GetBlobClient($"parallel-{index}.txt").UploadAsync(BinaryData.FromString($"payload-{index}"))));
+        await blob.DeleteAsync();
+
+        var logs = service.GetBlobContainerClient(StorageAnalyticsService.LogsContainerName);
+        Assert.True((await logs.ExistsAsync()).Value);
+        var logItems = new List<BlobItem>();
+        await foreach (var item in logs.GetBlobsAsync(new GetBlobsOptions { Traits = BlobTraits.Metadata }))
+            logItems.Add(item);
+        Assert.NotEmpty(logItems);
+        Assert.All(logItems, item =>
+        {
+            Assert.Matches("^blob/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{4}/[0-9]{6}\\.log$", item.Name);
+            Assert.Equal("2.0", item.Metadata["LogVersion"]);
+            Assert.Contains(item.Metadata["LogType"], new[] { "read", "write", "delete" });
+            Assert.EndsWith("Z", item.Metadata["StartTime"], StringComparison.Ordinal);
+            Assert.EndsWith("Z", item.Metadata["EndTime"], StringComparison.Ordinal);
+        });
+
+        var operations = new List<string>();
+        foreach (var item in logItems)
+        {
+            var text = (await logs.GetBlobClient(item.Name).DownloadContentAsync()).Value.Content.ToString();
+            var fields = ParseAnalyticsLogFields(Assert.Single(text.Split('\n', StringSplitOptions.RemoveEmptyEntries)));
+            Assert.Equal(38, fields.Count);
+            Assert.Equal("2.0", fields[0]);
+            Assert.Equal("blob", fields[10]);
+            Assert.Equal(SavaWebApplicationFactory.AccountName, fields[9]);
+            Assert.DoesNotContain(SavaWebApplicationFactory.AccountKey, text, StringComparison.Ordinal);
+            operations.Add(fields[2]);
+        }
+        Assert.Contains("SetBlobServiceProperties", operations);
+        Assert.Contains("CreateContainer", operations);
+        Assert.Contains("PutBlob", operations);
+        Assert.True(operations.Count(operation => operation == "PutBlob") >= 9);
+        Assert.Contains("GetBlob", operations);
+        Assert.Contains("DeleteBlob", operations);
+
+        var ordinaryContainers = new List<string>();
+        await foreach (var item in service.GetBlobContainersAsync())
+            ordinaryContainers.Add(item.Name);
+        Assert.DoesNotContain(StorageAnalyticsService.LogsContainerName, ordinaryContainers);
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var sasBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Service,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        sasBuilder.SetPermissions(AccountSasPermissions.List);
+        var systemListUri = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            $"?comp=list&include=system&{sasBuilder.ToSasQueryParameters(credential)}");
+        using (var transport = new HttpClient(application.Server.CreateHandler()))
+        using (var systemList = await transport.GetAsync(systemListUri))
+        {
+            Assert.Equal(HttpStatusCode.OK, systemList.StatusCode);
+            Assert.Contains(
+                $"<Name>{StorageAnalyticsService.LogsContainerName}</Name>",
+                await systemList.Content.ReadAsStringAsync(),
+                StringComparison.Ordinal);
+        }
+
+        var deniedWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            logs.GetBlobClient("manual.log").UploadAsync(BinaryData.FromString("not service-owned")));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedWrite.Status);
+        Assert.Equal("AuthorizationPermissionMismatch", deniedWrite.ErrorCode);
+
+        var deniedContainerDelete = await Assert.ThrowsAsync<RequestFailedException>(() => logs.DeleteAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedContainerDelete.Status);
+        Assert.Equal("ContainerOperationFailure", deniedContainerDelete.ErrorCode);
+
+        Assert.True((await logs.GetBlobClient(logItems[0].Name).DeleteIfExistsAsync()).Value);
+    }
+
+    [Fact]
+    public async Task StorageAnalyticsRetentionPurgesExpiredLogBlobsWhenLoggingIsDisabledForReads()
+    {
+        var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 20, 8, 30, 0, TimeSpan.Zero));
+        await using var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>());
+        var service = CreateClient(application);
+        var configured = (await service.GetPropertiesAsync()).Value;
+        configured.Logging = new BlobAnalyticsLogging
+        {
+            Version = "1.0",
+            Delete = false,
+            Read = false,
+            Write = true,
+            RetentionPolicy = new BlobRetentionPolicy { Enabled = true, Days = 1 }
+        };
+        await service.SetPropertiesAsync(configured);
+        await service.GetBlobContainerClient($"retention-{Guid.NewGuid():N}").CreateAsync();
+
+        var logs = service.GetBlobContainerClient(StorageAnalyticsService.LogsContainerName);
+        var before = new List<string>();
+        await foreach (var item in logs.GetBlobsAsync())
+            before.Add(item.Name);
+        Assert.NotEmpty(before);
+
+        clock.Advance(TimeSpan.FromDays(2));
+        await application.Services.GetRequiredService<BlobService>().RunMaintenanceAsync(CancellationToken.None);
+
+        var after = new List<string>();
+        await foreach (var item in logs.GetBlobsAsync())
+            after.Add(item.Name);
+        Assert.Empty(after);
+    }
+
+    [Fact]
     public async Task BlobServicePropertiesExcludeAndRejectControlPlaneOnlySettings()
     {
         var metadata = factory.Services.GetRequiredService<MetadataStore>();
@@ -8238,6 +8374,31 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         public void Advance(TimeSpan value) =>
             Interlocked.Add(ref _utcTicks, value.Ticks);
+    }
+
+    private static IReadOnlyList<string> ParseAnalyticsLogFields(string record)
+    {
+        var fields = new List<string>();
+        var field = new StringBuilder();
+        var quoted = false;
+        foreach (var character in record)
+        {
+            if (character == '"')
+            {
+                quoted = !quoted;
+                continue;
+            }
+            if (character == ';' && !quoted)
+            {
+                fields.Add(WebUtility.HtmlDecode(field.ToString()));
+                field.Clear();
+                continue;
+            }
+            field.Append(character);
+        }
+        Assert.False(quoted);
+        fields.Add(WebUtility.HtmlDecode(field.ToString()));
+        return fields;
     }
 
     private sealed class DeclaredLengthContent(long length) : HttpContent
