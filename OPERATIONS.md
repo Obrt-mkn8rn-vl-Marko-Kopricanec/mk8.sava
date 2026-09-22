@@ -17,6 +17,13 @@ and repeats the metadata reachability check before deleting an extent. If that
 pass is interrupted, disposing the reservation leaves the extent available to a
 future pass.
 
+On Unix, newly used storage directories and published chunk/pack directory
+entries are also flushed before SQLite can reference them. Flushing file bytes
+alone does not make a new filename durable across a sudden power loss. Windows
+still flushes file bytes but does not yet have an equivalent verified directory
+publication barrier in this implementation; power-loss durability on Windows
+and on deployment-specific filesystems needs further validation.
+
 Small-chunk publication serializes pack appends by sharing domain within one
 service process and repeats the existing-chunk lookup inside that gate. Concurrent
 identical uploads therefore reuse the first verified record without appending a
