@@ -5,7 +5,10 @@ using Microsoft.Data.Sqlite;
 
 namespace Mk8.Sava.Storage;
 
-public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvider = null)
+public sealed class MetadataStore(
+    IStoragePaths paths,
+    IStorageFaultInjector faultInjector,
+    TimeProvider? timeProvider = null)
 {
     public const int CurrentSchemaVersion = 4;
     private const int ChunkIndexSchemaVersion = 2;
@@ -1539,7 +1542,9 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 proposed.Container,
                 proposed.Name,
                 cancellationToken);
+            faultInjector.Inject(StorageFaultPoint.BeforeBlobMetadataCommit);
             await transaction.CommitAsync(cancellationToken);
+            faultInjector.Inject(StorageFaultPoint.AfterBlobMetadataCommit);
             return published;
         }
         finally
