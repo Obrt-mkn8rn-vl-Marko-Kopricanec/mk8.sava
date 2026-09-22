@@ -9687,6 +9687,63 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using var jsonReader = new StreamReader(jsonResponse.Value.Content);
         Assert.Equal("{\"_1\":\"400\"}\n", await jsonReader.ReadToEndAsync());
 
+        var arrowResponse = await blob.QueryAsync(
+            "SELECT _1, _2, _3, _4, true, '2026-09-22T12:34:56.789Z' FROM BlobStorage WHERE _1 >= 300;",
+            new BlobQueryOptions
+            {
+                OutputTextConfiguration = new BlobQueryArrowOptions
+                {
+                    Schema =
+                    {
+                        new BlobQueryArrowField { Name = "first", Type = BlobQueryArrowFieldType.Int64 },
+                        new BlobQueryArrowField { Name = "second", Type = BlobQueryArrowFieldType.Double },
+                        new BlobQueryArrowField
+                        {
+                            Name = "third",
+                            Type = BlobQueryArrowFieldType.Decimal,
+                            Precision = 6,
+                            Scale = 2
+                        },
+                        new BlobQueryArrowField { Name = "fourth", Type = BlobQueryArrowFieldType.String },
+                        new BlobQueryArrowField { Name = "enabled", Type = BlobQueryArrowFieldType.Bool },
+                        new BlobQueryArrowField { Name = "observed", Type = BlobQueryArrowFieldType.Timestamp }
+                    }
+                }
+            });
+        using (var arrowReader = new Apache.Arrow.Ipc.ArrowStreamReader(arrowResponse.Value.Content))
+        {
+            using var batch = await arrowReader.ReadNextRecordBatchAsync();
+            Assert.NotNull(batch);
+            Assert.Equal(1, batch.Length);
+            Assert.Equal(300L, Assert.IsType<Apache.Arrow.Int64Array>(batch.Column("first")).GetValue(0));
+            Assert.Equal(400D, Assert.IsType<Apache.Arrow.DoubleArray>(batch.Column("second")).GetValue(0));
+            Assert.Equal("500.00", Assert.IsType<Apache.Arrow.Decimal128Array>(batch.Column("third")).GetString(0));
+            Assert.Equal("600", Assert.IsType<Apache.Arrow.StringArray>(batch.Column("fourth")).GetString(0));
+            Assert.True(Assert.IsType<Apache.Arrow.BooleanArray>(batch.Column("enabled")).GetValue(0));
+            Assert.Equal(
+                new DateTimeOffset(2026, 9, 22, 12, 34, 56, 789, TimeSpan.Zero),
+                Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("observed")).GetTimestamp(0));
+            Assert.Null(await arrowReader.ReadNextRecordBatchAsync());
+        }
+
+        var emptyArrowResponse = await blob.QueryAsync(
+            "SELECT _1 FROM BlobStorage WHERE _1 > 999;",
+            new BlobQueryOptions
+            {
+                OutputTextConfiguration = new BlobQueryArrowOptions
+                {
+                    Schema =
+                    {
+                        new BlobQueryArrowField { Name = "value", Type = BlobQueryArrowFieldType.Int64 }
+                    }
+                }
+            });
+        using (var emptyArrowReader = new Apache.Arrow.Ipc.ArrowStreamReader(emptyArrowResponse.Value.Content))
+        {
+            Assert.Equal("value", emptyArrowReader.Schema.GetFieldByIndex(0).Name);
+            Assert.Null(await emptyArrowReader.ReadNextRecordBatchAsync());
+        }
+
         var append = container.GetAppendBlobClient("not-queryable");
         await append.CreateAsync();
         var invalidType = await Assert.ThrowsAsync<RequestFailedException>(() =>

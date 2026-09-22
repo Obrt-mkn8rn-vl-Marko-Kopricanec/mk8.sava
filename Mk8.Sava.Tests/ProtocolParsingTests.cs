@@ -9,6 +9,31 @@ namespace Mk8.Sava.Tests;
 public sealed class ProtocolParsingTests
 {
     [Fact]
+    public async Task BlobQueryParserAcceptsTheDocumentedCsvFormatAlias()
+    {
+        const string xml = """
+            <QueryRequest>
+              <QueryType>SQL</QueryType>
+              <Expression>SELECT * FROM BlobStorage</Expression>
+              <InputSerialization>
+                <Format>
+                  <Type>csv</Type>
+                  <DelimitedTextConfiguration>
+                    <HasHeaders>true</HasHeaders>
+                  </DelimitedTextConfiguration>
+                </Format>
+              </InputSerialization>
+            </QueryRequest>
+            """;
+        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+
+        var request = await BlobQueryProtocol.ReadRequestAsync(body, CancellationToken.None);
+
+        Assert.Equal(BlobQueryFormatKind.Delimited, request.Input.Kind);
+        Assert.True(request.Input.HasHeaders);
+    }
+
+    [Fact]
     public async Task BlockListParserAcceptsMaximumCountWithMaximumLengthIdentifiers()
     {
         var blockId = Convert.ToBase64String(Enumerable.Repeat((byte)0x5a, BlobServiceLimits.MaximumBlockIdBytes).ToArray());
