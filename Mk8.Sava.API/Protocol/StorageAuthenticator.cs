@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
@@ -67,8 +68,12 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             return AuthenticateSharedKey(context.Request, request, authorization, lite: true);
         if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
         {
-            var bearer = await AuthenticateBearerAsync(context, request);
-            return context.Request.Query.ContainsKey("sig")
+            var hasSas = context.Request.Query.ContainsKey("sig");
+            var bearer = await AuthenticateBearerAsync(
+                context,
+                request,
+                requireDataAuthorization: !hasSas);
+            return hasSas
                 ? await AuthenticateSasAsync(context, request, cancellationToken, bearer)
                 : bearer;
         }
@@ -169,7 +174,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
     private async Task<StorageAuthorization> AuthenticateBearerAsync(
         HttpContext context,
-        StorageRequestContext request)
+        StorageRequestContext request,
+        bool requireDataAuthorization)
     {
         var configuration = _options.BearerAuthentication;
         if (!configuration.Enabled)
@@ -206,7 +212,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             }
         }
 
-        if (granted.Count == 0)
+        if (requireDataAuthorization && granted.Count == 0)
             throw AzureStorageException.AuthorizationFailure();
         var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
         return new StorageAuthorization(
@@ -262,18 +268,51 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         var query = context.Request.Query;
         var version = query["sv"].ToString();
         var suppliedSignature = query["sig"].ToString();
-        if (!DateOnly.TryParseExact(version, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var signedVersion) ||
-            signedVersion < new DateOnly(2015, 4, 5) ||
+        var hasSignedVersion = !string.IsNullOrEmpty(version);
+        var signedVersion = new DateOnly(2009, 9, 19);
+        if (hasSignedVersion &&
+            (!DateOnly.TryParseExact(
+                 version,
+                 "yyyy-MM-dd",
+                 CultureInfo.InvariantCulture,
+                 DateTimeStyles.None,
+                 out signedVersion) ||
+             signedVersion < new DateOnly(2012, 2, 12)) ||
             string.IsNullOrEmpty(suppliedSignature))
+        {
             throw AzureStorageException.AuthenticationFailed();
+        }
         if (!_options.Accounts.TryGetValue(request.Account, out var encodedKey))
             throw AzureStorageException.AuthenticationFailed();
 
-        var protocol = query["spr"].ToString();
-        if (protocol is not ("" or "https" or "https,http") || protocol == "https" && !context.Request.IsHttps)
-            throw AzureStorageException.AuthenticationFailed("The request protocol is not permitted by the signed protocol field.");
+        var isAccountSas = query.ContainsKey("ss");
+        var isUserDelegationSas = query.ContainsKey("skoid");
+        if (isAccountSas && isUserDelegationSas ||
+            isAccountSas && (!hasSignedVersion || signedVersion < new DateOnly(2015, 4, 5)) ||
+            isUserDelegationSas && (!hasSignedVersion || signedVersion < new DateOnly(2018, 11, 9)))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        var hasSignedRequestFields = query.ContainsKey("srh") || query.ContainsKey("srq");
+        if (hasSignedRequestFields &&
+            (!isUserDelegationSas || signedVersion < new DateOnly(2026, 4, 6)))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
 
+        var protocol = query["spr"].ToString();
         var signedIp = query["sip"].ToString();
+        if ((!hasSignedVersion || signedVersion < new DateOnly(2015, 4, 5)) &&
+            (!string.IsNullOrEmpty(protocol) || !string.IsNullOrEmpty(signedIp)))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        if (protocol is not ("" or "https" or "https,http") ||
+            protocol == "https" && !context.Request.IsHttps)
+        {
+            throw AzureStorageException.AuthenticationFailed("The request protocol is not permitted by the signed protocol field.");
+        }
+
         if (!string.IsNullOrEmpty(signedIp) && !MatchesIpRange(context.Connection.RemoteIpAddress, signedIp))
             throw AzureStorageException.AuthenticationFailed("The request IP address is not permitted by the signed IP field.");
 
@@ -284,10 +323,6 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (!string.IsNullOrEmpty(signedEncryptionScope) && signedVersion < new DateOnly(2020, 12, 6))
             throw AzureStorageException.AuthorizationFailure();
         string stringToSign;
-        var isAccountSas = query.ContainsKey("ss");
-        var isUserDelegationSas = query.ContainsKey("skoid");
-        if (isAccountSas && isUserDelegationSas)
-            throw AzureStorageException.AuthenticationFailed();
         var signedResource = string.Empty;
         var signingKey = encodedKey;
         if (isAccountSas)
@@ -325,7 +360,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
-            var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query);
+            var canonicalizedResource = BuildSasCanonicalResource(
+                request,
+                resourceType,
+                query,
+                signedVersion);
 
             var objectId = query["skoid"].ToString();
             var tenantId = query["sktid"].ToString();
@@ -390,12 +429,22 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
             var delegatedUserTenantId = query["skdutid"].ToString();
             var delegatedUserObjectId = query["sduoid"].ToString();
+            if ((!string.IsNullOrEmpty(delegatedUserTenantId) &&
+                 !Guid.TryParse(delegatedUserTenantId, out _)) ||
+                (!string.IsNullOrEmpty(delegatedUserObjectId) &&
+                 !Guid.TryParse(delegatedUserObjectId, out _)))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
             if (!string.IsNullOrEmpty(delegatedUserObjectId))
             {
+                var expectedBearerTenantId = string.IsNullOrEmpty(delegatedUserTenantId)
+                    ? tenantId
+                    : delegatedUserTenantId;
                 if (signedVersion < new DateOnly(2025, 7, 5) ||
                     bearer is null ||
                     !string.Equals(bearer.Identifier, delegatedUserObjectId, StringComparison.Ordinal) ||
-                    !string.IsNullOrEmpty(delegatedUserTenantId) && !string.Equals(bearer.TenantId, delegatedUserTenantId, StringComparison.Ordinal))
+                    !string.Equals(bearer.TenantId, expectedBearerTenantId, StringComparison.Ordinal))
                 {
                     throw AzureStorageException.AuthorizationFailure();
                 }
@@ -447,7 +496,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             if (signedVersion >= new DateOnly(2026, 4, 6))
             {
                 fields.Add(BuildSignedRequestHeaders(context.Request, query["srh"].ToString()));
-                fields.Add(BuildSignedRequestQuery(context.Request, query["srq"].ToString()));
+                fields.Add(BuildSignedRequestQuery(context.Request));
             }
             fields.Add(query["rscc"].ToString());
             fields.Add(query["rscd"].ToString());
@@ -464,30 +513,51 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
-            var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query);
+            var canonicalizedResource = BuildSasCanonicalResource(
+                request,
+                resourceType,
+                query,
+                signedVersion);
             var fields = new List<string>
             {
                 permissions,
                 query["st"].ToString(),
                 query["se"].ToString(),
                 canonicalizedResource,
-                query["si"].ToString(),
-                signedIp,
-                protocol,
-                version
+                query["si"].ToString()
             };
-            if (signedVersion >= new DateOnly(2018, 11, 9))
+            if (hasSignedVersion)
             {
-                fields.Add(resourceType);
-                fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
+                if (signedVersion >= new DateOnly(2015, 4, 5))
+                {
+                    fields.Add(signedIp);
+                    fields.Add(protocol);
+                }
+                fields.Add(version);
+                if (signedVersion >= new DateOnly(2018, 11, 9))
+                {
+                    fields.Add(resourceType);
+                    fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
+                }
+                if (signedVersion >= new DateOnly(2020, 12, 6))
+                    fields.Add(query["ses"].ToString());
+                if (signedVersion >= new DateOnly(2013, 8, 15))
+                {
+                    fields.Add(query["rscc"].ToString());
+                    fields.Add(query["rscd"].ToString());
+                    fields.Add(query["rsce"].ToString());
+                    fields.Add(query["rscl"].ToString());
+                    fields.Add(query["rsct"].ToString());
+                }
+                else if (HasSasResponseOverrides(query))
+                {
+                    throw AzureStorageException.AuthenticationFailed();
+                }
             }
-            if (signedVersion >= new DateOnly(2020, 12, 6))
-                fields.Add(query["ses"].ToString());
-            fields.Add(query["rscc"].ToString());
-            fields.Add(query["rscd"].ToString());
-            fields.Add(query["rsce"].ToString());
-            fields.Add(query["rscl"].ToString());
-            fields.Add(query["rsct"].ToString());
+            else if (HasSasResponseOverrides(query))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
             stringToSign = string.Join('\n', fields);
 
             var identifier = query["si"].ToString();
@@ -509,6 +579,13 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             throw AzureStorageException.AuthenticationFailed();
 
         var now = DateTimeOffset.UtcNow;
+        if (!hasSignedVersion &&
+            string.IsNullOrEmpty(query["si"].ToString()) &&
+            expiresAt.HasValue &&
+            expiresAt.Value - (startsAt ?? now) > TimeSpan.FromHours(1))
+        {
+            throw AzureStorageException.AuthenticationFailed("Signature not valid in the specified time frame.");
+        }
         if (startsAt is { } start && now < start || expiresAt is null || now > expiresAt.Value)
             throw AzureStorageException.AuthenticationFailed("Signature not valid in the specified time frame.");
         if (string.IsNullOrEmpty(permissions))
@@ -689,7 +766,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                     request.Blob is not null &&
                     request.Snapshot is not null &&
                     request.VersionId is null,
-            "bv" => signedVersion >= new DateOnly(2019, 12, 12) &&
+            "bv" => signedVersion >= new DateOnly(2018, 11, 9) &&
                     request.ResourceKind == StorageResourceKind.Blob &&
                     request.Blob is not null &&
                     request.VersionId is not null &&
@@ -711,9 +788,12 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
     private static string BuildSasCanonicalResource(
         StorageRequestContext request,
         string resourceType,
-        IQueryCollection query)
+        IQueryCollection query,
+        DateOnly signedVersion)
     {
-        var path = $"/blob/{request.Account}";
+        var path = signedVersion >= new DateOnly(2015, 2, 21)
+            ? $"/blob/{request.Account}"
+            : $"/{request.Account}";
         if (request.Container is not null)
             path += "/" + request.Container;
         if (resourceType == "d")
@@ -757,8 +837,10 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         var builder = new StringBuilder();
         foreach (var item in names.Split(','))
         {
-            var name = item.Trim().ToLowerInvariant();
-            if (string.IsNullOrEmpty(name) || name.Contains('\n', StringComparison.Ordinal) || !seen.Add(name) ||
+            var name = item.ToLowerInvariant();
+            if (string.IsNullOrEmpty(name) ||
+                name.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)) ||
+                !seen.Add(name) ||
                 !request.Headers.TryGetValue(name, out var values))
             {
                 throw AzureStorageException.AuthenticationFailed("A signed request header is missing or invalid.");
@@ -771,21 +853,27 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         return builder.ToString();
     }
 
-    private static string BuildSignedRequestQuery(HttpRequest request, string names)
+    private static string BuildSignedRequestQuery(HttpRequest request)
     {
-        if (string.IsNullOrEmpty(names))
+        var names = ReadEncodedCommaSeparatedQueryValue(request, "srq");
+        if (names.Count == 0)
             return string.Empty;
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var builder = new StringBuilder();
-        foreach (var item in names.Split(','))
+        foreach (var name in names)
         {
-            var name = item.Trim();
-            if (string.IsNullOrEmpty(name) || name.Contains('\n', StringComparison.Ordinal) || !seen.Add(name) ||
-                !request.Query.TryGetValue(name, out var values))
+            if (string.IsNullOrEmpty(name) ||
+                name.Any(char.IsControl) ||
+                !seen.Add(name))
             {
                 throw AzureStorageException.AuthenticationFailed("A signed request query parameter is missing or invalid.");
             }
+            var parameter = request.Query.FirstOrDefault(candidate =>
+                string.Equals(candidate.Key, name, StringComparison.Ordinal));
+            if (parameter.Key is null)
+                throw AzureStorageException.AuthenticationFailed("A signed request query parameter is missing or invalid.");
+            var values = parameter.Value;
             var value = values.ToString();
             if (value.Contains('\n', StringComparison.Ordinal) || value.Contains('\r', StringComparison.Ordinal))
                 throw AzureStorageException.AuthenticationFailed("A signed request query parameter is invalid.");
@@ -793,6 +881,41 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         }
         return builder.ToString();
     }
+
+    private static IReadOnlyList<string> ReadEncodedCommaSeparatedQueryValue(
+        HttpRequest request,
+        string parameterName)
+    {
+        var rawQuery = request.QueryString.Value;
+        if (string.IsNullOrEmpty(rawQuery))
+            return [];
+
+        string? encodedValue = null;
+        foreach (var pair in rawQuery.AsSpan(1).ToString().Split('&'))
+        {
+            var separator = pair.IndexOf('=');
+            var encodedName = separator < 0 ? pair : pair[..separator];
+            if (!string.Equals(WebUtility.UrlDecode(encodedName), parameterName, StringComparison.Ordinal))
+                continue;
+            if (encodedValue is not null)
+                throw AzureStorageException.AuthenticationFailed("A signed request query parameter list is invalid.");
+            encodedValue = separator < 0 ? string.Empty : pair[(separator + 1)..];
+        }
+
+        if (encodedValue is null)
+            return [];
+        return encodedValue
+            .Split(',', StringSplitOptions.None)
+            .Select(value => WebUtility.UrlDecode(value) ?? string.Empty)
+            .ToArray();
+    }
+
+    private static bool HasSasResponseOverrides(IQueryCollection query) =>
+        query.ContainsKey("rscc") ||
+        query.ContainsKey("rscd") ||
+        query.ContainsKey("rsce") ||
+        query.ContainsKey("rscl") ||
+        query.ContainsKey("rsct");
 
     private static DateTimeOffset? Latest(DateTimeOffset? left, DateTimeOffset? right) =>
         left.HasValue && right.HasValue ? (left > right ? left : right) : left ?? right;
@@ -811,18 +934,20 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
     private static bool MatchesIpRange(IPAddress? address, string range)
     {
-        if (address is null)
+        if (address is null || address.AddressFamily != AddressFamily.InterNetwork)
             return false;
         var values = range.Split('-', 2);
-        if (!IPAddress.TryParse(values[0], out var start))
+        if (!IPAddress.TryParse(values[0], out var start) ||
+            start.AddressFamily != AddressFamily.InterNetwork)
             return false;
         if (values.Length == 1)
             return address.Equals(start);
-        if (!IPAddress.TryParse(values[1], out var end))
+        if (!IPAddress.TryParse(values[1], out var end) ||
+            end.AddressFamily != AddressFamily.InterNetwork)
             return false;
-        var candidateBytes = address.MapToIPv6().GetAddressBytes();
-        return Compare(candidateBytes, start.MapToIPv6().GetAddressBytes()) >= 0 &&
-               Compare(candidateBytes, end.MapToIPv6().GetAddressBytes()) <= 0;
+        var candidateBytes = address.GetAddressBytes();
+        return Compare(candidateBytes, start.GetAddressBytes()) >= 0 &&
+               Compare(candidateBytes, end.GetAddressBytes()) <= 0;
     }
 
     private static int Compare(ReadOnlySpan<byte> left, ReadOnlySpan<byte> right) => left.SequenceCompareTo(right);
