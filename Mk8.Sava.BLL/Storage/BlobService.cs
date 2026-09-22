@@ -494,6 +494,8 @@ public sealed class BlobService(
         var blockIdLength = ValidateBlockId(blockId);
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        if (current is not null)
+            EnsureNoPendingCopy(current);
         if (current is not null && current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current is not null && !chunks.IsInDomain(account, encryption, current.Content))

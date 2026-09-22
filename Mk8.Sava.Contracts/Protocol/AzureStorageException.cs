@@ -116,6 +116,11 @@ public sealed class AzureStorageException : Exception
         resource == "container" ? "LeaseNotPresentWithContainerOperation" : "LeaseNotPresentWithBlobOperation",
         $"A lease ID was specified, but there is currently no active lease on the {resource}.");
 
+    public static AzureStorageException InfiniteLeaseDurationRequired() => new(
+        (int)HttpStatusCode.PreconditionFailed,
+        "InfiniteLeaseDurationRequired",
+        "The lease ID matched, but the specified lease must be an infinite-duration lease.");
+
     public static AzureStorageException LeaseIdMismatchWithLeaseOperation() => new(
         (int)HttpStatusCode.Conflict,
         "LeaseIdMismatchWithLeaseOperation",
