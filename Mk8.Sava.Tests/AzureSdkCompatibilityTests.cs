@@ -5594,6 +5594,100 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task DisabledSharedKeyAccessRejectsKeyBasedAuthButAllowsUserDelegationSas()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowSharedKeyAccess"] = "false",
+                [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] =
+                    "racwdxytlfmeiopk"
+            });
+        var token = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var bearer = CreateBearerClient(application, token);
+        var container = bearer.GetBlobContainerClient($"no-shared-key-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("protected.txt");
+        await blob.UploadAsync(BinaryData.FromString("delegated only"));
+
+        static void AssertKeyBasedAuthenticationNotPermitted(RequestFailedException exception)
+        {
+            Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
+            Assert.Equal("KeyBasedAuthenticationNotPermitted", exception.ErrorCode);
+        }
+
+        var sharedKeyBlob = CreateClient(application)
+            .GetBlobContainerClient(container.Name)
+            .GetBlobClient(blob.Name);
+        AssertKeyBasedAuthenticationNotPermitted(
+            await Assert.ThrowsAsync<RequestFailedException>(() => sharedKeyBlob.DownloadContentAsync()));
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10);
+        var serviceBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        serviceBuilder.SetPermissions(BlobSasPermissions.Read);
+        var serviceSasBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
+                $"?{serviceBuilder.ToSasQueryParameters(credential)}"));
+        AssertKeyBasedAuthenticationNotPermitted(
+            await Assert.ThrowsAsync<RequestFailedException>(() => serviceSasBlob.DownloadContentAsync()));
+
+        var accountBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountBuilder.SetPermissions(AccountSasPermissions.Read);
+        var accountSasBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
+                $"?{accountBuilder.ToSasQueryParameters(credential)}"));
+        AssertKeyBasedAuthenticationNotPermitted(
+            await Assert.ThrowsAsync<RequestFailedException>(() => accountSasBlob.DownloadContentAsync()));
+
+        var key = (await bearer.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+        var delegationBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        delegationBuilder.SetPermissions(BlobSasPermissions.Read);
+        var delegationSasBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
+                $"?{delegationBuilder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName)}"));
+        Assert.Equal(
+            "delegated only",
+            (await delegationSasBlob.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task DirectoryServiceAndUserDelegationSasAreBoundToAnHnsPrefix()
     {
         await using var application = new SavaWebApplicationFactory(

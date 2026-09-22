@@ -63,9 +63,15 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         cancellationToken.ThrowIfCancellationRequested();
         var authorization = context.Request.Headers.Authorization.ToString();
         if (authorization.StartsWith("SharedKey ", StringComparison.Ordinal))
+        {
+            EnsureSharedKeyAccessAllowed(request.Account);
             return AuthenticateSharedKey(context.Request, request, authorization, lite: false);
+        }
         if (authorization.StartsWith("SharedKeyLite ", StringComparison.Ordinal))
+        {
+            EnsureSharedKeyAccessAllowed(request.Account);
             return AuthenticateSharedKey(context.Request, request, authorization, lite: true);
+        }
         if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
         {
             var hasSas = context.Request.Query.ContainsKey("sig");
@@ -293,6 +299,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         {
             throw AzureStorageException.AuthenticationFailed();
         }
+        if (!isUserDelegationSas)
+            EnsureSharedKeyAccessAllowed(request.Account);
         var hasSignedRequestFields = query.ContainsKey("srh") || query.ContainsKey("srq");
         if (hasSignedRequestFields &&
             (!isUserDelegationSas || signedVersion < new DateOnly(2026, 4, 6)))
@@ -1024,6 +1032,15 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
     private bool IsHierarchicalNamespaceEnabled(string account) =>
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         capabilities.HierarchicalNamespaceEnabled;
+
+    private void EnsureSharedKeyAccessAllowed(string account)
+    {
+        if (_options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+            !capabilities.AllowSharedKeyAccess)
+        {
+            throw AzureStorageException.KeyBasedAuthenticationNotPermitted();
+        }
+    }
 
     private static bool MatchesIpRange(IPAddress? address, string range)
     {
