@@ -485,16 +485,6 @@ public sealed partial class AzureResponseWriter
                     IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10))
                         ? properties.BlobPermanentDeleteEnabled
                         : null);
-            if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
-            {
-                WriteRetentionPolicy(
-                    writer,
-                    "ContainerDeleteRetentionPolicy",
-                    properties.ContainerSoftDeleteEnabled,
-                    properties.ContainerSoftDeleteRetentionDays,
-                    allowPermanentDelete: null);
-                writer.WriteElementString("IsVersioningEnabled", properties.VersioningEnabled ? "true" : "false");
-            }
             if (IsServiceVersionAtLeast(request, new DateOnly(2018, 3, 28)))
             {
                 writer.WriteStartElement("StaticWebsite");

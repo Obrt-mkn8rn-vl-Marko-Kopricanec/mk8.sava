@@ -96,9 +96,20 @@ public static class BlobProtocolEndpoint
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
         if (comp == "userdelegationkey" && HttpMethods.IsPost(http.Request.Method))
         {
+            RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Get User Delegation Key");
+            if (!http.Request.IsHttps)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status400BadRequest,
+                    "InvalidRequest",
+                    "Get User Delegation Key requires HTTPS.");
+            }
             if (request.Authorization.Kind != StorageAuthorizationKind.Bearer)
                 throw AzureStorageException.AuthorizationFailure();
-            var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(http.Request.Body, cancellationToken);
+            var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(
+                http.Request.Body,
+                request.ServiceVersion,
+                cancellationToken);
             var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
             var key = authenticator.IssueUserDelegationKey(request, keyRequest);
             await writer.WriteUserDelegationKeyAsync(http, key, cancellationToken);
