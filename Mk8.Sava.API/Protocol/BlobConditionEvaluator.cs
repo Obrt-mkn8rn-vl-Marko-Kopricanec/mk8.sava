@@ -39,7 +39,8 @@ internal static class BlobConditionEvaluator
                 etag,
                 lastModified,
                 AzureStorageException.ConditionNotMet,
-                AzureStorageException.NotModified);
+                AzureStorageException.NotModified,
+                supportsQuotedEtags: true);
             return;
         }
 
@@ -50,7 +51,8 @@ internal static class BlobConditionEvaluator
             resourceExists: true,
             writeFailure: false,
             AzureStorageException.ConditionNotMet,
-            AzureStorageException.NotModified);
+            AzureStorageException.NotModified,
+            supportsQuotedEtags: IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
     }
 
     public static void EvaluateWrite(
@@ -66,7 +68,8 @@ internal static class BlobConditionEvaluator
             resourceExists: etag is not null,
             writeFailure: true,
             AzureStorageException.ConditionNotMet,
-            AzureStorageException.NotModified);
+            AzureStorageException.NotModified,
+            supportsQuotedEtags: IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
     }
 
     public static void EvaluateCopySource(
@@ -83,7 +86,8 @@ internal static class BlobConditionEvaluator
             etag,
             lastModified,
             AzureStorageException.SourceConditionNotMet,
-            AzureStorageException.SourceConditionNotMet);
+            AzureStorageException.SourceConditionNotMet,
+            supportsQuotedEtags: true);
     }
 
     public static void EvaluateBlobTagRead(
@@ -99,7 +103,8 @@ internal static class BlobConditionEvaluator
             etag,
             lastModified,
             AzureStorageException.ConditionNotMet,
-            AzureStorageException.NotModified);
+            AzureStorageException.NotModified,
+            supportsQuotedEtags: true);
     }
 
     public static void EvaluateBlobTagWrite(
@@ -115,7 +120,8 @@ internal static class BlobConditionEvaluator
             resourceExists: true,
             writeFailure: true,
             AzureStorageException.ConditionNotMet,
-            AzureStorageException.NotModified);
+            AzureStorageException.NotModified,
+            supportsQuotedEtags: true);
     }
 
     public static void EvaluateContainerWrite(
@@ -137,7 +143,8 @@ internal static class BlobConditionEvaluator
             resourceExists: true,
             writeFailure: true,
             AzureStorageException.ConditionNotMet,
-            AzureStorageException.NotModified);
+            AzureStorageException.NotModified,
+            supportsQuotedEtags: false);
     }
 
     public static void EvaluateIfUnmodifiedSince(
@@ -182,11 +189,15 @@ internal static class BlobConditionEvaluator
         string etag,
         DateTimeOffset lastModified,
         Func<AzureStorageException> preconditionFailure,
-        Func<AzureStorageException> notModifiedFailure)
+        Func<AzureStorageException> notModifiedFailure,
+        bool supportsQuotedEtags)
     {
         var resourceTime = ToWholeSeconds(lastModified);
-        if (conditions.IfMatch.Count > 0 && !conditions.IfMatch.Any(candidate => Matches(candidate, etag)))
+        if (conditions.IfMatch.Count > 0 &&
+            !conditions.IfMatch.Any(candidate => Matches(candidate, etag, supportsQuotedEtags)))
+        {
             throw preconditionFailure();
+        }
         if (conditions.IfUnmodifiedSince.HasValue &&
             resourceTime > ToWholeSeconds(conditions.IfUnmodifiedSince.Value))
         {
@@ -199,7 +210,8 @@ internal static class BlobConditionEvaluator
             return;
 
         var ifNoneMatchPasses = hasIfNoneMatch &&
-                                conditions.IfNoneMatch.All(candidate => !Matches(candidate, etag));
+                                conditions.IfNoneMatch.All(candidate =>
+                                    !Matches(candidate, etag, supportsQuotedEtags));
         var ifModifiedSincePasses = hasIfModifiedSince &&
                                     resourceTime > ToWholeSeconds(conditions.IfModifiedSince!.Value);
         if (!ifNoneMatchPasses && !ifModifiedSincePasses)
@@ -213,7 +225,8 @@ internal static class BlobConditionEvaluator
         bool resourceExists,
         bool writeFailure,
         Func<AzureStorageException> preconditionFailure,
-        Func<AzureStorageException> notModifiedFailure)
+        Func<AzureStorageException> notModifiedFailure,
+        bool supportsQuotedEtags)
     {
         ValidateLegacyCombination(conditions);
         if (!conditions.HasAny)
@@ -221,15 +234,21 @@ internal static class BlobConditionEvaluator
 
         if (conditions.IfNoneMatch.Count > 0)
         {
-            if (resourceExists && conditions.IfNoneMatch.Any(candidate => Matches(candidate, etag!)))
+            if (resourceExists &&
+                conditions.IfNoneMatch.Any(candidate => Matches(candidate, etag!, supportsQuotedEtags)))
+            {
                 throw writeFailure ? preconditionFailure() : notModifiedFailure();
+            }
             return;
         }
 
         if (conditions.IfMatch.Count > 0)
         {
-            if (!resourceExists || !conditions.IfMatch.Any(candidate => Matches(candidate, etag!)))
+            if (!resourceExists ||
+                !conditions.IfMatch.Any(candidate => Matches(candidate, etag!, supportsQuotedEtags)))
+            {
                 throw preconditionFailure();
+            }
             return;
         }
 
@@ -337,8 +356,20 @@ internal static class BlobConditionEvaluator
         return parsed;
     }
 
-    private static bool Matches(string candidate, string etag) =>
-        candidate == "*" || string.Equals(candidate, etag, StringComparison.Ordinal);
+    private static bool Matches(string candidate, string etag, bool supportsQuotedEtags)
+    {
+        if (candidate == "*")
+            return true;
+        var unquotedEtag = Unquote(etag);
+        if (!supportsQuotedEtags)
+            return string.Equals(candidate, unquotedEtag, StringComparison.Ordinal);
+        return string.Equals(Unquote(candidate), unquotedEtag, StringComparison.Ordinal);
+    }
+
+    private static string Unquote(string etag) =>
+        etag.Length >= 2 && etag[0] == '"' && etag[^1] == '"'
+            ? etag[1..^1]
+            : etag;
 
     private static DateTimeOffset ToWholeSeconds(DateTimeOffset value)
     {

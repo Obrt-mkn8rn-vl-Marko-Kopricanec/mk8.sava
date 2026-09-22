@@ -1042,7 +1042,7 @@ public static class BlobProtocolEndpoint
             var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
                              ?? ProtocolParsing.First(http.Request.Headers, "Range")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-range");
-            var (start, end) = ProtocolParsing.ParseRange(rangeValue, current.Content.Length);
+            var (start, end) = ParsePageWriteRange(rangeValue, current.Content.Length);
             var rangeLength = checked(end - start + 1);
             var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToLowerInvariant();
             BlobRecord updated;
@@ -1413,7 +1413,7 @@ public static class BlobProtocolEndpoint
             http.Response.Headers["x-ms-snapshot"] = created.Snapshot;
             if (created.VersionId is not null)
                 http.Response.Headers["x-ms-version-id"] = created.VersionId;
-            http.Response.Headers.ETag = created.ETag;
+            AzureResponseWriter.AddEntityTag(http.Response, created.ETag);
             http.Response.Headers.LastModified = created.LastModified.ToString("R", CultureInfo.InvariantCulture);
             AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));
             http.Response.StatusCode = StatusCodes.Status201Created;
@@ -1458,7 +1458,7 @@ public static class BlobProtocolEndpoint
             EnsureLease(http.Request, blob.Lease, "blob");
             var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, DateTimeOffset.UtcNow);
             var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
-            http.Response.Headers.ETag = updated.ETag;
+            AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
             http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
             return;
         }
@@ -1486,7 +1486,7 @@ public static class BlobProtocolEndpoint
                 suppliedEncryption.CustomerProvidedKey);
             var rangeValue = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
                              ?? ProtocolParsing.First(http.Request.Headers, "Range");
-            var (rangeStart, rangeEnd) = ResolvePageListRange(blob, rangeValue);
+            var (rangeStart, rangeEnd) = ResolvePageListRange(request, blob, rangeValue);
             IReadOnlyList<PageRange> ranges;
             IReadOnlyList<PageRange> clearRanges;
             var previousSnapshot = NullIfEmpty(http.Request.Query["prevsnapshot"].ToString());
@@ -1498,7 +1498,7 @@ public static class BlobProtocolEndpoint
 
             if (previousSnapshot is null || rangeEnd < rangeStart)
             {
-                ranges = SelectPageRanges(blob, rangeValue);
+                ranges = SelectPageRanges(request, blob, rangeValue);
                 clearRanges = [];
             }
             else
@@ -1528,7 +1528,18 @@ public static class BlobProtocolEndpoint
                 .Concat(clearRanges.Select(range => (Range: range, IsClear: true)))
                 .OrderBy(item => item.Range.Start)
                 .ToArray();
-            var maxResults = ParsePageRangeMaxResults(http.Request.Query["maxresults"].ToString());
+            var hasPageRangePaging = http.Request.Query.ContainsKey("maxresults") ||
+                                     http.Request.Query.ContainsKey("marker");
+            if (hasPageRangePaging)
+            {
+                RequireFeatureVersion(
+                    request,
+                    new DateOnly(2020, 10, 2),
+                    "Get Page Ranges pagination");
+            }
+            var maxResults = ParsePageRangeMaxResults(
+                http.Request.Query["maxresults"].ToString(),
+                http.Request.Query.ContainsKey("maxresults"));
             var marker = ParsePageRangeMarker(http.Request.Query["marker"].ToString(), ordered.Length);
             var page = ordered.Skip(marker).Take(maxResults).ToArray();
             var nextOffset = marker + page.Length;
@@ -1970,11 +1981,17 @@ public static class BlobProtocolEndpoint
     {
         long start = 0;
         long end = blob.Content.Length - 1;
-        var rangeHeader = ProtocolParsing.First(http.Request.Headers, "x-ms-range")
-                          ?? ProtocolParsing.First(http.Request.Headers, "Range");
+        var rangeHeader = HttpMethods.IsGet(http.Request.Method)
+            ? ProtocolParsing.First(http.Request.Headers, "x-ms-range")
+              ?? ProtocolParsing.First(http.Request.Headers, "Range")
+            : null;
         if (!string.IsNullOrEmpty(rangeHeader))
         {
-            (start, end) = ProtocolParsing.ParseRange(rangeHeader, blob.Content.Length);
+            var request = StorageRequestContext.Get(http);
+            (start, end) = ProtocolParsing.ParseStorageRange(
+                rangeHeader,
+                blob.Content.Length,
+                allowOpenEnded: IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
             http.Response.StatusCode = StatusCodes.Status206PartialContent;
             http.Response.Headers.ContentRange = $"bytes {start}-{end}/{blob.Content.Length}";
         }
@@ -1988,14 +2005,27 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        var wantMd5 = string.Equals(ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-md5"), "true", StringComparison.OrdinalIgnoreCase);
-        var wantCrc64 = string.Equals(ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-crc64"), "true", StringComparison.OrdinalIgnoreCase);
+        var wantMd5 = string.Equals(
+            ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-md5"),
+            "true",
+            StringComparison.OrdinalIgnoreCase);
+        var wantCrc64 = string.Equals(
+            ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-crc64"),
+            "true",
+            StringComparison.OrdinalIgnoreCase);
         if (wantMd5 && wantCrc64)
         {
             throw new AzureStorageException(
                 StatusCodes.Status400BadRequest,
                 "BothCrc64AndMd5Specified",
                 "Both CRC64 and MD5 were requested. Specify only one checksum.");
+        }
+        if (wantCrc64)
+        {
+            RequireFeatureVersion(
+                StorageRequestContext.Get(http),
+                new DateOnly(2019, 2, 2),
+                "Transactional range CRC64 checksums");
         }
 
         var structuredBody = ProtocolParsing.First(http.Request.Headers, "x-ms-structured-body");
@@ -2406,7 +2436,7 @@ public static class BlobProtocolEndpoint
         var (action, transition) = ApplyLeaseAction(http.Request, container.Lease);
         var updated = await service.SetContainerLeaseAsync(container, transition.Lease, cancellationToken);
         http.Response.StatusCode = LeaseStatusCode(action);
-        http.Response.Headers.ETag = updated.ETag;
+        AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
         http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
         AddLeaseResponseHeaders(http.Response, action, transition);
     }
@@ -2420,7 +2450,7 @@ public static class BlobProtocolEndpoint
         var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease);
         var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken);
         http.Response.StatusCode = LeaseStatusCode(action);
-        http.Response.Headers.ETag = updated.ETag;
+        AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
         http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
         AddLeaseResponseHeaders(http.Response, action, transition);
     }
@@ -2491,12 +2521,15 @@ public static class BlobProtocolEndpoint
         return parsed;
     }
 
-    private static IReadOnlyList<PageRange> SelectPageRanges(BlobRecord blob, string? requestedRange)
+    private static IReadOnlyList<PageRange> SelectPageRanges(
+        StorageRequestContext request,
+        BlobRecord blob,
+        string? requestedRange)
     {
         if (requestedRange is null)
             return blob.PageRanges;
 
-        var (start, end) = ResolvePageListRange(blob, requestedRange);
+        var (start, end) = ResolvePageListRange(request, blob, requestedRange);
         if (end < start)
             return [];
         return blob.PageRanges
@@ -2505,11 +2538,33 @@ public static class BlobProtocolEndpoint
             .ToArray();
     }
 
-    private static (long Start, long End) ResolvePageListRange(BlobRecord blob, string? requestedRange)
+    private static (long Start, long End) ParsePageWriteRange(string value, long length)
+    {
+        try
+        {
+            return ProtocolParsing.ParseStorageRange(
+                value,
+                length,
+                allowOpenEnded: false,
+                allowEndPastLength: false);
+        }
+        catch (AzureStorageException exception) when (exception.ErrorCode == "InvalidRange")
+        {
+            throw AzureStorageException.InvalidPageRange();
+        }
+    }
+
+    private static (long Start, long End) ResolvePageListRange(
+        StorageRequestContext request,
+        BlobRecord blob,
+        string? requestedRange)
     {
         if (requestedRange is null)
             return blob.Content.Length == 0 ? (0, -1) : (0, blob.Content.Length - 1);
-        var (start, end) = ProtocolParsing.ParseRange(requestedRange, blob.Content.Length);
+        var (start, end) = ProtocolParsing.ParseStorageRange(
+            requestedRange,
+            blob.Content.Length,
+            allowOpenEnded: IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
         if (start % 512 != 0 || (end + 1) % 512 != 0)
             throw AzureStorageException.InvalidHeader("x-ms-range", requestedRange);
         return (start, end);
@@ -3999,13 +4054,13 @@ public static class BlobProtocolEndpoint
         return parsed;
     }
 
-    private static int ParsePageRangeMaxResults(string value)
+    private static int ParsePageRangeMaxResults(string value, bool specified)
     {
-        if (string.IsNullOrEmpty(value))
-            return 10_000;
-        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed is < 1 or > 10_000)
+        if (!specified)
+            return int.MaxValue;
+        if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed < 1)
             throw AzureStorageException.InvalidQuery("maxresults");
-        return parsed;
+        return Math.Min(parsed, 10_000);
     }
 
     private static int ParsePageRangeMarker(string value, int resultCount)
