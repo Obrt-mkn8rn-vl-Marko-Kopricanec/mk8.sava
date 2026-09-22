@@ -1127,6 +1127,14 @@ public static class BlobProtocolEndpoint
                     "Incremental Copy Blob requires service version 2016-05-31 or later.");
             }
 
+            ValidateAsynchronousCopyEncryption(http.Request);
+            if (http.Request.Headers.ContainsKey("x-ms-seal-blob"))
+            {
+                throw AzureStorageException.InvalidHeader(
+                    "x-ms-seal-blob",
+                    ProtocolParsing.First(http.Request.Headers, "x-ms-seal-blob"));
+            }
+
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             RequireAny(request, current is null ? 'c' : 'w', 'w');
             EvaluateWriteConditions(http.Request, current);
@@ -1610,6 +1618,12 @@ public static class BlobProtocolEndpoint
                 if (requiresSync)
                     throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
                 RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Put Blob From URL");
+                if (http.Request.Headers.ContainsKey("x-ms-seal-blob"))
+                {
+                    throw AzureStorageException.InvalidHeader(
+                        "x-ms-seal-blob",
+                        ProtocolParsing.First(http.Request.Headers, "x-ms-seal-blob"));
+                }
                 RequireZeroContentLength(http.Request);
                 if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
                     throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
@@ -1770,6 +1784,7 @@ public static class BlobProtocolEndpoint
                     containerName,
                     blobName,
                     source,
+                    ReadCopySealDestination(http.Request, source.Kind, source.IsSealed),
                     ReadCopyWriteOptions(http.Request, source, current),
                     publicSource,
                     current?.Lease ?? LeaseRecord.Available,
@@ -1800,7 +1815,7 @@ public static class BlobProtocolEndpoint
                             source.ContentLength!.Value,
                             sourceKind,
                             source.SequenceNumber,
-                            source.IsSealed,
+                            ReadCopySealDestination(http.Request, sourceKind, source.IsSealed),
                             source.AppendBlockCount,
                             source.CommittedBlocks,
                             source.PageRanges,
@@ -3092,6 +3107,12 @@ public static class BlobProtocolEndpoint
 
     private static void ValidateSynchronousCopyEncryption(HttpRequest request)
     {
+        if (request.Headers.ContainsKey("x-ms-seal-blob"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-seal-blob",
+                ProtocolParsing.First(request.Headers, "x-ms-seal-blob"));
+        }
         foreach (var headerName in new[]
                  {
                      "x-ms-encryption-key",
@@ -3131,6 +3152,25 @@ public static class BlobProtocolEndpoint
             if (request.Headers.ContainsKey(headerName))
                 throw AzureStorageException.InvalidHeader(headerName, ProtocolParsing.First(request.Headers, headerName));
         }
+    }
+
+    private static bool ReadCopySealDestination(
+        HttpRequest request,
+        BlobKind sourceKind,
+        bool sourceIsSealed)
+    {
+        const string headerName = "x-ms-seal-blob";
+        var value = ProtocolParsing.First(request.Headers, headerName);
+        if (value is null)
+            return sourceKind == BlobKind.AppendBlob && sourceIsSealed;
+
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2019, 12, 12),
+            "Copy Blob append sealing");
+        if (sourceKind != BlobKind.AppendBlob || !bool.TryParse(value, out var shouldSeal))
+            throw AzureStorageException.InvalidHeader(headerName, value);
+        return shouldSeal;
     }
 
     private static BlobEncryption ReadSignedCopyEncryption(HttpRequest request) =>
