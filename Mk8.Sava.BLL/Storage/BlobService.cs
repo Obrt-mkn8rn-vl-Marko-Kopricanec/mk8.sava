@@ -48,6 +48,10 @@ public sealed class BlobService(
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         capabilities.HierarchicalNamespaceBlobSnapshotsEnabled;
 
+    public bool IsLastAccessTimeTrackingEnabled(string account) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.LastAccessTimeTrackingEnabled;
+
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
@@ -475,20 +479,29 @@ public sealed class BlobService(
         return EffectiveBlob(await CompleteRehydrationIfDueAsync(blob, cancellationToken));
     }
 
-    public async Task<BlobRecord> RecordSmartTierAccessAsync(
+    public async Task<BlobRecord> RecordDataAccessAsync(
         BlobRecord current,
         CancellationToken cancellationToken)
     {
-        while (string.Equals(current.AccessTier, "Smart", StringComparison.Ordinal))
+        while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var now = metadata.GetUtcNow();
-            var movedToHot = !string.Equals(current.SmartAccessTier, "Hot", StringComparison.Ordinal);
+            var smartTier = string.Equals(current.AccessTier, "Smart", StringComparison.Ordinal);
+            var trackLastAccess = IsLastAccessTimeTrackingEnabled(current.Account) &&
+                                  (!current.LastAccessedAt.HasValue ||
+                                   now - current.LastAccessedAt.Value >= TimeSpan.FromHours(24));
+            if (!smartTier && !trackLastAccess)
+                return current;
+
+            var movedToHot = smartTier &&
+                             !string.Equals(current.SmartAccessTier, "Hot", StringComparison.Ordinal);
             var updated = current with
             {
                 Revision = MetadataStore.NewRevision(),
-                SmartAccessTier = "Hot",
-                SmartTierLastAccessedAt = now,
+                SmartAccessTier = smartTier ? "Hot" : current.SmartAccessTier,
+                SmartTierLastAccessedAt = smartTier ? now : current.SmartTierLastAccessedAt,
+                LastAccessedAt = trackLastAccess ? now : current.LastAccessedAt,
                 AccessTierChangedAt = movedToHot ? now : current.AccessTierChangedAt
             };
             try
@@ -509,7 +522,6 @@ public sealed class BlobService(
                           ?? throw AzureStorageException.BlobNotFound();
             }
         }
-        return current;
     }
 
     public async Task<BlobRecord> PutBlockBlobAsync(
@@ -780,13 +792,17 @@ public sealed class BlobService(
         }
         var content = await chunks.ComposeAsync(current.Account, encryption, [current.Content, appended.Manifest], cancellationToken);
         using var contentPin = chunks.Pin(content);
+        var now = metadata.GetUtcNow();
         var updated = current with
         {
             GenerationId = Guid.NewGuid().ToString("N"),
             Revision = MetadataStore.NewRevision(),
             Content = content,
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow(),
+            LastModified = now,
+            LastAccessedAt = IsLastAccessTimeTrackingEnabled(current.Account)
+                ? now
+                : current.LastAccessedAt,
             Lease = current.Lease,
             AppendBlockCount = checked(current.AppendBlockCount + 1),
             Copy = null
@@ -842,6 +858,7 @@ public sealed class BlobService(
         }
         using (content)
         {
+            var now = metadata.GetUtcNow();
             var updated = current with
             {
                 GenerationId = Guid.NewGuid().ToString("N"),
@@ -849,7 +866,10 @@ public sealed class BlobService(
                 Content = content.Manifest,
                 PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
                 ETag = MetadataStore.NewETag(),
-                LastModified = metadata.GetUtcNow()
+                LastModified = now,
+                LastAccessedAt = IsLastAccessTimeTrackingEnabled(current.Account)
+                    ? now
+                    : current.LastAccessedAt
             };
             return await metadata.PublishBlobAsync(
                 updated,
@@ -1044,6 +1064,7 @@ public sealed class BlobService(
             content = resized.Manifest;
         }
 
+        var now = metadata.GetUtcNow();
         var updated = current with
         {
             Revision = MetadataStore.NewRevision(),
@@ -1058,7 +1079,10 @@ public sealed class BlobService(
                 : current.PageRanges,
             Copy = null,
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow()
+            LastModified = now,
+            LastAccessedAt = resizeTo.HasValue && IsLastAccessTimeTrackingEnabled(current.Account)
+                ? now
+                : current.LastAccessedAt
         };
         try
         {
@@ -1798,6 +1822,9 @@ public sealed class BlobService(
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
             LastModified = now,
+            LastAccessedAt = IsLastAccessTimeTrackingEnabled(account)
+                ? now
+                : current?.LastAccessedAt,
             SequenceNumber = source.SequenceNumber,
             IsIncrementalCopy = true,
             IncrementalCopySource = sourceIdentity,
@@ -2815,7 +2842,10 @@ public sealed class BlobService(
             },
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
-            LastModified = now
+            LastModified = now,
+            LastAccessedAt = IsLastAccessTimeTrackingEnabled(blob.Account)
+                ? now
+                : blob.LastAccessedAt
         };
         try
         {
@@ -2987,6 +3017,8 @@ public sealed class BlobService(
             AccessTierInferred = kind == BlobKind.BlockBlob &&
                                  (options.AccessTierInferred ?? options.AccessTier is null),
             SmartAccessTier = options.AccessTier == "Smart" ? "Hot" : null,
+            LastAccessedAt = IsLastAccessTimeTrackingEnabled(account) ? now : null,
+            AccessTierChangedAt = options.AccessTierSpecified ? now : null,
             ImmutabilityUntil = options.ImmutabilityUntil,
             ImmutabilityLocked = options.ImmutabilityLocked,
             HasLegalHold = options.HasLegalHold,

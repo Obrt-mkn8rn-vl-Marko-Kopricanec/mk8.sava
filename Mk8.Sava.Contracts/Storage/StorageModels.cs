@@ -116,6 +116,7 @@ public sealed record BlobRecord
     public bool AccessTierInferred { get; init; }
     public string? SmartAccessTier { get; init; }
     public DateTimeOffset? SmartTierLastAccessedAt { get; init; }
+    public DateTimeOffset? LastAccessedAt { get; init; }
     public DateTimeOffset? AccessTierChangedAt { get; init; }
     public string? ArchiveStatus { get; init; }
     public string? RehydratePriority { get; init; }

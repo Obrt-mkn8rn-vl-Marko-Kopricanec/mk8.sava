@@ -147,6 +147,7 @@ public sealed partial class AzureResponseWriter
         IReadOnlySet<string> includes,
         bool arrow,
         bool hierarchicalNamespace,
+        bool lastAccessTimeTracking,
         CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
@@ -169,6 +170,7 @@ public sealed partial class AzureResponseWriter
                 nextMarker,
                 includes,
                 hierarchicalNamespace,
+                lastAccessTimeTracking,
                 cancellationToken);
         }
         var serviceEndpoint = StorageResourcePath.GetServiceEndpoint(context.Request, request.Account);
@@ -366,6 +368,14 @@ public sealed partial class AzureResponseWriter
                     WriteOptional(writer, "EncryptionContext", blob.EncryptionContext);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
                     WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
+                if (lastAccessTimeTracking &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+                {
+                    WriteOptional(
+                        writer,
+                        "LastAccessTime",
+                        blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
+                }
                 if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
                     WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
                 if (blob.IsDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
@@ -730,7 +740,8 @@ public sealed partial class AzureResponseWriter
     public static void AddBlobHeaders(
         HttpResponse response,
         BlobRecord blob,
-        bool hierarchicalNamespace = false)
+        bool hierarchicalNamespace = false,
+        bool lastAccessTimeTracking = false)
     {
         var request = StorageRequestContext.Get(response.HttpContext);
         AddBlobEntityHeaders(response, blob);
@@ -776,6 +787,8 @@ public sealed partial class AzureResponseWriter
         }
         if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
+        if (lastAccessTimeTracking && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+            SetOptional(response.Headers, "x-ms-last-access-time", blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
             SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
