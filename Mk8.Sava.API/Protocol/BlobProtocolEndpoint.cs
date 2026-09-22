@@ -979,6 +979,8 @@ public static class BlobProtocolEndpoint
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
         if (snapshot is not null)
             RequireBlobSnapshots(request, service);
+        if (versionId is not null && service.IsHierarchicalNamespaceEnabled(request.Account))
+            throw AzureStorageException.BlobNotFound();
         var permanentDelete = HttpMethods.IsDelete(http.Request.Method) &&
                               string.IsNullOrEmpty(comp) &&
                               http.Request.Query.ContainsKey("deletetype");

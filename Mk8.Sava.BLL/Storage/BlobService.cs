@@ -414,6 +414,8 @@ public sealed class BlobService(
         ValidateBlobName(name);
         if (snapshot is not null && !SupportsBlobSnapshots(account))
             throw AzureStorageException.BlobOperationNotSupported();
+        if (versionId is not null && IsHierarchicalNamespaceEnabled(account))
+            throw AzureStorageException.BlobNotFound();
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
@@ -3047,7 +3049,11 @@ public sealed class BlobService(
         container with { Lease = leases.GetEffective(container.Lease) };
 
     private BlobRecord EffectiveBlob(BlobRecord blob) =>
-        blob with { Lease = leases.GetEffective(blob.Lease) };
+        blob with
+        {
+            Lease = leases.GetEffective(blob.Lease),
+            VersionId = IsHierarchicalNamespaceEnabled(blob.Account) ? null : blob.VersionId
+        };
 
     private BlobRecord PrepareBlobWrite(BlobRecord blob) =>
         blob with { Lease = leases.ResetAfterBlobWrite(blob.Lease) };

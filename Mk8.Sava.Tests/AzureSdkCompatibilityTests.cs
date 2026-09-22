@@ -1923,6 +1923,66 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceNeverExposesBlobVersions()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var container = service.GetBlobContainerClient($"hns-versions-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("state.bin");
+        await blob.UploadAsync(BinaryData.FromString("legacy state"));
+
+        var current = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(current);
+        var legacyVersionId = MetadataStore.CreateVersionId(DateTimeOffset.UtcNow);
+        await metadata.PutBlobRecordAsync(
+            current with
+            {
+                VersionId = legacyVersionId,
+                Revision = MetadataStore.NewRevision()
+            },
+            current.Revision,
+            CancellationToken.None);
+
+        Assert.Null((await blob.GetPropertiesAsync()).Value.VersionId);
+        var versionListing = await container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Version,
+            Prefix = blob.Name
+        }).ToListAsync();
+        Assert.Null(Assert.Single(versionListing).VersionId);
+
+        var historical = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.WithVersion(legacyVersionId).GetPropertiesAsync());
+        Assert.Equal(StatusCodes.Status404NotFound, historical.Status);
+        Assert.Equal("BlobNotFound", historical.ErrorCode);
+
+        await blob.UploadAsync(BinaryData.FromString("current HNS state"), overwrite: true);
+        var family = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            blob.Name,
+            includeDeleted: true,
+            CancellationToken.None);
+        Assert.Null(Assert.Single(family).VersionId);
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);
