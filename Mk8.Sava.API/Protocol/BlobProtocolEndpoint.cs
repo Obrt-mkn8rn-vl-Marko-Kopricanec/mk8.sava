@@ -373,13 +373,6 @@ public static class BlobProtocolEndpoint
             await HandleBatchAsync(http, request, service, containerName, cancellationToken);
             return;
         }
-        if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
-            !request.Authorization.IsAccountSas &&
-            !(HttpMethods.IsGet(http.Request.Method) && comp is "list" or "blobs"))
-        {
-            throw AzureStorageException.AuthorizationFailure();
-        }
-
         if (HttpMethods.IsGet(http.Request.Method) && comp == "blobs")
         {
             Require(request, 'f');
@@ -423,6 +416,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
             RequireAny(request, 'c', 'w');
+            RequireZeroContentLength(http.Request);
             var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name") ?? containerName;
             var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
                           ?? throw AzureStorageException.InvalidHeader("x-ms-deleted-container-version");
@@ -528,6 +522,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "metadata")
         {
             Require(request, 'w');
+            RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateContainerWrite(
                 http.Request,
                 container.LastModified,
@@ -541,7 +536,7 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
             comp == "acl")
         {
-            Require(request, 'r');
+            RequireContainerAclPermission(request);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
             if (HttpMethods.IsGet(http.Request.Method))
@@ -551,7 +546,7 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "acl")
         {
-            Require(request, 'w');
+            RequireContainerAclPermission(request);
             BlobConditionEvaluator.EvaluateContainerWrite(
                 http.Request,
                 container.LastModified,
@@ -1176,6 +1171,7 @@ public static class BlobProtocolEndpoint
 
             ValidateAsynchronousCopyEncryption(http.Request);
             ValidateIncrementalCopyHeaders(http.Request);
+            RequireZeroContentLength(http.Request);
 
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             RequireAny(request, current is null ? 'c' : 'w', 'w');
@@ -1243,6 +1239,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Undelete Blob");
             Require(request, 'w');
+            RequireZeroContentLength(http.Request);
             await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
             return;
         }
@@ -1293,6 +1290,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Set Blob Immutability Policy");
             Require(request, 'i');
+            RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
             var untilValue = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-until-date")
                              ?? throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date");
@@ -1321,6 +1319,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Delete Blob Immutability Policy");
             Require(request, 'i');
+            RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
             await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken);
             return;
@@ -1330,6 +1329,7 @@ public static class BlobProtocolEndpoint
         {
             RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Set Blob Legal Hold");
             Require(request, 'i');
+            RequireZeroContentLength(http.Request);
             var value = ProtocolParsing.First(http.Request.Headers, "x-ms-legal-hold");
             if (!bool.TryParse(value, out var hasLegalHold))
                 throw AzureStorageException.InvalidHeader("x-ms-legal-hold", value);
@@ -1342,6 +1342,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            RequireZeroContentLength(http.Request);
             EnsureLease(http.Request, blob.Lease, "blob");
             var action = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-action");
             if (!string.Equals(action, "abort", StringComparison.OrdinalIgnoreCase))
@@ -1390,6 +1391,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            RequireZeroContentLength(http.Request);
             EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
@@ -1422,6 +1424,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
+            RequireZeroContentLength(http.Request);
             var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: true);
             var contentEncryption = new BlobEncryption(
                 blob.EncryptionScope,
@@ -1450,12 +1453,12 @@ public static class BlobProtocolEndpoint
 
         if (HttpMethods.IsPut(http.Request.Method) && comp == "snapshot")
         {
-            Require(request, 'w');
+            RequireAny(request, 'c', 'w');
             RequireZeroContentLength(http.Request);
             EnsureMutableVersion(blob);
             EnsureCustomerProvidedKey(http.Request, blob, write: true);
             EvaluateWriteConditions(http.Request, blob);
-            EnsureLease(http.Request, blob.Lease, "blob");
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             var hasSnapshotMetadata = http.Request.Headers.Keys.Any(name =>
                 name.StartsWith("x-ms-meta-", StringComparison.OrdinalIgnoreCase));
             var created = await service.CreateSnapshotAsync(
@@ -1467,6 +1470,7 @@ public static class BlobProtocolEndpoint
                 http.Response.Headers["x-ms-version-id"] = created.VersionId;
             AzureResponseWriter.AddEntityTag(http.Response, created.ETag);
             http.Response.Headers.LastModified = created.LastModified.ToString("R", CultureInfo.InvariantCulture);
+            AddRequestServerEncryptedHeader(http.Response, new DateOnly(2019, 2, 2));
             AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -2918,6 +2922,13 @@ public static class BlobProtocolEndpoint
                 : AzureStorageException.AuthorizationPermissionMismatch();
     }
 
+    private static void RequireContainerAclPermission(StorageRequestContext request)
+    {
+        if (request.Authorization.Kind == StorageAuthorizationKind.Sas)
+            throw AzureStorageException.AuthorizationFailure();
+        Require(request, 'p');
+    }
+
     private static void RequireBlockWrite(StorageRequestContext request, bool createsBlob)
     {
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas &&
@@ -3836,11 +3847,13 @@ public static class BlobProtocolEndpoint
             response.Headers["x-ms-encryption-scope"] = encryption.Scope;
     }
 
-    private static void AddRequestServerEncryptedHeader(HttpResponse response)
+    private static void AddRequestServerEncryptedHeader(
+        HttpResponse response,
+        DateOnly? minimumVersion = null)
     {
         if (IsServiceVersionAtLeast(
                 StorageRequestContext.Get(response.HttpContext),
-                new DateOnly(2015, 12, 11)))
+                minimumVersion ?? new DateOnly(2015, 12, 11)))
         {
             response.Headers["x-ms-request-server-encrypted"] = "true";
         }
