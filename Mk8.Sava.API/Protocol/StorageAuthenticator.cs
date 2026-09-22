@@ -329,6 +329,12 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         {
             var services = query["ss"].ToString();
             var resourceTypes = query["srt"].ToString();
+            ValidateAccountSasFields(
+                services,
+                resourceTypes,
+                permissions,
+                signedVersion,
+                expiresAt);
             if (!services.Contains('b'))
                 throw AzureStorageException.AuthorizationServiceMismatch();
             if (!AccountSasCoversRequest(resourceTypes, request, context.Request))
@@ -355,6 +361,9 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 throw AzureStorageException.AuthenticationFailed();
 
             var resourceType = query["sr"].ToString();
+            if (string.IsNullOrEmpty(permissions) || expiresAt is null)
+                throw AzureStorageException.AuthenticationFailed();
+            ValidateServiceSasPermissions(permissions, signedVersion);
             signedResource = resourceType;
             if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
                 throw AzureStorageException.AuthorizationFailure();
@@ -508,6 +517,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         else
         {
             var resourceType = query["sr"].ToString();
+            ValidateServiceSasPermissions(permissions, signedVersion);
             signedResource = resourceType;
             if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
                 throw AzureStorageException.AuthorizationFailure();
@@ -826,6 +836,74 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (string.IsNullOrEmpty(policy))
             return token;
         return new string(token.Where(policy.Contains).ToArray());
+    }
+
+    private static void ValidateAccountSasFields(
+        string services,
+        string resourceTypes,
+        string permissions,
+        DateOnly signedVersion,
+        DateTimeOffset? expiresAt)
+    {
+        if (string.IsNullOrEmpty(services) ||
+            string.IsNullOrEmpty(resourceTypes) ||
+            string.IsNullOrEmpty(permissions) ||
+            expiresAt is null ||
+            !IsOrderedSubset(services, "bqtf") ||
+            !IsOrderedSubset(resourceTypes, "sco") ||
+            !IsOrderedSubset(permissions, "rwdxylacuptfi"))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+
+        foreach (var permission in permissions)
+        {
+            var minimumVersion = permission switch
+            {
+                'x' or 't' or 'f' => new DateOnly(2019, 12, 12),
+                'y' => new DateOnly(2020, 2, 10),
+                'i' => new DateOnly(2020, 6, 12),
+                _ => DateOnly.MinValue
+            };
+            if (signedVersion < minimumVersion)
+                throw AzureStorageException.AuthenticationFailed();
+        }
+    }
+
+    private static void ValidateServiceSasPermissions(
+        string permissions,
+        DateOnly signedVersion)
+    {
+        if (string.IsNullOrEmpty(permissions))
+            return;
+        if (!IsOrderedSubset(permissions, "racwdxyltfmeiop"))
+            throw AzureStorageException.AuthenticationFailed();
+
+        foreach (var permission in permissions)
+        {
+            var minimumVersion = permission switch
+            {
+                'x' or 't' or 'f' => new DateOnly(2019, 12, 12),
+                'y' or 'm' or 'e' or 'o' or 'p' => new DateOnly(2020, 2, 10),
+                'i' => new DateOnly(2020, 6, 12),
+                _ => DateOnly.MinValue
+            };
+            if (signedVersion < minimumVersion)
+                throw AzureStorageException.AuthenticationFailed();
+        }
+    }
+
+    private static bool IsOrderedSubset(string value, string order)
+    {
+        var previous = -1;
+        foreach (var character in value)
+        {
+            var current = order.IndexOf(character);
+            if (current <= previous)
+                return false;
+            previous = current;
+        }
+        return true;
     }
 
     private static string BuildSignedRequestHeaders(HttpRequest request, string names)

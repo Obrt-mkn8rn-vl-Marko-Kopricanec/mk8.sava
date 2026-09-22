@@ -81,7 +81,10 @@ signed service version. Legacy service SAS forms are retained: pre-2015 tokens
 use the historical canonical-resource prefix, response overrides enter the
 signature in `2013-08-15`, and IP/protocol restrictions enter it in
 `2015-04-05`. A service SAS without `sv` is limited to Azure's one-hour ad hoc
-lifetime. An HNS account can issue a directory SAS (`sr=d`) from version
+lifetime. Permission letters and account-SAS service/resource sets must be
+unique and in Azure's canonical order; permissions introduced by a later
+service version fail authentication. An HNS account can issue a directory SAS
+(`sr=d`) from version
 `2020-02-10`; its required directory depth binds the token to the exact signed
 virtual directory and its descendants. Parent and sibling paths do not share
 that authorization, and flat-namespace accounts reject directory SAS.
@@ -101,7 +104,9 @@ decision. It must not be enabled by trusting the signed object identifier alone.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,
-including URL-encoded commas in query-parameter names.
+including URL-encoded commas in query-parameter names. User-delegation SAS
+tokens always require their own signed permission and expiry; neither value is
+implicitly inherited from the delegation key or issuing principal.
 
 Rename Container implements Azure's `PUT ?restype=container&comp=rename`
 contract from service version `2020-06-12`, including the source-container and
