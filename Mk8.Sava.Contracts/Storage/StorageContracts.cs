@@ -14,7 +14,8 @@ public sealed record BlobWriteOptions(
     bool? AccessTierInferred = null,
     bool GenerateContentMd5 = false,
     bool AccessTierSpecified = false,
-    string? EncryptionContext = null);
+    string? EncryptionContext = null,
+    DateTimeOffset? ExpiresAt = null);
 
 public sealed record PageRange(long Start, long End);
 

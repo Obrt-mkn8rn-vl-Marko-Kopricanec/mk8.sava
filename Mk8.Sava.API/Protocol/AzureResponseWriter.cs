@@ -366,7 +366,7 @@ public sealed partial class AzureResponseWriter
                     WriteOptional(writer, "EncryptionContext", blob.EncryptionContext);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
                     WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
-                if (IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
                     WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
                 if (blob.IsDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
                 {
@@ -776,7 +776,7 @@ public sealed partial class AzureResponseWriter
         }
         if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
             SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
-        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
             SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
         if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))

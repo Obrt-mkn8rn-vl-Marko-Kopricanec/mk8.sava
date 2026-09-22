@@ -1126,6 +1126,8 @@ public sealed class BlobService(
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
     {
+        if (!IsHierarchicalNamespaceEnabled(current.Account) || current.IsDirectory)
+            throw AzureStorageException.BlobOperationNotSupported();
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -2809,7 +2811,7 @@ public sealed class BlobService(
         return updated;
     }
 
-    private static BlobRecord NewBlob(
+    private BlobRecord NewBlob(
         string account,
         string container,
         string name,
@@ -2831,6 +2833,17 @@ public sealed class BlobService(
         }
         if (options.EncryptionScope is not null && options.AccessTierSpecified)
             throw EncryptionScopeTierChangeNotSupported();
+        if (options.ExpiresAt.HasValue)
+        {
+            if (!IsHierarchicalNamespaceEnabled(account))
+                throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
+            if (options.ExpiresAt <= now)
+            {
+                throw AzureStorageException.InvalidHeader(
+                    "x-ms-expiry-time",
+                    options.ExpiresAt.Value.ToString("R", CultureInfo.InvariantCulture));
+            }
+        }
 
         return new BlobRecord
         {
@@ -2859,6 +2872,7 @@ public sealed class BlobService(
             EncryptionContext = string.IsNullOrEmpty(options.EncryptionContext)
                 ? null
                 : options.EncryptionContext,
+            ExpiresAt = options.ExpiresAt,
             CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256,
             SmartTierLastAccessedAt = options.AccessTier == "Smart" ? now : null
         };
