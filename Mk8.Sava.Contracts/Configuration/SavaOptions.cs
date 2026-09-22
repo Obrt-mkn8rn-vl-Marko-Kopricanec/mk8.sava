@@ -476,6 +476,7 @@ public enum SasExpirationPolicyAction
 public sealed class StorageAccountCapabilities
 {
     public bool EnableHttpsTrafficOnly { get; init; }
+    public bool? AllowBlobPublicAccess { get; init; }
     public bool AllowSharedKeyAccess { get; init; } = true;
     public StorageSharedKeyAccessForServices AllowSharedKeyAccessForServices { get; init; } = new();
     public bool AllowCrossTenantDelegationSas { get; init; }

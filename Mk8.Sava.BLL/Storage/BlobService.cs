@@ -34,7 +34,10 @@ public sealed class BlobService(
     private string? _packCompactionCursor;
     private ObjectReplicationStateKey? _objectReplicationStateCursor;
 
-    public bool AllowsAnonymousPublicAccess => _options.AllowAnonymousPublicAccess;
+    public bool AllowsAnonymousPublicAccess(string account) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities)
+            ? capabilities.AllowBlobPublicAccess ?? _options.AllowAnonymousPublicAccess
+            : _options.AllowAnonymousPublicAccess;
 
     public bool IsHierarchicalNamespaceEnabled(string account) =>
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
@@ -151,7 +154,7 @@ public sealed class BlobService(
         ValidateContainerName(name);
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
-        EnsurePublicAccessAllowed(publicAccess);
+        EnsurePublicAccessAllowed(account, publicAccess);
 
         var now = metadata.GetUtcNow();
         var container = new ContainerRecord
@@ -219,7 +222,7 @@ public sealed class BlobService(
     {
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
-        EnsurePublicAccessAllowed(publicAccess);
+        EnsurePublicAccessAllowed(current.Account, publicAccess);
         var updated = current with
         {
             PublicAccess = publicAccess,
@@ -3614,15 +3617,10 @@ public sealed class BlobService(
         }
     }
 
-    private void EnsurePublicAccessAllowed(string? publicAccess)
+    private void EnsurePublicAccessAllowed(string account, string? publicAccess)
     {
-        if (publicAccess is not null && !_options.AllowAnonymousPublicAccess)
-        {
-            throw new AzureStorageException(
-                StatusCodes.Status409Conflict,
-                "PublicAccessNotPermitted",
-                "Public access is not permitted on this storage account.");
-        }
+        if (publicAccess is not null && !AllowsAnonymousPublicAccess(account))
+            throw AzureStorageException.PublicAccessNotPermitted();
     }
 
     private static int ValidateBlockId(string blockId)

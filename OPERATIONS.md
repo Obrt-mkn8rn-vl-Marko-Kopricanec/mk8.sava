@@ -258,6 +258,15 @@ although newly created Azure accounts enable secure transfer by default. If TLS
 terminates at a proxy, that proxy must forward requests to mk8.sava over HTTPS;
 untrusted `X-Forwarded-Proto` headers do not satisfy the policy.
 
+`AllowBlobPublicAccess` is Azure's per-account anonymous-read policy. When
+unset, it falls back to the legacy global `Sava:AllowAnonymousPublicAccess`
+setting (false by default). An explicit `true` permits containers in that
+account to opt into blob or container public access; an explicit `false` blocks
+new public ACLs with `409 PublicAccessNotPermitted` and also overrides public
+ACLs already stored in that account for anonymous Blob reads. Signed requests
+still work, and a configured `$web` static website remains publicly readable,
+as in Azure.
+
 Cross-tenant user-bound user-delegation SAS is denied by default. Set
 `AllowCrossTenantDelegationSas` on the account only when the delegated user's
 tenant is intentionally different from the delegation-key tenant. The setting

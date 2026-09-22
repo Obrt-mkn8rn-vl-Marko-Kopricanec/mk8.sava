@@ -88,6 +88,11 @@ public sealed class AzureStorageException : Exception
         "AccountRequiresHttps",
         "The account being accessed does not support http.");
 
+    public static AzureStorageException PublicAccessNotPermitted() => new(
+        (int)HttpStatusCode.Conflict,
+        "PublicAccessNotPermitted",
+        "Public access is not permitted on this storage account.");
+
     public static AzureStorageException AuthorizationFailure() => new(
         (int)HttpStatusCode.Forbidden,
         "AuthorizationFailure",
