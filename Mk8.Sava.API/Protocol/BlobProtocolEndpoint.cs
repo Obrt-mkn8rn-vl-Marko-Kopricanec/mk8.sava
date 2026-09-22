@@ -760,11 +760,20 @@ public static class BlobProtocolEndpoint
                         resolved.Request.ContentId);
 
                 case BlobBatchOperationKind.SetTier:
+                    if (resolved.Snapshot is not null)
+                    {
+                        RequireFeatureVersion(
+                            subrequestContext,
+                            new DateOnly(2019, 12, 12),
+                            "Set Blob Tier on a snapshot");
+                    }
                     Require(subrequestContext, 'w');
                     EvaluateTagCondition(inner.Request, blob, "x-ms-if-tags", source: false);
+                    ValidateOptionalLease(inner.Request, blob.Lease, "blob");
                     var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
                                ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
                     ValidateAccessTierVersion(inner.Request, tier);
+                    ValidateRehydratePriorityVersion(inner.Request);
                     var tierUpdate = await service.SetTierAsync(
                         blob,
                         tier,
@@ -1461,7 +1470,9 @@ public static class BlobProtocolEndpoint
             if (snapshot is not null)
                 RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Set Blob Tier on a snapshot");
             Require(request, 'w');
+            RequireZeroContentLength(http.Request);
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
+            ValidateOptionalLease(http.Request, blob.Lease, "blob");
             var tier = ProtocolParsing.First(http.Request.Headers, "x-ms-access-tier")
                        ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
             ValidateAccessTierVersion(http.Request, tier);
@@ -2747,10 +2758,8 @@ public static class BlobProtocolEndpoint
         StorageRequestContext request,
         CancellationToken cancellationToken)
     {
-        var origin = ProtocolParsing.First(http.Request.Headers, "Origin")
-                     ?? throw AzureStorageException.InvalidHeader("Origin");
-        var requestedMethod = ProtocolParsing.First(http.Request.Headers, "Access-Control-Request-Method")
-                              ?? throw AzureStorageException.InvalidHeader("Access-Control-Request-Method");
+        var origin = RequiredCorsHeader(http.Request.Headers, "Origin");
+        var requestedMethod = RequiredCorsHeader(http.Request.Headers, "Access-Control-Request-Method");
         var requestedHeaders = ProtocolParsing.First(http.Request.Headers, "Access-Control-Request-Headers") ?? string.Empty;
         var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
         var rule = properties.Cors.FirstOrDefault(candidate =>
@@ -2763,9 +2772,9 @@ public static class BlobProtocolEndpoint
         http.Response.Headers.AccessControlAllowOrigin = AllowsAllCorsOrigins(rule.AllowedOrigins) ? "*" : origin;
         http.Response.Headers.AccessControlAllowMethods = requestedMethod;
         http.Response.Headers.AccessControlAllowHeaders = requestedHeaders;
-        http.Response.Headers.AccessControlExposeHeaders = rule.ExposedHeaders;
         http.Response.Headers.AccessControlMaxAge = rule.MaxAgeInSeconds.ToString(CultureInfo.InvariantCulture);
         http.Response.Headers.AccessControlAllowCredentials = "true";
+        http.Response.ContentLength = 0;
     }
 
     private static async Task ApplyCorsResponseHeadersAsync(
@@ -4192,7 +4201,20 @@ public static class BlobProtocolEndpoint
         return parsed;
     }
 
-    private static bool MatchesCsv(string csv, string value) => csv.Split(',', StringSplitOptions.TrimEntries).Any(item => item == "*" || string.Equals(item, value, StringComparison.OrdinalIgnoreCase));
+    private static string RequiredCorsHeader(IHeaderDictionary headers, string name)
+    {
+        if (!headers.TryGetValue(name, out var values) ||
+            values.Count != 1 ||
+            string.IsNullOrEmpty(values[0]))
+        {
+            throw AzureStorageException.InvalidHeader(name);
+        }
+        return values[0]!;
+    }
+
+    private static bool MatchesCsv(string csv, string value) =>
+        csv.Split(',', StringSplitOptions.TrimEntries)
+            .Any(item => string.Equals(item, value, StringComparison.Ordinal));
 
     private static bool MatchesCorsOrigin(string csv, string origin) =>
         csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate =>
