@@ -15,7 +15,8 @@ public sealed record BlobWriteOptions(
     bool GenerateContentMd5 = false,
     bool AccessTierSpecified = false,
     string? EncryptionContext = null,
-    DateTimeOffset? ExpiresAt = null);
+    DateTimeOffset? ExpiresAt = null,
+    string? RehydratePriority = null);
 
 public sealed record PageRange(long Start, long End);
 

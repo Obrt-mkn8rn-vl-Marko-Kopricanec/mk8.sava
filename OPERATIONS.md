@@ -70,6 +70,24 @@ are omitted; `NeverExpire` removes it explicitly. Get Blob, Get Blob Properties,
 and List Blobs expose the expiry from 2020-02-10 only for HNS accounts. Expired
 files are reclaimed as expiration rather than converted into soft-deleted data.
 
+## Archive copy and rehydration
+
+Copy Blob accepts an archived block-blob source only when the request supplies
+an online destination tier. The destination is published in Archive with its
+copy status, target archive status, and rehydration priority visible through
+normal Blob properties. Copy completion and rehydration are separate durable
+transitions: copied bytes remain unreadable until the destination reaches its
+target tier. `Sava:AsyncCopyCompletionDelay`,
+`Sava:StandardRehydrationDelay`, and `Sava:HighPriorityRehydrationDelay` control
+those transitions.
+
+Omitting `x-ms-rehydrate-priority` defaults to Standard. Set Blob Tier can
+upgrade a pending Standard rehydration to High for service version 2020-06-12
+or later; older versions preserve the first priority. A High priority is never
+lowered to Standard. Aborted or failed copies clear their pending rehydration
+state, while a successful copy retains its copy properties across subsequent
+tier changes.
+
 ## Health and metrics
 
 - `GET /health/live` reports that the process is running.

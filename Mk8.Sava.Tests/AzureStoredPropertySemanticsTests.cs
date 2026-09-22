@@ -352,7 +352,11 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         var rehydratedCopy = container.GetBlockBlobClient("archive-to-hot.bin");
         var rehydrate = await rehydratedCopy.StartCopyFromUriAsync(
             source.Uri,
-            new BlobCopyFromUriOptions { AccessTier = AccessTier.Hot });
+            new BlobCopyFromUriOptions
+            {
+                AccessTier = AccessTier.Hot,
+                RehydratePriority = RehydratePriority.High
+            });
         await rehydrate.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
         Assert.Equal(AccessTier.Hot, (await rehydratedCopy.GetPropertiesAsync()).Value.AccessTier);
 
