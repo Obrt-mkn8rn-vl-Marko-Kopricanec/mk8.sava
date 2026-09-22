@@ -991,6 +991,10 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 : includeDeleted
                     ? "((is_current = 1 AND is_deleted = 0) OR is_deleted = 1)"
                     : "is_current = 1 AND is_deleted = 0");
+            if (showOnly == BlobListShowOnly.Files)
+                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 0");
+            else if (showOnly == BlobListShowOnly.Directories)
+                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 1");
         }
         else
         {
@@ -1017,7 +1021,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         var eligibleBlobs = $"""
             SELECT data, name, version_id, snapshot, generation_id,
                    {rankExpression} AS rank,
-                   0 AS is_uncommitted
+                   0 AS is_uncommitted,
+                   COALESCE(json_extract(data, '$.isDirectory'), 0) AS is_directory
             FROM blobs
             WHERE {string.Join(" AND ", predicates)}
             """;
@@ -1034,7 +1039,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         var eligibleUncommitted = $"""
             SELECT NULL AS data, staged.blob_name AS name,
                    NULL AS version_id, NULL AS snapshot, '' AS generation_id,
-                   -1 AS rank, 1 AS is_uncommitted
+                   -1 AS rank, 1 AS is_uncommitted, 0 AS is_directory
             FROM staged_blocks AS staged
             WHERE $include_uncommitted = 1
               AND {string.Join(" AND ", uncommittedPredicates)}
@@ -1058,10 +1063,66 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             ? $"""
                 WITH entries AS (
                     SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id, is_uncommitted
+                           version_id, snapshot, generation_id, is_uncommitted, is_directory
                     FROM ({eligible})
                 )
                 """
+            : hierarchicalNamespace
+                ? $"""
+                    WITH eligible AS (
+                        SELECT source.*,
+                               instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
+                        FROM ({eligible}) AS source
+                    ),
+                    candidates AS (
+                        SELECT data,
+                               CASE
+                                   WHEN is_directory = 1 AND delimiter_offset = 0 THEN name || '/'
+                                   WHEN delimiter_offset > 0 THEN substr(
+                                       name,
+                                       1,
+                                       length($prefix) + delimiter_offset)
+                                   ELSE name
+                               END AS entry_name,
+                               CASE
+                                   WHEN is_directory = 1 OR delimiter_offset > 0 THEN 0
+                                   ELSE 1
+                               END AS entry_type,
+                               CASE
+                                   WHEN is_directory = 1 AND delimiter_offset = 0 THEN data
+                                   ELSE NULL
+                               END AS prefix_data,
+                               rank, version_id, snapshot, generation_id,
+                               is_uncommitted, is_directory
+                        FROM eligible
+                    ),
+                    entries AS (
+                        SELECT COALESCE(
+                                   MAX(prefix_data),
+                                   CASE WHEN $include_directory_properties = 1 THEN (
+                                       SELECT directory.data
+                                       FROM blobs AS directory
+                                       WHERE directory.account = $account
+                                         AND directory.container = $container
+                                         AND directory.name = substr(entry_name, 1, length(entry_name) - 1)
+                                         AND directory.is_current = 1
+                                         AND directory.is_deleted = 0
+                                         AND COALESCE(json_extract(directory.data, '$.isDirectory'), 0) = 1
+                                       LIMIT 1
+                                   ) END) AS data,
+                               entry_name, 0 AS entry_type,
+                               -1 AS rank, NULL AS version_id, NULL AS snapshot,
+                               '' AS generation_id, 0 AS is_uncommitted, 1 AS is_directory
+                        FROM candidates
+                        WHERE entry_type = 0
+                        GROUP BY entry_name
+                        UNION ALL
+                        SELECT data, entry_name, 1 AS entry_type, rank,
+                               version_id, snapshot, generation_id, is_uncommitted, is_directory
+                        FROM candidates
+                        WHERE entry_type = 1
+                    )
+                    """
             : $"""
                 WITH eligible AS (
                     SELECT source.*,
@@ -1080,12 +1141,13 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                            NULL AS version_id,
                            NULL AS snapshot,
                            '' AS generation_id,
-                           0 AS is_uncommitted
+                           0 AS is_uncommitted,
+                           0 AS is_directory
                     FROM eligible
                     WHERE delimiter_offset > 0
                     UNION ALL
                     SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id, is_uncommitted
+                           version_id, snapshot, generation_id, is_uncommitted, is_directory
                     FROM eligible
                     WHERE delimiter_offset = 0
                 )
@@ -1096,7 +1158,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.CommandText = $"""
             {entries}
             SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
-                   is_uncommitted
+                   is_uncommitted, is_directory
             FROM entries
             WHERE $has_cursor = 0
                OR ($name_complete = 1 AND entry_name > $cursor_name)
@@ -1134,7 +1196,12 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$start_from", startFrom);
         command.Parameters.AddWithValue("$end_before", endBefore);
         command.Parameters.AddWithValue("$delimiter", delimiter);
-        command.Parameters.AddWithValue("$include_uncommitted", includeUncommitted ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$include_uncommitted",
+            includeUncommitted && showOnly is not (BlobListShowOnly.Deleted or BlobListShowOnly.Directories) ? 1 : 0);
+        command.Parameters.AddWithValue(
+            "$include_directory_properties",
+            hierarchicalNamespace && showOnly != BlobListShowOnly.Deleted ? 1 : 0);
         command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
         command.Parameters.AddWithValue("$name_complete", cursor?.NameComplete == true ? 1 : 0);
         command.Parameters.AddWithValue("$cursor_name", cursor?.Name ?? string.Empty);
@@ -1150,7 +1217,9 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         while (await reader.ReadAsync(cancellationToken))
         {
             items.Add(reader.GetInt32(2) == 0
-                ? new BlobListEntry(null, reader.GetString(1))
+                ? new BlobListEntry(
+                    reader.IsDBNull(0) ? null : Deserialize<BlobRecord>(reader.GetString(0)),
+                    reader.GetString(1))
                 : reader.GetInt32(7) == 1
                     ? new BlobListEntry(null, null, reader.GetString(1))
                     : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null));
@@ -1335,9 +1404,14 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
             var current = await GetCurrentBlobAsync(connection, transaction, proposed.Account, proposed.Container, proposed.Name, cancellationToken);
             var activeCurrent = current is { IsDeleted: false } ? current : null;
+            if (hierarchicalNamespace && activeCurrent is { IsDirectory: true } && !proposed.IsDirectory)
+                throw new StoragePathConflictException();
             if (!string.Equals(activeCurrent?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
                 !string.Equals(activeCurrent?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
+
+            if (hierarchicalNamespace)
+                await EnsureHierarchicalParentsAsync(connection, transaction, proposed, cancellationToken);
 
             if (stagedBlockSnapshot is not null)
             {
@@ -1590,6 +1664,8 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
                 throw new StorageConcurrencyException();
             }
 
+            await EnsureHierarchicalParentsAsync(connection, transaction, restored, cancellationToken);
+
             var destination = await GetCurrentBlobAsync(
                 connection,
                 transaction,
@@ -1612,6 +1688,64 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         {
             _writeGate.Release();
         }
+    }
+
+    internal async Task EnsureHierarchicalDirectoriesAsync(
+        string account,
+        string container,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = """
+                SELECT data FROM blobs
+                WHERE account = $account
+                  AND container = $container
+                  AND is_current = 1
+                  AND is_deleted = 0
+                ORDER BY name;
+                """;
+            command.Parameters.AddWithValue("$account", account);
+            command.Parameters.AddWithValue("$container", container);
+            var records = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+            foreach (var record in records.Where(item => !item.IsDirectory))
+                await EnsureHierarchicalParentsAsync(connection, transaction, record, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    internal async Task<bool> HasActiveBlobDescendantsAsync(
+        string account,
+        string container,
+        string directoryName,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT 1 FROM blobs
+            WHERE account = $account
+              AND container = $container
+              AND is_current = 1
+              AND is_deleted = 0
+              AND name <> $directory
+              AND substr(name, 1, length($prefix)) = $prefix
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$directory", directoryName);
+        command.Parameters.AddWithValue("$prefix", directoryName + "/");
+        return await command.ExecuteScalarAsync(cancellationToken) is not null;
     }
 
     public async Task<BlobRecord> CompleteIncrementalCopyAsync(
@@ -2609,6 +2743,55 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
     }
 
+    private static async Task EnsureHierarchicalParentsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord path,
+        CancellationToken cancellationToken)
+    {
+        var separator = path.Name.IndexOf('/', StringComparison.Ordinal);
+        while (separator > 0)
+        {
+            var directoryName = path.Name[..separator];
+            var existing = await GetCurrentBlobAsync(
+                connection,
+                transaction,
+                path.Account,
+                path.Container,
+                directoryName,
+                cancellationToken);
+            if (existing is null)
+            {
+                var directory = new BlobRecord
+                {
+                    Account = path.Account,
+                    Container = path.Container,
+                    Name = directoryName,
+                    GenerationId = Guid.NewGuid().ToString("N"),
+                    Revision = NewRevision(),
+                    IsCurrent = true,
+                    IsDirectory = true,
+                    Kind = BlobKind.BlockBlob,
+                    Content = ContentManifest.Empty(path.Content.Domain),
+                    ETag = NewETag(),
+                    CreatedAt = path.CreatedAt,
+                    LastModified = path.CreatedAt,
+                    Http = new BlobHttpProperties(),
+                    Lease = LeaseRecord.Available,
+                    AccessTier = "Hot",
+                    AccessTierInferred = true
+                };
+                await InsertBlobRowAsync(connection, transaction, directory, cancellationToken);
+            }
+            else if (!existing.IsDirectory)
+            {
+                throw new StoragePathConflictException();
+            }
+
+            separator = path.Name.IndexOf('/', separator + 1);
+        }
+    }
+
     private static async Task DeleteSoftDeletedBlobRowsAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
@@ -2995,4 +3178,9 @@ public sealed class StorageImmutabilityException(bool legalHold) : Exception(
 public sealed class StoragePendingCopyException : Exception
 {
     public StoragePendingCopyException() : base("There is currently a pending copy operation.") { }
+}
+
+public sealed class StoragePathConflictException : Exception
+{
+    public StoragePathConflictException() : base("A hierarchical path component has an incompatible resource type.") { }
 }

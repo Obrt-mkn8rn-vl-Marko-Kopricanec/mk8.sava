@@ -97,6 +97,7 @@ public sealed record BlobRecord
     public string? Snapshot { get; init; }
     public bool IsCurrent { get; init; }
     public bool IsDeleted { get; init; }
+    public bool IsDirectory { get; init; }
     public ulong? DeletionId { get; init; }
     public DateTimeOffset? DeletedAt { get; init; }
     public DateTimeOffset? DeleteRetentionUntil { get; init; }

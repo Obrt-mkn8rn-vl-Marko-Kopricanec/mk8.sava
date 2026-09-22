@@ -150,7 +150,14 @@ public sealed partial class AzureResponseWriter
         CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
-        var listingScope = CreateBlobListingScope(request, prefix, startFrom, endBefore, delimiter, includes);
+        var listingScope = CreateBlobListingScope(
+            request,
+            prefix,
+            startFrom,
+            endBefore,
+            delimiter,
+            context.Request.Query["showonly"].ToString(),
+            includes);
         var nextMarker = listing.HasMore && listing.Items.Count > 0
             ? EncodeBlobMarker(listing.Items[^1].Cursor, listingScope)
             : string.Empty;
@@ -199,6 +206,48 @@ public sealed partial class AzureResponseWriter
                 {
                     writer.WriteStartElement("BlobPrefix");
                     writer.WriteElementString("Name", entry.Prefix);
+                    if (hierarchicalNamespace &&
+                        IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
+                    {
+                        var directory = entry.Blob;
+                        writer.WriteStartElement("Properties");
+                        if (directory is not null)
+                        {
+                            if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+                            {
+                                writer.WriteElementString(
+                                    "Creation-Time",
+                                    directory.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
+                            }
+                            writer.WriteElementString(
+                                "Last-Modified",
+                                directory.LastModified.ToString("R", CultureInfo.InvariantCulture));
+                            writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
+                            if (includes.Contains("permissions"))
+                            {
+                                writer.WriteElementString("Owner", "$superuser");
+                                writer.WriteElementString("Group", "$superuser");
+                                writer.WriteElementString("Permissions", "rwxr-x---");
+                                writer.WriteElementString("Acl", "user::rwx,group::r-x,other::---");
+                            }
+                        }
+                        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+                            writer.WriteElementString("ResourceType", "directory");
+                        if (directory is null &&
+                            string.Equals(
+                                context.Request.Query["showonly"],
+                                "deleted",
+                                StringComparison.Ordinal) &&
+                            IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
+                        {
+                            writer.WriteElementString("Placeholder", "true");
+                        }
+                        writer.WriteElementString("Content-Length", "0");
+                        writer.WriteElementString("BlobType", "BlockBlob");
+                        if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+                            writer.WriteElementString("ServerEncrypted", "true");
+                        writer.WriteEndElement();
+                    }
                     writer.WriteEndElement();
                     continue;
                 }
@@ -276,11 +325,13 @@ public sealed partial class AzureResponseWriter
                 {
                     writer.WriteElementString("Owner", "$superuser");
                     writer.WriteElementString("Group", "$superuser");
-                    writer.WriteElementString("Permissions", "rw-r-----");
-                    writer.WriteElementString("Acl", "user::rw-,group::r--,other::---");
+                    writer.WriteElementString("Permissions", blob.IsDirectory ? "rwxr-x---" : "rw-r-----");
+                    writer.WriteElementString(
+                        "Acl",
+                        blob.IsDirectory ? "user::rwx,group::r-x,other::---" : "user::rw-,group::r--,other::---");
                 }
                 if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
-                    writer.WriteElementString("ResourceType", "file");
+                    writer.WriteElementString("ResourceType", blob.IsDirectory ? "directory" : "file");
                 writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
                 writer.WriteElementString("Content-Type", blob.Http.ContentType);
                 writer.WriteElementString("Content-Encoding", blob.Http.ContentEncoding ?? string.Empty);
@@ -687,12 +738,16 @@ public sealed partial class AzureResponseWriter
         {
             response.Headers["x-ms-owner"] = "$superuser";
             response.Headers["x-ms-group"] = "$superuser";
-            response.Headers["x-ms-permissions"] = "rw-r-----";
+            response.Headers["x-ms-permissions"] = blob.IsDirectory ? "rwxr-x---" : "rw-r-----";
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
-            response.Headers["x-ms-resource-type"] = "file";
+            response.Headers["x-ms-resource-type"] = blob.IsDirectory ? "directory" : "file";
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2023, 11, 3)))
-            response.Headers["x-ms-acl"] = "user::rw-,group::r--,other::---";
+        {
+            response.Headers["x-ms-acl"] = blob.IsDirectory
+                ? "user::rwx,group::r-x,other::---"
+                : "user::rw-,group::r--,other::---";
+        }
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
             response.Headers["x-ms-server-encrypted"] = "true";
@@ -925,6 +980,7 @@ public sealed partial class AzureResponseWriter
         string startFrom,
         string endBefore,
         string delimiter,
+        string showOnly,
         IReadOnlySet<string> includes)
     {
         var scopeParts = new List<string>
@@ -938,6 +994,7 @@ public sealed partial class AzureResponseWriter
         if (!string.IsNullOrEmpty(endBefore))
             scopeParts.Add(endBefore);
         scopeParts.Add(delimiter);
+        scopeParts.Add(showOnly);
         scopeParts.Add(string.Join(',', includes.Order(StringComparer.OrdinalIgnoreCase)));
         var value = string.Join('\n', scopeParts);
         return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(value)).AsSpan(0, 12));
@@ -949,6 +1006,7 @@ public sealed partial class AzureResponseWriter
         string startFrom,
         string endBefore,
         string delimiter,
+        string showOnly,
         IReadOnlySet<string> includes,
         string marker)
     {
@@ -961,6 +1019,7 @@ public sealed partial class AzureResponseWriter
             startFrom,
             endBefore,
             delimiter,
+            showOnly,
             includes);
         if (marker.StartsWith(BlobMarkerPrefix, StringComparison.Ordinal))
         {
