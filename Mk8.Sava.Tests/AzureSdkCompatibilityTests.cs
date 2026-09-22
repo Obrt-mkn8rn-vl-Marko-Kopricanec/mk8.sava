@@ -9909,6 +9909,40 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("value", result.RootElement.GetProperty("trimmed").GetString());
     }
 
+    [Fact]
+    public async Task QueryBlobContentsStreamsDocumentedAggregateExpressions()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"aggregate-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.json");
+        await blob.UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(
+            "{\"name\":\"apple\",\"qty\":2,\"price\":3.5}\n" +
+            "{\"name\":\"pear\",\"qty\":4,\"price\":1.25}\n" +
+            "{\"name\":\"plum\",\"qty\":null,\"price\":2.0}\n")));
+
+        async Task<JsonElement> QueryValueAsync(string aggregate)
+        {
+            var response = await blob.QueryAsync(
+                $"SELECT {aggregate} AS value FROM BlobStorage;",
+                new BlobQueryOptions
+                {
+                    InputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" },
+                    OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+                });
+            using var reader = new StreamReader(response.Value.Content);
+            using var document = JsonDocument.Parse((await reader.ReadToEndAsync()).Trim());
+            return document.RootElement.GetProperty("value").Clone();
+        }
+
+        Assert.Equal(3, (await QueryValueAsync("COUNT(*)")).GetInt64());
+        Assert.Equal(2, (await QueryValueAsync("COUNT(qty)")).GetInt64());
+        Assert.Equal(6, (await QueryValueAsync("SUM(qty)")).GetInt64());
+        Assert.Equal(2.25D, (await QueryValueAsync("AVG(price)")).GetDouble());
+        Assert.Equal("apple", (await QueryValueAsync("MIN(name)")).GetString());
+        Assert.Equal(3.5D, (await QueryValueAsync("MAX(price)")).GetDouble());
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 

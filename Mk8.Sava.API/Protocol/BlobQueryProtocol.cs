@@ -107,11 +107,12 @@ internal static class BlobQueryProtocol
         {
             await using var enumerator = ReadRowsAsync(input, request.Input, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
+            await using var selections = SelectRowsAsync(enumerator, plan, cancellationToken)
+                .GetAsyncEnumerator(cancellationToken);
             if (request.Output.Kind == BlobQueryFormatKind.Arrow)
             {
                 await WriteArrowResultsAsync(
-                    enumerator,
-                    plan,
+                    selections,
                     request.Output.ArrowSchema,
                     avro,
                     cancellationToken);
@@ -120,11 +121,9 @@ internal static class BlobQueryProtocol
             }
 
             var wroteHeader = false;
-            while (!plan.LimitReached && await enumerator.MoveNextAsync())
+            while (await selections.MoveNextAsync())
             {
-                var selected = plan.Select(enumerator.Current);
-                if (selected is null)
-                    continue;
+                var selected = selections.Current;
 
                 if (!wroteHeader && request.Output.Kind == BlobQueryFormatKind.Delimited && request.Output.HasHeaders)
                 {
@@ -153,6 +152,33 @@ internal static class BlobQueryProtocol
         }
 
         await avro.CompleteAsync(totalBytes, cancellationToken);
+    }
+
+    private static async IAsyncEnumerable<QuerySelection> SelectRowsAsync(
+        IAsyncEnumerator<QueryRow> rows,
+        BlobQueryPlan plan,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (plan.IsAggregate)
+        {
+            if (plan.LimitReached)
+                yield break;
+            while (await rows.MoveNextAsync())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                plan.Accumulate(rows.Current);
+            }
+            if (plan.CompleteAggregate() is { } aggregate)
+                yield return aggregate;
+            yield break;
+        }
+
+        while (!plan.LimitReached && await rows.MoveNextAsync())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (plan.Select(rows.Current) is { } selected)
+                yield return selected;
+        }
     }
 
     private static BlobQueryTextFormat ReadFormat(XElement? serialization, bool input)
@@ -262,8 +288,7 @@ internal static class BlobQueryProtocol
     }
 
     private static async Task WriteArrowResultsAsync(
-        IAsyncEnumerator<QueryRow> rows,
-        BlobQueryPlan plan,
+        IAsyncEnumerator<QuerySelection> rows,
         IReadOnlyList<QueryArrowColumn> fields,
         BlobQueryAvroWriter avro,
         CancellationToken cancellationToken)
@@ -276,11 +301,9 @@ internal static class BlobQueryProtocol
         await writer.WriteStartAsync(cancellationToken);
 
         var batch = new List<QuerySelection>(ArrowRecordBatchSize);
-        while (!plan.LimitReached && await rows.MoveNextAsync())
+        while (await rows.MoveNextAsync())
         {
-            var selected = plan.Select(rows.Current);
-            if (selected is null)
-                continue;
+            var selected = rows.Current;
             if (selected.Values.Count != fields.Count)
             {
                 throw new BlobQueryDataException(
@@ -1296,21 +1319,25 @@ internal sealed class BlobQueryPlan
     private readonly IReadOnlyList<QueryProjection> _projections;
     private readonly QueryPredicate? _predicate;
     private readonly long? _limit;
+    private readonly QueryAggregateState? _aggregate;
     private long _selectedRows;
 
     private BlobQueryPlan(
         IReadOnlyList<QueryProjection> projections,
         QueryPredicate? predicate,
-        long? limit)
+        long? limit,
+        QueryAggregateState? aggregate)
     {
         _projections = projections;
         _predicate = predicate;
         _limit = limit;
+        _aggregate = aggregate;
     }
 
     public static BlobQueryPlan Parse(string expression) => new QueryParser(expression).Parse();
 
     public bool LimitReached => _limit.HasValue && _selectedRows >= _limit.Value;
+    public bool IsAggregate => _aggregate is not null;
 
     public QuerySelection? Select(QueryRow row)
     {
@@ -1324,6 +1351,24 @@ internal sealed class BlobQueryPlan
         return new QuerySelection(
             _projections.Select(projection => projection.Name).ToArray(),
             _projections.Select(projection => projection.Expression!.Evaluate(row)).ToArray());
+    }
+
+    public void Accumulate(QueryRow row)
+    {
+        if (_aggregate is null)
+            throw new InvalidOperationException("The query is not an aggregate query.");
+        if (_predicate is null || _predicate.Evaluate(row))
+            _aggregate.Accumulate(row);
+    }
+
+    public QuerySelection? CompleteAggregate()
+    {
+        if (_aggregate is null)
+            throw new InvalidOperationException("The query is not an aggregate query.");
+        if (_limit == 0)
+            return null;
+        _selectedRows = 1;
+        return new QuerySelection([_aggregate.Name], [_aggregate.Complete()]);
     }
 
     private sealed record QueryProjection(bool Star, QueryExpression? Expression, string Name);
@@ -1387,6 +1432,15 @@ internal sealed class BlobQueryPlan
         IReadOnlyList<QueryExpression> Arguments) : QueryExpression
     {
         public override QueryCell Evaluate(QueryRow row) => EvaluateFunction(Name, Arguments, row);
+    }
+
+    private sealed record QueryAggregateExpression(
+        QueryAggregateKind Kind,
+        QueryExpression? Operand,
+        bool CountStar) : QueryExpression
+    {
+        public override QueryCell Evaluate(QueryRow row) =>
+            throw new InvalidOperationException("Aggregate expressions are evaluated across rows.");
     }
 
     private abstract record QueryPredicate
@@ -1493,6 +1547,122 @@ internal sealed class BlobQueryPlan
         String,
         Timestamp,
         Boolean
+    }
+
+    private enum QueryAggregateKind
+    {
+        Count,
+        Average,
+        Minimum,
+        Maximum,
+        Sum
+    }
+
+    private sealed class QueryAggregateState(
+        string name,
+        QueryAggregateKind kind,
+        QueryExpression? operand,
+        bool countStar)
+    {
+        private long _count;
+        private decimal _decimalSum;
+        private double _floatingSum;
+        private bool _usesFloatingPoint;
+        private QueryCell? _extreme;
+
+        public string Name { get; } = name;
+
+        public void Accumulate(QueryRow row)
+        {
+            if (kind == QueryAggregateKind.Count && countStar)
+            {
+                _count = checked(_count + 1);
+                return;
+            }
+
+            var value = operand!.Evaluate(row);
+            if (value.Value is null)
+                return;
+
+            switch (kind)
+            {
+                case QueryAggregateKind.Count:
+                    _count = checked(_count + 1);
+                    break;
+                case QueryAggregateKind.Average:
+                case QueryAggregateKind.Sum:
+                    AccumulateNumber(value);
+                    _count = checked(_count + 1);
+                    break;
+                case QueryAggregateKind.Minimum:
+                    if (_extreme is null || CompareValues(value, _extreme) < 0)
+                        _extreme = value;
+                    _count = checked(_count + 1);
+                    break;
+                case QueryAggregateKind.Maximum:
+                    if (_extreme is null || CompareValues(value, _extreme) > 0)
+                        _extreme = value;
+                    _count = checked(_count + 1);
+                    break;
+                default:
+                    throw new InvalidOperationException("Unknown aggregate type.");
+            }
+        }
+
+        public QueryCell Complete() => kind switch
+        {
+            QueryAggregateKind.Count => new QueryCell(_count),
+            QueryAggregateKind.Average when _count == 0 => new QueryCell(null),
+            QueryAggregateKind.Average => new QueryCell(
+                (_usesFloatingPoint ? _floatingSum : (double)_decimalSum) / _count),
+            QueryAggregateKind.Sum when _count == 0 => new QueryCell(null),
+            QueryAggregateKind.Sum when _usesFloatingPoint => new QueryCell(_floatingSum),
+            QueryAggregateKind.Sum when _decimalSum == decimal.Truncate(_decimalSum) &&
+                                        _decimalSum is >= long.MinValue and <= long.MaxValue =>
+                new QueryCell((long)_decimalSum),
+            QueryAggregateKind.Sum => new QueryCell(_decimalSum),
+            QueryAggregateKind.Minimum or QueryAggregateKind.Maximum => _extreme ?? new QueryCell(null),
+            _ => throw new InvalidOperationException("Unknown aggregate type.")
+        };
+
+        private void AccumulateNumber(QueryCell value)
+        {
+            try
+            {
+                if (value.Value is double)
+                {
+                    if (!TryDouble(value, out var floating))
+                        throw InvalidType($"The aggregate value '{value.ToText()}' is not numeric.");
+                    if (!_usesFloatingPoint)
+                    {
+                        _floatingSum = (double)_decimalSum;
+                        _usesFloatingPoint = true;
+                    }
+                    _floatingSum += floating;
+                    if (!double.IsFinite(_floatingSum))
+                        throw InvalidType("The aggregate result is outside the supported numeric range.");
+                    return;
+                }
+
+                if (_usesFloatingPoint)
+                {
+                    if (!TryDouble(value, out var floating))
+                        throw InvalidType($"The aggregate value '{value.ToText()}' is not numeric.");
+                    _floatingSum += floating;
+                    if (!double.IsFinite(_floatingSum))
+                        throw InvalidType("The aggregate result is outside the supported numeric range.");
+                    return;
+                }
+
+                if (!TryDecimal(value, out var exact))
+                    throw InvalidType($"The aggregate value '{value.ToText()}' is not numeric.");
+                _decimalSum = checked(_decimalSum + exact);
+            }
+            catch (OverflowException)
+            {
+                throw InvalidType("The aggregate result is outside the supported numeric range.");
+            }
+        }
     }
 
     private static QueryCell EvaluateBinary(QueryCell left, QueryCell right, string operation)
@@ -1995,7 +2165,25 @@ internal sealed class BlobQueryPlan
             _ = MatchSymbol(";");
             if (Current.Kind != QueryTokenKind.End)
                 throw InvalidQuery(Current.Position, $"Unexpected token '{Current.Text}'.");
-            return new BlobQueryPlan(projections, predicate, limit);
+
+            QueryAggregateState? aggregate = null;
+            if (projections.Any(projection => projection.Expression is QueryAggregateExpression))
+            {
+                if (projections.Count != 1 ||
+                    projections[0] is not { Star: false, Expression: QueryAggregateExpression expression } projection)
+                {
+                    throw InvalidQuery(
+                        Current.Position,
+                        "An aggregate query must select exactly one aggregate expression.");
+                }
+                aggregate = new QueryAggregateState(
+                    projection.Name,
+                    expression.Kind,
+                    expression.Operand,
+                    expression.CountStar);
+                projections = [];
+            }
+            return new BlobQueryPlan(projections, predicate, limit, aggregate);
         }
 
         private IReadOnlyList<QueryProjection> ParseProjections()
@@ -2152,6 +2340,8 @@ internal sealed class BlobQueryPlan
                     if (!token.Quoted && MatchSymbol("("))
                     {
                         var function = token.Text.ToUpperInvariant();
+                        if (function is "COUNT" or "AVG" or "MIN" or "MAX" or "SUM")
+                            return ParseAggregateExpression(token, function);
                         var arguments = function switch
                         {
                             "DATE_ADD" or "DATE_DIFF" => ParseDateFunctionArguments(),
@@ -2186,6 +2376,27 @@ internal sealed class BlobQueryPlan
                 default:
                     throw InvalidQuery(token.Position, $"Expected an expression, found '{token.Text}'.");
             }
+        }
+
+        private QueryExpression ParseAggregateExpression(QueryToken token, string function)
+        {
+            var countStar = function == "COUNT" && MatchSymbol("*");
+            QueryExpression? operand = null;
+            if (!countStar)
+                operand = ParseExpression();
+            if (MatchSymbol(","))
+                throw InvalidQuery(token.Position, $"The aggregate '{function}' accepts one argument.");
+            ExpectSymbol(")");
+            var kind = function switch
+            {
+                "COUNT" => QueryAggregateKind.Count,
+                "AVG" => QueryAggregateKind.Average,
+                "MIN" => QueryAggregateKind.Minimum,
+                "MAX" => QueryAggregateKind.Maximum,
+                "SUM" => QueryAggregateKind.Sum,
+                _ => throw new InvalidOperationException("Unknown aggregate function.")
+            };
+            return new QueryAggregateExpression(kind, operand, countStar);
         }
 
         private List<QueryExpression> ParseFunctionArguments()
