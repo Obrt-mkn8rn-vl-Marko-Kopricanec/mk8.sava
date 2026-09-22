@@ -48,6 +48,7 @@ internal sealed class UrlTransferClient(
         string sourceValue,
         string? sourceRange,
         bool allowSourceCustomerProvidedKey,
+        bool allowFileRequestIntent,
         long maximumBytes,
         bool sourceLengthConflict,
         Func<UrlSource, Task<TResult>> consume,
@@ -69,13 +70,14 @@ internal sealed class UrlTransferClient(
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
+        ValidateFileRequestIntent(destinationRequest, sourceUri, allowFileRequestIntent);
 
         var sourceTags = copySourceTags
             ? await ReadSourceTagsAsync(destinationRequest, sourceUri, cancellationToken)
             : new Dictionary<string, string>(StringComparer.Ordinal);
 
         using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
-        AddSourceAuthorization(destinationRequest, sourceRequest);
+        AddSourceAuthenticationHeaders(destinationRequest, sourceRequest);
         AddSourceConditions(destinationRequest, sourceRequest);
         sourceRequest.Headers.TryAddWithoutValidation(
             "x-ms-version",
@@ -251,11 +253,79 @@ internal sealed class UrlTransferClient(
         }
     }
 
+    internal static void ValidateFileRequestIntent(
+        HttpRequest destination,
+        string sourceValue,
+        bool allowed)
+    {
+        if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
+            sourceUri.Scheme is not ("http" or "https"))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+        }
+        ValidateFileRequestIntent(destination, sourceUri, allowed);
+    }
+
+    private static void ValidateFileRequestIntent(
+        HttpRequest destination,
+        Uri sourceUri,
+        bool allowed)
+    {
+        const string headerName = "x-ms-file-request-intent";
+        var value = ProtocolParsing.First(destination.Headers, headerName);
+        if (!allowed)
+        {
+            if (value is not null)
+                throw AzureStorageException.UnsupportedHeader(headerName, value);
+            return;
+        }
+
+        var authorization = ReadSourceAuthorization(destination);
+        if (value is not null)
+        {
+            if (!IsServiceVersionAtLeast(destination, new DateOnly(2025, 7, 5)))
+            {
+                throw AzureStorageException.FeatureVersionMismatch(
+                    "Azure Files copy source intent requires service version 2025-07-05 or later.",
+                    headerName,
+                    value);
+            }
+            if (!string.Equals(value, "backup", StringComparison.Ordinal))
+                throw AzureStorageException.InvalidHeader(headerName, value);
+        }
+
+        if (value is null && authorization is not null && IsAzureFilesSource(sourceUri))
+            throw AzureStorageException.MissingHeader(headerName);
+    }
+
+    private static bool IsAzureFilesSource(Uri sourceUri)
+    {
+        var host = sourceUri.IdnHost;
+        return host.EndsWith(".file.core.windows.net", StringComparison.OrdinalIgnoreCase) ||
+               host.EndsWith(".file.core.usgovcloudapi.net", StringComparison.OrdinalIgnoreCase) ||
+               host.EndsWith(".file.core.chinacloudapi.cn", StringComparison.OrdinalIgnoreCase) ||
+               host.EndsWith(".file.core.cloudapi.de", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AddSourceAuthenticationHeaders(HttpRequest destination, HttpRequestMessage source)
+    {
+        AddSourceAuthorization(destination, source);
+        if (ProtocolParsing.First(destination.Headers, "x-ms-file-request-intent") is { } fileRequestIntent)
+            source.Headers.TryAddWithoutValidation("x-ms-file-request-intent", fileRequestIntent);
+    }
+
     private static void AddSourceAuthorization(HttpRequest destination, HttpRequestMessage source)
+    {
+        var authorization = ReadSourceAuthorization(destination);
+        if (authorization is not null)
+            source.Headers.Authorization = authorization;
+    }
+
+    private static AuthenticationHeaderValue? ReadSourceAuthorization(HttpRequest destination)
     {
         var value = ProtocolParsing.First(destination.Headers, "x-ms-copy-source-authorization");
         if (value is null)
-            return;
+            return null;
         if (!IsServiceVersionAtLeast(destination, new DateOnly(2020, 10, 2)))
         {
             throw AzureStorageException.FeatureVersionMismatch(
@@ -266,7 +336,7 @@ internal sealed class UrlTransferClient(
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source-authorization");
         }
-        source.Headers.Authorization = authorization;
+        return authorization;
     }
 
     private static void AddSourceConditions(HttpRequest destination, HttpRequestMessage source)
@@ -423,7 +493,7 @@ internal sealed class UrlTransferClient(
             Query = QueryString.Create(values).Value?.TrimStart('?') ?? string.Empty
         };
         using var request = new HttpRequestMessage(HttpMethod.Get, builder.Uri);
-        AddSourceAuthorization(destinationRequest, request);
+        AddSourceAuthenticationHeaders(destinationRequest, request);
         request.Headers.TryAddWithoutValidation(
             "x-ms-version",
             StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
@@ -650,7 +720,7 @@ internal sealed class UrlTransferClient(
         CancellationToken cancellationToken)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-        AddSourceAuthorization(destinationRequest, request);
+        AddSourceAuthenticationHeaders(destinationRequest, request);
         request.Headers.TryAddWithoutValidation(
             "x-ms-version",
             StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);

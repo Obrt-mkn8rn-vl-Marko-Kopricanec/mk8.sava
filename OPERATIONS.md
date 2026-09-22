@@ -81,6 +81,14 @@ transaction. Blob bytes and content-addressed chunks are never read or copied;
 the operation preserves logical and physical storage totals even for a large
 container.
 
+The five URL-source write operations accept `x-ms-file-request-intent: backup`
+from service version `2025-07-05`. It is mandatory when the copy source is an
+Azure Files endpoint authenticated by a bearer token and is forwarded with that
+token on every source request. It remains optional for public/SAS Azure Files
+sources and for bearer-authenticated non-File URLs; asynchronous and incremental
+Copy Blob reject it because Azure exposes the header only on Put Blob, synchronous
+Copy Blob, Put Block, Put Page, and Append Block from URL.
+
 Query Blob Contents accepts Azure's `delimited`/`csv`, JSON, and Parquet input
 forms and its delimited/CSV, JSON, and Arrow result forms. Parquet input is read
 through authenticated seeks over the deduplicated chunk store and retains at

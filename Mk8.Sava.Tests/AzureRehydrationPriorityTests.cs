@@ -112,7 +112,7 @@ public sealed class AzureRehydrationPriorityTests
         await blob.SetAccessTierAsync(AccessTier.Archive);
         using var transport = new HttpClient(application.Server.CreateHandler());
         var tierUri = AppendQuery(
-            blob.GenerateSasUri(BlobSasPermissions.Write, clock.GetUtcNow().AddHours(1)),
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddHours(1)),
             "comp=tier");
 
         using (var start = TierRequest(tierUri, "2019-12-12", "Standard"))
