@@ -36,4 +36,50 @@ for scenario in chunk-publication metadata-precommit metadata-postcommit reclama
             --logger 'console;verbosity=minimal'
 done
 
-echo "All process-termination recovery scenarios passed."
+lease_path=$(mktemp -d "${TMPDIR:-/tmp}/mk8-sava-root-lease-XXXXXX")
+lease_filter='FullyQualifiedName=Mk8.Sava.Tests.StorageRootLeaseTests.CrossProcessRootLeaseWorker'
+echo "Verifying exclusive data-root ownership across processes using ${lease_path}"
+env \
+    MK8_SAVA_ROOT_LEASE_PATH="$lease_path" \
+    MK8_SAVA_ROOT_LEASE_ROLE=holder \
+    "$dotnet_host" test "$test_project" \
+        --no-build \
+        --no-restore \
+        --filter "$lease_filter" \
+        --logger 'console;verbosity=minimal' &
+holder_pid=$!
+ready=0
+for ((attempt=0; attempt<100; attempt++)); do
+    if [[ -f "$lease_path/holder-ready" ]]; then
+        ready=1
+        break
+    fi
+    if ! kill -0 "$holder_pid" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if ((ready == 0)); then
+    touch "$lease_path/release-holder"
+    wait "$holder_pid" || true
+    echo "The root-lease holder did not become ready." >&2
+    exit 1
+fi
+
+if ! env \
+    MK8_SAVA_ROOT_LEASE_PATH="$lease_path" \
+    MK8_SAVA_ROOT_LEASE_ROLE=contender \
+    "$dotnet_host" test "$test_project" \
+        --no-build \
+        --no-restore \
+        --filter "$lease_filter" \
+        --logger 'console;verbosity=minimal'; then
+    touch "$lease_path/release-holder"
+    wait "$holder_pid" || true
+    echo "The root-lease contender was not rejected." >&2
+    exit 1
+fi
+touch "$lease_path/release-holder"
+wait "$holder_pid"
+
+echo "All process-termination recovery and cross-process root-lease scenarios passed."
