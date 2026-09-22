@@ -929,13 +929,18 @@ public sealed class BlobService(
         }
     }
 
-    public async Task<BlobRecord> SealAppendBlobAsync(BlobRecord current, CancellationToken cancellationToken)
+    public async Task<BlobRecord> SealAppendBlobAsync(
+        BlobRecord current,
+        long? expectedPosition,
+        CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.AppendBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (expectedPosition.HasValue && expectedPosition.Value != current.Content.Length)
+            throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, "AppendPositionConditionNotMet", "The append position condition specified was not met.");
         var updated = current with
         {
             IsSealed = true,
