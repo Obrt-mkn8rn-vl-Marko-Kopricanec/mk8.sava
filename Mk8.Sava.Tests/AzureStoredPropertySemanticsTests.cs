@@ -433,6 +433,10 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
 
             var block = container.GetBlockBlobClient("block-copy.bin");
             var blockCopy = await block.StartCopyFromUriAsync(new Uri("https://source.example/block"));
+            var pendingBlock = (await block.GetPropertiesAsync()).Value;
+            Assert.Equal(CopyStatus.Pending, pendingBlock.CopyStatus);
+            Assert.Equal(0, pendingBlock.ContentLength);
+            Assert.Empty((await block.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks);
             await blockCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
             var blockProperties = (await block.GetPropertiesAsync()).Value;
             Assert.Equal(BlobType.Block, blockProperties.BlobType);
@@ -452,6 +456,11 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
 
             var append = container.GetAppendBlobClient("append-copy.bin");
             var appendCopy = await append.StartCopyFromUriAsync(new Uri("https://source.example/append"));
+            var pendingAppend = (await append.GetPropertiesAsync()).Value;
+            Assert.Equal(CopyStatus.Pending, pendingAppend.CopyStatus);
+            Assert.Equal(0, pendingAppend.ContentLength);
+            Assert.Equal(0, pendingAppend.BlobCommittedBlockCount);
+            Assert.False(pendingAppend.IsSealed);
             await appendCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
             var appendProperties = (await append.GetPropertiesAsync()).Value;
             Assert.Equal(BlobType.Append, appendProperties.BlobType);
@@ -461,6 +470,35 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             var sealedAppend = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
                 append.AppendBlockAsync(BinaryData.FromString("rejected").ToStream()));
             Assert.Equal("BlobIsSealed", sealedAppend.ErrorCode);
+
+            var unsealedAppend = container.GetAppendBlobClient("unsealed-append-copy.bin");
+            var unsealedCopy = await unsealedAppend.StartCopyFromUriAsync(
+                new Uri("https://source.example/append"),
+                new BlobCopyFromUriOptions { ShouldSealDestination = false });
+            await unsealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+            Assert.False((await unsealedAppend.GetPropertiesAsync()).Value.IsSealed);
+            await unsealedAppend.AppendBlockAsync(BinaryData.FromString("|allowed").ToStream());
+            Assert.Equal(
+                CopyShapeSourceHandler.AppendPayload.Concat("|allowed"u8.ToArray()).ToArray(),
+                (await unsealedAppend.DownloadContentAsync()).Value.Content.ToArray());
+
+            var invalidSeal = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+                block.StartCopyFromUriAsync(
+                    new Uri("https://source.example/block"),
+                    new BlobCopyFromUriOptions { ShouldSealDestination = true }));
+            Assert.Equal(400, invalidSeal.Status);
+            Assert.Equal("InvalidHeaderValue", invalidSeal.ErrorCode);
+
+            var unsealedSource = container.GetAppendBlobClient("unsealed-source.bin");
+            await unsealedSource.CreateAsync();
+            await unsealedSource.AppendBlockAsync(BinaryData.FromString("seal on completion").ToStream());
+            var explicitlySealed = container.GetAppendBlobClient("explicitly-sealed-copy.bin");
+            var explicitlySealedCopy = await explicitlySealed.StartCopyFromUriAsync(
+                unsealedSource.Uri,
+                new BlobCopyFromUriOptions { ShouldSealDestination = true });
+            Assert.False((await explicitlySealed.GetPropertiesAsync()).Value.IsSealed);
+            await explicitlySealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+            Assert.True((await explicitlySealed.GetPropertiesAsync()).Value.IsSealed);
 
             var page = container.GetPageBlobClient("page-copy.bin");
             var pageCopy = await page.StartCopyFromUriAsync(new Uri("https://source.example/page"));
@@ -496,6 +534,49 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.True(sourceHandler.BlockListReadWithPinnedEtag);
             Assert.Equal(4, sourceHandler.PageListRequests);
             Assert.True(sourceHandler.PageListReadWithPinnedEtag);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task AsynchronousCopyTimesOutToDurableFailedEmptyBlob()
+    {
+        var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 12, 0, 0, TimeSpan.Zero));
+        var application = new SavaWebApplicationFactory(
+            clock,
+            new Dictionary<string, string?>
+            {
+                ["Sava:AsyncCopyCompletionDelay"] = "15.00:00:00"
+            });
+        try
+        {
+            await application.InitializeAsync();
+            var service = CreateClient(application);
+            var container = service.GetBlobContainerClient($"copy-timeout-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var source = container.GetBlobClient("source.bin");
+            await source.UploadAsync(BinaryData.FromString("copy timeout payload"));
+            var destination = container.GetBlobClient("destination.bin");
+
+            var operation = await destination.StartCopyFromUriAsync(source.Uri);
+            Assert.False(operation.HasCompleted);
+            Assert.Equal(CopyStatus.Pending, (await destination.GetPropertiesAsync()).Value.CopyStatus);
+
+            clock.Advance(TimeSpan.FromDays(14) + TimeSpan.FromTicks(1));
+            var failed = (await destination.GetPropertiesAsync()).Value;
+            Assert.Equal(CopyStatus.Failed, failed.CopyStatus);
+            Assert.Equal("500 (OperationCancelled)", failed.CopyStatusDescription);
+            Assert.Equal(0, failed.ContentLength);
+            Assert.Empty((await destination.DownloadContentAsync()).Value.Content.ToArray());
+
+            clock.Advance(TimeSpan.FromDays(2));
+            var durable = (await destination.GetPropertiesAsync()).Value;
+            Assert.Equal(CopyStatus.Failed, durable.CopyStatus);
+            Assert.Equal("500 (OperationCancelled)", durable.CopyStatusDescription);
+            Assert.Equal(0, durable.ContentLength);
         }
         finally
         {
@@ -704,5 +785,16 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Array.Fill(payload, (byte)0x33, 1024, 512);
             return payload;
         }
+    }
+
+    private sealed class AdjustableTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private long _utcTicks = utcNow.UtcDateTime.Ticks;
+
+        public override DateTimeOffset GetUtcNow() =>
+            new(Interlocked.Read(ref _utcTicks), TimeSpan.Zero);
+
+        public void Advance(TimeSpan value) =>
+            Interlocked.Add(ref _utcTicks, value.Ticks);
     }
 }

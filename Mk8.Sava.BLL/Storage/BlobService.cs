@@ -1275,6 +1275,7 @@ public sealed class BlobService(
         string container,
         string name,
         BlobRecord source,
+        bool destinationIsSealed,
         BlobWriteOptions options,
         string sourceUri,
         LeaseRecord destinationLease,
@@ -1295,7 +1296,7 @@ public sealed class BlobService(
             source.Kind,
             prepared.Content,
             source.SequenceNumber,
-            source.IsSealed,
+            destinationIsSealed,
             source.AppendBlockCount,
             prepared.CommittedBlocks,
             source.PageRanges,
@@ -1499,6 +1500,7 @@ public sealed class BlobService(
                 BytesCopied = 0,
                 TotalBytes = prepared.Content.Length,
                 ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
+                ExpiresAt = now.AddDays(14),
                 IsIncremental = true,
                 SourceSnapshot = source.Snapshot
             }
@@ -1518,7 +1520,7 @@ public sealed class BlobService(
         long contentLength,
         BlobKind sourceKind,
         long sequenceNumber,
-        bool isSealed,
+        bool destinationIsSealed,
         int appendBlockCount,
         IReadOnlyList<CopySourceBlock> sourceBlocks,
         IReadOnlyList<PageRange> pageRanges,
@@ -1546,7 +1548,7 @@ public sealed class BlobService(
                 sourceKind,
                 content.Content,
                 sequenceNumber,
-                isSealed,
+                destinationIsSealed,
                 appendBlockCount,
                 content.CommittedBlocks,
                 pageRanges,
@@ -1567,7 +1569,7 @@ public sealed class BlobService(
             sourceKind,
             stored.Manifest,
             sequenceNumber,
-            isSealed,
+            destinationIsSealed,
             appendBlockCount,
             committedBlocks: [],
             pageRanges,
@@ -1586,7 +1588,7 @@ public sealed class BlobService(
         BlobKind sourceKind,
         ContentManifest sourceContent,
         long sequenceNumber,
-        bool isSealed,
+        bool destinationIsSealed,
         int appendBlockCount,
         IReadOnlyList<CommittedBlockRecord> committedBlocks,
         IReadOnlyList<PageRange> pageRanges,
@@ -1612,10 +1614,13 @@ public sealed class BlobService(
         {
             Lease = leases.ResetAfterBlobWrite(destinationLease),
             SequenceNumber = sequenceNumber,
-            IsSealed = isSealed,
-            AppendBlockCount = appendBlockCount,
-            CommittedBlocks = [.. committedBlocks],
+            IsSealed = false,
+            AppendBlockCount = 0,
+            CommittedBlocks = [],
             PageRanges = [],
+            PendingCopyCommittedBlocks = sourceKind == BlobKind.BlockBlob ? [.. committedBlocks] : null,
+            PendingCopyAppendBlockCount = sourceKind == BlobKind.AppendBlob ? appendBlockCount : null,
+            PendingCopyIsSealed = sourceKind == BlobKind.AppendBlob ? destinationIsSealed : null,
             PendingCopyPageRanges = sourceKind == BlobKind.PageBlob ? [.. pageRanges] : null,
             PendingCopyContent = sourceContent,
             Copy = new CopyState
@@ -1625,7 +1630,8 @@ public sealed class BlobService(
                 Status = "pending",
                 BytesCopied = 0,
                 TotalBytes = sourceContent.Length,
-                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay)
+                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
+                ExpiresAt = now.AddDays(14)
             }
         };
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
@@ -1863,6 +1869,9 @@ public sealed class BlobService(
                 ? current.Content
                 : chunks.Empty(current.Account, EncryptionOf(current)),
             PendingCopyContent = null,
+            PendingCopyCommittedBlocks = null,
+            PendingCopyAppendBlockCount = null,
+            PendingCopyIsSealed = null,
             PendingCopyPageRanges = null,
             CommittedBlocks = current.Copy.IsIncremental ? current.CommittedBlocks : [],
             PageRanges = current.Copy.IsIncremental ? current.PageRanges : [],
@@ -1873,7 +1882,8 @@ public sealed class BlobService(
                 Status = "aborted",
                 BytesCopied = 0,
                 CompletedAt = now,
-                ReadyAt = null
+                ReadyAt = null,
+                ExpiresAt = null
             },
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
@@ -2324,20 +2334,76 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         if (blob.Copy?.Status != "pending" ||
-            blob.PendingCopyContent is null ||
-            !blob.Copy.ReadyAt.HasValue ||
-            blob.Copy.ReadyAt.Value > metadata.GetUtcNow())
+            blob.PendingCopyContent is null)
         {
             return blob;
         }
 
-        using var contentPin = chunks.Pin(blob.PendingCopyContent);
         var now = metadata.GetUtcNow();
+        if (blob.Copy.ExpiresAt <= now &&
+            (!blob.Copy.ReadyAt.HasValue || blob.Copy.ReadyAt > blob.Copy.ExpiresAt))
+        {
+            var failed = blob with
+            {
+                Content = blob.Copy.IsIncremental
+                    ? blob.Content
+                    : chunks.Empty(blob.Account, EncryptionOf(blob)),
+                PendingCopyContent = null,
+                PendingCopyCommittedBlocks = null,
+                PendingCopyAppendBlockCount = null,
+                PendingCopyIsSealed = null,
+                PendingCopyPageRanges = null,
+                CommittedBlocks = blob.Copy.IsIncremental ? blob.CommittedBlocks : [],
+                PageRanges = blob.Copy.IsIncremental ? blob.PageRanges : [],
+                AppendBlockCount = blob.Copy.IsIncremental ? blob.AppendBlockCount : 0,
+                IsSealed = blob.Copy.IsIncremental && blob.IsSealed,
+                Copy = blob.Copy with
+                {
+                    Status = "failed",
+                    BytesCopied = 0,
+                    Description = "500 (OperationCancelled)",
+                    CompletedAt = now,
+                    ReadyAt = null,
+                    ExpiresAt = null
+                },
+                Revision = MetadataStore.NewRevision(),
+                ETag = MetadataStore.NewETag(),
+                LastModified = now
+            };
+            try
+            {
+                await metadata.PutBlobRecordAsync(failed, blob.Revision, cancellationToken);
+                return failed;
+            }
+            catch (StorageConcurrencyException)
+            {
+                return await metadata.GetBlobAsync(
+                           blob.Account,
+                           blob.Container,
+                           blob.Name,
+                           blob.VersionId,
+                           blob.Snapshot,
+                           includeDeleted: false,
+                           cancellationToken)
+                       ?? throw AzureStorageException.BlobNotFound();
+            }
+        }
+
+        if (!blob.Copy.ReadyAt.HasValue || blob.Copy.ReadyAt.Value > now)
+            return blob;
+
+        using var contentPin = chunks.Pin(blob.PendingCopyContent);
         var updated = blob with
         {
             Content = blob.PendingCopyContent,
             Lease = leases.ResetAfterBlobWrite(blob.Lease),
             PendingCopyContent = null,
+            CommittedBlocks = blob.PendingCopyCommittedBlocks ?? blob.CommittedBlocks,
+            PendingCopyCommittedBlocks = null,
+            AppendBlockCount = blob.PendingCopyAppendBlockCount ?? blob.AppendBlockCount,
+            PendingCopyAppendBlockCount = null,
+            IsSealed = blob.PendingCopyIsSealed ?? blob.IsSealed,
+            PendingCopyIsSealed = null,
             PageRanges = blob.PendingCopyPageRanges ?? blob.PageRanges,
             PendingCopyPageRanges = null,
             IncrementalCopySourceSnapshot = blob.Copy.IsIncremental
@@ -2348,7 +2414,8 @@ public sealed class BlobService(
                 Status = "success",
                 BytesCopied = blob.Copy.TotalBytes,
                 CompletedAt = now,
-                ReadyAt = null
+                ReadyAt = null,
+                ExpiresAt = null
             },
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
