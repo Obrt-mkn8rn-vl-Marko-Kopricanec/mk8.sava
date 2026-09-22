@@ -25,7 +25,11 @@ public sealed record StorageAuthorization(
     bool IsAccountSas = false,
     string? SignedResource = null,
     string? TenantId = null,
-    bool CanGenerateUserDelegationKey = false)
+    bool CanGenerateUserDelegationKey = false,
+    string? ApplicationId = null,
+    string? Audience = null,
+    string? Issuer = null,
+    string? UserPrincipalName = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
@@ -173,7 +177,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             permissions,
             Identifier: subject,
             TenantId: principal.FindFirst("tid")?.Value,
-            CanGenerateUserDelegationKey: mappedAccessApplies && access!.CanGenerateUserDelegationKey);
+            CanGenerateUserDelegationKey: mappedAccessApplies && access!.CanGenerateUserDelegationKey,
+            ApplicationId: principal.FindFirst("appid")?.Value ?? principal.FindFirst("azp")?.Value,
+            Audience: principal.FindFirst("aud")?.Value,
+            Issuer: principal.FindFirst("iss")?.Value,
+            UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value);
     }
 
     private StorageAuthorization AuthenticateSharedKey(

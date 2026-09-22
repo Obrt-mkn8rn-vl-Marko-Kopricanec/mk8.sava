@@ -10,6 +10,7 @@ public sealed class BlobService(
     MetadataStore metadata,
     ChunkStore chunks,
     LeaseService leases,
+    StorageAnalyticsService analytics,
     IStorageTelemetry telemetry,
     IOptions<SavaOptions> configuredOptions)
 {
@@ -35,6 +36,9 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         var containers = await metadata.ListContainersAsync(account, includeDeleted, cancellationToken);
+        containers = containers
+            .Where(container => container.Name != StorageAnalyticsService.LogsContainerName)
+            .ToArray();
         if (!includeDeleted || !containers.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
             return containers.Select(EffectiveContainer).ToArray();
         var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
@@ -49,6 +53,7 @@ public sealed class BlobService(
     internal async Task<ContainerListPage> ListContainersPageAsync(
         string account,
         bool includeDeleted,
+        bool includeSystem,
         string prefix,
         string marker,
         int maximum,
@@ -57,6 +62,7 @@ public sealed class BlobService(
         var page = await metadata.ListContainersPageAsync(
             account,
             includeDeleted,
+            includeSystem,
             prefix,
             marker,
             maximum,
@@ -173,6 +179,13 @@ public sealed class BlobService(
 
     public async Task DeleteContainerAsync(ContainerRecord current, CancellationToken cancellationToken)
     {
+        if (current.Name == StorageAnalyticsService.LogsContainerName)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status403Forbidden,
+                "ContainerOperationFailure",
+                "The account being accessed does not have sufficient permissions to execute this operation.");
+        }
         EnsureContainerMutable(current);
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
         if (properties.ContainerSoftDeleteEnabled)
@@ -1993,6 +2006,7 @@ public sealed class BlobService(
         ServiceProperties properties,
         CancellationToken cancellationToken)
     {
+        await analytics.EnsureContainerAsync(account, cancellationToken);
         if (properties.StaticWebsite.Enabled)
         {
             var websiteContainer = await metadata.GetContainerAsync(
@@ -2056,6 +2070,20 @@ public sealed class BlobService(
             try
             {
                 var blob = candidate;
+                if (blob.Container == StorageAnalyticsService.LogsContainerName)
+                {
+                    if (!serviceProperties.TryGetValue(blob.Account, out var analyticsProperties))
+                    {
+                        analyticsProperties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken);
+                        serviceProperties.Add(blob.Account, analyticsProperties);
+                    }
+                    if (analyticsProperties.Logging.RetentionPolicy is { Enabled: true, Days: { } retentionDays } &&
+                        blob.CreatedAt.AddDays(retentionDays) <= now &&
+                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                    {
+                        continue;
+                    }
+                }
                 if (blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null)
                 {
                     var pendingCopy = blob;

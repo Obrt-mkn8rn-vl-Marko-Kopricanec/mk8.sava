@@ -668,7 +668,7 @@ internal static class ProtocolParsing
         ValidateUniqueChildren(element);
         ValidateKnownChildren(element, "Version", "Delete", "Read", "Write", "RetentionPolicy");
         var version = RequiredText(element, "Version");
-        if (version != "1.0")
+        if (version is not ("1.0" or "2.0"))
             throw InvalidServicePropertiesXml("The Storage Analytics version is invalid.");
         return new StorageAnalyticsLogging
         {

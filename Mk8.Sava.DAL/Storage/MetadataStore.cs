@@ -207,6 +207,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
     internal async Task<ContainerListPage> ListContainersPageAsync(
         string account,
         bool includeDeleted,
+        bool includeSystem,
         string prefix,
         string marker,
         int maximum,
@@ -220,6 +221,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
             SELECT data FROM containers
             WHERE account = $account
               {(includeDeleted ? string.Empty : "AND deleted = 0")}
+              {(includeSystem ? string.Empty : "AND name <> '$logs'")}
               AND name >= $prefix
               AND substr(name, 1, length($prefix)) = $prefix
               AND name > $marker
@@ -389,6 +391,28 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
+    }
+
+    internal async Task<string?> GetLastBlobNameAsync(
+        string account,
+        string container,
+        string prefix,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT name FROM blobs
+            WHERE account = $account
+              AND container = $container
+              AND substr(name, 1, length($prefix)) = $prefix
+            ORDER BY name DESC
+            LIMIT 1;
+            """;
+        command.Parameters.AddWithValue("$account", account);
+        command.Parameters.AddWithValue("$container", container);
+        command.Parameters.AddWithValue("$prefix", prefix);
+        return (string?)await command.ExecuteScalarAsync(cancellationToken);
     }
 
     public async Task<IReadOnlyList<BlobRecord>> ListBlobsAsync(
