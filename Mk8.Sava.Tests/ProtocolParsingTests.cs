@@ -34,6 +34,40 @@ public sealed class ProtocolParsingTests
     }
 
     [Fact]
+    public async Task BlobQueryParserAcceptsParquetOnlyAsAnInputFormat()
+    {
+        const string parquetInput = """
+            <QueryRequest>
+              <QueryType>SQL</QueryType>
+              <Expression>SELECT * FROM BlobStorage</Expression>
+              <InputSerialization><Format><Type>parquet</Type></Format></InputSerialization>
+              <OutputSerialization><Format><Type>json</Type></Format></OutputSerialization>
+            </QueryRequest>
+            """;
+        await using var acceptedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetInput), writable: false);
+
+        var request = await BlobQueryProtocol.ReadRequestAsync(acceptedBody, CancellationToken.None);
+
+        Assert.Equal(BlobQueryFormatKind.Parquet, request.Input.Kind);
+        Assert.Equal(BlobQueryFormatKind.Json, request.Output.Kind);
+
+        const string parquetOutput = """
+            <QueryRequest>
+              <QueryType>SQL</QueryType>
+              <Expression>SELECT * FROM BlobStorage</Expression>
+              <OutputSerialization><Format><Type>parquet</Type></Format></OutputSerialization>
+            </QueryRequest>
+            """;
+        await using var rejectedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetOutput), writable: false);
+
+        var exception = await Assert.ThrowsAsync<AzureStorageException>(
+            () => BlobQueryProtocol.ReadRequestAsync(rejectedBody, CancellationToken.None));
+
+        Assert.Equal((int)HttpStatusCode.BadRequest, exception.StatusCode);
+        Assert.Equal("BlobQueryError", exception.ErrorCode);
+    }
+
+    [Fact]
     public async Task BlockListParserAcceptsMaximumCountWithMaximumLengthIdentifiers()
     {
         var blockId = Convert.ToBase64String(Enumerable.Repeat((byte)0x5a, BlobServiceLimits.MaximumBlockIdBytes).ToArray());

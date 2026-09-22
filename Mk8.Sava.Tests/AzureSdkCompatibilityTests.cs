@@ -9752,6 +9752,92 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("InvalidBlobType", invalidType.ErrorCode);
     }
 
+    [Fact]
+    public async Task QueryBlobContentsReadsParquetRowGroupsThroughTheOfficialSdk()
+    {
+        var id = new Parquet.Schema.DataField<int>("id");
+        var name = new Parquet.Schema.DataField<string>("name");
+        var enabled = new Parquet.Schema.DataField<bool>("enabled");
+        var score = new Parquet.Schema.DataField<double>("score");
+        var observed = new Parquet.Schema.DataField<DateTime>("observed");
+        var maybe = new Parquet.Schema.DataField<int?>("maybe");
+        var schema = new Parquet.Schema.ParquetSchema(id, name, enabled, score, observed, maybe);
+
+        using var content = new MemoryStream();
+        await using (var writer = await Parquet.ParquetWriter.CreateAsync(schema, content))
+        {
+            using (var group = writer.CreateRowGroup())
+            {
+                await group.WriteAsync<int>(id, new[] { 1, 2 }.AsMemory());
+                await group.WriteAsync(name, new string?[] { "one", "two" });
+                await group.WriteAsync<bool>(enabled, new[] { true, false }.AsMemory());
+                await group.WriteAsync<double>(score, new[] { 1.25D, 2.5D }.AsMemory());
+                await group.WriteAsync<DateTime>(
+                    observed,
+                    new[]
+                    {
+                        new DateTime(2026, 9, 20, 10, 15, 0, DateTimeKind.Utc),
+                        new DateTime(2026, 9, 21, 11, 30, 0, DateTimeKind.Utc)
+                    }.AsMemory());
+                await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory());
+                group.CompleteValidate();
+            }
+
+            using (var group = writer.CreateRowGroup())
+            {
+                await group.WriteAsync<int>(id, new[] { 3 }.AsMemory());
+                await group.WriteAsync(name, new string?[] { "three" });
+                await group.WriteAsync<bool>(enabled, new[] { true }.AsMemory());
+                await group.WriteAsync<double>(score, new[] { 3.75D }.AsMemory());
+                await group.WriteAsync<DateTime>(
+                    observed,
+                    new[] { new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc) }.AsMemory());
+                await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory());
+                group.CompleteValidate();
+            }
+        }
+        content.Position = 0;
+
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"parquet-query-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("rows.parquet");
+        await blob.UploadAsync(content);
+
+        var response = await blob.QueryAsync(
+            "SELECT id AS id, name AS name, enabled AS enabled, score AS score, " +
+            "observed AS observed, maybe AS maybe FROM BlobStorage WHERE id >= 2;",
+            new BlobQueryOptions
+            {
+                InputTextConfiguration = new BlobQueryParquetTextOptions(),
+                OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
+            });
+        using var resultReader = new StreamReader(response.Value.Content);
+        var result = await resultReader.ReadToEndAsync();
+        var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+
+        Assert.Equal(2, lines.Length);
+        using var second = JsonDocument.Parse(lines[0]);
+        Assert.Equal(2, second.RootElement.GetProperty("id").GetInt64());
+        Assert.Equal("two", second.RootElement.GetProperty("name").GetString());
+        Assert.False(second.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.Equal(2.5D, second.RootElement.GetProperty("score").GetDouble());
+        Assert.Equal(
+            new DateTimeOffset(2026, 9, 21, 11, 30, 0, TimeSpan.Zero),
+            second.RootElement.GetProperty("observed").GetDateTimeOffset());
+        Assert.Equal(20, second.RootElement.GetProperty("maybe").GetInt64());
+
+        using var third = JsonDocument.Parse(lines[1]);
+        Assert.Equal(3, third.RootElement.GetProperty("id").GetInt64());
+        Assert.Equal("three", third.RootElement.GetProperty("name").GetString());
+        Assert.True(third.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.Equal(3.75D, third.RootElement.GetProperty("score").GetDouble());
+        Assert.Equal(
+            new DateTimeOffset(2026, 9, 22, 12, 45, 0, TimeSpan.Zero),
+            third.RootElement.GetProperty("observed").GetDateTimeOffset());
+        Assert.Equal(JsonValueKind.Null, third.RootElement.GetProperty("maybe").ValueKind);
+    }
+
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
 

@@ -2420,6 +2420,19 @@ public static class BlobProtocolEndpoint
         http.Response.ContentType = "avro/binary";
         http.Response.StatusCode = StatusCodes.Status200OK;
 
+        var encryption = new BlobEncryption(blob.EncryptionScope, null);
+        if (query.Input.Kind == BlobQueryFormatKind.Parquet)
+        {
+            await using var seekableContent = new BlobSeekableReadStream(service, blob, encryption);
+            await BlobQueryProtocol.ExecuteAsync(
+                query,
+                seekableContent,
+                http.Response.Body,
+                blob.Content.Length,
+                cancellationToken);
+            return;
+        }
+
         var pipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: 1024 * 1024,
             resumeWriterThreshold: 512 * 1024,
@@ -2428,7 +2441,7 @@ public static class BlobProtocolEndpoint
         var producer = ProduceQueryInputAsync(
             service,
             blob,
-            new BlobEncryption(blob.EncryptionScope, null),
+            encryption,
             pipe.Writer,
             producerCancellation.Token);
 

@@ -8,6 +8,8 @@ using System.Xml.Linq;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
+using Parquet;
+using Parquet.Data;
 
 namespace Mk8.Sava.Protocol;
 
@@ -15,7 +17,8 @@ internal enum BlobQueryFormatKind
 {
     Delimited,
     Json,
-    Arrow
+    Arrow,
+    Parquet
 }
 
 internal sealed record BlobQueryTextFormat(
@@ -203,6 +206,9 @@ internal static class BlobQueryProtocol
                 throw InvalidXml("An Arrow output schema must contain between one and 256 fields.");
             return new BlobQueryTextFormat(BlobQueryFormatKind.Arrow, ",", '"', "\n", '\\', false, fields);
         }
+
+        if (input && type == "parquet")
+            return new BlobQueryTextFormat(BlobQueryFormatKind.Parquet, ",", '"', "\n", '\\', false, []);
 
         var direction = input ? "input" : "output";
         throw new AzureStorageException(
@@ -469,11 +475,221 @@ internal static class BlobQueryProtocol
         _ => throw new InvalidOperationException("Unknown Arrow field type.")
     };
 
+    private static async IAsyncEnumerable<QueryRow> ReadParquetRowsAsync(
+        Stream input,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (!input.CanSeek)
+        {
+            throw new BlobQueryDataException(
+                "InvalidParquetFile",
+                "The Parquet query input is not seekable.",
+                0);
+        }
+
+        ParquetReader reader;
+        try
+        {
+            reader = await ParquetReader.CreateAsync(
+                input,
+                leaveStreamOpen: true,
+                cancellationToken: cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            throw InvalidParquetFile();
+        }
+
+        await using (reader)
+        {
+            var fields = reader.Schema.GetDataFields();
+            if (fields.Length == 0)
+                throw InvalidParquetFile("The Parquet schema does not contain any data fields.");
+            if (fields.Any(field => field.Path.Length != 1 || field.MaxRepetitionLevel != 0 || field.IsArray))
+            {
+                throw new BlobQueryDataException(
+                    "UnsupportedParquetType",
+                    "Nested and repeated Parquet fields are not supported by Query Blob Contents.",
+                    0);
+            }
+
+            var names = fields.Select(field => field.Name).ToArray();
+            for (var groupIndex = 0; groupIndex < reader.RowGroupCount; groupIndex++)
+            {
+                using var group = reader.OpenRowGroupReader(groupIndex);
+                if (group.RowCount > int.MaxValue)
+                    throw InvalidParquetFile("A Parquet row group contains too many rows.");
+                var rowCount = checked((int)group.RowCount);
+                var columns = new object?[fields.Length][];
+                for (var column = 0; column < fields.Length; column++)
+                {
+                    columns[column] = await ReadParquetColumnAsync(
+                        group,
+                        fields[column],
+                        rowCount,
+                        cancellationToken);
+                }
+
+                for (var row = 0; row < rowCount; row++)
+                {
+                    var cells = new QueryCell[fields.Length];
+                    for (var column = 0; column < fields.Length; column++)
+                        cells[column] = new QueryCell(columns[column][row]);
+                    yield return new QueryRow(names, cells);
+                }
+            }
+        }
+    }
+
+    private static async Task<object?[]> ReadParquetColumnAsync(
+        ParquetRowGroupReader group,
+        Parquet.Schema.DataField field,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var type = field.ClrType;
+            if (type == typeof(ReadOnlyMemory<char>))
+            {
+                var values = new string?[rowCount];
+                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken);
+                return values;
+            }
+            if (type == typeof(ReadOnlyMemory<byte>))
+            {
+                var values = new byte[]?[rowCount];
+                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken);
+                return values.Select(value => value is null ? null : Convert.ToBase64String(value)).ToArray();
+            }
+            if (type == typeof(bool))
+                return await ReadParquetValueColumnAsync<bool>(group, field, rowCount, cancellationToken);
+            if (type == typeof(byte))
+                return await ReadParquetValueColumnAsync<byte>(group, field, rowCount, cancellationToken);
+            if (type == typeof(sbyte))
+                return await ReadParquetValueColumnAsync<sbyte>(group, field, rowCount, cancellationToken);
+            if (type == typeof(short))
+                return await ReadParquetValueColumnAsync<short>(group, field, rowCount, cancellationToken);
+            if (type == typeof(ushort))
+                return await ReadParquetValueColumnAsync<ushort>(group, field, rowCount, cancellationToken);
+            if (type == typeof(int))
+                return await ReadParquetValueColumnAsync<int>(group, field, rowCount, cancellationToken);
+            if (type == typeof(uint))
+                return await ReadParquetValueColumnAsync<uint>(group, field, rowCount, cancellationToken);
+            if (type == typeof(long))
+                return await ReadParquetValueColumnAsync<long>(group, field, rowCount, cancellationToken);
+            if (type == typeof(ulong))
+                return await ReadParquetValueColumnAsync<ulong>(group, field, rowCount, cancellationToken);
+            if (type == typeof(float))
+                return await ReadParquetValueColumnAsync<float>(group, field, rowCount, cancellationToken);
+            if (type == typeof(double))
+                return await ReadParquetValueColumnAsync<double>(group, field, rowCount, cancellationToken);
+            if (type == typeof(decimal))
+                return await ReadParquetValueColumnAsync<decimal>(group, field, rowCount, cancellationToken);
+            if (type == typeof(BigDecimal))
+                return await ReadParquetValueColumnAsync<BigDecimal>(group, field, rowCount, cancellationToken);
+            if (type == typeof(System.Numerics.BigInteger))
+                return await ReadParquetValueColumnAsync<System.Numerics.BigInteger>(group, field, rowCount, cancellationToken);
+            if (type == typeof(DateTime))
+                return await ReadParquetValueColumnAsync<DateTime>(group, field, rowCount, cancellationToken);
+            if (type == typeof(DateOnly))
+                return await ReadParquetValueColumnAsync<DateOnly>(group, field, rowCount, cancellationToken);
+            if (type == typeof(Guid))
+                return await ReadParquetValueColumnAsync<Guid>(group, field, rowCount, cancellationToken);
+
+            throw new BlobQueryDataException(
+                "UnsupportedParquetType",
+                $"Parquet field '{field.Name}' uses an unsupported data type.",
+                0);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (BlobQueryDataException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            throw InvalidParquetFile();
+        }
+    }
+
+    private static async Task<object?[]> ReadParquetValueColumnAsync<T>(
+        ParquetRowGroupReader group,
+        Parquet.Schema.DataField field,
+        int rowCount,
+        CancellationToken cancellationToken)
+        where T : struct
+    {
+        var result = new object?[rowCount];
+        if (field.IsNullable)
+        {
+            var values = new T?[rowCount];
+            await group.ReadAsync<T>(
+                field,
+                values.AsMemory(),
+                cancellationToken: cancellationToken);
+            for (var index = 0; index < values.Length; index++)
+                result[index] = values[index] is { } value ? NormalizeParquetValue(value) : null;
+        }
+        else
+        {
+            var values = new T[rowCount];
+            await group.ReadAsync<T>(
+                field,
+                values.AsMemory(),
+                cancellationToken: cancellationToken);
+            for (var index = 0; index < values.Length; index++)
+                result[index] = NormalizeParquetValue(values[index]);
+        }
+        return result;
+    }
+
+    private static object NormalizeParquetValue<T>(T value) where T : struct => value switch
+    {
+        byte number => (long)number,
+        sbyte number => (long)number,
+        short number => (long)number,
+        ushort number => (long)number,
+        int number => (long)number,
+        uint number => (long)number,
+        ulong number when number <= long.MaxValue => (long)number,
+        ulong number => (decimal)number,
+        float number => (double)number,
+        DateTime dateTime => dateTime.Kind == DateTimeKind.Unspecified
+            ? new DateTimeOffset(dateTime, TimeSpan.Zero)
+            : new DateTimeOffset(dateTime).ToUniversalTime(),
+        DateOnly date => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+        Guid guid => guid.ToString("D"),
+        BigDecimal number => number.ToString(),
+        System.Numerics.BigInteger number => number.ToString(CultureInfo.InvariantCulture),
+        _ => value
+    };
+
+    private static BlobQueryDataException InvalidParquetFile(
+        string message = "The Parquet query input is invalid or corrupt.") => new(
+        "InvalidParquetFile",
+        message,
+        0);
+
     private static async IAsyncEnumerable<QueryRow> ReadRowsAsync(
         Stream input,
         BlobQueryTextFormat format,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        if (format.Kind == BlobQueryFormatKind.Parquet)
+        {
+            await foreach (var row in ReadParquetRowsAsync(input, cancellationToken))
+                yield return row;
+            yield break;
+        }
+
         using var reader = new StreamReader(
             input,
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true),
@@ -1012,6 +1228,8 @@ internal sealed record QueryCell(object? Value)
     {
         null => string.Empty,
         bool boolean => boolean ? "true" : "false",
+        DateTimeOffset timestamp => timestamp.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
+        DateTime timestamp => timestamp.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture),
         IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture) ?? string.Empty,
         _ => Value.ToString() ?? string.Empty
     };
@@ -1031,6 +1249,15 @@ internal sealed record QueryCell(object? Value)
                 break;
             case decimal number:
                 writer.WriteNumber(name, number);
+                break;
+            case double number:
+                writer.WriteNumber(name, number);
+                break;
+            case DateTimeOffset timestamp:
+                writer.WriteString(name, timestamp.ToUniversalTime());
+                break;
+            case DateTime timestamp:
+                writer.WriteString(name, timestamp.ToUniversalTime());
                 break;
             default:
                 writer.WriteString(name, ToText());
