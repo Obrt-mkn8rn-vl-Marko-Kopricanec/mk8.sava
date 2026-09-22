@@ -125,6 +125,7 @@ public sealed record BlobRecord
     public bool ImmutabilityLocked { get; init; }
     public bool HasLegalHold { get; init; }
     public string? EncryptionScope { get; init; }
+    public string? EncryptionContext { get; init; }
     public string? CustomerProvidedKeySha256 { get; init; }
     public CopyState? Copy { get; init; }
     public ContentManifest? PendingCopyContent { get; init; }

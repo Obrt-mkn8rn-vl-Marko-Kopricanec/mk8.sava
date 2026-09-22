@@ -362,6 +362,8 @@ public sealed partial class AzureResponseWriter
                     WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
                     WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
                 }
+                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
+                    WriteOptional(writer, "EncryptionContext", blob.EncryptionContext);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
                     WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
@@ -756,6 +758,8 @@ public sealed partial class AzureResponseWriter
             SetOptional(response.Headers, "x-ms-encryption-key-sha256", blob.CustomerProvidedKeySha256);
             SetOptional(response.Headers, "x-ms-encryption-scope", blob.EncryptionScope);
         }
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2021, 8, 6)))
+            SetOptional(response.Headers, "x-ms-encryption-context", blob.EncryptionContext);
         if (blob.Kind == Storage.BlobKind.BlockBlob &&
             IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
         {

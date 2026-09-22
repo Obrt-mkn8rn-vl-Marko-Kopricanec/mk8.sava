@@ -1983,6 +1983,180 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceEncryptionContextHonorsBlobRestWriteAndReadContracts()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-encryption-context-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        using var transport = new HttpClient(application.Server.CreateHandler());
+
+        static HttpRequestMessage CreatePutRequest(
+            BlobClient blob,
+            string version,
+            string? encryptionContext,
+            string payload)
+        {
+            var request = new HttpRequestMessage(
+                HttpMethod.Put,
+                blob.GenerateSasUri(
+                    BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read,
+                    DateTimeOffset.UtcNow.AddMinutes(5)))
+            {
+                Content = new StringContent(payload, Encoding.UTF8, "application/octet-stream")
+            };
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            if (encryptionContext is not null)
+                request.Headers.TryAddWithoutValidation("x-ms-encryption-context", encryptionContext);
+            return request;
+        }
+
+        async Task<HttpResponseMessage> GetPropertiesAsync(BlobBaseClient blob, string version)
+        {
+            var request = new HttpRequestMessage(
+                HttpMethod.Head,
+                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            return await transport.SendAsync(request);
+        }
+
+        async Task<System.Xml.Linq.XDocument> ListAsync(string version)
+        {
+            var uri = AppendQuery(
+                container.GenerateSasUri(
+                    BlobContainerSasPermissions.List,
+                    DateTimeOffset.UtcNow.AddMinutes(5)),
+                "restype=container&comp=list");
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+        }
+
+        const string context = "tenant=alpha;key=v1";
+        var blob = container.GetBlobClient("folder/context.bin");
+        using (var put = CreatePutRequest(blob, "2021-08-06", context, "context payload"))
+        using (var response = await transport.SendAsync(put))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        using (var properties = await GetPropertiesAsync(blob, "2021-08-06"))
+        {
+            Assert.Equal(HttpStatusCode.OK, properties.StatusCode);
+            Assert.Equal(context, GetResponseHeader(properties, "x-ms-encryption-context"));
+        }
+        using (var legacyProperties = await GetPropertiesAsync(blob, "2021-06-08"))
+        {
+            Assert.Equal(HttpStatusCode.OK, legacyProperties.StatusCode);
+            Assert.Null(GetResponseHeaderOrDefault(legacyProperties, "x-ms-encryption-context"));
+        }
+
+        var modernListing = await ListAsync("2021-06-08");
+        var modernEntry = modernListing.Descendants("Blob").Single(element =>
+            element.Element("Name")?.Value == blob.Name);
+        Assert.Equal(context, modernEntry.Element("Properties")?.Element("EncryptionContext")?.Value);
+        var legacyListing = await ListAsync("2021-04-10");
+        var legacyEntry = legacyListing.Descendants("Blob").Single(element =>
+            element.Element("Name")?.Value == blob.Name);
+        Assert.Null(legacyEntry.Element("Properties")?.Element("EncryptionContext"));
+
+        var block = container.GetBlockBlobClient("folder/committed.bin");
+        var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes("block-0001"));
+        await block.StageBlockAsync(blockId, new MemoryStream(Encoding.UTF8.GetBytes("committed payload")));
+        var commitUri = AppendQuery(
+            block.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=blocklist");
+        using (var commit = new HttpRequestMessage(HttpMethod.Put, commitUri)
+        {
+            Content = new StringContent(
+                $"<BlockList><Latest>{blockId}</Latest></BlockList>",
+                Encoding.UTF8,
+                "application/xml")
+        })
+        {
+            commit.Headers.TryAddWithoutValidation("x-ms-version", "2021-08-06");
+            commit.Headers.TryAddWithoutValidation("x-ms-encryption-context", "commit-context");
+            using var response = await transport.SendAsync(commit);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+        using (var properties = await GetPropertiesAsync(block, "2021-08-06"))
+        {
+            Assert.Equal("commit-context", GetResponseHeader(properties, "x-ms-encryption-context"));
+        }
+
+        using (var overwrite = CreatePutRequest(blob, "2021-08-06", null, "replacement"))
+        using (var response = await transport.SendAsync(overwrite))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+        using (var properties = await GetPropertiesAsync(blob, "2021-08-06"))
+        {
+            Assert.Null(GetResponseHeaderOrDefault(properties, "x-ms-encryption-context"));
+        }
+
+        using (var oversized = CreatePutRequest(blob, "2021-08-06", new string('x', 1025), "rejected"))
+        using (var response = await transport.SendAsync(oversized))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
+        }
+        Assert.Equal("replacement", (await blob.DownloadContentAsync()).Value.Content.ToString());
+
+        var legacyTarget = container.GetBlobClient("legacy.bin");
+        using (var legacyPut = CreatePutRequest(legacyTarget, "2021-06-08", context, "rejected"))
+        using (var response = await transport.SendAsync(legacyPut))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", GetResponseHeader(response, "x-ms-error-code"));
+        }
+        Assert.False((await legacyTarget.ExistsAsync()).Value);
+
+        var copyTarget = container.GetBlobClient("copy.bin");
+        using (var copy = new HttpRequestMessage(
+            HttpMethod.Put,
+            copyTarget.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            copy.Headers.TryAddWithoutValidation("x-ms-version", "2021-08-06");
+            copy.Headers.TryAddWithoutValidation(
+                "x-ms-copy-source",
+                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)).ToString());
+            copy.Headers.TryAddWithoutValidation("x-ms-encryption-context", context);
+            using var response = await transport.SendAsync(copy);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
+        }
+
+        await using var flatApplication = new SavaWebApplicationFactory();
+        var flatService = CreateClient(flatApplication);
+        var flatContainer = flatService.GetBlobContainerClient($"flat-encryption-context-{Guid.NewGuid():N}");
+        await flatContainer.CreateAsync();
+        var flatBlob = flatContainer.GetBlobClient("context.bin");
+        using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
+        using var flatPut = CreatePutRequest(flatBlob, "2021-08-06", context, "rejected");
+        using var flatResponse = await flatTransport.SendAsync(flatPut);
+        Assert.Equal(HttpStatusCode.BadRequest, flatResponse.StatusCode);
+        Assert.Equal("InvalidHeaderValue", GetResponseHeader(flatResponse, "x-ms-error-code"));
+        Assert.False((await flatBlob.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

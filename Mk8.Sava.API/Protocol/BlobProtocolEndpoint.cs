@@ -1066,7 +1066,11 @@ public static class BlobProtocolEndpoint
                 async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken),
                 allowStructured: false,
                 maximumBodyBytes: ProtocolParsing.MaximumBlockListBodyBytes);
-            var options = ReadWriteOptions(http.Request, current, useStandardProperties: false);
+            var options = ReadWriteOptions(
+                http.Request,
+                current,
+                useStandardProperties: false,
+                encryptionContext: ReadEncryptionContext(http.Request, service, request.Account));
             var committed = await service.CommitBlockListAsync(
                 request.Account,
                 containerName,
@@ -1811,6 +1815,7 @@ public static class BlobProtocolEndpoint
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
         {
+            RejectUnsupportedHeader(http.Request, "x-ms-encryption-context");
             var supportsAsynchronousCopy = IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12));
             if (supportsAsynchronousCopy)
             {
@@ -2117,7 +2122,8 @@ public static class BlobProtocolEndpoint
                         ReadWriteOptions(
                             http.Request,
                             current,
-                            generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12))),
+                            generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)),
+                            encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
@@ -2134,7 +2140,10 @@ public static class BlobProtocolEndpoint
                     request.Account,
                     containerName,
                     blobName,
-                    ReadWriteOptions(http.Request, current),
+                    ReadWriteOptions(
+                        http.Request,
+                        current,
+                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
@@ -2151,7 +2160,10 @@ public static class BlobProtocolEndpoint
                     containerName,
                     blobName,
                     length,
-                    ReadWriteOptions(http.Request, current),
+                    ReadWriteOptions(
+                        http.Request,
+                        current,
+                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account)),
                     sequence,
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
@@ -3233,7 +3245,8 @@ public static class BlobProtocolEndpoint
         HttpRequest request,
         BlobRecord? fallback,
         bool useStandardProperties = true,
-        bool generateContentMd5 = false)
+        bool generateContentMd5 = false,
+        string? encryptionContext = null)
     {
         var (until, locked, legalHold) = ReadImmutabilityHeaders(request);
         ValidateRehydratePriorityVersion(request);
@@ -3253,7 +3266,27 @@ public static class BlobProtocolEndpoint
                 ? fallback?.AccessTierInferred
                 : false,
             generateContentMd5,
-            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
+            EncryptionContext: encryptionContext);
+    }
+
+    private static string? ReadEncryptionContext(
+        HttpRequest request,
+        BlobService service,
+        string account)
+    {
+        const string headerName = "x-ms-encryption-context";
+        if (!request.Headers.ContainsKey(headerName))
+            return null;
+
+        var value = ProtocolParsing.First(request.Headers, headerName) ?? string.Empty;
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2021, 8, 6),
+            "Blob encryption context");
+        if (!service.IsHierarchicalNamespaceEnabled(account) || value.Length > 1024)
+            throw AzureStorageException.InvalidHeader(headerName, value);
+        return NullIfEmpty(value);
     }
 
     private static string? ReadAccessTier(HttpRequest request, string? fallback)
