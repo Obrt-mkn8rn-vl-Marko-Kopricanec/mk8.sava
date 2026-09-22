@@ -49,7 +49,10 @@ public sealed record UserDelegationKey(
     string? SignedDelegatedUserTenantId,
     string Value);
 
-public sealed class StorageAuthenticator(IOptions<SavaOptions> options, MetadataStore metadata)
+public sealed class StorageAuthenticator(
+    IOptions<SavaOptions> options,
+    MetadataStore metadata,
+    ILogger<StorageAuthenticator> logger)
 {
     public const string BearerScheme = "StorageBearer";
 
@@ -100,6 +103,12 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
 
         if (!Guid.TryParse(request.Authorization.Identifier, out _) ||
             !Guid.TryParse(request.Authorization.TenantId, out _))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        if (keyRequest.DelegatedUserTenantId is not null &&
+            !SameTenant(keyRequest.DelegatedUserTenantId, request.Authorization.TenantId!) &&
+            !AllowsCrossTenantDelegationSas(request.Account))
         {
             throw AzureStorageException.AuthorizationFailure();
         }
@@ -333,6 +342,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         string stringToSign;
         var signedResource = string.Empty;
         var signingKey = encodedKey;
+        var isCrossTenantUserBoundSas = false;
         if (isAccountSas)
         {
             var services = query["ss"].ToString();
@@ -458,6 +468,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
                 var expectedBearerTenantId = string.IsNullOrEmpty(delegatedUserTenantId)
                     ? tenantId
                     : delegatedUserTenantId;
+                isCrossTenantUserBoundSas = !string.IsNullOrEmpty(delegatedUserTenantId) &&
+                                            !SameTenant(delegatedUserTenantId, tenantId);
                 if (signedVersion < new DateOnly(2025, 7, 5) ||
                     bearer is null ||
                     !string.Equals(bearer.Identifier, delegatedUserObjectId, StringComparison.Ordinal) ||
@@ -608,6 +620,11 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             throw AzureStorageException.AuthenticationFailed("Signature not valid in the specified time frame.");
         if (string.IsNullOrEmpty(permissions))
             throw AzureStorageException.AuthorizationFailure();
+        if (isCrossTenantUserBoundSas && !AllowsCrossTenantDelegationSas(request.Account))
+            throw AzureStorageException.AuthorizationFailure();
+        ApplyUserBoundSasPolicy(
+            request,
+            isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
 
         return new StorageAuthorization(
             StorageAuthorizationKind.Sas,
@@ -1041,6 +1058,35 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             throw AzureStorageException.KeyBasedAuthenticationNotPermitted();
         }
     }
+
+    private bool AllowsCrossTenantDelegationSas(string account) =>
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.AllowCrossTenantDelegationSas;
+
+    private void ApplyUserBoundSasPolicy(StorageRequestContext request, bool isUserBound)
+    {
+        if (isUserBound ||
+            !_options.AccountCapabilities.TryGetValue(request.Account, out var capabilities) ||
+            !capabilities.RequireUserBoundUserDelegationSas)
+        {
+            return;
+        }
+
+        if (capabilities.RequireUserBoundUserDelegationSasAction == SasPolicyViolationAction.Block)
+            throw AzureStorageException.AuthorizationFailure();
+        if (capabilities.RequireUserBoundUserDelegationSasAction == SasPolicyViolationAction.Log)
+        {
+            logger.LogWarning(
+                "SAS request {RequestId} for account {Account} is not bound to an end-user identity.",
+                request.RequestId,
+                request.Account);
+        }
+    }
+
+    private static bool SameTenant(string left, string right) =>
+        Guid.TryParse(left, out var leftTenant) &&
+        Guid.TryParse(right, out var rightTenant) &&
+        leftTenant == rightTenant;
 
     private static bool MatchesIpRange(IPAddress? address, string range)
     {

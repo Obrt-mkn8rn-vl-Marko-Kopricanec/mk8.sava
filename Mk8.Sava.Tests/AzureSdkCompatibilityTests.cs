@@ -6322,6 +6322,114 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UserBoundSasAccountPolicyLogsOrBlocksUnboundTokens()
+    {
+        await using (var logApplication = new SavaWebApplicationFactory(
+                         new Dictionary<string, string?>
+                         {
+                             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
+                                 "true"
+                         }))
+        {
+            var owner = CreateClient(logApplication);
+            var container = owner.GetBlobContainerClient($"user-bound-log-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blob = container.GetBlobClient("allowed.txt");
+            await blob.UploadAsync(BinaryData.FromString("log-only policy"));
+            var unboundServiceSas = CreateBlobClient(
+                logApplication,
+                HttpsSasUri(blob, BlobSasPermissions.Read));
+            Assert.Equal(
+                "log-only policy",
+                (await unboundServiceSas.DownloadContentAsync()).Value.Content.ToString());
+        }
+
+        await using var blockApplication = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
+                    "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSasAction"] =
+                    "Block"
+            });
+        var blockOwner = CreateClient(blockApplication);
+        var blockContainer = blockOwner.GetBlobContainerClient($"user-bound-block-{Guid.NewGuid():N}");
+        await blockContainer.CreateAsync();
+        var blockBlob = blockContainer.GetBlobClient("protected.txt");
+        await blockBlob.UploadAsync(BinaryData.FromString("bound policy payload"));
+
+        static void AssertAuthorizationFailure(RequestFailedException exception)
+        {
+            Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
+            Assert.Equal("AuthorizationFailure", exception.ErrorCode);
+        }
+
+        var serviceSas = CreateBlobClient(
+            blockApplication,
+            HttpsSasUri(blockBlob, BlobSasPermissions.Read));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => serviceSas.DownloadContentAsync()));
+
+        var delegatorToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var delegator = CreateBearerClient(blockApplication, delegatorToken);
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+        var unboundBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = blockContainer.Name,
+            BlobName = blockBlob.Name,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        unboundBuilder.SetPermissions(BlobSasPermissions.Read);
+        var unboundSas = CreateBlobClient(
+            blockApplication,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                $"{blockContainer.Name}/{blockBlob.Name}?" +
+                unboundBuilder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName)));
+        AssertAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => unboundSas.DownloadContentAsync()));
+
+        var delegatedUserObjectId = Guid.NewGuid().ToString();
+        var boundBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = blockContainer.Name,
+            BlobName = blockBlob.Name,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp,
+            DelegatedUserObjectId = delegatedUserObjectId
+        };
+        boundBuilder.SetPermissions(BlobSasPermissions.Read);
+        var boundSas = boundBuilder.ToSasQueryParameters(
+            key,
+            SavaWebApplicationFactory.AccountName);
+        var boundUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            $"{blockContainer.Name}/{blockBlob.Name}?{boundSas}");
+        var delegatedUserToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            delegatedUserObjectId,
+            SavaWebApplicationFactory.TenantId);
+        using var transport = new HttpClient(blockApplication.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Get, boundUri);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", delegatedUserToken);
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2025-07-05");
+        using var response = await transport.SendAsync(request);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("bound policy payload", await response.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task SasRejectsMissingRequiredFieldsAndNoncanonicalAuthorizationSets()
     {
         var owner = CreateClient(factory);
@@ -6902,7 +7010,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var httpUri = new UriBuilder(httpsUri) { Scheme = Uri.UriSchemeHttp, Port = -1 }.Uri;
         using var transport = new HttpClient(factory.Server.CreateHandler());
 
-        async Task<HttpResponseMessage> SendAsync(Uri uri, string version, string body)
+        async Task<HttpResponseMessage> SendAsync(
+            HttpClient client,
+            Uri uri,
+            string version,
+            string body)
         {
             using var request = new HttpRequestMessage(HttpMethod.Post, uri)
             {
@@ -6910,28 +7022,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            return await transport.SendAsync(request);
+            return await client.SendAsync(request);
         }
 
-        using (var oldVersion = await SendAsync(httpsUri, "2018-03-28", baseBody))
+        using (var oldVersion = await SendAsync(transport, httpsUri, "2018-03-28", baseBody))
         {
             Assert.Equal(HttpStatusCode.Conflict, oldVersion.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldVersion.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var insecure = await SendAsync(httpUri, "2025-07-05", baseBody))
+        using (var insecure = await SendAsync(transport, httpUri, "2025-07-05", baseBody))
         {
             Assert.Equal(HttpStatusCode.BadRequest, insecure.StatusCode);
             Assert.Equal("InvalidRequest", insecure.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var prematureDelegation = await SendAsync(httpsUri, "2023-11-03", delegatedBody))
+        using (var prematureDelegation = await SendAsync(
+                   transport,
+                   httpsUri,
+                   "2023-11-03",
+                   delegatedBody))
         {
             Assert.Equal(HttpStatusCode.Conflict, prematureDelegation.StatusCode);
             Assert.Equal("FeatureVersionMismatch", prematureDelegation.Headers.GetValues("x-ms-error-code").Single());
         }
 
         using (var unknownElement = await SendAsync(
+                   transport,
                    httpsUri,
                    "2025-07-05",
                    $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry><Unknown /></KeyInfo>"))
@@ -6941,6 +7058,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
 
         using (var duplicateElement = await SendAsync(
+                   transport,
                    httpsUri,
                    "2025-07-05",
                    $"<KeyInfo><Start>{startsAt}</Start><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry></KeyInfo>"))
@@ -6949,7 +7067,37 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("InvalidXmlDocument", duplicateElement.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var accepted = await SendAsync(httpsUri, "2025-07-05", delegatedBody))
+        using (var accepted = await SendAsync(transport, httpsUri, "2025-07-05", baseBody))
+        {
+            Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(await accepted.Content.ReadAsStringAsync());
+            Assert.Empty(document.Root!.Elements("SignedDelegatedUserTid"));
+        }
+
+        using (var deniedCrossTenant = await SendAsync(
+                   transport,
+                   httpsUri,
+                   "2025-07-05",
+                   delegatedBody))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, deniedCrossTenant.StatusCode);
+            Assert.Equal(
+                "AuthorizationFailure",
+                deniedCrossTenant.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        await using var crossTenantApplication = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowCrossTenantDelegationSas"] =
+                    "true"
+            });
+        using var crossTenantTransport = new HttpClient(crossTenantApplication.Server.CreateHandler());
+        using (var accepted = await SendAsync(
+                   crossTenantTransport,
+                   httpsUri,
+                   "2025-07-05",
+                   delegatedBody))
         {
             Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
             var document = System.Xml.Linq.XDocument.Parse(await accepted.Content.ReadAsStringAsync());
