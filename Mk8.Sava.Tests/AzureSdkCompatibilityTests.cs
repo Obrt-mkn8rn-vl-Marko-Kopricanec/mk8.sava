@@ -5513,6 +5513,275 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task DirectoryServiceAndUserDelegationSasAreBoundToAnHnsPrefix()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var owner = CreateClient(application);
+        var container = owner.GetBlobContainerClient($"directory-sas-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("signed/directory/child.txt").UploadAsync(BinaryData.FromString("child"));
+        await container.GetBlobClient("signed/directory/nested/leaf.txt").UploadAsync(BinaryData.FromString("leaf"));
+        await container.GetBlobClient("signed/sibling.txt").UploadAsync(BinaryData.FromString("sibling"));
+
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var serviceBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = "signed/directory",
+            Resource = "d",
+            IsDirectory = true,
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        serviceBuilder.SetPermissions(BlobContainerSasPermissions.Read);
+        var serviceSas = serviceBuilder.ToSasQueryParameters(credential);
+        Assert.Equal(2, serviceSas.DirectoryDepth);
+
+        BlobClient GetServiceSasBlob(string name) => CreateBlobClient(
+            application,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}" +
+                $"?{serviceSas}"));
+
+        var directoryProperties = await GetServiceSasBlob("signed/directory").GetPropertiesAsync();
+        Assert.Equal(
+            "directory",
+            directoryProperties.GetRawResponse().Headers.TryGetValue("x-ms-resource-type", out var resourceType)
+                ? resourceType
+                : null);
+        Assert.Equal(
+            "child",
+            (await GetServiceSasBlob("signed/directory/child.txt").DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal(
+            "leaf",
+            (await GetServiceSasBlob("signed/directory/nested/leaf.txt").DownloadContentAsync()).Value.Content.ToString());
+        var deniedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            GetServiceSasBlob("signed/sibling.txt").DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedSibling.Status);
+        var deniedParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            GetServiceSasBlob("signed").GetPropertiesAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedParent.Status);
+
+        var token = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var delegator = CreateBearerClient(application, token);
+        var key = await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
+        var delegatedBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = "signed/directory",
+            Resource = "d",
+            IsDirectory = true,
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp,
+            PreauthorizedAgentObjectId = Guid.NewGuid().ToString(),
+            CorrelationId = Guid.NewGuid().ToString()
+        };
+        delegatedBuilder.SetPermissions(BlobContainerSasPermissions.Read);
+        var delegatedSas = delegatedBuilder.ToSasQueryParameters(
+            key.Value,
+            SavaWebApplicationFactory.AccountName);
+
+        BlobClient GetDelegatedBlob(string name) => CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}" +
+                $"?{delegatedSas}"));
+
+        Assert.Equal(
+            "child",
+            (await GetDelegatedBlob("signed/directory/child.txt").DownloadContentAsync()).Value.Content.ToString());
+        var deniedDelegatedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            GetDelegatedBlob("signed/sibling.txt").DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedDelegatedSibling.Status);
+
+        var flatOwner = CreateClient(factory);
+        var flatContainer = flatOwner.GetBlobContainerClient($"flat-directory-sas-{Guid.NewGuid():N}");
+        await flatContainer.CreateAsync();
+        await flatContainer.GetBlobClient("signed/directory").UploadAsync(BinaryData.FromString("flat"));
+        var flatBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = flatContainer.Name,
+            BlobName = "signed/directory",
+            Resource = "d",
+            IsDirectory = true,
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        flatBuilder.SetPermissions(BlobContainerSasPermissions.Read);
+        var flatSas = flatBuilder.ToSasQueryParameters(credential);
+        var flatDirectory = CreateBlobClient(
+            factory,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{flatContainer.Name}/signed/directory" +
+                $"?{flatSas}"));
+        var deniedFlatDirectory = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            flatDirectory.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedFlatDirectory.Status);
+    }
+
+    [Fact]
+    public async Task ContainerSasReadsSnapshotsWithoutSigningTheSnapshotIdentifier()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"container-snapshot-sas-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("state.txt");
+        await blob.UploadAsync(BinaryData.FromString("snapshot state"));
+        var snapshot = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+        await blob.UploadAsync(BinaryData.FromString("current state"), overwrite: true);
+
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            Resource = "c",
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(BlobContainerSasPermissions.Read);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var sas = builder.ToSasQueryParameters(credential);
+        var snapshotClient = CreateBlobClient(
+            factory,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
+                $"?snapshot={Uri.EscapeDataString(snapshot)}&{sas}"));
+
+        Assert.Equal(
+            "snapshot state",
+            (await snapshotClient.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
+    public async Task SasEncryptionScopeMustBeSignedByASupportedVersion()
+    {
+        var owner = CreateClient(factory);
+        var container = owner.GetBlobContainerClient($"sas-scope-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+
+        const string signedBlobName = "signed-scope.txt";
+        const string signedScope = "signed-scope";
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = signedBlobName,
+            Resource = "b",
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp,
+            EncryptionScope = signedScope
+        };
+        builder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+        var sas = builder.ToSasQueryParameters(credential);
+        var signedBlobUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{signedBlobName}" +
+            $"?{sas}");
+        var signedBlob = CreateBlobClient(factory, signedBlobUri);
+        await signedBlob.UploadAsync(BinaryData.FromString("signed encryption scope"));
+        Assert.Equal(signedScope, (await container.GetBlobClient(signedBlobName).GetPropertiesAsync()).Value.EncryptionScope);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using (var wrongScope = new HttpRequestMessage(HttpMethod.Put, signedBlobUri)
+        {
+            Content = new StringContent("wrong scope")
+        })
+        {
+            wrongScope.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            wrongScope.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "wrong-scope");
+            using var response = await transport.SendAsync(wrongScope);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        const string legacyVersion = "2019-12-12";
+        const string legacyBlobName = "legacy-scope.txt";
+        const string permissions = "cw";
+        const string protocol = "https";
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1)
+            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
+            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var canonicalResource =
+            $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{legacyBlobName}";
+        var stringToSign = string.Join(
+            '\n',
+            permissions,
+            startsOn,
+            expiresOn,
+            canonicalResource,
+            string.Empty,
+            string.Empty,
+            protocol,
+            legacyVersion,
+            "b",
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty);
+        using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
+        var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
+        var legacyBlobUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{legacyBlobName}" +
+            $"?sp={permissions}" +
+            $"&st={Uri.EscapeDataString(startsOn)}" +
+            $"&se={Uri.EscapeDataString(expiresOn)}" +
+            $"&spr={protocol}" +
+            $"&sv={legacyVersion}" +
+            "&sr=b" +
+            $"&sig={Uri.EscapeDataString(signature)}");
+
+        using (var validLegacy = new HttpRequestMessage(HttpMethod.Put, legacyBlobUri)
+        {
+            Content = new StringContent("legacy signature is valid")
+        })
+        {
+            validLegacy.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(validLegacy);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+        using (var unsignedScope = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(legacyBlobUri, "ses=unsigned-scope"))
+        {
+            Content = new StringContent("must not replace")
+        })
+        {
+            unsignedScope.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(unsignedScope);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var legacyProperties = await container.GetBlobClient(legacyBlobName).GetPropertiesAsync();
+        Assert.Null(legacyProperties.Value.EncryptionScope);
+        Assert.Equal(
+            "legacy signature is valid",
+            (await container.GetBlobClient(legacyBlobName).DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task ContainerOwnerOperationsRequireAccountSasAndReportScopeMismatches()
     {
         var service = CreateClient(factory);

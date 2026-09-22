@@ -73,6 +73,28 @@ binary-cache, install, and build roots. Each harness starts a real loopback
 mk8.sava process with a disposable storage root rather than routing the client
 through ASP.NET's in-memory test server.
 
+## SAS authorization boundaries
+
+Service, account, and user-delegation SAS tokens use Azure's versioned
+strings-to-sign and fail closed when a field is not available in the token's
+signed service version. An HNS account can issue a directory SAS (`sr=d`) from
+version `2020-02-10`; its required directory depth binds the token to the exact
+signed virtual directory and its descendants. Parent and sibling paths do not
+share that authorization, and flat-namespace accounts reject directory SAS.
+
+A container SAS continues to cover snapshots and versions in the container
+without signing their individual identifiers. Snapshot (`sr=bs`) and version
+(`sr=bv`) tokens instead bind those identifiers explicitly; version SAS begins
+with service version `2019-12-12`. A signed encryption scope (`ses`) is honored
+only from version `2020-12-06`, is applied when the caller omits the matching
+header, and rejects a conflicting `x-ms-encryption-scope` header. Adding `ses`
+to an older token cannot inject an unsigned storage policy.
+
+User-delegation `saoid` and `scid` fields are signature-validated from version
+`2020-02-10`; `saoid` is restricted to HNS accounts as it is in Azure. The
+`suoid` form remains fail-closed because it requires a POSIX ACL authorization
+decision. It must not be enabled by trusting the signed object identifier alone.
+
 Rename Container implements Azure's `PUT ?restype=container&comp=rename`
 contract from service version `2020-06-12`, including the source-container and
 source-lease headers. The metadata store moves the container, every blob
