@@ -143,6 +143,11 @@ public sealed class AzureStorageException : Exception
         "RequestForbiddenByContainerEncryptionPolicy",
         "The request is forbidden by the container encryption policy.");
 
+    public static AzureStorageException BlobUsesCustomerSpecifiedEncryption() => new(
+        (int)HttpStatusCode.Conflict,
+        "BlobUsesCustomerSpecifiedEncryption",
+        "The blob uses customer-specified encryption settings that do not match this request.");
+
     public static AzureStorageException InfiniteLeaseDurationRequired() => new(
         (int)HttpStatusCode.PreconditionFailed,
         "InfiniteLeaseDurationRequired",

@@ -1079,7 +1079,12 @@ public static class BlobProtocolEndpoint
             EvaluateWriteConditions(http.Request, current);
             EvaluatePageSequenceConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
-            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, current, write: true);
+            var suppliedEncryption = await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                current,
+                write: true,
+                cancellationToken);
             var encryption = new BlobEncryption(
                 current.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -1180,7 +1185,12 @@ public static class BlobProtocolEndpoint
             {
                 EvaluatePageSequenceConditions(http.Request, current);
                 EnsureLease(http.Request, current.Lease, "blob");
-                EnsureCustomerProvidedKey(http.Request, current, write: true);
+                await EnsureBlobEncryptionAsync(
+                    http.Request,
+                    service,
+                    current,
+                    write: true,
+                    cancellationToken);
             }
             EnsureNoPendingCopyDestination(current);
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
@@ -1358,7 +1368,12 @@ public static class BlobProtocolEndpoint
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
-            var encryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
+            var encryption = await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: false,
+                cancellationToken);
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             await WriteBlobAsync(http, service, blob, encryption, cancellationToken);
@@ -1369,7 +1384,12 @@ public static class BlobProtocolEndpoint
             comp == "metadata")
         {
             await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
-            EnsureCustomerProvidedKey(http.Request, blob, write: false);
+            await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: false,
+                cancellationToken);
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             AzureResponseWriter.AddBlobMetadataHeaders(http.Response, blob);
@@ -1392,7 +1412,12 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             EnsureMutableVersion(blob);
             RequireZeroContentLength(http.Request);
-            EnsureCustomerProvidedKey(http.Request, blob, write: true);
+            await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: true,
+                cancellationToken);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
             var updated = await service.SetBlobMetadataAsync(blob, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
@@ -1425,7 +1450,12 @@ public static class BlobProtocolEndpoint
             Require(request, 'w');
             EnsureMutableVersion(blob);
             RequireZeroContentLength(http.Request);
-            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: true);
+            var suppliedEncryption = await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: true,
+                cancellationToken);
             var contentEncryption = new BlobEncryption(
                 blob.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -1456,7 +1486,12 @@ public static class BlobProtocolEndpoint
             RequireAny(request, 'c', 'w');
             RequireZeroContentLength(http.Request);
             EnsureMutableVersion(blob);
-            EnsureCustomerProvidedKey(http.Request, blob, write: true);
+            await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: true,
+                cancellationToken);
             EvaluateWriteConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             var hasSnapshotMetadata = http.Request.Headers.Keys.Any(name =>
@@ -1545,7 +1580,12 @@ public static class BlobProtocolEndpoint
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
-            var suppliedEncryption = EnsureCustomerProvidedKey(http.Request, blob, write: false);
+            var suppliedEncryption = await EnsureBlobEncryptionAsync(
+                http.Request,
+                service,
+                blob,
+                write: false,
+                cancellationToken);
             var encryption = new BlobEncryption(
                 blob.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -3812,22 +3852,48 @@ public static class BlobProtocolEndpoint
         return (scope, preventOverride);
     }
 
-    private static BlobEncryption EnsureCustomerProvidedKey(HttpRequest request, BlobRecord blob, bool write)
+    private static async Task<BlobEncryption> EnsureBlobEncryptionAsync(
+        HttpRequest request,
+        BlobService service,
+        BlobRecord blob,
+        bool write,
+        CancellationToken cancellationToken)
     {
         var supplied = ReadRequestEncryption(request, write);
-        if (string.Equals(
-                supplied.CustomerProvidedKeySha256,
-                blob.CustomerProvidedKeySha256,
-                StringComparison.Ordinal))
+        var keyMatches = string.Equals(
+            supplied.CustomerProvidedKeySha256,
+            blob.CustomerProvidedKeySha256,
+            StringComparison.Ordinal);
+        var scopeMatches = !write || string.Equals(supplied.Scope, blob.EncryptionScope, StringComparison.Ordinal);
+        if (write && !scopeMatches)
+        {
+            var container = await service.GetContainerAsync(
+                blob.Account,
+                blob.Container,
+                includeDeleted: false,
+                cancellationToken);
+            if (container.PreventEncryptionScopeOverride &&
+                supplied.Scope is not null &&
+                !string.Equals(supplied.Scope, container.DefaultEncryptionScope, StringComparison.Ordinal))
+            {
+                if (supplied.CustomerProvidedKey is not null)
+                    CryptographicOperations.ZeroMemory(supplied.CustomerProvidedKey);
+                throw AzureStorageException.RequestForbiddenByContainerEncryptionPolicy();
+            }
+            if (supplied.Scope is null &&
+                string.Equals(blob.EncryptionScope, container.DefaultEncryptionScope, StringComparison.Ordinal))
+            {
+                supplied = supplied with { Scope = blob.EncryptionScope };
+                scopeMatches = true;
+            }
+        }
+        if (keyMatches && scopeMatches)
         {
             return supplied;
         }
         if (supplied.CustomerProvidedKey is not null)
             CryptographicOperations.ZeroMemory(supplied.CustomerProvidedKey);
-        throw new AzureStorageException(
-            StatusCodes.Status409Conflict,
-            "CustomerProvidedKeyInUse",
-            "The blob is encrypted with a customer-provided key that does not match this request.");
+        throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
     }
 
     private static BlobEncryption EncryptionOf(BlobRecord blob) =>

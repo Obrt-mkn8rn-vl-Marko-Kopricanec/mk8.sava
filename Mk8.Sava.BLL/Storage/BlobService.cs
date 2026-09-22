@@ -507,7 +507,7 @@ public sealed class BlobService(
         if (current is not null && current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current is not null && !chunks.IsInDomain(account, encryption, current.Content))
-            throw CustomerProvidedKeyMismatch();
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
         if (staged.Count >= BlobServiceLimits.MaximumUncommittedBlockCount &&
             staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
@@ -517,7 +517,7 @@ public sealed class BlobService(
         if (existingId is not null && ValidateBlockId(existingId) != blockIdLength)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlobOrBlock", "All block IDs for a blob must have the same length.");
         if (staged.Any(item => !chunks.IsInDomain(account, encryption, item.Content)))
-            throw CustomerProvidedKeyMismatch();
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
         await metadata.PutStagedBlockAsync(new StagedBlockRecord
         {
@@ -562,11 +562,16 @@ public sealed class BlobService(
         if (blockList.Count > BlobServiceLimits.MaximumCommittedBlockCount)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(
+            account,
+            container,
+            options,
+            cancellationToken,
+            current);
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
         var encryption = EncryptionOf(options);
         var stagedById = staged.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
-        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
         var committedById = current?.CommittedBlocks
             .GroupBy(item => item.Id, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal)
@@ -594,7 +599,7 @@ public sealed class BlobService(
             if (resolved is null)
                 throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlockList", "The specified block list is invalid.");
             if (!chunks.IsInDomain(account, encryption, resolved))
-                throw CustomerProvidedKeyMismatch();
+                throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
             selected.Add(new CommittedBlockRecord(blockId, resolved));
         }
 
@@ -637,7 +642,7 @@ public sealed class BlobService(
             throw new AzureStorageException(StatusCodes.Status412PreconditionFailed, "AppendPositionConditionNotMet", "The append position condition specified was not met.");
 
         if (!chunks.IsInDomain(current.Account, encryption, current.Content))
-            throw CustomerProvidedKeyMismatch();
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
         using var appended = await chunks.StorePinnedAsync(current.Account, encryption, source, cancellationToken);
         if (appended.Manifest.Length > 100L * 1024 * 1024)
             throw new AzureStorageException(StatusCodes.Status413PayloadTooLarge, "RequestBodyTooLarge", "An append block cannot exceed 100 MiB.");
@@ -685,7 +690,7 @@ public sealed class BlobService(
         if (!clear && end - start + 1 > 4L * 1024 * 1024)
             throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
         if (!chunks.IsInDomain(current.Account, encryption, current.Content))
-            throw CustomerProvidedKeyMismatch();
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
 
         StoredContent content;
         try
@@ -740,7 +745,7 @@ public sealed class BlobService(
         if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
             throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
         if (!chunks.IsInDomain(current.Account, encryption, current.Content))
-            throw CustomerProvidedKeyMismatch();
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
 
         var changed = new List<PageRange>();
         var cleared = new List<PageRange>();
@@ -2681,9 +2686,6 @@ public sealed class BlobService(
             throw AzureStorageException.RequestForbiddenByContainerEncryptionPolicy();
         }
 
-        if (requested.CustomerProvidedKeySha256 is not null)
-            return requested;
-
         if (current is not null)
         {
             if (container.PreventEncryptionScopeOverride &&
@@ -2693,10 +2695,26 @@ public sealed class BlobService(
                 throw AzureStorageException.RequestForbiddenByContainerEncryptionPolicy();
             }
 
-            return requested.Scope is null
-                ? requested with { Scope = current.EncryptionScope ?? container.DefaultEncryptionScope }
-                : requested;
+            if (requested.Scope is null &&
+                requested.CustomerProvidedKeySha256 is null &&
+                current.CustomerProvidedKeySha256 is null &&
+                string.Equals(current.EncryptionScope, container.DefaultEncryptionScope, StringComparison.Ordinal))
+            {
+                requested = requested with { Scope = current.EncryptionScope };
+            }
+            if (!string.Equals(requested.Scope, current.EncryptionScope, StringComparison.Ordinal) ||
+                !string.Equals(
+                    requested.CustomerProvidedKeySha256,
+                    current.CustomerProvidedKeySha256,
+                    StringComparison.Ordinal))
+            {
+                throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
+            }
+            return requested;
         }
+
+        if (requested.CustomerProvidedKeySha256 is not null)
+            return requested;
 
         return requested.Scope is null && container.DefaultEncryptionScope is not null
             ? requested with { Scope = container.DefaultEncryptionScope }
@@ -2708,11 +2726,6 @@ public sealed class BlobService(
 
     private static BlobEncryption EncryptionOf(BlobRecord blob) =>
         new(blob.EncryptionScope, blob.CustomerProvidedKeySha256);
-
-    private static AzureStorageException CustomerProvidedKeyMismatch() => new(
-        StatusCodes.Status409Conflict,
-        "CustomerProvidedKeyInUse",
-        "The blob is encrypted with a customer-provided key that does not match this request.");
 
     private static AzureStorageException UnsupportedEncryptionTransition() => new(
         StatusCodes.Status409Conflict,

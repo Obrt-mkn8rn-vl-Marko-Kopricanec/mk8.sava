@@ -5022,12 +5022,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var missingKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
             normalService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").GetPropertiesAsync());
         Assert.Equal(409, missingKey.Status);
-        Assert.Equal("CustomerProvidedKeyInUse", missingKey.ErrorCode);
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingKey.ErrorCode);
         var wrongKeyService = CreateEncryptedClient(factory, new CustomerProvidedKey(wrongKey), encryptionScope: null);
         var mismatchedKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
             wrongKeyService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").DownloadContentAsync());
         Assert.Equal(409, mismatchedKey.Status);
-        Assert.Equal("CustomerProvidedKeyInUse", mismatchedKey.ErrorCode);
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", mismatchedKey.ErrorCode);
 
         const string scope = "records-scope";
         var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, scope);
@@ -5037,6 +5037,48 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var scopedProperties = (await scopedBlob.GetPropertiesAsync()).Value;
         Assert.Equal(scope, scopedProperties.EncryptionScope);
         Assert.Equal(content, (await normalService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin").DownloadContentAsync()).Value.Content.ToArray());
+        var missingScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            normalService.GetBlobContainerClient(containerName)
+                .GetBlobClient("scoped.bin")
+                .SetMetadataAsync(new Dictionary<string, string> { ["scope"] = "missing" }));
+        Assert.Equal(StatusCodes.Status409Conflict, missingScope.Status);
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingScope.ErrorCode);
+        var wrongScopeService = CreateEncryptedClient(factory, customerProvidedKey: null, "wrong-scope");
+        var wrongScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            wrongScopeService.GetBlobContainerClient(containerName)
+                .GetBlobClient("scoped.bin")
+                .SetMetadataAsync(new Dictionary<string, string> { ["scope"] = "wrong" }));
+        Assert.Equal(StatusCodes.Status409Conflict, wrongScope.Status);
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", wrongScope.ErrorCode);
+        await scopedBlob.SetMetadataAsync(new Dictionary<string, string> { ["scope"] = "matched" });
+
+        var scopedAppend = scopedService.GetBlobContainerClient(containerName).GetAppendBlobClient("scoped-append.bin");
+        await scopedAppend.CreateAsync();
+        var missingAppendScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            normalService.GetBlobContainerClient(containerName)
+                .GetAppendBlobClient(scopedAppend.Name)
+                .AppendBlockAsync(BinaryData.FromString("must fail").ToStream()));
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingAppendScope.ErrorCode);
+        await scopedAppend.AppendBlockAsync(BinaryData.FromString("matched append").ToStream());
+
+        var scopedPage = scopedService.GetBlobContainerClient(containerName).GetPageBlobClient("scoped-page.bin");
+        await scopedPage.CreateAsync(512);
+        var missingPageScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            normalService.GetBlobContainerClient(containerName)
+                .GetPageBlobClient(scopedPage.Name)
+                .UploadPagesAsync(new MemoryStream(new byte[512]), 0));
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingPageScope.ErrorCode);
+        await scopedPage.UploadPagesAsync(new MemoryStream(new byte[512]), 0);
+
+        var scopedBlock = scopedService.GetBlobContainerClient(containerName).GetBlockBlobClient("scoped-block.bin");
+        await scopedBlock.UploadAsync(BinaryData.FromString("initial block").ToStream());
+        var missingBlockScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            normalService.GetBlobContainerClient(containerName)
+                .GetBlockBlobClient(scopedBlock.Name)
+                .StageBlockAsync(
+                    Convert.ToBase64String("scope-block"u8),
+                    BinaryData.FromString("must fail").ToStream()));
+        Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingBlockScope.ErrorCode);
 
         var listed = new List<BlobItem>();
         await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(
@@ -5084,6 +5126,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var defaultBlob = container.GetBlobClient("default.bin");
         await defaultBlob.UploadAsync(BinaryData.FromString("default encryption scope"));
         Assert.Equal(defaultScope, (await defaultBlob.GetPropertiesAsync()).Value.EncryptionScope);
+        await defaultBlob.SetMetadataAsync(new Dictionary<string, string> { ["scope"] = "container-default" });
+        var defaultSnapshot = await defaultBlob.CreateSnapshotAsync();
+        Assert.Equal(
+            defaultScope,
+            (await defaultBlob.WithSnapshot(defaultSnapshot.Value.Snapshot).GetPropertiesAsync()).Value.EncryptionScope);
         var tierChange = await Assert.ThrowsAsync<RequestFailedException>(() =>
             defaultBlob.SetAccessTierAsync(AccessTier.Cool));
         Assert.Equal(StatusCodes.Status409Conflict, tierChange.Status);
