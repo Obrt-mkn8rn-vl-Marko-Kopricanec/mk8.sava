@@ -66,6 +66,12 @@ public sealed class RequestContextMiddleware(
 
         var parsed = await ParseAsync(context);
         StorageRequestContext.Set(context, parsed.Context);
+        if (!context.Request.IsHttps &&
+            _options.AccountCapabilities.TryGetValue(parsed.Context.Account, out var capabilities) &&
+            capabilities.EnableHttpsTrafficOnly)
+        {
+            throw AzureStorageException.AccountRequiresHttps();
+        }
         BlobProtocolEndpoint.ValidateBlobVersionRequest(parsed.Context);
         var isCorsPreflight = parsed.Context.ResourceKind != StorageResourceKind.StaticWebsite &&
                               HttpMethods.IsOptions(context.Request.Method);

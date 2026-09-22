@@ -5813,6 +5813,62 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HttpsOnlyAccountRejectsInsecureBlobRequestsBeforeAuthorization()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:EnableHttpsTrafficOnly"] = "true"
+            });
+        var secureService = CreateEncryptedClient(application, null, null);
+        var container = secureService.GetBlobContainerClient($"https-only-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var secureBlob = container.GetBlobClient("content.txt");
+        await secureBlob.UploadAsync(BinaryData.FromString("secure content"));
+        Assert.Equal("secure content", (await secureBlob.DownloadContentAsync()).Value.Content.ToString());
+
+        var insecureBlob = CreateClient(application)
+            .GetBlobContainerClient(container.Name)
+            .GetBlobClient(secureBlob.Name);
+        var sdkError = await Assert.ThrowsAsync<RequestFailedException>(() => insecureBlob.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status400BadRequest, sdkError.Status);
+        Assert.Equal("AccountRequiresHttps", sdkError.ErrorCode);
+
+        using var rawClient = new HttpClient(application.Server.CreateHandler());
+        foreach (var request in new[]
+        {
+            new HttpRequestMessage(HttpMethod.Get,
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{secureBlob.Name}"),
+            new HttpRequestMessage(HttpMethod.Options,
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}?restype=container"),
+            new HttpRequestMessage(HttpMethod.Get,
+                $"http://{SavaWebApplicationFactory.AccountName}.z1.web.localhost/{secureBlob.Name}"),
+            new HttpRequestMessage(HttpMethod.Get,
+                $"http://localhost/{SavaWebApplicationFactory.AccountName}/{container.Name}/{secureBlob.Name}")
+        })
+        {
+            using (request)
+            {
+                request.Headers.TryAddWithoutValidation("x-forwarded-proto", "https");
+                using var response = await rawClient.SendAsync(request);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("AccountRequiresHttps", response.Headers.GetValues("x-ms-error-code").Single());
+                Assert.Contains("The account being accessed does not support http.",
+                    await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+            }
+        }
+
+        var otherAccount = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        await otherAccount.GetBlobContainerClient($"http-allowed-{Guid.NewGuid():N}").CreateAsync();
+
+        using var health = await rawClient.GetAsync("http://localhost/health/live");
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+    }
+
+    [Fact]
     public async Task DirectoryServiceAndUserDelegationSasAreBoundToAnHnsPrefix()
     {
         await using var application = new SavaWebApplicationFactory(

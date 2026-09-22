@@ -241,6 +241,15 @@ to work. An unset Blob setting preserves the account-wide default. The
 account-wide `AllowSharedKeyAccess=false` still denies key-based Blob access even
 when the Blob-specific setting is `true`.
 
+`EnableHttpsTrafficOnly=true` mirrors Azure's storage-account secure-transfer
+setting for Blob requests. Every HTTP request to that account, including
+anonymous reads, CORS preflights, and static-website requests, receives
+`400 AccountRequiresHttps` before authentication; HTTPS requests continue
+normally. This setting is opt-in here so local HTTP SDK endpoints remain usable,
+although newly created Azure accounts enable secure transfer by default. If TLS
+terminates at a proxy, that proxy must forward requests to mk8.sava over HTTPS;
+untrusted `X-Forwarded-Proto` headers do not satisfy the policy.
+
 Cross-tenant user-bound user-delegation SAS is denied by default. Set
 `AllowCrossTenantDelegationSas` on the account only when the delegated user's
 tenant is intentionally different from the delegation-key tenant. The setting
