@@ -73,6 +73,14 @@ binary-cache, install, and build roots. Each harness starts a real loopback
 mk8.sava process with a disposable storage root rather than routing the client
 through ASP.NET's in-memory test server.
 
+Rename Container implements Azure's `PUT ?restype=container&comp=rename`
+contract from service version `2020-06-12`, including the source-container and
+source-lease headers. The metadata store moves the container, every blob
+generation, uncommitted blocks, and their reachability references in one SQLite
+transaction. Blob bytes and content-addressed chunks are never read or copied;
+the operation preserves logical and physical storage totals even for a large
+container.
+
 Query Blob Contents accepts Azure's `delimited`/`csv`, JSON, and Parquet input
 forms and its delimited/CSV, JSON, and Arrow result forms. Parquet input is read
 through authenticated seeks over the deduplicated chunk store and retains at

@@ -455,6 +455,26 @@ public static class BlobProtocolEndpoint
             return;
         }
 
+        if (comp == "rename" && HttpMethods.IsPut(http.Request.Method))
+        {
+            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Rename Container");
+            RequireAccountSasForContainerOperation(request);
+            Require(request, 'w');
+            RequireZeroContentLength(http.Request);
+            var sourceName = ProtocolParsing.First(http.Request.Headers, "x-ms-source-container-name")
+                             ?? throw AzureStorageException.MissingHeader("x-ms-source-container-name");
+            http.RequestServices.GetRequiredService<StorageAuthenticator>()
+                .EnsureContainerPermission(request, sourceName, 'w');
+            _ = await service.RenameContainerAsync(
+                request.Account,
+                sourceName,
+                containerName,
+                ProtocolParsing.First(http.Request.Headers, "x-ms-source-lease-id"),
+                cancellationToken);
+            http.Response.ContentLength = 0;
+            return;
+        }
+
         var container = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken);
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&

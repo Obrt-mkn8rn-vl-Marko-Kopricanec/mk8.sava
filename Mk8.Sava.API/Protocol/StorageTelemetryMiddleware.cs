@@ -177,6 +177,7 @@ public sealed class StorageTelemetryMiddleware(
         ("PUT", "acl") => "SetContainerACL",
         ("PUT", "lease") => ResolveLeaseOperation(http, "Container"),
         ("PUT", "undelete") => "RestoreContainer",
+        ("PUT", "rename") => "RenameContainer",
         ("GET", "blobs") => "FindBlobsByTags",
         ("POST", "batch") => "BlobBatch",
         _ => "Unknown"

@@ -29,7 +29,8 @@ public sealed record StorageAuthorization(
     string? ApplicationId = null,
     string? Audience = null,
     string? Issuer = null,
-    string? UserPrincipalName = null)
+    string? UserPrincipalName = null,
+    string AccountWidePermissions = "")
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
@@ -134,6 +135,38 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             key);
     }
 
+    internal void EnsureContainerPermission(
+        StorageRequestContext request,
+        string container,
+        char permission)
+    {
+        var authorization = request.Authorization;
+        if (authorization.Kind == StorageAuthorizationKind.SharedKey)
+            return;
+        if (authorization.Kind == StorageAuthorizationKind.Sas)
+        {
+            if (authorization.IsAccountSas && authorization.Allows(permission))
+                return;
+            throw AzureStorageException.AuthorizationPermissionMismatch();
+        }
+        if (authorization.Kind == StorageAuthorizationKind.Bearer)
+        {
+            if (authorization.AccountWidePermissions.Contains(permission, StringComparison.Ordinal))
+                return;
+            if (authorization.Identifier is not null &&
+                _options.BearerAuthentication.Principals.TryGetValue(authorization.Identifier, out var access) &&
+                Covers(access.Accounts, request.Account) &&
+                Covers(access.Containers, container) &&
+                access.Permissions.Contains(permission, StringComparison.Ordinal))
+            {
+                return;
+            }
+            throw AzureStorageException.AuthorizationPermissionMismatch();
+        }
+
+        throw AzureStorageException.AuthenticationFailed();
+    }
+
     private async Task<StorageAuthorization> AuthenticateBearerAsync(
         HttpContext context,
         StorageRequestContext request)
@@ -163,10 +196,14 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             mappedAccessApplies = true;
         }
 
+        var accountWide = new HashSet<char>();
         foreach (var role in principal.FindAll("roles").Select(claim => claim.Value))
         {
             if (configuration.RolePermissions.TryGetValue(role, out var rolePermissions))
+            {
                 granted.UnionWith(rolePermissions);
+                accountWide.UnionWith(rolePermissions);
+            }
         }
 
         if (granted.Count == 0)
@@ -181,7 +218,8 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
             ApplicationId: principal.FindFirst("appid")?.Value ?? principal.FindFirst("azp")?.Value,
             Audience: principal.FindFirst("aud")?.Value,
             Issuer: principal.FindFirst("iss")?.Value,
-            UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value);
+            UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value,
+            AccountWidePermissions: new string("racwdxytlfmeiopk".Where(accountWide.Contains).ToArray()));
     }
 
     private StorageAuthorization AuthenticateSharedKey(

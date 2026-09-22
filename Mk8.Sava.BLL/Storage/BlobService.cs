@@ -265,6 +265,56 @@ public sealed class BlobService(
         return restored;
     }
 
+    public async Task<ContainerRecord> RenameContainerAsync(
+        string account,
+        string sourceName,
+        string destinationName,
+        string? sourceLeaseId,
+        CancellationToken cancellationToken)
+    {
+        ValidateContainerName(sourceName);
+        ValidateContainerName(destinationName);
+        var current = await GetContainerAsync(account, sourceName, includeDeleted: false, cancellationToken);
+        if (current.Name == StorageAnalyticsService.LogsContainerName)
+            throw AzureStorageException.ContainerNotFound();
+        EnsureContainerMutable(current);
+        leases.EnsureWriteAccess(
+            current.Lease,
+            sourceLeaseId,
+            "container",
+            "x-ms-source-lease-id");
+
+        var renamed = current with
+        {
+            Name = destinationName,
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = metadata.GetUtcNow()
+        };
+        if (!await metadata.TryRenameContainerAsync(
+                sourceName,
+                renamed,
+                current.Revision,
+                cancellationToken))
+        {
+            var existing = await metadata.GetContainerAsync(
+                account,
+                destinationName,
+                includeDeleted: true,
+                cancellationToken);
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                existing?.DeletedAt is null ? "ContainerAlreadyExists" : "ContainerBeingDeleted",
+                existing?.DeletedAt is null
+                    ? "The specified container already exists."
+                    : "The specified container is being deleted.");
+        }
+
+        _indexedHierarchicalContainers.TryRemove(new ContainerKey(account, sourceName), out _);
+        _indexedHierarchicalContainers.TryRemove(new ContainerKey(account, destinationName), out _);
+        return renamed;
+    }
+
     public async Task<ContainerRecord> SetContainerLeaseAsync(
         ContainerRecord current,
         LeaseRecord lease,
