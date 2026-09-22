@@ -22,7 +22,8 @@ public sealed class StorageMaintenanceService(
                 var result = await blobs.RunMaintenanceAsync(stoppingToken);
                 if (result is not
                     {
-                        CompletedCopies: 0, CompletedRehydrations: 0, CompletedSmartTierTransitions: 0,
+                        CompletedCopies: 0, CompletedObjectReplications: 0, FailedObjectReplications: 0,
+                        RemovedObjectReplicas: 0, CompletedRehydrations: 0, CompletedSmartTierTransitions: 0,
                         ExpiredBlobs: 0,
                         PurgedSoftDeletedBlobs: 0, PurgedSoftDeletedContainers: 0,
                         ExpiredUncommittedBlocks: 0, ReclaimedChunks: 0, ReclaimedStagingFiles: 0,
@@ -30,7 +31,9 @@ public sealed class StorageMaintenanceService(
                     })
                 {
                     logger.LogInformation(
-                        "Storage maintenance completed: {CompletedCopies} copies, {CompletedRehydrations} rehydrations, " +
+                        "Storage maintenance completed: {CompletedCopies} copies, {CompletedReplications} object replications, " +
+                        "{FailedReplications} failed object replications, {RemovedReplicas} removed replicas, " +
+                        "{CompletedRehydrations} rehydrations, " +
                         "{SmartTierTransitions} smart-tier transitions, " +
                         "{ExpiredBlobs} expired blobs, {PurgedBlobs} purged blobs, {PurgedContainers} purged containers, " +
                         "{ExpiredBlocks} expired blocks, {ReclaimedChunks} reclaimed chunks, and " +
@@ -38,6 +41,9 @@ public sealed class StorageMaintenanceService(
                         "saving {RecompressionBytesSaved} bytes; {CompactedPacks} chunk packs compacted, " +
                         "saving {PackCompactionBytesSaved} bytes.",
                         result.CompletedCopies,
+                        result.CompletedObjectReplications,
+                        result.FailedObjectReplications,
+                        result.RemovedObjectReplicas,
                         result.CompletedRehydrations,
                         result.CompletedSmartTierTransitions,
                         result.ExpiredBlobs,

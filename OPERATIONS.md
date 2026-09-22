@@ -196,6 +196,69 @@ container is empty. Version-level immutable storage requires
 `VersioningEnabled` and cannot be combined with hierarchical namespace or
 last-access-time tracking; invalid combinations fail configuration validation.
 
+Object replication is supplied as durable deployment configuration, mirroring
+Azure's separation between its management plane and Blob data plane. A source
+account requires both `VersioningEnabled` and `ChangeFeedEnabled`; the
+destination requires `VersioningEnabled`. Neither account may use hierarchical
+namespace. Both containers must be created through the Blob API before eligible
+objects can replicate:
+
+```json
+{
+  "Sava": {
+    "AccountCapabilities": {
+      "sourceaccount": {
+        "VersioningEnabled": true,
+        "ChangeFeedEnabled": true
+      },
+      "destinationaccount": {
+        "VersioningEnabled": true
+      }
+    },
+    "ObjectReplicationPolicies": [
+      {
+        "PolicyId": "70dc1326-15a2-45f4-9408-487f6581f204",
+        "SourceAccount": "sourceaccount",
+        "DestinationAccount": "destinationaccount",
+        "EnabledAt": "2026-09-22T00:00:00Z",
+        "Rules": [
+          {
+            "RuleId": "a2455a77-8f44-4d22-b07e-a03203ae64f0",
+            "SourceContainer": "incoming",
+            "DestinationContainer": "replica",
+            "PrefixMatch": [ "documents/", "media/" ],
+            "MinimumCreationTime": "2026-09-01T00:00:00Z",
+            "ReplicateBlobTags": true
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Policy and rule IDs are GUIDs. Each account pair has at most one policy, each
+policy has at most 1,000 rules, and a rule has at most 10 nonempty prefix
+filters. `EnabledAt` records when the management-plane policy became active and
+is the default creation-time boundary; `MinimumCreationTime` deliberately
+overrides that boundary when a rule should include older blobs.
+
+Maintenance asynchronously copies only block blobs and preserves bytes,
+versions, HTTP properties, application metadata, and optionally index tags.
+Snapshots are not copied. Archive or rehydrating sources and blobs encrypted
+with a customer-provided key are reported as failed, as Azure does. The source
+projects `x-ms-or-{policy-id}_{rule-id}` and List Blobs `OrMetadata`; the
+destination projects `x-ms-or-policy-id`. Replication progress and the exact
+source-to-destination generation mapping are committed atomically in SQLite, so
+restart and retry cannot manufacture duplicate versions.
+
+An active destination rule rejects Blob writes with
+`BlobOperationNotSupported`. Reads, Set Blob Tier, and Delete Blob remain
+available. Deleting a destination copy does not cause unchanged source data to
+reappear; a later source change may create a new copy. Removing or remapping a
+configured policy forgets its execution ledger without deleting copies already
+delivered by that policy.
+
 HNS accounts support the Blob REST encryption-context system property. Put Blob
 and Put Block List accept `x-ms-encryption-context` from service version
 2021-08-06, reject values longer than 1,024 characters, and clear the property

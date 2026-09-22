@@ -451,6 +451,19 @@ public sealed partial class AzureResponseWriter
                     WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
                 if (includes.Contains("tags") && blob.Tags.Count > 0)
                     WriteTags(writer, blob.Tags);
+                if (blob.Kind == Storage.BlobKind.BlockBlob &&
+                    blob.ObjectReplicationStatuses.Count > 0 &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+                {
+                    writer.WriteStartElement("OrMetadata");
+                    foreach (var status in blob.ObjectReplicationStatuses.OrderBy(
+                                 pair => pair.Key,
+                                 StringComparer.Ordinal))
+                    {
+                        writer.WriteElementString($"or-{status.Key}", status.Value.Status);
+                    }
+                    writer.WriteEndElement();
+                }
                 writer.WriteEndElement();
             }
             writer.WriteEndElement();
@@ -797,7 +810,22 @@ public sealed partial class AzureResponseWriter
             SetOptional(response.Headers, "x-ms-access-tier-change-time", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
         }
         if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+        {
             SetOptional(response.Headers, "x-ms-rehydrate-priority", blob.RehydratePriority);
+            if (blob.Kind == Storage.BlobKind.BlockBlob)
+            {
+                SetOptional(
+                    response.Headers,
+                    "x-ms-or-policy-id",
+                    blob.ObjectReplicationDestinationPolicyId);
+                foreach (var status in blob.ObjectReplicationStatuses.OrderBy(
+                             pair => pair.Key,
+                             StringComparer.Ordinal))
+                {
+                    response.Headers[$"x-ms-or-{status.Key}"] = status.Value.Status;
+                }
+            }
+        }
         if (lastAccessTimeTracking && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
             SetOptional(response.Headers, "x-ms-last-access-time", blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))

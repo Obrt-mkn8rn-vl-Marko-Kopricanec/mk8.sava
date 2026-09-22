@@ -143,6 +143,15 @@ public sealed record BlobRecord
     public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
     public List<PageRange> PageRanges { get; init; } = [];
+    public Dictionary<string, ObjectReplicationStatusRecord> ObjectReplicationStatuses { get; init; } =
+        new(StringComparer.Ordinal);
+    public string? ObjectReplicationDestinationPolicyId { get; init; }
+}
+
+public sealed record ObjectReplicationStatusRecord
+{
+    public required string Status { get; init; }
+    public required string SourceFingerprint { get; init; }
 }
 
 public sealed record BlobHttpProperties
@@ -291,6 +300,31 @@ internal sealed record BlobRecordMutation(
     string GenerationId,
     string ExpectedRevision,
     BlobRecord? Replacement);
+
+internal sealed record ObjectReplicationState
+{
+    public required string PolicyId { get; init; }
+    public required string RuleId { get; init; }
+    public required string SourceGenerationId { get; init; }
+    public required string SourceAccount { get; init; }
+    public required string SourceContainer { get; init; }
+    public required string SourceName { get; init; }
+    public required string DestinationAccount { get; init; }
+    public required string DestinationContainer { get; init; }
+    public string? DestinationGenerationId { get; init; }
+    public required string SourceFingerprint { get; init; }
+    public required string Status { get; init; }
+    public required DateTimeOffset UpdatedAt { get; init; }
+}
+
+internal readonly record struct ObjectReplicationStateKey(
+    string PolicyId,
+    string RuleId,
+    string SourceGenerationId);
+
+internal sealed record ObjectReplicationStatePage(
+    IReadOnlyList<ObjectReplicationState> Items,
+    bool HasMore);
 
 internal sealed record ChunkPackRecord(
     string PackId,
