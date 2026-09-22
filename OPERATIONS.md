@@ -37,6 +37,26 @@ terminates the worker without unwinding it, and validates recovery in a new test
 host before deleting that exact temporary root. Core dumps are disabled for the
 intentional terminations.
 
+## SDK substitution checks
+
+The normal .NET integration suite uses the official Azure Storage client. A
+separate JavaScript process lane proves that endpoint substitution also works
+through the independent official `@azure/storage-blob` protocol stack, including
+path-style account URLs, service and blob listings, block/append/page blobs,
+staged blocks, snapshots, leases, tags, byte ranges, and SAS authentication.
+
+Run it from the repository root with Node.js 20 or later, Corepack, and the .NET
+SDK available:
+
+```bash
+DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/javascript/run.sh
+```
+
+The harness pins the newest Azure JavaScript client line that supports Node.js
+20 and locks its transitive Azure packages to their Node.js 20-compatible
+releases. It starts a real loopback mk8.sava process with a disposable storage
+root, rather than routing the client through ASP.NET's in-memory test server.
+
 ## Account capabilities
 
 Storage-account capabilities are configured independently so one deployment can

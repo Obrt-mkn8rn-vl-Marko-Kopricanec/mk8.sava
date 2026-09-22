@@ -99,6 +99,8 @@ public sealed class RequestContextMiddleware(
             throw AzureStorageException.AuthenticationFailed("The specified account does not exist.");
 
         var remaining = segments.Skip(pathOffset).ToArray();
+        if (pathOffset == 1 && remaining is [""])
+            remaining = [];
         var container = staticWebsite
             ? "$web"
             : remaining.Length > 0 ? remaining[0] : null;
