@@ -55,6 +55,13 @@ from 2021-08-06; List Blobs exposes `EncryptionContext` from 2021-06-08. The
 header is rejected on flat-namespace accounts and on copy operations, matching
 the Azure Blob operation-specific contract.
 
+HNS identity projection follows the Blob REST request shape. List Blobs accepts
+`x-ms-upn` only when `include=permissions` is present. Get Blob and Get Blob
+Properties accept it only from service version 2023-11-03. The value must be a
+Boolean and the header is rejected for flat-namespace accounts. Shared Key
+requests continue to report Azure's `$superuser` owner and group because that
+well-known identity has no user-principal-name substitution.
+
 ## Health and metrics
 
 - `GET /health/live` reports that the process is running.
