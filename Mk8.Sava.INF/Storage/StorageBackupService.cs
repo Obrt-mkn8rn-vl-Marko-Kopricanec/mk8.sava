@@ -83,8 +83,7 @@ public sealed class StorageBackupService(
             await WriteManifestAsync(Path.Combine(temporary, ManifestFileName), manifest, cancellationToken);
             StorageDurability.FlushDirectory(temporary);
             var validation = await ValidateCoreAsync(temporary, _options, cancellationToken);
-            Directory.Move(temporary, destination);
-            StorageDurability.FlushDirectory(parent);
+            StorageDurability.PublishDirectory(temporary, destination);
             return validation with { BackupPath = destination };
         }
         catch
@@ -149,8 +148,7 @@ public sealed class StorageBackupService(
                 cancellationToken);
             if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
                 throw new InvalidDataException("The restored metadata schema version changed while copying the backup.");
-            Directory.Move(temporary, target);
-            StorageDurability.FlushDirectory(parent);
+            StorageDurability.PublishDirectory(temporary, target);
             return validation with { BackupPath = backup };
         }
         catch

@@ -20,9 +20,11 @@ future pass.
 On Unix, newly used storage directories and published chunk/pack directory
 entries are also flushed before SQLite can reference them. Flushing file bytes
 alone does not make a new filename durable across a sudden power loss. Windows
-still flushes file bytes but does not yet have an equivalent verified directory
-publication barrier in this implementation; power-loss durability on Windows
-and on deployment-specific filesystems needs further validation.
+uses `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` for same-volume file and
+backup-directory publication, without a copy-and-delete fallback. Its directory
+creation and active-pack entry paths still lack a verified directory flush;
+power-loss durability on Windows and deployment-specific filesystems needs
+further validation.
 
 Small-chunk publication serializes pack appends by sharing domain within one
 service process and repeats the existing-chunk lookup inside that gate. Concurrent
@@ -511,7 +513,8 @@ copies exactly that root set, and publishes the backup directory only after a
 versioned manifest and all file hashes are durable. On Unix, each newly created
 backup directory and copied file entry is also flushed before the final backup
 or restored-root rename is published and its parent directory flushed. Windows
-directory-entry durability remains unverified, as it does for live chunks.
+uses write-through publication for the final rename, but directory-entry
+durability remains unverified, as it does for live chunks.
 
 ```bash
 dotnet Mk8.Sava.API.dll --backup-create /srv/backups/mk8-sava-2026-09-21
