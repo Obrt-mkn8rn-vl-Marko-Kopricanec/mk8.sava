@@ -12,7 +12,8 @@ public sealed record BlobWriteOptions(
     string? CustomerProvidedKeySha256 = null,
     byte[]? CustomerProvidedKey = null,
     bool? AccessTierInferred = null,
-    bool GenerateContentMd5 = false);
+    bool GenerateContentMd5 = false,
+    bool AccessTierSpecified = false);
 
 public sealed record PageRange(long Start, long End);
 

@@ -85,6 +85,8 @@ public sealed class BlobService(
         string name,
         Dictionary<string, string> userMetadata,
         string? publicAccess,
+        string? defaultEncryptionScope,
+        bool preventEncryptionScopeOverride,
         CancellationToken cancellationToken)
     {
         ValidateContainerName(name);
@@ -102,7 +104,9 @@ public sealed class BlobService(
             CreatedAt = now,
             LastModified = now,
             Metadata = userMetadata,
-            PublicAccess = publicAccess
+            PublicAccess = publicAccess,
+            DefaultEncryptionScope = defaultEncryptionScope,
+            PreventEncryptionScopeOverride = preventEncryptionScopeOverride
         };
 
         if (!await metadata.TryCreateContainerAsync(container, cancellationToken))
@@ -416,7 +420,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var encryption = EncryptionOf(options);
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
         if (options.GenerateContentMd5 && options.Http.ContentMd5 is null)
@@ -445,7 +449,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now) with
         {
@@ -474,7 +478,7 @@ public sealed class BlobService(
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
         if (sequenceNumber < 0)
             throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.ToString(CultureInfo.InvariantCulture));
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with
         {
@@ -484,7 +488,7 @@ public sealed class BlobService(
         return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
     }
 
-    public async Task StageBlockAsync(
+    public async Task<BlobEncryption> StageBlockAsync(
         string account,
         string container,
         string name,
@@ -495,8 +499,9 @@ public sealed class BlobService(
     {
         ValidateBlobName(name);
         var blockIdLength = ValidateBlockId(blockId);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        encryption = ApplyContainerEncryptionPolicy(containerRecord, encryption, current);
         if (current is not null)
             EnsureNoPendingCopy(current);
         if (current is not null && current.Kind != BlobKind.BlockBlob)
@@ -541,6 +546,7 @@ public sealed class BlobService(
                 }
             }
         }
+        return encryption;
     }
 
     public async Task<BlobRecord> CommitBlockListAsync(
@@ -556,6 +562,7 @@ public sealed class BlobService(
         if (blockList.Count > BlobServiceLimits.MaximumCommittedBlockCount)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
         var encryption = EncryptionOf(options);
         var stagedById = staged.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
@@ -615,6 +622,8 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken);
+        encryption = ApplyContainerEncryptionPolicy(container, encryption, current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -664,6 +673,8 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken);
+        encryption = ApplyContainerEncryptionPolicy(container, encryption, current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -947,6 +958,8 @@ public sealed class BlobService(
         current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.BlockBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (current.EncryptionScope is not null)
+            throw EncryptionScopeTierChangeNotSupported();
         if (tier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", tier);
         if (rehydratePriority is not null && rehydratePriority is not ("Standard" or "High"))
@@ -1292,6 +1305,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1336,6 +1350,7 @@ public sealed class BlobService(
                 "InvalidSourceBlobType",
                 "The source blob type is invalid for this operation.");
         }
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1367,6 +1382,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1402,6 +1418,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         using var content = await StoreRemoteBlockBlobAsync(
             account,
             source,
@@ -1437,7 +1454,6 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
         {
@@ -1467,7 +1483,12 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(
+            account,
+            container,
+            options,
+            cancellationToken,
+            current);
         if (source.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidSourceBlobType", "The source blob type is invalid for incremental copy.");
         if (source.Snapshot is null)
@@ -1572,6 +1593,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
         var encryption = EncryptionOf(options);
         if (sourceKind == BlobKind.BlockBlob)
         {
@@ -1982,6 +2004,8 @@ public sealed class BlobService(
                     "$web",
                     new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
                     publicAccess: null,
+                    defaultEncryptionScope: null,
+                    preventEncryptionScopeOverride: false,
                     cancellationToken);
             }
         }
@@ -2591,6 +2615,8 @@ public sealed class BlobService(
         {
             throw AzureStorageException.InvalidHeader("x-ms-access-tier", options.AccessTier);
         }
+        if (options.EncryptionScope is not null && options.AccessTierSpecified)
+            throw EncryptionScopeTierChangeNotSupported();
 
         return new BlobRecord
         {
@@ -2621,6 +2647,57 @@ public sealed class BlobService(
         };
     }
 
+    private async Task<BlobWriteOptions> ApplyContainerEncryptionPolicyAsync(
+        string account,
+        string container,
+        BlobWriteOptions options,
+        CancellationToken cancellationToken,
+        BlobRecord? current = null)
+    {
+        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var resolved = ApplyContainerEncryptionPolicy(containerRecord, EncryptionOf(options), current);
+        return options with
+        {
+            EncryptionScope = resolved.Scope,
+            CustomerProvidedKeySha256 = resolved.CustomerProvidedKeySha256,
+            CustomerProvidedKey = resolved.CustomerProvidedKey
+        };
+    }
+
+    private static BlobEncryption ApplyContainerEncryptionPolicy(
+        ContainerRecord container,
+        BlobEncryption requested,
+        BlobRecord? current = null)
+    {
+        if (container.PreventEncryptionScopeOverride &&
+            requested.Scope is not null &&
+            !string.Equals(requested.Scope, container.DefaultEncryptionScope, StringComparison.Ordinal))
+        {
+            throw AzureStorageException.RequestForbiddenByContainerEncryptionPolicy();
+        }
+
+        if (requested.CustomerProvidedKeySha256 is not null)
+            return requested;
+
+        if (current is not null)
+        {
+            if (container.PreventEncryptionScopeOverride &&
+                current.CustomerProvidedKeySha256 is null &&
+                !string.Equals(current.EncryptionScope, container.DefaultEncryptionScope, StringComparison.Ordinal))
+            {
+                throw AzureStorageException.RequestForbiddenByContainerEncryptionPolicy();
+            }
+
+            return requested.Scope is null
+                ? requested with { Scope = current.EncryptionScope ?? container.DefaultEncryptionScope }
+                : requested;
+        }
+
+        return requested.Scope is null && container.DefaultEncryptionScope is not null
+            ? requested with { Scope = container.DefaultEncryptionScope }
+            : requested;
+    }
+
     private static BlobEncryption EncryptionOf(BlobWriteOptions options) =>
         new(options.EncryptionScope, options.CustomerProvidedKeySha256, options.CustomerProvidedKey);
 
@@ -2636,6 +2713,11 @@ public sealed class BlobService(
         StatusCodes.Status409Conflict,
         "BlobOperationNotSupported",
         "The copy source and destination use different request-level encryption settings.");
+
+    private static AzureStorageException EncryptionScopeTierChangeNotSupported() => new(
+        StatusCodes.Status409Conflict,
+        "BlobOperationNotSupported",
+        "The access tier cannot be changed for a blob that uses an encryption scope.");
 
     private static AzureStorageException CannotVerifyCopySource(string message) => new(
         StatusCodes.Status500InternalServerError,

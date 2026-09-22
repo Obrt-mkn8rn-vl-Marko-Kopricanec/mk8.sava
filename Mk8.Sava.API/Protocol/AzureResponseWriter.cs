@@ -105,6 +105,15 @@ public sealed partial class AzureResponseWriter
                         container.ImmutabilityUntil.HasValue ? "true" : "false");
                     writer.WriteElementString("HasLegalHold", container.HasLegalHold ? "true" : "false");
                 }
+                if (!isDeleted &&
+                    container.DefaultEncryptionScope is not null &&
+                    IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
+                {
+                    writer.WriteElementString("DefaultEncryptionScope", container.DefaultEncryptionScope);
+                    writer.WriteElementString(
+                        "DenyEncryptionScopeOverride",
+                        container.PreventEncryptionScopeOverride ? "true" : "false");
+                }
                 if (isDeleted)
                 {
                     WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
@@ -546,6 +555,13 @@ public sealed partial class AzureResponseWriter
         {
             response.Headers["x-ms-has-immutability-policy"] = "false";
             response.Headers["x-ms-has-legal-hold"] = "false";
+        }
+        if (container.DefaultEncryptionScope is not null &&
+            IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
+        {
+            response.Headers["x-ms-default-encryption-scope"] = container.DefaultEncryptionScope;
+            response.Headers["x-ms-deny-encryption-scope-override"] =
+                container.PreventEncryptionScopeOverride ? "true" : "false";
         }
     }
 

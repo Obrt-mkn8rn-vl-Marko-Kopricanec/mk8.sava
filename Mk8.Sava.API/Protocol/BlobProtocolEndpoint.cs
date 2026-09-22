@@ -401,14 +401,18 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
             RequireAny(request, 'c', 'w');
+            RequireZeroContentLength(http.Request);
             var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
             if (publicAccess is not null)
                 RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
+            var encryptionPolicy = ReadContainerEncryptionPolicy(http.Request);
             var created = await service.CreateContainerAsync(
                 request.Account,
                 containerName,
                 ProtocolParsing.ReadMetadata(http.Request.Headers),
                 publicAccess,
+                encryptionPolicy.DefaultScope,
+                encryptionPolicy.PreventOverride,
                 cancellationToken);
             AzureResponseWriter.AddContainerHeaders(http.Response, created);
             http.Response.StatusCode = StatusCodes.Status201Created;
@@ -940,11 +944,19 @@ public static class BlobProtocolEndpoint
             var blockId = http.Request.Query["blockid"].ToString();
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
             var encryption = ReadRequestEncryption(http.Request, write: true);
+            var resolvedEncryption = encryption;
             TransactionalChecksums checksums;
             if (copySource is null)
             {
                 checksums = await WithIntegrityValidationAsync(http.Request, async body =>
-                    await service.StageBlockAsync(request.Account, containerName, blobName, blockId, body, encryption, cancellationToken),
+                    resolvedEncryption = await service.StageBlockAsync(
+                        request.Account,
+                        containerName,
+                        blobName,
+                        blockId,
+                        body,
+                        encryption,
+                        cancellationToken),
                     maximumBodyBytes: GetMaximumPutBlockBytes(request));
             }
             else
@@ -961,7 +973,14 @@ public static class BlobProtocolEndpoint
                     sourceLengthConflict: false,
                     async source =>
                     {
-                        await service.StageBlockAsync(request.Account, containerName, blobName, blockId, source.Content, encryption, cancellationToken);
+                        resolvedEncryption = await service.StageBlockAsync(
+                            request.Account,
+                            containerName,
+                            blobName,
+                            blockId,
+                            source.Content,
+                            encryption,
+                            cancellationToken);
                         return true;
                     },
                     cancellationToken);
@@ -969,7 +988,7 @@ public static class BlobProtocolEndpoint
             }
             http.Response.StatusCode = StatusCodes.Status201Created;
             AddRequestServerEncryptedHeader(http.Response);
-            AddEncryptionResponseHeaders(http.Response, encryption);
+            AddEncryptionResponseHeaders(http.Response, resolvedEncryption);
             AddTransactionalChecksumHeaders(http, checksums, copySource is not null);
             return;
         }
@@ -3052,7 +3071,8 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? fallback?.AccessTierInferred
                 : false,
-            generateContentMd5);
+            generateContentMd5,
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
     }
 
     private static string? ReadAccessTier(HttpRequest request, string? fallback)
@@ -3369,7 +3389,8 @@ public static class BlobProtocolEndpoint
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? destination?.AccessTierInferred
                 : false,
-            GenerateContentMd5: true);
+            GenerateContentMd5: true,
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
     }
 
     private static BlobWriteOptions ReadUrlCopyWriteOptions(
@@ -3403,7 +3424,8 @@ public static class BlobProtocolEndpoint
             encryption.CustomerProvidedKey,
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? destination?.AccessTierInferred
-                : false);
+                : false,
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
     }
 
     private static bool ReadCopySourceBlobProperties(HttpRequest request)
@@ -3448,7 +3470,8 @@ public static class BlobProtocolEndpoint
             encryption.CustomerProvidedKey,
             ProtocolParsing.First(request.Headers, "x-ms-access-tier") is null
                 ? destination?.AccessTierInferred
-                : false);
+                : false,
+            AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null);
     }
 
     private static void ValidateSynchronousCopyEncryption(HttpRequest request)
@@ -3738,6 +3761,37 @@ public static class BlobProtocolEndpoint
             CryptographicOperations.ZeroMemory(key);
             throw;
         }
+    }
+
+    private static (string? DefaultScope, bool PreventOverride) ReadContainerEncryptionPolicy(
+        HttpRequest request)
+    {
+        const string scopeHeader = "x-ms-default-encryption-scope";
+        const string preventHeader = "x-ms-deny-encryption-scope-override";
+        var hasScope = request.Headers.ContainsKey(scopeHeader);
+        var hasPrevent = request.Headers.ContainsKey(preventHeader);
+        if (!hasScope && !hasPrevent)
+            return (null, false);
+
+        RequireFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            new DateOnly(2019, 7, 7),
+            "Container encryption scope policy");
+        if (!hasScope)
+            throw AzureStorageException.InvalidHeader(scopeHeader);
+        if (!hasPrevent)
+            throw AzureStorageException.InvalidHeader(preventHeader);
+        if (request.Headers[scopeHeader].Count != 1 || request.Headers[preventHeader].Count != 1)
+            throw AzureStorageException.InvalidHeader(
+                request.Headers[scopeHeader].Count != 1 ? scopeHeader : preventHeader);
+
+        var scope = ProtocolParsing.First(request.Headers, scopeHeader);
+        if (scope is null || scope.Length is 0 or > 256 || scope.Any(char.IsControl))
+            throw AzureStorageException.InvalidHeader(scopeHeader, scope);
+        var preventValue = ProtocolParsing.First(request.Headers, preventHeader);
+        if (!bool.TryParse(preventValue, out var preventOverride))
+            throw AzureStorageException.InvalidHeader(preventHeader, preventValue);
+        return (scope, preventOverride);
     }
 
     private static BlobEncryption EnsureCustomerProvidedKey(HttpRequest request, BlobRecord blob, bool write)
