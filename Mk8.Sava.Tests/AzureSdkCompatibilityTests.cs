@@ -1470,6 +1470,86 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task BlobServicePropertiesExcludeAndRejectControlPlaneOnlySettings()
+    {
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var original = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var sasBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Service,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        sasBuilder.SetPermissions(AccountSasPermissions.Read | AccountSasPermissions.Write);
+        var sas = sasBuilder.ToSasQueryParameters(credential);
+        var propertiesUri = new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            $"?restype=service&comp=properties&{sas}");
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        try
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original with
+                {
+                    VersioningEnabled = true,
+                    ContainerSoftDeleteEnabled = true,
+                    ContainerSoftDeleteRetentionDays = 19
+                },
+                CancellationToken.None);
+
+            using (var get = new HttpRequestMessage(HttpMethod.Get, propertiesUri))
+            {
+                get.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+                using var response = await transport.SendAsync(get);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                var xml = await response.Content.ReadAsStringAsync();
+                Assert.DoesNotContain("<ContainerDeleteRetentionPolicy>", xml, StringComparison.Ordinal);
+                Assert.DoesNotContain("<IsVersioningEnabled>", xml, StringComparison.Ordinal);
+            }
+
+            foreach (var xml in new[]
+                     {
+                         "<StorageServiceProperties />",
+                         "<StorageServiceProperties><ContainerDeleteRetentionPolicy><Enabled>true</Enabled><Days>19</Days></ContainerDeleteRetentionPolicy></StorageServiceProperties>",
+                         "<StorageServiceProperties><IsVersioningEnabled>false</IsVersioningEnabled></StorageServiceProperties>"
+                     })
+            {
+                using var put = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
+                {
+                    Content = new StringContent(xml, Encoding.UTF8, "application/xml")
+                };
+                put.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+                using var response = await transport.SendAsync(put);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidXmlDocument", response.Headers.GetValues("x-ms-error-code").Single());
+            }
+
+            var unchanged = await metadata.GetServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                CancellationToken.None);
+            Assert.True(unchanged.VersioningEnabled);
+            Assert.True(unchanged.ContainerSoftDeleteEnabled);
+            Assert.Equal(19, unchanged.ContainerSoftDeleteRetentionDays);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    [Fact]
     public async Task ServiceVersionSelectionMatchesSharedKeySasBearerAndDefaultRules()
     {
         var service = CreateClient(factory);
@@ -3521,6 +3601,81 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
                 original,
                 CancellationToken.None);
+        }
+    }
+
+    [Fact]
+    public async Task UserDelegationKeyRequiresHttpsAndHonorsItsVersionedXmlContract()
+    {
+        var token = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId);
+        var startsAt = DateTimeOffset.UtcNow.AddMinutes(-1).ToString("O", CultureInfo.InvariantCulture);
+        var expiresAt = DateTimeOffset.UtcNow.AddHours(1).ToString("O", CultureInfo.InvariantCulture);
+        var delegatedTenant = Guid.NewGuid().ToString();
+        var baseBody = $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry></KeyInfo>";
+        var delegatedBody = $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry><DelegatedUserTid>{delegatedTenant}</DelegatedUserTid></KeyInfo>";
+        var httpsUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+            "?restype=service&comp=userdelegationkey");
+        var httpUri = new UriBuilder(httpsUri) { Scheme = Uri.UriSchemeHttp, Port = -1 }.Uri;
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        async Task<HttpResponseMessage> SendAsync(Uri uri, string version, string body)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, uri)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/xml")
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            return await transport.SendAsync(request);
+        }
+
+        using (var oldVersion = await SendAsync(httpsUri, "2018-03-28", baseBody))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, oldVersion.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldVersion.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var insecure = await SendAsync(httpUri, "2025-07-05", baseBody))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, insecure.StatusCode);
+            Assert.Equal("InvalidRequest", insecure.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var prematureDelegation = await SendAsync(httpsUri, "2023-11-03", delegatedBody))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, prematureDelegation.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", prematureDelegation.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var unknownElement = await SendAsync(
+                   httpsUri,
+                   "2025-07-05",
+                   $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry><Unknown /></KeyInfo>"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, unknownElement.StatusCode);
+            Assert.Equal("InvalidXmlDocument", unknownElement.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var duplicateElement = await SendAsync(
+                   httpsUri,
+                   "2025-07-05",
+                   $"<KeyInfo><Start>{startsAt}</Start><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry></KeyInfo>"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, duplicateElement.StatusCode);
+            Assert.Equal("InvalidXmlDocument", duplicateElement.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var accepted = await SendAsync(httpsUri, "2025-07-05", delegatedBody))
+        {
+            Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(await accepted.Content.ReadAsStringAsync());
+            Assert.Equal(
+                delegatedTenant,
+                Assert.Single(document.Root!.Elements("SignedDelegatedUserTid")).Value);
         }
     }
 

@@ -299,6 +299,7 @@ internal static class ProtocolParsing
 
     public static async Task<UserDelegationKeyRequest> ReadUserDelegationKeyRequestAsync(
         Stream body,
+        string serviceVersion,
         CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
@@ -306,11 +307,21 @@ internal static class ProtocolParsing
         if (document.Root?.Name.LocalName != "KeyInfo")
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
-        var startsAt = ParseRequiredDate(ChildValue(document.Root, "Start"), "Start");
-        var expiresAt = ParseRequiredDate(ChildValue(document.Root, "Expiry"), "Expiry");
-        var delegatedTenant = ChildValue(document.Root, "DelegatedUserTid");
+        var root = document.Root;
+        ValidateUniqueChildren(root);
+        ValidateKnownChildren(root, "Start", "Expiry", "DelegatedUserTid");
+        var startsAt = ParseRequiredDate(ChildValue(root, "Start"), "Start");
+        var expiresAt = ParseRequiredDate(ChildValue(root, "Expiry"), "Expiry");
+        var delegatedTenant = ChildValue(root, "DelegatedUserTid");
         if (!string.IsNullOrEmpty(delegatedTenant) && !Guid.TryParse(delegatedTenant, out _))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The DelegatedUserTid value is invalid.");
+        if (!string.IsNullOrEmpty(delegatedTenant) &&
+            (!StorageServiceVersions.TryParse(serviceVersion, out var version) ||
+             version < new DateOnly(2025, 7, 5)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "DelegatedUserTid requires service version 2025-07-05 or later.");
+        }
         return new UserDelegationKeyRequest(startsAt, expiresAt, NullIfEmpty(delegatedTenant));
     }
 
@@ -346,9 +357,10 @@ internal static class ProtocolParsing
             "Cors",
             "DefaultServiceVersion",
             "DeleteRetentionPolicy",
-            "ContainerDeleteRetentionPolicy",
-            "IsVersioningEnabled",
             "StaticWebsite");
+
+        if (!root.Elements().Any())
+            throw InvalidServicePropertiesXml("At least one service property must be specified.");
 
         var modernAnalytics = version >= new DateOnly(2013, 8, 15);
         var loggingElement = Child(root, "Logging");
@@ -417,10 +429,6 @@ internal static class ProtocolParsing
             RequireServicePropertiesVersion(version, new DateOnly(2017, 7, 29), "DeleteRetentionPolicy");
         if (deleteRetentionPolicy is not null && Child(deleteRetentionPolicy, "AllowPermanentDelete") is not null)
             RequireServicePropertiesVersion(version, new DateOnly(2020, 2, 10), "AllowPermanentDelete");
-        if (Child(root, "ContainerDeleteRetentionPolicy") is not null)
-            RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "ContainerDeleteRetentionPolicy");
-        if (Child(root, "IsVersioningEnabled") is not null)
-            RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "IsVersioningEnabled");
 
         var deletePolicy = ReadRetentionPolicy(
             root,
@@ -429,13 +437,6 @@ internal static class ProtocolParsing
             current.BlobSoftDeleteRetentionDays,
             current.BlobPermanentDeleteEnabled,
             supportsPermanentDelete: true);
-        var containerPolicy = ReadRetentionPolicy(
-            root,
-            "ContainerDeleteRetentionPolicy",
-            current.ContainerSoftDeleteEnabled,
-            current.ContainerSoftDeleteRetentionDays,
-            currentAllowPermanentDelete: false,
-            supportsPermanentDelete: false);
         var website = Child(root, "StaticWebsite");
         var staticWebsite = current.StaticWebsite;
         if (website is not null)
@@ -478,11 +479,6 @@ internal static class ProtocolParsing
             BlobSoftDeleteEnabled = deletePolicy.Enabled,
             BlobSoftDeleteRetentionDays = deletePolicy.Days,
             BlobPermanentDeleteEnabled = deletePolicy.AllowPermanentDelete,
-            ContainerSoftDeleteEnabled = containerPolicy.Enabled,
-            ContainerSoftDeleteRetentionDays = containerPolicy.Days,
-            VersioningEnabled = Child(root, "IsVersioningEnabled") is null
-                ? current.VersioningEnabled
-                : ParseBool(RequiredText(root, "IsVersioningEnabled"), current.VersioningEnabled),
             StaticWebsite = staticWebsite
         };
     }
