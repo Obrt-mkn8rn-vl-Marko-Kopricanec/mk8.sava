@@ -1055,6 +1055,7 @@ public static class BlobProtocolEndpoint
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     allowSourceCustomerProvidedKey: true,
+                    allowFileRequestIntent: true,
                     GetMaximumPutBlockFromUrlBytes(request),
                     sourceLengthConflict: false,
                     async source =>
@@ -1150,6 +1151,7 @@ public static class BlobProtocolEndpoint
                     copySource,
                     ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                     allowSourceCustomerProvidedKey: true,
+                    allowFileRequestIntent: true,
                     GetMaximumAppendBlockBytes(request),
                     sourceLengthConflict: false,
                     async source => updated = await service.AppendBlockAsync(
@@ -1234,6 +1236,7 @@ public static class BlobProtocolEndpoint
                         copySource,
                         ProtocolParsing.First(http.Request.Headers, "x-ms-source-range"),
                         allowSourceCustomerProvidedKey: true,
+                        allowFileRequestIntent: true,
                         maximumPageWriteBytes,
                         sourceLengthConflict: false,
                         async source => updated = await service.PutPageAsync(
@@ -1936,6 +1939,7 @@ public static class BlobProtocolEndpoint
                     copySource,
                     sourceRange: null,
                     allowSourceCustomerProvidedKey: true,
+                    allowFileRequestIntent: true,
                     5_000L * 1024 * 1024,
                     sourceLengthConflict: true,
                     async source => await service.PutBlockBlobAsync(
@@ -1977,6 +1981,7 @@ public static class BlobProtocolEndpoint
                 }
                 var copySourceTags = ReadCopySourceTags(http.Request);
                 BlobRecord synchronousCopy;
+                UrlTransferClient.ValidateFileRequestIntent(http.Request, copySource, allowed: true);
                 var synchronousInternalSource = ResolveInternalCopySource(http.Request, request, copySource);
                 if (synchronousInternalSource is not null)
                 {
@@ -2014,6 +2019,7 @@ public static class BlobProtocolEndpoint
                         copySource,
                         sourceRange: null,
                         allowSourceCustomerProvidedKey: false,
+                        allowFileRequestIntent: true,
                         256L * 1024 * 1024,
                         sourceLengthConflict: true,
                         async source =>
@@ -2069,6 +2075,7 @@ public static class BlobProtocolEndpoint
                     ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
             }
             ValidateAsynchronousCopyEncryption(http.Request);
+            RejectUnsupportedHeader(http.Request, "x-ms-file-request-intent");
             _ = ReadRehydratePriority(http.Request);
             EnsureAsynchronousCopyDestinationLease(http.Request, current);
             RequireZeroContentLength(http.Request);
@@ -2107,6 +2114,7 @@ public static class BlobProtocolEndpoint
                     copySource,
                     sourceRange: null,
                     allowSourceCustomerProvidedKey: false,
+                    allowFileRequestIntent: false,
                     long.MaxValue,
                     sourceLengthConflict: false,
                     async source =>
@@ -3974,6 +3982,7 @@ public static class BlobProtocolEndpoint
                      "x-ms-copy-source-authorization",
                      "x-ms-copy-source-blob-properties",
                      "x-ms-copy-source-tag-option",
+                     "x-ms-file-request-intent",
                      "x-ms-immutability-policy-mode",
                      "x-ms-immutability-policy-until-date",
                      "x-ms-legal-hold",
