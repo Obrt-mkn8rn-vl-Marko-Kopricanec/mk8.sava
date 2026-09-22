@@ -70,13 +70,17 @@ public sealed class LeaseService(TimeProvider timeProvider)
             throw AzureStorageException.LeaseNotPresentForOperation(resource);
     }
 
-    public void ValidateOptionalAccess(LeaseRecord lease, string? suppliedId, string resource)
+    public void ValidateOptionalAccess(
+        LeaseRecord lease,
+        string? suppliedId,
+        string resource,
+        string headerName = "x-ms-lease-id")
     {
         if (suppliedId is null)
             return;
 
         var effective = GetEffective(lease);
-        var supplied = ParseRequiredId(suppliedId, "x-ms-lease-id");
+        var supplied = ParseRequiredId(suppliedId, headerName);
         if (effective.State is not (LeaseState.Leased or LeaseState.Breaking))
             throw AzureStorageException.LeaseNotPresentForOperation(resource);
         if (!Matches(effective, supplied))

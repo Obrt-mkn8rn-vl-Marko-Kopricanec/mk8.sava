@@ -1349,6 +1349,38 @@ public sealed class BlobService(
             cancellationToken);
     }
 
+    public async Task<BlobRecord> CopyBlobFromBlobSynchronouslyAsync(
+        string account,
+        string container,
+        string name,
+        BlobRecord source,
+        BlobWriteOptions options,
+        LeaseRecord destinationLease,
+        string? expectedGeneration,
+        string? expectedRevision,
+        CancellationToken cancellationToken)
+    {
+        using var prepared = await PrepareCopyContentAsync(
+            account,
+            source,
+            EncryptionOf(options),
+            preserveCommittedBlocks: true,
+            cancellationToken);
+        ValidateBlobName(name);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var now = metadata.GetUtcNow();
+        var proposed = NewBlob(account, container, name, source.Kind, prepared.Content, options, now) with
+        {
+            Lease = leases.ResetAfterBlobWrite(destinationLease),
+            SequenceNumber = source.SequenceNumber,
+            IsSealed = source.IsSealed,
+            AppendBlockCount = source.AppendBlockCount,
+            CommittedBlocks = [.. prepared.CommittedBlocks],
+            PageRanges = [.. source.PageRanges]
+        };
+        return await metadata.PublishBlobAsync(proposed, expectedGeneration, expectedRevision, cancellationToken);
+    }
+
     public async Task<BlobRecord> CopyBlockBlobFromStreamAsync(
         string account,
         string container,

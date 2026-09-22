@@ -3451,6 +3451,102 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task LegacyCopyBlobIsSynchronousSameAccountAndHonorsItsSourceLeaseHeader()
+    {
+        var service = CreateClient(factory);
+        var container = service.GetBlobContainerClient($"legacy-copy-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var source = container.GetBlockBlobClient("source.bin");
+        var firstBlockId = Convert.ToBase64String("legacy-copy-block-0001"u8);
+        var secondBlockId = Convert.ToBase64String("legacy-copy-block-0002"u8);
+        await source.StageBlockAsync(firstBlockId, BinaryData.FromString("first|").ToStream());
+        await source.StageBlockAsync(secondBlockId, BinaryData.FromString("second").ToStream());
+        await source.CommitBlockListAsync(
+            [firstBlockId, secondBlockId],
+            new CommitBlockListOptions
+            {
+                Metadata = new Dictionary<string, string> { ["origin"] = "legacy" },
+                HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-legacy-copy" }
+            });
+        var sourcePath = $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{source.Name}";
+        var sourceLeaseId = Guid.NewGuid().ToString();
+        var sourceLease = source.GetBlobLeaseClient(sourceLeaseId);
+        await sourceLease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        var mismatchedTarget = container.GetBlobClient("mismatched-source-lease.bin");
+        using (var request = CreateLegacyCopyRequest(mismatchedTarget.Uri, sourcePath, Guid.NewGuid().ToString()))
+        using (var response = await transport.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+            Assert.Equal("LeaseIdMismatchWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await mismatchedTarget.ExistsAsync()).Value);
+
+        var destination = container.GetBlockBlobClient("destination.bin");
+        using (var request = CreateLegacyCopyRequest(destination.Uri, sourcePath, sourceLeaseId))
+        using (var response = await transport.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            Assert.NotNull(response.Headers.ETag);
+            Assert.True(response.Content.Headers.LastModified.HasValue);
+            Assert.False(response.Headers.Contains("x-ms-copy-id"));
+            Assert.False(response.Headers.Contains("x-ms-copy-status"));
+        }
+
+        var properties = (await destination.GetPropertiesAsync()).Value;
+        Assert.Equal(default, properties.CopyStatus);
+        Assert.Equal("application/x-legacy-copy", properties.ContentType);
+        Assert.Equal("legacy", properties.Metadata["origin"]);
+        Assert.Equal("first|second", (await destination.DownloadContentAsync()).Value.Content.ToString());
+        var blocks = (await destination.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks;
+        Assert.Equal([firstBlockId, secondBlockId], blocks.Select(block => block.Name));
+
+        var noSourceLeaseHeaderTarget = container.GetBlobClient("source-lease-optional.bin");
+        using (var request = CreateLegacyCopyRequest(noSourceLeaseHeaderTarget.Uri, sourcePath))
+        using (var response = await transport.SendAsync(request))
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        await sourceLease.ReleaseAsync();
+        var absentSourceLeaseTarget = container.GetBlobClient("absent-source-lease.bin");
+        using (var request = CreateLegacyCopyRequest(absentSourceLeaseTarget.Uri, sourcePath, sourceLeaseId))
+        using (var response = await transport.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+            Assert.Equal("LeaseNotPresentWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await absentSourceLeaseTarget.ExistsAsync()).Value);
+
+        var pageSource = container.GetPageBlobClient("source.vhd");
+        await pageSource.CreateAsync(1024, new PageBlobCreateOptions { SequenceNumber = 9 });
+        await pageSource.UploadPagesAsync(
+            new MemoryStream(Enumerable.Repeat((byte)0x51, 512).ToArray()),
+            offset: 512);
+        var pageDestination = container.GetPageBlobClient("destination.vhd");
+        var pageSourcePath = $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{pageSource.Name}";
+        using (var request = CreateLegacyCopyRequest(pageDestination.Uri, pageSourcePath))
+        using (var response = await transport.SendAsync(request))
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var pageProperties = (await pageDestination.GetPropertiesAsync()).Value;
+        Assert.Equal(BlobType.Page, pageProperties.BlobType);
+        Assert.Equal(9, pageProperties.BlobSequenceNumber);
+        Assert.Equal(default, pageProperties.CopyStatus);
+        var pageRange = Assert.Single((await pageDestination.GetPageRangesAsync()).Value.PageRanges);
+        Assert.Equal(512, pageRange.Offset);
+        Assert.Equal(512, pageRange.Length);
+
+        var crossAccountTarget = container.GetBlobClient("cross-account.bin");
+        var crossAccountSource = $"/{SavaWebApplicationFactory.SecondAccountName}/{container.Name}/{source.Name}";
+        using (var request = CreateLegacyCopyRequest(crossAccountTarget.Uri, crossAccountSource))
+        using (var response = await transport.SendAsync(request))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("CopyAcrossAccountsNotSupported", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await crossAccountTarget.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task CopyBlobAuthenticatesSourceIndependentlyForSasDestinations()
     {
         var owner = CreateClient(factory);
@@ -6162,6 +6258,45 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static string ListIdentity(BlobItem item) =>
         $"{item.Name}|{item.VersionId}|{item.Snapshot}|{item.IsLatestVersion}";
+
+    private static HttpRequestMessage CreateLegacyCopyRequest(
+        Uri destination,
+        string sourcePath,
+        string? sourceLeaseId = null)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, destination)
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", sourcePath);
+        request.Headers.TryAddWithoutValidation("x-ms-date", DateTimeOffset.UtcNow.ToString("R", CultureInfo.InvariantCulture));
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2011-08-18");
+        if (sourceLeaseId is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-source-lease-id", sourceLeaseId);
+
+        var canonicalHeaders = new StringBuilder();
+        foreach (var header in request.Headers
+                     .Where(header => header.Key.StartsWith("x-ms-", StringComparison.OrdinalIgnoreCase))
+                     .OrderBy(header => header.Key, StringComparer.OrdinalIgnoreCase))
+        {
+            canonicalHeaders
+                .Append(header.Key.ToLowerInvariant())
+                .Append(':')
+                .AppendJoin(',', header.Value.Select(value => string.Join(
+                    ' ',
+                    value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))))
+                .Append('\n');
+        }
+
+        var stringToSign = "\n" + canonicalHeaders +
+                           $"/{SavaWebApplicationFactory.AccountName}{destination.AbsolutePath}";
+        using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
+        var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
+        request.Headers.TryAddWithoutValidation(
+            "Authorization",
+            $"SharedKeyLite {SavaWebApplicationFactory.AccountName}:{signature}");
+        return request;
+    }
 
     private static HttpRequestMessage CreateSourceKeyRequest(
         Uri destination,

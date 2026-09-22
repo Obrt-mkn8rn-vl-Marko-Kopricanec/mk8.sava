@@ -1605,8 +1605,48 @@ public static class BlobProtocolEndpoint
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
         {
-            if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+            var supportsAsynchronousCopy = IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12));
+            if (supportsAsynchronousCopy)
+            {
                 RejectUnsupportedHeader(http.Request, "x-ms-source-lease-id");
+            }
+            else
+            {
+                if (request.Authorization.Kind != StorageAuthorizationKind.SharedKey)
+                    throw AzureStorageException.AuthorizationFailure();
+                RequireZeroContentLength(http.Request);
+                EnsureDestinationCanBeOverwritten(current);
+                var legacySourceReference = ResolveLegacyCopySource(http.Request, request, copySource);
+                var legacySource = await service.GetBlobAsync(
+                    legacySourceReference.Account,
+                    legacySourceReference.Container,
+                    legacySourceReference.Blob,
+                    versionId: null,
+                    legacySourceReference.Snapshot,
+                    includeDeleted: false,
+                    cancellationToken);
+                ValidateOptionalLease(
+                    http.Request,
+                    legacySource.Lease,
+                    "blob",
+                    "x-ms-source-lease-id");
+                EvaluateCopySourceConditions(http.Request, legacySource);
+                ValidateCopySourceTier(http.Request, legacySource, allowArchivedSource: false);
+                ValidateCopyDestinationType(current, legacySource.Kind);
+                var legacyCopy = await service.CopyBlobFromBlobSynchronouslyAsync(
+                    request.Account,
+                    containerName,
+                    blobName,
+                    legacySource,
+                    ReadCopyWriteOptions(http.Request, legacySource, current, synchronous: true),
+                    current?.Lease ?? LeaseRecord.Available,
+                    current?.GenerationId,
+                    current?.Revision,
+                    cancellationToken);
+                AzureResponseWriter.AddBlobWriteHeaders(http.Response, legacyCopy);
+                http.Response.StatusCode = StatusCodes.Status201Created;
+                return;
+            }
             var requestedType = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type");
             var requiresSyncValue = ProtocolParsing.First(http.Request.Headers, "x-ms-requires-sync");
             var requiresSync = false;
@@ -2194,6 +2234,69 @@ public static class BlobProtocolEndpoint
             query.TryGetValue("versionid", out var version) ? NullIfEmpty(version.ToString()) : null);
     }
 
+    private static ResolvedInternalCopySource ResolveLegacyCopySource(
+        HttpRequest destination,
+        StorageRequestContext destinationRequest,
+        string sourceValue)
+    {
+        if (sourceValue.Length > 2048 ||
+            !sourceValue.StartsWith("/", StringComparison.Ordinal) ||
+            sourceValue.StartsWith("//", StringComparison.Ordinal) ||
+            sourceValue.Contains('#', StringComparison.Ordinal))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        }
+
+        var queryOffset = sourceValue.IndexOf('?');
+        var escapedPath = queryOffset < 0 ? sourceValue : sourceValue[..queryOffset];
+        var queryText = queryOffset < 0 ? string.Empty : sourceValue[queryOffset..];
+        string[] segments;
+        try
+        {
+            segments = StorageResourcePath.DecodeSegments(escapedPath);
+        }
+        catch (UriFormatException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        }
+
+        if (segments.Length < 2 || string.IsNullOrEmpty(segments[0]))
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        if (!string.Equals(segments[0], destinationRequest.Account, StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "CopyAcrossAccountsNotSupported",
+                "The copy source account and destination account must be the same.");
+        }
+
+        var (container, blob) = StorageResourcePath.ResolveBlob(segments, 1);
+        if (string.IsNullOrEmpty(container) || string.IsNullOrEmpty(blob))
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        var query = QueryHelpers.ParseQuery(queryText);
+        if (query.Keys.Any(key => !string.Equals(key, "snapshot", StringComparison.OrdinalIgnoreCase)))
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
+        var snapshot = query.TryGetValue("snapshot", out var snapshotValue)
+            ? NullIfEmpty(snapshotValue.ToString())
+            : null;
+
+        var sourceUri = new UriBuilder(
+            destination.Scheme,
+            destination.Host.Host,
+            destination.Host.Port ?? -1,
+            escapedPath)
+        {
+            Query = queryText.TrimStart('?')
+        }.Uri;
+        return new ResolvedInternalCopySource(
+            sourceUri,
+            destinationRequest.Account,
+            container,
+            blob,
+            snapshot,
+            VersionId: null);
+    }
+
     private static async Task<BlobRecord> ResolveCopySourceAsync(
         HttpContext destination,
         StorageRequestContext destinationRequest,
@@ -2779,13 +2882,18 @@ public static class BlobProtocolEndpoint
         }
     }
 
-    private static void ValidateOptionalLease(HttpRequest request, LeaseRecord lease, string resource)
+    private static void ValidateOptionalLease(
+        HttpRequest request,
+        LeaseRecord lease,
+        string resource,
+        string headerName = "x-ms-lease-id")
     {
         var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
         leases.ValidateOptionalAccess(
             lease,
-            ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
-            resource);
+            ProtocolParsing.First(request.Headers, headerName),
+            resource,
+            headerName);
     }
 
     private static async Task<BlobRecord?> TryGetCurrentBlobAsync(
