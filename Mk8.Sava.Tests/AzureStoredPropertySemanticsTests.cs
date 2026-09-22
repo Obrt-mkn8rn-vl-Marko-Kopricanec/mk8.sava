@@ -382,7 +382,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         {
             request.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "scope-old");
             using var response = await transport.SendAsync(request);
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal(
                 "FeatureVersionMismatch",
                 response.Headers.GetValues("x-ms-error-code").Single());

@@ -58,6 +58,16 @@ public sealed class AzureStorageException : Exception
         header,
         value);
 
+    public static AzureStorageException FeatureVersionMismatch(
+        string message,
+        string? headerName = null,
+        string? headerValue = null) => new(
+        (int)HttpStatusCode.Conflict,
+        "FeatureVersionMismatch",
+        message,
+        headerName,
+        headerValue);
+
     public static AzureStorageException AuthenticationFailed(string detail = "Server failed to authenticate the request.") => new(
         (int)HttpStatusCode.Forbidden,
         "AuthenticationFailed",

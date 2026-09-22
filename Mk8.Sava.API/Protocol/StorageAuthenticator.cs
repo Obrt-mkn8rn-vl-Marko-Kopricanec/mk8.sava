@@ -91,9 +91,7 @@ public sealed class StorageAuthenticator(IOptions<SavaOptions> options, Metadata
         if (!DateOnly.TryParseExact(request.ServiceVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var version) ||
             version < new DateOnly(2018, 11, 9))
         {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "FeatureVersionMismatch",
+            throw AzureStorageException.FeatureVersionMismatch(
                 "The requested operation requires service version 2018-11-09 or later.");
         }
 
