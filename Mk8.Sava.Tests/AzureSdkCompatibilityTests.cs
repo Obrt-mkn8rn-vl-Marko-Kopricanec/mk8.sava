@@ -3653,6 +3653,193 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task RenameContainerMovesCompleteStateWithoutCopyingContent()
+    {
+        var service = CreateClient(factory);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var sourceName = $"rename-source-{Guid.NewGuid():N}";
+        var destinationName = $"rename-destination-{Guid.NewGuid():N}";
+        var source = service.GetBlobContainerClient(sourceName);
+        await source.CreateAsync(
+            PublicAccessType.None,
+            new Dictionary<string, string> { ["purpose"] = "rename" });
+        var committed = source.GetBlobClient("committed.bin");
+        await committed.UploadAsync(
+            BinaryData.FromString("container rename preserves content"),
+            new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string> { ["state"] = "committed" },
+                Tags = new Dictionary<string, string> { ["kind"] = "renamed" }
+            });
+        var staged = source.GetBlockBlobClient("staged.bin");
+        var blockId = Convert.ToBase64String("rename-block"u8);
+        await staged.StageBlockAsync(blockId, BinaryData.FromString("staged rename content").ToStream());
+
+        var leaseId = Guid.NewGuid().ToString();
+        var lease = source.GetBlobLeaseClient(leaseId);
+        await lease.AcquireAsync(TimeSpan.FromSeconds(60));
+        var before = await metadata.GetStorageInventoryAsync(CancellationToken.None);
+
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Write);
+        var sas = accountSas.ToSasQueryParameters(credential);
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        async Task<HttpResponseMessage> RenameAsync(
+            string target,
+            string? sourceContainer,
+            string? sourceLeaseId = null,
+            string serviceVersion = "2026-02-06")
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Put,
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{target}" +
+                $"?restype=container&comp=rename&{sas}")
+            {
+                Content = new ByteArrayContent([])
+            };
+            request.Headers.TryAddWithoutValidation("x-ms-version", serviceVersion);
+            if (sourceContainer is not null)
+                request.Headers.TryAddWithoutValidation("x-ms-source-container-name", sourceContainer);
+            if (sourceLeaseId is not null)
+                request.Headers.TryAddWithoutValidation("x-ms-source-lease-id", sourceLeaseId);
+            return await transport.SendAsync(request);
+        }
+
+        using (var oldVersion = await RenameAsync(destinationName, sourceName, serviceVersion: "2020-04-08"))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, oldVersion.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", oldVersion.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var missingSource = await RenameAsync(destinationName, sourceContainer: null))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, missingSource.StatusCode);
+            Assert.Equal("MissingRequiredHeader", missingSource.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Contains(
+                "<HeaderName>x-ms-source-container-name</HeaderName>",
+                await missingSource.Content.ReadAsStringAsync(),
+                StringComparison.Ordinal);
+        }
+        using (var malformedLease = await RenameAsync(destinationName, sourceName, "not-a-lease-id"))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, malformedLease.StatusCode);
+            Assert.Equal("InvalidHeaderValue", malformedLease.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Contains(
+                "<HeaderName>x-ms-source-lease-id</HeaderName>",
+                await malformedLease.Content.ReadAsStringAsync(),
+                StringComparison.Ordinal);
+        }
+        using (var missingLease = await RenameAsync(destinationName, sourceName))
+        {
+            Assert.Equal(HttpStatusCode.PreconditionFailed, missingLease.StatusCode);
+            Assert.Equal("LeaseIdMissing", missingLease.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var mismatchedLease = await RenameAsync(destinationName, sourceName, Guid.NewGuid().ToString()))
+        {
+            Assert.Equal(HttpStatusCode.PreconditionFailed, mismatchedLease.StatusCode);
+            Assert.Equal(
+                "LeaseIdMismatchWithContainerOperation",
+                mismatchedLease.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var rename = await RenameAsync(destinationName, sourceName, leaseId))
+        {
+            Assert.Equal(HttpStatusCode.OK, rename.StatusCode);
+            Assert.Null(rename.Headers.ETag);
+            Assert.Null(rename.Content.Headers.LastModified);
+            Assert.Equal(0, rename.Content.Headers.ContentLength);
+        }
+
+        Assert.False((await source.ExistsAsync()).Value);
+        var destination = service.GetBlobContainerClient(destinationName);
+        var properties = (await destination.GetPropertiesAsync()).Value;
+        Assert.Equal("rename", properties.Metadata["purpose"]);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, properties.LeaseState);
+        var renamedBlob = destination.GetBlobClient(committed.Name);
+        Assert.Equal(
+            "container rename preserves content",
+            (await renamedBlob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("committed", (await renamedBlob.GetPropertiesAsync()).Value.Metadata["state"]);
+        Assert.Equal("renamed", (await renamedBlob.GetTagsAsync()).Value.Tags["kind"]);
+        var renamedBlocks = (await destination.GetBlockBlobClient(staged.Name)
+            .GetBlockListAsync(BlockListTypes.Uncommitted)).Value;
+        Assert.Equal(blockId, Assert.Single(renamedBlocks.UncommittedBlocks).Name);
+        var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'renamed'").ToListAsync();
+        Assert.Equal(destinationName, Assert.Single(tagged, item => item.BlobName == committed.Name).BlobContainerName);
+
+        var after = await metadata.GetStorageInventoryAsync(CancellationToken.None);
+        Assert.Equal(before.LogicalBlobBytes, after.LogicalBlobBytes);
+        Assert.Equal(before.LogicalStagedBlockBytes, after.LogicalStagedBlockBytes);
+        Assert.Equal(before.BlobRecordCount, after.BlobRecordCount);
+        Assert.Equal(before.StagedBlockCount, after.StagedBlockCount);
+        Assert.True(before.ReachableChunkIds.SetEquals(after.ReachableChunkIds));
+
+        var collisionSource = service.GetBlobContainerClient($"rename-collision-source-{Guid.NewGuid():N}");
+        var collisionDestination = service.GetBlobContainerClient($"rename-collision-target-{Guid.NewGuid():N}");
+        await collisionSource.CreateAsync();
+        await collisionDestination.CreateAsync();
+        using var collision = await RenameAsync(collisionDestination.Name, collisionSource.Name);
+        Assert.Equal(HttpStatusCode.Conflict, collision.StatusCode);
+        Assert.Equal("ContainerAlreadyExists", collision.Headers.GetValues("x-ms-error-code").Single());
+        Assert.True((await collisionSource.ExistsAsync()).Value);
+    }
+
+    [Fact]
+    public async Task RenameContainerRequiresBearerAccessToBothNames()
+    {
+        var sourceName = $"rename-bearer-source-{Guid.NewGuid():N}";
+        var destinationName = $"rename-bearer-target-{Guid.NewGuid():N}";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:BearerAuthentication:Principals:rename-writer:Permissions"] = "w",
+            ["Sava:BearerAuthentication:Principals:rename-writer:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            ["Sava:BearerAuthentication:Principals:rename-writer:Containers:0"] = destinationName
+        });
+        try
+        {
+            var owner = CreateClient(application);
+            var source = owner.GetBlobContainerClient(sourceName);
+            await source.CreateAsync();
+            var token = CreateJwt(SavaWebApplicationFactory.AccountKey, "rename-writer");
+            using var transport = new HttpClient(application.Server.CreateHandler());
+            using var request = new HttpRequestMessage(
+                HttpMethod.Put,
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{destinationName}" +
+                "?restype=container&comp=rename")
+            {
+                Content = new ByteArrayContent([])
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2026-02-06");
+            request.Headers.TryAddWithoutValidation("x-ms-source-container-name", sourceName);
+
+            using var response = await transport.SendAsync(request);
+
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal(
+                "AuthorizationPermissionMismatch",
+                response.Headers.GetValues("x-ms-error-code").Single());
+            Assert.True((await source.ExistsAsync()).Value);
+            Assert.False((await owner.GetBlobContainerClient(destinationName).ExistsAsync()).Value);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task RestoreContainerSupportsDestinationNamesAndPreservesTheCompleteContainerState()
     {
         var service = CreateClient(factory);

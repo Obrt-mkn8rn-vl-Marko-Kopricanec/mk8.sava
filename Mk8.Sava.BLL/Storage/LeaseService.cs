@@ -53,10 +53,14 @@ public sealed class LeaseService(TimeProvider timeProvider)
             : effective;
     }
 
-    public void EnsureWriteAccess(LeaseRecord lease, string? suppliedId, string resource)
+    public void EnsureWriteAccess(
+        LeaseRecord lease,
+        string? suppliedId,
+        string resource,
+        string headerName = "x-ms-lease-id")
     {
         var effective = GetEffective(lease);
-        var supplied = ParseOptionalId(suppliedId, "x-ms-lease-id");
+        var supplied = ParseOptionalId(suppliedId, headerName);
         if (effective.State is LeaseState.Leased or LeaseState.Breaking)
         {
             if (!supplied.HasValue)

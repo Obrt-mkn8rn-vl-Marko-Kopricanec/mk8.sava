@@ -320,10 +320,35 @@ public sealed class MetadataStore(
         }
     }
 
-    public async Task<bool> TryRestoreContainerAsync(
+    public Task<bool> TryRestoreContainerAsync(
         string sourceName,
         ContainerRecord restored,
         string expectedSourceRevision,
+        CancellationToken cancellationToken) =>
+        TryRelocateContainerAsync(
+            sourceName,
+            restored,
+            expectedSourceRevision,
+            allowSameName: true,
+            cancellationToken);
+
+    public Task<bool> TryRenameContainerAsync(
+        string sourceName,
+        ContainerRecord renamed,
+        string expectedSourceRevision,
+        CancellationToken cancellationToken) =>
+        TryRelocateContainerAsync(
+            sourceName,
+            renamed,
+            expectedSourceRevision,
+            allowSameName: false,
+            cancellationToken);
+
+    private async Task<bool> TryRelocateContainerAsync(
+        string sourceName,
+        ContainerRecord destination,
+        string expectedSourceRevision,
+        bool allowSameName,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken);
@@ -334,35 +359,37 @@ public sealed class MetadataStore(
             var source = await GetContainerAsync(
                 connection,
                 transaction,
-                restored.Account,
+                destination.Account,
                 sourceName,
                 includeDeleted: true,
                 cancellationToken);
             if (source is null || !string.Equals(source.Revision, expectedSourceRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
-            if (string.Equals(sourceName, restored.Name, StringComparison.Ordinal))
+            if (string.Equals(sourceName, destination.Name, StringComparison.Ordinal))
             {
+                if (!allowSameName)
+                    return false;
                 await using var update = connection.CreateCommand();
                 update.Transaction = transaction;
                 update.CommandText = """
                     UPDATE containers SET deleted = $deleted, modified_ticks = $modified, data = $data
                     WHERE account = $account AND name = $name;
                     """;
-                AddContainerParameters(update, restored);
+                AddContainerParameters(update, destination);
                 if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
                     throw new StorageConcurrencyException();
             }
             else
             {
-                var destination = await GetContainerAsync(
+                var existingDestination = await GetContainerAsync(
                     connection,
                     transaction,
-                    restored.Account,
-                    restored.Name,
+                    destination.Account,
+                    destination.Name,
                     includeDeleted: true,
                     cancellationToken);
-                if (destination is not null)
+                if (existingDestination is not null)
                     return false;
 
                 await using (var addContainer = connection.CreateCommand())
@@ -372,72 +399,62 @@ public sealed class MetadataStore(
                         INSERT INTO containers(account, name, deleted, modified_ticks, data)
                         VALUES ($account, $name, $deleted, $modified, $data);
                         """;
-                    AddContainerParameters(addContainer, restored);
+                    AddContainerParameters(addContainer, destination);
                     if (await addContainer.ExecuteNonQueryAsync(cancellationToken) != 1)
                         throw new StorageConcurrencyException();
                 }
 
-                IReadOnlyList<BlobRecord> blobs;
-                await using (var listBlobs = connection.CreateCommand())
+                await using (var updateBlobs = connection.CreateCommand())
                 {
-                    listBlobs.Transaction = transaction;
-                    listBlobs.CommandText = """
-                        SELECT data FROM blobs
+                    updateBlobs.Transaction = transaction;
+                    updateBlobs.CommandText = """
+                        UPDATE blobs
+                        SET container = $destination,
+                            data = json_set(data, '$.container', $destination)
                         WHERE account = $account AND container = $container;
                         """;
-                    listBlobs.Parameters.AddWithValue("$account", restored.Account);
-                    listBlobs.Parameters.AddWithValue("$container", sourceName);
-                    blobs = await ReadJsonRowsAsync<BlobRecord>(listBlobs, cancellationToken);
-                }
-                foreach (var blob in blobs)
-                {
-                    await using var updateBlob = connection.CreateCommand();
-                    updateBlob.Transaction = transaction;
-                    updateBlob.CommandText = """
-                        UPDATE blobs SET container = $destination, data = $data
-                        WHERE generation_id = $generation AND account = $account AND container = $source;
-                        """;
-                    updateBlob.Parameters.AddWithValue("$destination", restored.Name);
-                    updateBlob.Parameters.AddWithValue("$data", Serialize(blob with { Container = restored.Name }));
-                    updateBlob.Parameters.AddWithValue("$generation", blob.GenerationId);
-                    updateBlob.Parameters.AddWithValue("$account", restored.Account);
-                    updateBlob.Parameters.AddWithValue("$source", sourceName);
-                    if (await updateBlob.ExecuteNonQueryAsync(cancellationToken) != 1)
-                        throw new StorageConcurrencyException();
+                    updateBlobs.Parameters.AddWithValue("$destination", destination.Name);
+                    updateBlobs.Parameters.AddWithValue("$account", destination.Account);
+                    updateBlobs.Parameters.AddWithValue("$container", sourceName);
+                    await updateBlobs.ExecuteNonQueryAsync(cancellationToken);
                 }
 
-                IReadOnlyList<StagedBlockRecord> blocks;
-                await using (var listBlocks = connection.CreateCommand())
+                await using (var addBlocks = connection.CreateCommand())
                 {
-                    listBlocks.Transaction = transaction;
-                    listBlocks.CommandText = """
-                        SELECT data FROM staged_blocks
-                        WHERE account = $account AND container = $container;
-                        """;
-                    listBlocks.Parameters.AddWithValue("$account", restored.Account);
-                    listBlocks.Parameters.AddWithValue("$container", sourceName);
-                    blocks = await ReadJsonRowsAsync<StagedBlockRecord>(listBlocks, cancellationToken);
-                }
-                foreach (var block in blocks)
-                {
-                    var renamed = block with { Container = restored.Name };
-                    await using var addBlock = connection.CreateCommand();
-                    addBlock.Transaction = transaction;
-                    addBlock.CommandText = """
+                    addBlocks.Transaction = transaction;
+                    addBlocks.CommandText = """
                         INSERT INTO staged_blocks(
                             account, container, blob_name, block_id, created_ticks, logical_length, data)
-                        VALUES ($account, $container, $blob, $block, $created, $logical, $data);
+                        SELECT account,
+                               $destination,
+                               blob_name,
+                               block_id,
+                               created_ticks,
+                               logical_length,
+                               json_set(data, '$.container', $destination)
+                        FROM staged_blocks
+                        WHERE account = $account AND container = $container;
                         """;
-                    addBlock.Parameters.AddWithValue("$account", renamed.Account);
-                    addBlock.Parameters.AddWithValue("$container", renamed.Container);
-                    addBlock.Parameters.AddWithValue("$blob", renamed.BlobName);
-                    addBlock.Parameters.AddWithValue("$block", renamed.BlockId);
-                    addBlock.Parameters.AddWithValue("$created", renamed.CreatedAt.UtcTicks);
-                    addBlock.Parameters.AddWithValue("$logical", renamed.Content.Length);
-                    addBlock.Parameters.AddWithValue("$data", Serialize(renamed));
-                    if (await addBlock.ExecuteNonQueryAsync(cancellationToken) != 1)
-                        throw new StorageConcurrencyException();
-                    await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, renamed, cancellationToken);
+                    addBlocks.Parameters.AddWithValue("$destination", destination.Name);
+                    addBlocks.Parameters.AddWithValue("$account", destination.Account);
+                    addBlocks.Parameters.AddWithValue("$container", sourceName);
+                    await addBlocks.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                await using (var addBlockReferences = connection.CreateCommand())
+                {
+                    addBlockReferences.Transaction = transaction;
+                    addBlockReferences.CommandText = """
+                        INSERT INTO staged_block_chunk_references(
+                            account, container, blob_name, block_id, chunk_id)
+                        SELECT account, $destination, blob_name, block_id, chunk_id
+                        FROM staged_block_chunk_references
+                        WHERE account = $account AND container = $container;
+                        """;
+                    addBlockReferences.Parameters.AddWithValue("$destination", destination.Name);
+                    addBlockReferences.Parameters.AddWithValue("$account", destination.Account);
+                    addBlockReferences.Parameters.AddWithValue("$container", sourceName);
+                    await addBlockReferences.ExecuteNonQueryAsync(cancellationToken);
                 }
 
                 await using (var deleteBlocks = connection.CreateCommand())
@@ -447,7 +464,7 @@ public sealed class MetadataStore(
                         DELETE FROM staged_blocks
                         WHERE account = $account AND container = $container;
                         """;
-                    deleteBlocks.Parameters.AddWithValue("$account", restored.Account);
+                    deleteBlocks.Parameters.AddWithValue("$account", destination.Account);
                     deleteBlocks.Parameters.AddWithValue("$container", sourceName);
                     await deleteBlocks.ExecuteNonQueryAsync(cancellationToken);
                 }
@@ -459,7 +476,7 @@ public sealed class MetadataStore(
                         DELETE FROM containers
                         WHERE account = $account AND name = $name;
                         """;
-                    deleteSource.Parameters.AddWithValue("$account", restored.Account);
+                    deleteSource.Parameters.AddWithValue("$account", destination.Account);
                     deleteSource.Parameters.AddWithValue("$name", sourceName);
                     if (await deleteSource.ExecuteNonQueryAsync(cancellationToken) != 1)
                         throw new StorageConcurrencyException();
