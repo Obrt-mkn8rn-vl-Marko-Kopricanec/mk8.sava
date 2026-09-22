@@ -87,6 +87,9 @@ precedence, typed `CAST`, `BETWEEN`, `IN`, `NULLIF`, `COALESCE`,
 `CHAR_LENGTH`/`CHARACTER_LENGTH`, `LOWER`, `UPPER`, `SUBSTRING`, and `LIMIT`.
 Once a `LIMIT` is satisfied, input enumeration and its underlying blob read are
 cancelled instead of scanning the remainder of the object.
+Date expressions include `DATE_ADD`, `DATE_DIFF`, `EXTRACT`, `TO_STRING`,
+`TO_TIMESTAMP`, and `UTCNOW`; `TRIM` accepts Azure's `BOTH`, `LEADING`, and
+`TRAILING` forms with caller-selected characters.
 
 ## Account capabilities
 

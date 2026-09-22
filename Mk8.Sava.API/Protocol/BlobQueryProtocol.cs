@@ -1609,6 +1609,12 @@ internal sealed class BlobQueryPlan
             "LOWER" => new QueryCell(first.ToText().ToLowerInvariant()),
             "UPPER" => new QueryCell(first.ToText().ToUpperInvariant()),
             "SUBSTRING" => EvaluateSubstring(first, arguments, row),
+            "DATE_ADD" => EvaluateDateAdd(first, arguments, row),
+            "DATE_DIFF" => EvaluateDateDiff(first, arguments, row),
+            "EXTRACT" => EvaluateExtract(first, arguments, row),
+            "TO_STRING" => EvaluateTimestampString(first, arguments, row),
+            "TO_TIMESTAMP" => Cast(first, QueryValueType.Timestamp),
+            "TRIM" => EvaluateTrim(first, arguments, row),
             _ => throw InvalidType($"The function '{name}' is not supported.")
         };
     }
@@ -1631,6 +1637,208 @@ internal sealed class BlobQueryPlan
         for (var index = start; index < start + length; index++)
             result.Append(characters[index]);
         return new QueryCell(result.ToString());
+    }
+
+    private static QueryCell EvaluateDateAdd(
+        QueryCell part,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        var quantity = Cast(arguments[1].Evaluate(row), QueryValueType.Int);
+        var timestamp = Cast(arguments[2].Evaluate(row), QueryValueType.Timestamp);
+        if (quantity.Value is null || timestamp.Value is null)
+            return new QueryCell(null);
+        var amount = (long)quantity.Value;
+        var value = (DateTimeOffset)timestamp.Value;
+        try
+        {
+            value = NormalizeDatePart(part.ToText()) switch
+            {
+                "year" => value.AddYears(checked((int)amount)),
+                "month" => value.AddMonths(checked((int)amount)),
+                "day" => value.AddDays(amount),
+                "hour" => value.AddHours(amount),
+                "minute" => value.AddMinutes(amount),
+                "second" => value.AddSeconds(amount),
+                _ => throw InvalidDatePart(part)
+            };
+            return new QueryCell(value);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            throw InvalidType("The DATE_ADD result is outside the supported timestamp range.");
+        }
+        catch (OverflowException)
+        {
+            throw InvalidType("The DATE_ADD quantity is outside the supported range.");
+        }
+    }
+
+    private static QueryCell EvaluateDateDiff(
+        QueryCell part,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        var start = Cast(arguments[1].Evaluate(row), QueryValueType.Timestamp);
+        var end = Cast(arguments[2].Evaluate(row), QueryValueType.Timestamp);
+        if (start.Value is null || end.Value is null)
+            return new QueryCell(null);
+        var startTimestamp = ((DateTimeOffset)start.Value).ToUniversalTime();
+        var endTimestamp = ((DateTimeOffset)end.Value).ToUniversalTime();
+        var difference = NormalizeDatePart(part.ToText()) switch
+        {
+            "year" => endTimestamp.Year - startTimestamp.Year,
+            "month" => checked((endTimestamp.Year - startTimestamp.Year) * 12L + endTimestamp.Month - startTimestamp.Month),
+            "day" => BoundaryDifference(startTimestamp, endTimestamp, TimeSpan.TicksPerDay),
+            "hour" => BoundaryDifference(startTimestamp, endTimestamp, TimeSpan.TicksPerHour),
+            "minute" => BoundaryDifference(startTimestamp, endTimestamp, TimeSpan.TicksPerMinute),
+            "second" => BoundaryDifference(startTimestamp, endTimestamp, TimeSpan.TicksPerSecond),
+            _ => throw InvalidDatePart(part)
+        };
+        return new QueryCell(difference);
+    }
+
+    private static QueryCell EvaluateExtract(
+        QueryCell part,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        var timestamp = Cast(arguments[1].Evaluate(row), QueryValueType.Timestamp);
+        if (timestamp.Value is null)
+            return new QueryCell(null);
+        var value = (DateTimeOffset)timestamp.Value;
+        var extracted = NormalizeDatePart(part.ToText()) switch
+        {
+            "year" => value.Year,
+            "month" => value.Month,
+            "day" => value.Day,
+            "hour" => value.Hour,
+            "minute" => value.Minute,
+            "second" => value.Second,
+            "timezone_hour" => value.Offset.Hours,
+            "timezone_minute" => value.Offset.Minutes,
+            _ => throw InvalidDatePart(part)
+        };
+        return new QueryCell((long)extracted);
+    }
+
+    private static QueryCell EvaluateTimestampString(
+        QueryCell timestamp,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        var converted = Cast(timestamp, QueryValueType.Timestamp);
+        var format = arguments[1].Evaluate(row);
+        if (converted.Value is null || format.Value is null)
+            return new QueryCell(null);
+        return new QueryCell(FormatTimestamp((DateTimeOffset)converted.Value, format.ToText()));
+    }
+
+    private static QueryCell EvaluateTrim(
+        QueryCell first,
+        IReadOnlyList<QueryExpression> arguments,
+        QueryRow row)
+    {
+        if (arguments.Count == 1)
+            return new QueryCell(first.ToText().Trim());
+
+        var characters = arguments[1].Evaluate(row);
+        var value = arguments[2].Evaluate(row);
+        if (characters.Value is null || value.Value is null)
+            return new QueryCell(null);
+        var trimCharacters = characters.ToText().ToCharArray();
+        var text = value.ToText();
+        var trimmed = first.ToText().ToUpperInvariant() switch
+        {
+            "BOTH" => text.Trim(trimCharacters),
+            "LEADING" => text.TrimStart(trimCharacters),
+            "TRAILING" => text.TrimEnd(trimCharacters),
+            _ => throw InvalidType($"The TRIM mode '{first.ToText()}' is invalid.")
+        };
+        return new QueryCell(trimmed);
+    }
+
+    private static long BoundaryDifference(
+        DateTimeOffset start,
+        DateTimeOffset end,
+        long unitTicks) =>
+        end.UtcTicks / unitTicks - start.UtcTicks / unitTicks;
+
+    private static string NormalizeDatePart(string part)
+    {
+        var normalized = part.Trim().ToLowerInvariant();
+        return normalized.EndsWith('s') ? normalized[..^1] : normalized;
+    }
+
+    private static BlobQueryDataException InvalidDatePart(QueryCell part) =>
+        InvalidType($"The date part '{part.ToText()}' is not supported.");
+
+    private static string FormatTimestamp(DateTimeOffset timestamp, string format)
+    {
+        var result = new StringBuilder(format.Length + 8);
+        for (var index = 0; index < format.Length;)
+        {
+            var character = format[index];
+            if (character == '\'')
+            {
+                index++;
+                while (index < format.Length && format[index] != '\'')
+                    result.Append(format[index++]);
+                if (index >= format.Length)
+                    throw InvalidType("The TO_STRING format contains an unterminated quoted literal.");
+                index++;
+                continue;
+            }
+
+            var count = 1;
+            while (index + count < format.Length && format[index + count] == character)
+                count++;
+            var token = format.Substring(index, count);
+            result.Append(character switch
+            {
+                'y' when count == 2 => timestamp.ToString("yy", CultureInfo.InvariantCulture),
+                'y' when count is 1 or 4 => timestamp.ToString("yyyy", CultureInfo.InvariantCulture),
+                'M' when count == 1 => timestamp.Month.ToString(CultureInfo.InvariantCulture),
+                'M' when count == 2 => timestamp.ToString("MM", CultureInfo.InvariantCulture),
+                'M' when count == 3 => timestamp.ToString("MMM", CultureInfo.InvariantCulture),
+                'M' when count == 4 => timestamp.ToString("MMMM", CultureInfo.InvariantCulture),
+                'd' when count == 1 => timestamp.Day.ToString(CultureInfo.InvariantCulture),
+                'd' when count == 2 => timestamp.ToString("dd", CultureInfo.InvariantCulture),
+                'a' when count == 1 => timestamp.ToString("tt", CultureInfo.InvariantCulture),
+                'h' when count == 1 => (timestamp.Hour % 12 is 0 ? 12 : timestamp.Hour % 12).ToString(CultureInfo.InvariantCulture),
+                'h' when count == 2 => timestamp.ToString("hh", CultureInfo.InvariantCulture),
+                'H' when count == 1 => timestamp.Hour.ToString(CultureInfo.InvariantCulture),
+                'H' when count == 2 => timestamp.ToString("HH", CultureInfo.InvariantCulture),
+                'm' when count == 1 => timestamp.Minute.ToString(CultureInfo.InvariantCulture),
+                'm' when count == 2 => timestamp.ToString("mm", CultureInfo.InvariantCulture),
+                's' when count == 1 => timestamp.Second.ToString(CultureInfo.InvariantCulture),
+                's' when count == 2 => timestamp.ToString("ss", CultureInfo.InvariantCulture),
+                'S' when count is >= 1 and <= 3 => timestamp.Millisecond
+                    .ToString("D3", CultureInfo.InvariantCulture)[..count],
+                'X' when count is >= 1 and <= 5 => FormatOffset(timestamp.Offset, count, useZulu: true),
+                'x' when count is >= 1 and <= 5 => FormatOffset(timestamp.Offset, count, useZulu: false),
+                _ when char.IsLetter(character) =>
+                    throw InvalidType($"The TO_STRING format token '{token}' is not supported."),
+                _ => token
+            });
+            index += count;
+        }
+        return result.ToString();
+    }
+
+    private static string FormatOffset(TimeSpan offset, int count, bool useZulu)
+    {
+        if (offset == TimeSpan.Zero && useZulu)
+            return "Z";
+        var sign = offset < TimeSpan.Zero ? "-" : "+";
+        offset = offset.Duration();
+        return count switch
+        {
+            1 => $"{sign}{offset.Hours:00}",
+            2 or 4 => $"{sign}{offset.Hours:00}{offset.Minutes:00}",
+            3 or 5 => $"{sign}{offset.Hours:00}:{offset.Minutes:00}",
+            _ => throw InvalidType("The TO_STRING offset format is invalid.")
+        };
     }
 
     private static int ToNonNegativeInt(QueryCell value, string description)
@@ -1931,7 +2139,9 @@ internal sealed class BlobQueryPlan
                         return new QueryOperand(null, false, new QueryCell(true));
                     if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
                         return new QueryOperand(null, false, new QueryCell(false));
-                    if (string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) && MatchSymbol("("))
+                    if (!token.Quoted &&
+                        string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) &&
+                        MatchSymbol("("))
                     {
                         var operand = ParseExpression();
                         ExpectKeyword("AS");
@@ -1939,20 +2149,18 @@ internal sealed class BlobQueryPlan
                         ExpectSymbol(")");
                         return new QueryCastExpression(operand, type);
                     }
-                    if (MatchSymbol("("))
+                    if (!token.Quoted && MatchSymbol("("))
                     {
-                        var arguments = new List<QueryExpression>();
-                        if (!MatchSymbol(")"))
+                        var function = token.Text.ToUpperInvariant();
+                        var arguments = function switch
                         {
-                            do
-                            {
-                                arguments.Add(ParseExpression());
-                            }
-                            while (MatchSymbol(","));
-                            ExpectSymbol(")");
-                        }
+                            "DATE_ADD" or "DATE_DIFF" => ParseDateFunctionArguments(),
+                            "EXTRACT" => ParseExtractArguments(),
+                            "TRIM" => ParseTrimArguments(),
+                            _ => ParseFunctionArguments()
+                        };
                         ValidateFunction(token, arguments.Count);
-                        return new QueryFunctionExpression(token.Text.ToUpperInvariant(), arguments);
+                        return new QueryFunctionExpression(function, arguments);
                     }
                     var field = token.Text;
                     var caseSensitive = token.Quoted;
@@ -1979,6 +2187,87 @@ internal sealed class BlobQueryPlan
                     throw InvalidQuery(token.Position, $"Expected an expression, found '{token.Text}'.");
             }
         }
+
+        private List<QueryExpression> ParseFunctionArguments()
+        {
+            var arguments = new List<QueryExpression>();
+            if (!MatchSymbol(")"))
+            {
+                do
+                {
+                    arguments.Add(ParseExpression());
+                }
+                while (MatchSymbol(","));
+                ExpectSymbol(")");
+            }
+            return arguments;
+        }
+
+        private List<QueryExpression> ParseDateFunctionArguments()
+        {
+            var part = ExpectDatePart();
+            ExpectSymbol(",");
+            var first = ParseExpression();
+            ExpectSymbol(",");
+            var second = ParseExpression();
+            ExpectSymbol(")");
+            return [Literal(part), first, second];
+        }
+
+        private List<QueryExpression> ParseExtractArguments()
+        {
+            var part = ExpectDatePart();
+            ExpectKeyword("FROM");
+            var timestamp = ParseExpression();
+            ExpectSymbol(")");
+            return [Literal(part), timestamp];
+        }
+
+        private List<QueryExpression> ParseTrimArguments()
+        {
+            if (MatchSymbol(")"))
+                throw InvalidQuery(Current.Position, "TRIM requires a value.");
+
+            var mode = "BOTH";
+            if (Current.Kind == QueryTokenKind.Identifier &&
+                Current.Text.ToUpperInvariant() is "BOTH" or "LEADING" or "TRAILING")
+            {
+                mode = Current.Text.ToUpperInvariant();
+                _position++;
+                QueryExpression characters = Literal(" ");
+                if (!MatchKeyword("FROM"))
+                {
+                    characters = ParseExpression();
+                    ExpectKeyword("FROM");
+                }
+                var value = ParseExpression();
+                ExpectSymbol(")");
+                return [Literal(mode), characters, value];
+            }
+
+            var first = ParseExpression();
+            if (MatchKeyword("FROM"))
+            {
+                var value = ParseExpression();
+                ExpectSymbol(")");
+                return [Literal(mode), first, value];
+            }
+
+            ExpectSymbol(")");
+            return [first];
+        }
+
+        private string ExpectDatePart()
+        {
+            var token = Current;
+            if (token.Kind is not (QueryTokenKind.Identifier or QueryTokenKind.String))
+                throw InvalidQuery(token.Position, "Expected a date part.");
+            _position++;
+            return token.Text;
+        }
+
+        private static QueryExpression Literal(object? value) =>
+            new QueryOperand(null, false, new QueryCell(value));
 
         private QueryToken Current => _tokens[_position];
 
@@ -2038,6 +2327,10 @@ internal sealed class BlobQueryPlan
                 "NULLIF" => (Minimum: 2, Maximum: 2),
                 "COALESCE" => (Minimum: 1, Maximum: int.MaxValue),
                 "UTCNOW" => (Minimum: 0, Maximum: 0),
+                "DATE_ADD" or "DATE_DIFF" => (Minimum: 3, Maximum: 3),
+                "EXTRACT" or "TO_STRING" => (Minimum: 2, Maximum: 2),
+                "TO_TIMESTAMP" => (Minimum: 1, Maximum: 1),
+                "TRIM" => (Minimum: 1, Maximum: 3),
                 _ => throw InvalidQuery(token.Position, $"The function '{token.Text}' is not supported.")
             };
             if (argumentCount < expected.Minimum || argumentCount > expected.Maximum)
