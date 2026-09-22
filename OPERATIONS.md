@@ -39,23 +39,28 @@ intentional terminations.
 
 ## SDK substitution checks
 
-The normal .NET integration suite uses the official Azure Storage client. A
-separate JavaScript process lane proves that endpoint substitution also works
-through the independent official `@azure/storage-blob` protocol stack, including
-path-style account URLs, service and blob listings, block/append/page blobs,
-staged blocks, snapshots, leases, tags, byte ranges, and SAS authentication.
+The normal .NET integration suite uses the official Azure Storage client.
+Separate JavaScript and Python process lanes prove that endpoint substitution
+also works through independent official protocol stacks, including path-style
+account URLs, service and blob listings, block/append/page blobs, staged blocks,
+snapshots, leases, tags, byte ranges, and SAS authentication.
 
 Run it from the repository root with Node.js 20 or later, Corepack, and the .NET
 SDK available:
 
 ```bash
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/javascript/run.sh
+DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/python/run.sh
 ```
 
-The harness pins the newest Azure JavaScript client line that supports Node.js
-20 and locks its transitive Azure packages to their Node.js 20-compatible
-releases. It starts a real loopback mk8.sava process with a disposable storage
-root, rather than routing the client through ASP.NET's in-memory test server.
+The JavaScript harness requires Node.js 20 or later and Corepack. It pins the
+newest Azure client line supporting Node.js 20 and locks its transitive Azure
+packages to Node.js 20-compatible releases. The Python harness requires Python
+3.10 or later and `curl`; it hash-verifies a pinned pip wheel, installs an entirely
+hash-locked dependency graph into a disposable target, and never modifies the
+host Python installation. Each harness starts a real loopback mk8.sava process
+with a disposable storage root rather than routing the client through ASP.NET's
+in-memory test server.
 
 ## Account capabilities
 
