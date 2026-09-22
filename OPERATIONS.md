@@ -7,6 +7,24 @@ may be atomically replaced by background recompression or pack compaction. The
 configured `Sava:DataPath` is a single storage root; do not copy a live root with
 a generic filesystem command and assume the result is consistent.
 
+## Publication and failure boundaries
+
+Blob content is staged, authenticated, flushed, and published before its logical
+metadata can commit. A failure before the SQLite commit therefore exposes no new
+blob; any already-published but unreachable extent remains safe for a later
+garbage-collection pass. Reclamation obtains an exclusive mutation reservation
+and repeats the metadata reachability check before deleting an extent. If that
+pass is interrupted, disposing the reservation leaves the extent available to a
+future pass.
+
+Once the metadata transaction commits, the logical write is authoritative even
+if the client connection is lost or the server cannot return the response.
+Storage Analytics and ordinary request logging execute outside that transaction;
+their failure is logged but cannot roll back or replace the storage response.
+The integration suite has deterministic checkpoints at extent publication,
+metadata pre-commit and post-commit, and the final reclamation delete so these
+boundaries can be exercised without making fault injection a deployment feature.
+
 ## Account capabilities
 
 Storage-account capabilities are configured independently so one deployment can

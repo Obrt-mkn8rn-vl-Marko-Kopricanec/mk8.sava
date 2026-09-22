@@ -4,6 +4,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Mk8.Sava.Protocol;
+using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
@@ -12,6 +13,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
     private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
     private readonly TimeProvider? _timeProvider;
+    private readonly IStorageFaultInjector? _faultInjector;
+    private readonly IStorageAnalyticsSink? _analyticsSink;
     private readonly bool _deleteDataPath;
 
     public const string AccountName = "devstoreaccount1";
@@ -22,17 +25,32 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public const string TenantId = "27cb1b93-a01c-4f4c-8674-cf52973c2fe2";
 
     public SavaWebApplicationFactory()
-        : this(Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), null, null, null, true)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            urlTransferHandlerFactory: null,
+            configurationOverrides: null,
+            timeProvider: null,
+            deleteDataPath: true)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath)
-        : this(dataPath, null, null, null, true)
+        : this(
+            dataPath,
+            urlTransferHandlerFactory: null,
+            configurationOverrides: null,
+            timeProvider: null,
+            deleteDataPath: true)
     {
     }
 
     internal SavaWebApplicationFactory(string dataPath, bool deleteDataPath)
-        : this(dataPath, null, null, null, deleteDataPath)
+        : this(
+            dataPath,
+            urlTransferHandlerFactory: null,
+            configurationOverrides: null,
+            timeProvider: null,
+            deleteDataPath)
     {
     }
 
@@ -74,6 +92,18 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             timeProvider,
             true)
     {
+    }
+
+    internal SavaWebApplicationFactory(
+        string dataPath,
+        IStorageFaultInjector faultInjector,
+        IStorageAnalyticsSink? analyticsSink,
+        IReadOnlyDictionary<string, string?>? configurationOverrides,
+        bool deleteDataPath)
+        : this(dataPath, null, configurationOverrides, null, deleteDataPath)
+    {
+        _faultInjector = faultInjector;
+        _analyticsSink = analyticsSink;
     }
 
     private SavaWebApplicationFactory(
@@ -148,6 +178,22 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             {
                 services.RemoveAll<TimeProvider>();
                 services.AddSingleton(_timeProvider);
+            });
+        }
+        if (_faultInjector is not null || _analyticsSink is not null)
+        {
+            builder.ConfigureServices(services =>
+            {
+                if (_faultInjector is not null)
+                {
+                    services.RemoveAll<IStorageFaultInjector>();
+                    services.AddSingleton(_faultInjector);
+                }
+                if (_analyticsSink is not null)
+                {
+                    services.RemoveAll<IStorageAnalyticsSink>();
+                    services.AddSingleton(_analyticsSink);
+                }
             });
         }
     }

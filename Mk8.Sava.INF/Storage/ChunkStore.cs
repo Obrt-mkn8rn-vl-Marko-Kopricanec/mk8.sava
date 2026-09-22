@@ -35,6 +35,7 @@ public sealed class ChunkStore
 
     private readonly StoragePaths _paths;
     private readonly MetadataStore _metadata;
+    private readonly IStorageFaultInjector _faultInjector;
     private readonly SavaOptions _options;
     private readonly ContentDefinedChunker _chunker;
     private readonly object _pinGate = new();
@@ -43,10 +44,15 @@ public sealed class ChunkStore
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
     private string? _orphanPackCursor;
 
-    public ChunkStore(StoragePaths paths, MetadataStore metadata, IOptions<SavaOptions> options)
+    public ChunkStore(
+        StoragePaths paths,
+        MetadataStore metadata,
+        IStorageFaultInjector faultInjector,
+        IOptions<SavaOptions> options)
     {
         _paths = paths;
         _metadata = metadata;
+        _faultInjector = faultInjector;
         _options = options.Value;
         _chunker = new ContentDefinedChunker(
             _options.MinimumChunkBytes,
@@ -1236,6 +1242,7 @@ public sealed class ChunkStore
                         _options.CompressionQuality,
                         _options.CompressionMinimumSavingsBytes,
                         cancellationToken);
+                    _faultInjector.Inject(StorageFaultPoint.BeforeChunkPublication);
                     if (_options.EnableSmallChunkPacking &&
                         bytes.Length <= _options.SmallChunkPackingThresholdBytes)
                     {

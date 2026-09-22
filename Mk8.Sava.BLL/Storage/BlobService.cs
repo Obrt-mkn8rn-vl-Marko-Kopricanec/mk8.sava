@@ -13,6 +13,7 @@ public sealed class BlobService(
     LeaseService leases,
     StorageAnalyticsService analytics,
     IStorageTelemetry telemetry,
+    IStorageFaultInjector faultInjector,
     IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
@@ -2516,10 +2517,11 @@ public sealed class BlobService(
             foreach (var reservation in reservations)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (!confirmedReachability.Contains(reservation.Id) &&
-                    await reservation.TryDeleteAsync(cancellationToken))
+                if (!confirmedReachability.Contains(reservation.Id))
                 {
-                    deleted++;
+                    faultInjector.Inject(StorageFaultPoint.BeforeGarbageCollectionDelete);
+                    if (await reservation.TryDeleteAsync(cancellationToken))
+                        deleted++;
                 }
             }
             _garbageCollectionCursor = page.HasMore ? page.Items[^1] : null;
