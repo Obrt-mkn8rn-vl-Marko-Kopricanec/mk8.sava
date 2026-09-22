@@ -1811,6 +1811,118 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceBlobSnapshotsRequireTheExplicitPreviewCapability()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-snapshots-disabled-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/plain.bin");
+        await blob.UploadAsync(BinaryData.FromString("current"));
+
+        static void AssertUnsupported(RequestFailedException exception)
+        {
+            Assert.Equal(StatusCodes.Status409Conflict, exception.Status);
+            Assert.Equal("BlobOperationNotSupported", exception.ErrorCode);
+        }
+
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() => blob.CreateSnapshotAsync()));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.WithSnapshot("2026-09-22T12:00:00.0000000Z").GetPropertiesAsync()));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            await foreach (var _ in container.GetBlobsAsync(new GetBlobsOptions { States = BlobStates.Snapshots }))
+            {
+            }
+        }));
+        AssertUnsupported(await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots)));
+        Assert.True((await blob.ExistsAsync()).Value);
+    }
+
+    [Fact]
+    public async Task HierarchicalNamespaceBlobSnapshotPreviewPreservesSnapshotsWithoutCreatingVersions()
+    {
+        await using var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true",
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceBlobSnapshotsEnabled"] = "true"
+            });
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var serviceProperties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            CancellationToken.None);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            serviceProperties with
+            {
+                BlobSoftDeleteEnabled = true,
+                BlobSoftDeleteRetentionDays = 7,
+                VersioningEnabled = true
+            },
+            CancellationToken.None);
+
+        var container = service.GetBlobContainerClient($"hns-snapshots-preview-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/state.bin");
+        await blob.UploadAsync(BinaryData.FromString("before snapshot"));
+        var snapshotInfo = (await blob.CreateSnapshotAsync()).Value;
+        Assert.Null(snapshotInfo.VersionId);
+        var snapshot = blob.WithSnapshot(snapshotInfo.Snapshot);
+
+        await blob.UploadAsync(BinaryData.FromString("after snapshot"), overwrite: true);
+        Assert.Equal("before snapshot", (await snapshot.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("after snapshot", (await blob.DownloadContentAsync()).Value.Content.ToString());
+
+        var listed = await container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Snapshots,
+            Prefix = blob.Name
+        }).ToListAsync();
+        Assert.Contains(listed, item => item.Snapshot == snapshotInfo.Snapshot);
+
+        var family = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            blob.Name,
+            includeDeleted: true,
+            CancellationToken.None);
+        Assert.All(family, item => Assert.Null(item.VersionId));
+        Assert.Single(family, item => item.Snapshot == snapshotInfo.Snapshot);
+
+        await snapshot.DeleteAsync();
+        var deletedSnapshot = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshotInfo.Snapshot,
+            includeDeleted: true,
+            CancellationToken.None);
+        Assert.NotNull(deletedSnapshot);
+        Assert.True(deletedSnapshot.IsDeleted);
+        Assert.Equal(snapshotInfo.Snapshot, deletedSnapshot.Snapshot);
+        Assert.Null(deletedSnapshot.DeletionId);
+
+        var directorySnapshot = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("folder").CreateSnapshotAsync());
+        Assert.Equal(StatusCodes.Status409Conflict, directorySnapshot.Status);
+        Assert.Equal("BlobOperationNotSupported", directorySnapshot.ErrorCode);
+    }
+
+    [Fact]
     public async Task BlobTagSasRequiresTheDedicatedTagPermission()
     {
         var service = CreateClient(factory);

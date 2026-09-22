@@ -42,6 +42,11 @@ public sealed class BlobService(
         _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
         capabilities.HierarchicalNamespaceBlobIndexTagsEnabled;
 
+    public bool SupportsBlobSnapshots(string account) =>
+        !IsHierarchicalNamespaceEnabled(account) ||
+        _options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+        capabilities.HierarchicalNamespaceBlobSnapshotsEnabled;
+
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
         string account,
         bool includeDeleted,
@@ -284,6 +289,8 @@ public sealed class BlobService(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
+        if (includeSnapshots && !SupportsBlobSnapshots(account))
+            throw AzureStorageException.BlobOperationNotSupported();
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
@@ -321,6 +328,8 @@ public sealed class BlobService(
         int maximum,
         CancellationToken cancellationToken)
     {
+        if (includeSnapshots && !SupportsBlobSnapshots(account))
+            throw AzureStorageException.BlobOperationNotSupported();
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var page = await metadata.ListBlobsPageAsync(
@@ -403,6 +412,8 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
+        if (snapshot is not null && !SupportsBlobSnapshots(account))
+            throw AzureStorageException.BlobOperationNotSupported();
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
         await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
         var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
@@ -1210,6 +1221,8 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         EnsureNoPendingCopy(current);
+        if (!SupportsBlobSnapshots(current.Account) || current.IsDirectory)
+            throw AzureStorageException.BlobOperationNotSupported();
         if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal))
         {
             throw new AzureStorageException(
@@ -1217,7 +1230,12 @@ public sealed class BlobService(
                 "BlobArchived",
                 "This operation is not permitted on an archived blob.");
         }
-        return metadata.CreateSnapshotAsync(current, snapshotMetadata, metadata.GetUtcNow(), cancellationToken);
+        return metadata.CreateSnapshotAsync(
+            current,
+            snapshotMetadata,
+            metadata.GetUtcNow(),
+            IsHierarchicalNamespaceEnabled(current.Account),
+            cancellationToken);
     }
 
     public async Task DeleteBlobAsync(
@@ -1228,6 +1246,11 @@ public sealed class BlobService(
     {
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
+        if ((current.Snapshot is not null || deleteSnapshots != BlobDeleteSnapshotsOption.Unspecified) &&
+            !SupportsBlobSnapshots(current.Account))
+        {
+            throw AzureStorageException.BlobOperationNotSupported();
+        }
         if (current.IsDirectory &&
             await metadata.HasActiveBlobDescendantsAsync(
                 current.Account,
@@ -1298,7 +1321,8 @@ public sealed class BlobService(
             {
                 var deletedAt = metadata.GetUtcNow();
                 ulong? deletionId = null;
-                if (hierarchicalNamespace)
+                var hierarchicalPathDelete = hierarchicalNamespace && target.Snapshot is null;
+                if (hierarchicalPathDelete)
                 {
                     do
                     {
@@ -1314,7 +1338,7 @@ public sealed class BlobService(
                     DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
                     IsCurrent = !hierarchicalNamespace && target.IsCurrent,
                     VersionId = hierarchicalNamespace ? null : target.VersionId,
-                    Snapshot = hierarchicalNamespace ? null : target.Snapshot,
+                    Snapshot = hierarchicalPathDelete ? null : target.Snapshot,
                     Lease = LeaseRecord.Available,
                     Revision = MetadataStore.NewRevision()
                 };

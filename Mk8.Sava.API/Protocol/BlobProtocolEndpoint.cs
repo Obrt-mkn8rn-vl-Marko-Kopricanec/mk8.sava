@@ -484,7 +484,8 @@ public static class BlobProtocolEndpoint
                 delimiter,
                 http.Request.Query["showonly"].ToString(),
                 hierarchicalNamespace,
-                service.SupportsBlobIndexTags(request.Account));
+                service.SupportsBlobIndexTags(request.Account),
+                service.SupportsBlobSnapshots(request.Account));
             if (http.Request.Query.ContainsKey("startfrom") &&
                 !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
             {
@@ -751,6 +752,8 @@ public static class BlobProtocolEndpoint
             ValidateBlobVersionRequest(subrequestContext);
             var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
             subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken);
+            if (resolved.Snapshot is not null)
+                RequireBlobSnapshots(subrequestContext, service);
             if (resolved.Container == StorageAnalyticsService.LogsContainerName &&
                 resolved.Request.Kind != BlobBatchOperationKind.Delete)
             {
@@ -974,6 +977,8 @@ public static class BlobProtocolEndpoint
         }
         var versionId = NullIfEmpty(http.Request.Query["versionid"].ToString());
         var snapshot = NullIfEmpty(http.Request.Query["snapshot"].ToString());
+        if (snapshot is not null)
+            RequireBlobSnapshots(request, service);
         var permanentDelete = HttpMethods.IsDelete(http.Request.Method) &&
                               string.IsNullOrEmpty(comp) &&
                               http.Request.Query.ContainsKey("deletetype");
@@ -1561,8 +1566,11 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsPut(http.Request.Method) && comp == "snapshot")
         {
             RequireAny(request, 'c', 'w');
+            RequireBlobSnapshots(request, service);
             RequireZeroContentLength(http.Request);
             EnsureMutableVersion(blob);
+            if (blob.IsDirectory)
+                throw AzureStorageException.BlobOperationNotSupported();
             await EnsureBlobEncryptionAsync(
                 http.Request,
                 service,
@@ -1813,6 +1821,8 @@ public static class BlobProtocolEndpoint
                 RequireZeroContentLength(http.Request);
                 EnsureDestinationCanBeOverwritten(current);
                 var legacySourceReference = ResolveLegacyCopySource(http.Request, request, copySource);
+                if (legacySourceReference.Snapshot is not null)
+                    RequireBlobSnapshots(request, service, legacySourceReference.Account);
                 var legacySource = await service.GetBlobAsync(
                     legacySourceReference.Account,
                     legacySourceReference.Container,
@@ -2610,6 +2620,9 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.AuthorizationFailure();
         }
 
+        if (source.Snapshot is not null)
+            RequireBlobSnapshots(sourceContext, service, source.Account);
+
         var sourceBlob = await service.GetBlobAsync(
             source.Account,
             source.Container,
@@ -3358,6 +3371,10 @@ public static class BlobProtocolEndpoint
         var value = ProtocolParsing.First(request.Headers, headerName);
         if (value is null)
             return BlobDeleteSnapshotsOption.Unspecified;
+        var context = StorageRequestContext.Get(request.HttpContext);
+        RequireBlobSnapshots(
+            context,
+            request.HttpContext.RequestServices.GetRequiredService<BlobService>());
         if (hasExplicitSnapshotOrVersion)
             throw AzureStorageException.InvalidHeader(headerName, value);
         return value switch
@@ -3403,7 +3420,8 @@ public static class BlobProtocolEndpoint
         string delimiter,
         string showOnly,
         bool hierarchicalNamespace,
-        bool supportsBlobIndexTags)
+        bool supportsBlobIndexTags,
+        bool supportsBlobSnapshots)
     {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -3427,6 +3445,8 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.FeatureVersionMismatch(
                 "The requested listing details require service version 2009-09-19 or later.");
         }
+        if (includes.Contains("snapshots") && hierarchicalNamespace && !supportsBlobSnapshots)
+            throw AzureStorageException.BlobOperationNotSupported();
         if (includes.Contains("copy"))
             RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Listing copy properties");
         if (includes.Contains("deleted"))
@@ -4218,6 +4238,19 @@ public static class BlobProtocolEndpoint
             feature);
         if (hierarchicalNamespace && !supportsBlobIndexTags)
             throw AzureStorageException.BlobTagsNotSupportedForAccountType();
+    }
+
+    private static void RequireBlobSnapshots(
+        StorageRequestContext request,
+        BlobService service,
+        string? account = null)
+    {
+        var resolvedAccount = account ?? request.Account;
+        if (service.IsHierarchicalNamespaceEnabled(resolvedAccount) &&
+            !service.SupportsBlobSnapshots(resolvedAccount))
+        {
+            throw AzureStorageException.BlobOperationNotSupported();
+        }
     }
 
     private static AzureStorageException SourceConditionNotMet() =>

@@ -20,7 +20,8 @@ before clients write data:
     "AccountCapabilities": {
       "datalakeaccount": {
         "HierarchicalNamespaceEnabled": true,
-        "HierarchicalNamespaceBlobIndexTagsEnabled": false
+        "HierarchicalNamespaceBlobIndexTagsEnabled": false,
+        "HierarchicalNamespaceBlobSnapshotsEnabled": false
       }
     }
   }
@@ -38,6 +39,13 @@ Blob index tags on HNS accounts remain an Azure preview that requires the
 preview behavior is intended; its REST surface additionally requires service
 version 2024-11-04 or later. Flat-namespace accounts always retain normal blob
 index tag support.
+
+Blob snapshots on HNS accounts are also an Azure preview and the preview is no
+longer accepting new Azure customers. Set
+`HierarchicalNamespaceBlobSnapshotsEnabled` only when deliberately emulating an
+account already enrolled in that preview. Without it, mk8.sava rejects snapshot
+creation, selectors, listings, source copies, and delete-snapshot options on the
+HNS account instead of applying flat-namespace behavior.
 
 ## Health and metrics
 

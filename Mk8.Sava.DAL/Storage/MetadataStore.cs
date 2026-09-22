@@ -986,11 +986,17 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         };
         if (hierarchicalNamespace)
         {
-            predicates.Add(showOnly == BlobListShowOnly.Deleted
+            var activePredicate = includeSnapshots
+                ? "((is_current = 1 OR snapshot IS NOT NULL) AND is_deleted = 0)"
+                : "is_current = 1 AND is_deleted = 0";
+            var deletedPredicate = includeSnapshots
                 ? "is_deleted = 1"
+                : "is_deleted = 1 AND snapshot IS NULL";
+            predicates.Add(showOnly == BlobListShowOnly.Deleted
+                ? deletedPredicate
                 : includeDeleted
-                    ? "((is_current = 1 AND is_deleted = 0) OR is_deleted = 1)"
-                    : "is_current = 1 AND is_deleted = 0");
+                    ? $"({activePredicate} OR ({deletedPredicate}))"
+                    : activePredicate);
             if (showOnly == BlobListShowOnly.Files)
                 predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 0");
             else if (showOnly == BlobListShowOnly.Directories)
@@ -1800,6 +1806,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
         BlobRecord source,
         Dictionary<string, string>? snapshotMetadata,
         DateTimeOffset now,
+        bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken);
@@ -1834,7 +1841,7 @@ public sealed class MetadataStore(IStoragePaths paths, TimeProvider? timeProvide
 
             var properties = await GetServicePropertiesAsync(connection, transaction, source.Account, cancellationToken);
             string? newVersionId = null;
-            if (properties.VersioningEnabled)
+            if (properties.VersioningEnabled && !hierarchicalNamespace)
             {
                 var historical = source with
                 {
