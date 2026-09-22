@@ -6966,18 +6966,46 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
         await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString("policy payload"));
+        var policyStart = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var policyExpiry = DateTimeOffset.UtcNow.AddMinutes(10);
         await container.SetAccessPolicyAsync(
             PublicAccessType.None,
-            [new BlobSignedIdentifier
-            {
-                Id = "read-policy",
-                AccessPolicy = new BlobAccessPolicy
+            [
+                new BlobSignedIdentifier
                 {
-                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
-                    ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-                    Permissions = "r"
+                    Id = "read-policy",
+                    AccessPolicy = new BlobAccessPolicy
+                    {
+                        StartsOn = policyStart,
+                        ExpiresOn = policyExpiry,
+                        Permissions = "r"
+                    }
+                },
+                new BlobSignedIdentifier
+                {
+                    Id = "time-policy",
+                    AccessPolicy = new BlobAccessPolicy
+                    {
+                        StartsOn = policyStart,
+                        ExpiresOn = policyExpiry
+                    }
+                },
+                new BlobSignedIdentifier
+                {
+                    Id = "permission-policy",
+                    AccessPolicy = new BlobAccessPolicy { Permissions = "r" }
+                },
+                new BlobSignedIdentifier
+                {
+                    Id = "duplicate-policy",
+                    AccessPolicy = new BlobAccessPolicy
+                    {
+                        StartsOn = policyStart,
+                        ExpiresOn = policyExpiry,
+                        Permissions = "r"
+                    }
                 }
-            }]);
+            ]);
 
         var builder = new BlobSasBuilder
         {
@@ -6991,6 +7019,85 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var sas = builder.ToSasQueryParameters(credential);
         var policyBlob = CreateBlobClient(factory, new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
         Assert.Equal("policy payload", (await policyBlob.DownloadContentAsync()).Value.Content.ToString());
+
+        var tokenPermissionBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            Identifier = "time-policy",
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        tokenPermissionBuilder.SetPermissions(BlobSasPermissions.Read);
+        var tokenPermissionBlob = CreateBlobClient(
+            factory,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{tokenPermissionBuilder.ToSasQueryParameters(credential)}"));
+        Assert.Equal(
+            "policy payload",
+            (await tokenPermissionBlob.DownloadContentAsync()).Value.Content.ToString());
+
+        var tokenTimeBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            Identifier = "permission-policy",
+            StartsOn = policyStart,
+            ExpiresOn = policyExpiry,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        var tokenTimeBlob = CreateBlobClient(
+            factory,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{tokenTimeBuilder.ToSasQueryParameters(credential)}"));
+        Assert.Equal(
+            "policy payload",
+            (await tokenTimeBlob.DownloadContentAsync()).Value.Content.ToString());
+
+        var duplicateBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            Identifier = "duplicate-policy",
+            StartsOn = policyStart,
+            ExpiresOn = policyExpiry,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        duplicateBuilder.SetPermissions(BlobSasPermissions.Read);
+        var duplicateBlob = CreateBlobClient(
+            factory,
+            new Uri(
+                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{duplicateBuilder.ToSasQueryParameters(credential)}"));
+        var duplicate = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            duplicateBlob.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status400BadRequest, duplicate.Status);
+        Assert.Equal("InvalidQueryParameterValue", duplicate.ErrorCode);
+
+        var accountBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = policyStart,
+            ExpiresOn = policyExpiry,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountBuilder.SetPermissions(AccountSasPermissions.Read);
+        var accountSasWithIdentifier = CreateBlobClient(
+            factory,
+            AppendQuery(
+                new Uri(
+                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?{accountBuilder.ToSasQueryParameters(credential)}"),
+                "si=read-policy"));
+        var unsupportedIdentifier = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            accountSasWithIdentifier.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, unsupportedIdentifier.Status);
+        Assert.Equal("AuthenticationFailed", unsupportedIdentifier.ErrorCode);
 
         await container.SetAccessPolicyAsync(PublicAccessType.None, []);
         var revoked = await Assert.ThrowsAsync<RequestFailedException>(() => policyBlob.DownloadContentAsync());

@@ -96,6 +96,13 @@ container-scoped URI. Container-scoped tag searches continue to use the
 container resource type (`srt=c`), ordinary service operations use `srt=s`, and
 Undelete Blob retains Azure's documented container-resource exception.
 
+A service SAS may divide its start time, expiry, and permissions between its
+URI and a named container access policy, but the same field cannot appear in
+both places; duplicates fail with `400 InvalidQueryParameterValue`. Stored
+permissions are subject to the same canonical and version gates as permissions
+carried by the token. Account and user-delegation SAS cannot reference a stored
+access policy.
+
 A container SAS continues to cover snapshots and versions in the container
 without signing their individual identifiers. Snapshot (`sr=bs`) and version
 (`sr=bv`) tokens instead bind those identifiers explicitly; version SAS begins
