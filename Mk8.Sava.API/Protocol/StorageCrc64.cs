@@ -11,7 +11,7 @@ internal sealed class StorageCrc64
     public void Append(ReadOnlySpan<byte> bytes)
     {
         var crc = _value ^ ulong.MaxValue;
-        foreach (var value in bytes)
+        foreach (ref readonly var value in bytes)
             crc = crc >> 8 ^ Table[(byte)(crc ^ value)];
         _value = crc ^ ulong.MaxValue;
     }

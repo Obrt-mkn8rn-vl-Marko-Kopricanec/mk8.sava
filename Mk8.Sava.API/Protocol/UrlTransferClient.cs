@@ -982,11 +982,11 @@ internal sealed class UrlTransferClient(
         {
             var remaining = maximumBytes - _read;
             if (remaining <= 0)
-                return ProbeAsync(buffer);
+                return ProbeWindow(buffer);
             return buffer[..(int)Math.Min(buffer.Length, remaining)];
         }
 
-        private Memory<byte> ProbeAsync(Memory<byte> buffer)
+        private static Memory<byte> ProbeWindow(Memory<byte> buffer)
         {
             // Read one byte asynchronously on the next call so a source that lies
             // about Content-Length cannot publish more than the operation limit.

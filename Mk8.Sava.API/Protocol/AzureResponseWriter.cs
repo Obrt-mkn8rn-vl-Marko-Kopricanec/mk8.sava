@@ -9,7 +9,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-internal sealed partial class AzureResponseWriter
+internal static partial class AzureResponseWriter
 {
     private const string LegacyBlobMarkerPrefix = "mk8s1.";
     private const string BlobMarkerPrefix = "mk8s2.";
@@ -29,7 +29,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             : objectId;
     }
 
-    public async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
+    public static async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
     {
         var builder = new StringBuilder();
         using (var writer = XmlWriter.Create(builder, new XmlWriterSettings
@@ -46,7 +46,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         await context.Response.WriteAsync(builder.ToString(), cancellationToken).ConfigureAwait(false);
     }
 
-    internal Task WriteContainersAsync(
+    internal static Task WriteContainersAsync(
         HttpContext context,
         ContainerListPage page,
         string prefix,
@@ -158,7 +158,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         }, cancellationToken);
     }
 
-    internal Task WriteBlobsAsync(
+    internal static Task WriteBlobsAsync(
         HttpContext context,
         BlobListPage listing,
         string prefix,
@@ -487,7 +487,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         }, cancellationToken);
     }
 
-    public Task WriteTagsAsync(HttpContext context, IReadOnlyDictionary<string, string> tags, CancellationToken cancellationToken) =>
+    public static Task WriteTagsAsync(HttpContext context, IReadOnlyDictionary<string, string> tags, CancellationToken cancellationToken) =>
         WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("Tags");
@@ -495,7 +495,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WriteBlockListAsync(
+    public static Task WriteBlockListAsync(
         HttpContext context,
         BlobRecord? blob,
         IReadOnlyList<StagedBlockRecord> staged,
@@ -534,7 +534,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WritePageRangesAsync(
+    public static Task WritePageRangesAsync(
         HttpContext context,
         IReadOnlyList<PageRange> ranges,
         IReadOnlyList<PageRange> clearRanges,
@@ -562,7 +562,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WriteAclAsync(HttpContext context, ContainerRecord container, CancellationToken cancellationToken) =>
+    public static Task WriteAclAsync(HttpContext context, ContainerRecord container, CancellationToken cancellationToken) =>
         WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("SignedIdentifiers");
@@ -580,7 +580,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             writer.WriteEndElement();
         }, cancellationToken);
 
-    public Task WriteServicePropertiesAsync(HttpContext context, ServiceProperties properties, CancellationToken cancellationToken)
+    public static Task WriteServicePropertiesAsync(HttpContext context, ServiceProperties properties, CancellationToken cancellationToken)
     {
         var request = StorageRequestContext.Get(context);
         return WriteXmlAsync(context, writer =>
@@ -634,7 +634,7 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         }, cancellationToken);
     }
 
-    public Task WriteUserDelegationKeyAsync(
+    public static Task WriteUserDelegationKeyAsync(
         HttpContext context,
         UserDelegationKey key,
         CancellationToken cancellationToken) =>

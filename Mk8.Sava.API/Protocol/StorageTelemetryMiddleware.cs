@@ -50,6 +50,7 @@ internal sealed class StorageTelemetryMiddleware(
                         CaptureAnalyticsRequest(context, request, startedAt, completedAt, elapsed),
                         CancellationToken.None).ConfigureAwait(false);
                 }
+#pragma warning disable CA1031 // Best-effort analytics must not fail the completed storage request.
                 catch (Exception exception)
                 {
                     logger.LogWarning(
@@ -57,6 +58,7 @@ internal sealed class StorageTelemetryMiddleware(
                         "Storage Analytics could not persist request {RequestId}.",
                         request.RequestId);
                 }
+#pragma warning restore CA1031
             }
         }
     }

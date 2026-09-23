@@ -20,7 +20,6 @@ internal static class BlobProtocolEndpoint
     {
         var request = StorageRequestContext.Get(http);
         var service = http.RequestServices.GetRequiredService<BlobService>();
-        var writer = http.RequestServices.GetRequiredService<AzureResponseWriter>();
         var cancellationToken = http.RequestAborted;
 
         if (request.ResourceKind != StorageResourceKind.StaticWebsite &&
@@ -45,13 +44,13 @@ internal static class BlobProtocolEndpoint
         switch (request.ResourceKind)
         {
             case StorageResourceKind.Service:
-                await HandleServiceAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
+                await HandleServiceAsync(http, request, service, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.Container:
-                await HandleContainerAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
+                await HandleContainerAsync(http, request, service, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.Blob:
-                await HandleBlobAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
+                await HandleBlobAsync(http, request, service, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.StaticWebsite:
                 await HandleStaticWebsiteAsync(http, request, service, cancellationToken).ConfigureAwait(false);
@@ -94,7 +93,6 @@ internal static class BlobProtocolEndpoint
         HttpContext http,
         StorageRequestContext request,
         BlobService service,
-        AzureResponseWriter writer,
         CancellationToken cancellationToken)
     {
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
@@ -116,7 +114,7 @@ internal static class BlobProtocolEndpoint
                 cancellationToken).ConfigureAwait(false);
             var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
             var key = authenticator.IssueUserDelegationKey(request, keyRequest);
-            await writer.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
+            await AzureResponseWriter.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -138,7 +136,7 @@ internal static class BlobProtocolEndpoint
                 marker,
                 maxResults,
                 cancellationToken).ConfigureAwait(false);
-            await writer.WriteContainersAsync(
+            await AzureResponseWriter.WriteContainersAsync(
                 http,
                 containers,
                 prefix,
@@ -154,7 +152,7 @@ internal static class BlobProtocolEndpoint
         {
             Require(request, 'r');
             var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
-            await writer.WriteServicePropertiesAsync(http, properties, cancellationToken).ConfigureAwait(false);
+            await AzureResponseWriter.WriteServicePropertiesAsync(http, properties, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -189,7 +187,6 @@ internal static class BlobProtocolEndpoint
                 http,
                 request,
                 service,
-                writer,
                 scopedContainer: null,
                 cancellationToken).ConfigureAwait(false);
             return;
@@ -369,7 +366,6 @@ internal static class BlobProtocolEndpoint
         HttpContext http,
         StorageRequestContext request,
         BlobService service,
-        AzureResponseWriter writer,
         CancellationToken cancellationToken)
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
@@ -408,7 +404,6 @@ internal static class BlobProtocolEndpoint
                 http,
                 request,
                 service,
-                writer,
                 containerName,
                 cancellationToken).ConfigureAwait(false);
             return;
@@ -572,7 +567,7 @@ internal static class BlobProtocolEndpoint
                     cancellationToken).ConfigureAwait(false);
             }
             ValidateListedBlobTypes(request, blobs);
-            await writer.WriteBlobsAsync(
+            await AzureResponseWriter.WriteBlobsAsync(
                 http,
                 blobs,
                 prefix,
@@ -629,7 +624,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             }
             AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
             if (HttpMethods.IsGet(http.Request.Method))
-                await writer.WriteAclAsync(http, container, cancellationToken).ConfigureAwait(false);
+                await AzureResponseWriter.WriteAclAsync(http, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -767,7 +762,9 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         inner.Request.Scheme = outer.Request.Scheme;
         inner.Request.Host = outer.Request.Host;
         inner.Request.Method = resolved.Request.Method;
+#pragma warning disable CA2234 // Batch RawPath is an escaped path component, not a URI; URI parsing would normalize signed bytes.
         inner.Request.Path = PathString.FromUriComponent(resolved.Request.RawPath);
+#pragma warning restore CA2234
         inner.Request.QueryString = resolved.Request.QueryString;
         inner.Request.Body = Stream.Null;
         inner.Connection.RemoteIpAddress = outer.Connection.RemoteIpAddress;
@@ -891,6 +888,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         {
             throw;
         }
+#pragma warning disable CA1031 // Blob Batch reports each subrequest failure as an independent protocol response.
         catch (Exception exception)
         {
             var storageException = MapBatchException(exception);
@@ -915,6 +913,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                 body,
                 resolved.Request.ContentId);
         }
+#pragma warning restore CA1031
     }
 
     private static Dictionary<string, string> CreateBatchCommonHeaders(
@@ -1010,7 +1009,6 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         HttpContext http,
         StorageRequestContext request,
         BlobService service,
-        AzureResponseWriter writer,
         CancellationToken cancellationToken)
     {
         var containerName = request.Container ?? "$root";
@@ -1383,7 +1381,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             var listType = http.Request.Query["blocklisttype"].ToString().ToRequiredLowerInvariant();
             if (listType is not ("all" or "committed" or "uncommitted"))
                 throw AzureStorageException.InvalidQuery("blocklisttype");
-            await writer.WriteBlockListAsync(http, current, staged, listType, cancellationToken).ConfigureAwait(false);
+            await AzureResponseWriter.WriteBlockListAsync(http, current, staged, listType, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1565,7 +1563,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
-            await writer.WriteTagsAsync(http, blob.Tags, cancellationToken).ConfigureAwait(false);
+            await AzureResponseWriter.WriteTagsAsync(http, blob.Tags, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1827,7 +1825,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                 : http.Request.Query.ContainsKey("maxresults") || http.Request.Query.ContainsKey("marker") ? string.Empty : null;
             AzureResponseWriter.AddBlobEntityHeaders(http.Response, blob);
             http.Response.Headers["x-ms-blob-content-length"] = blob.Content.Length.ToString(CultureInfo.InvariantCulture);
-            await writer.WritePageRangesAsync(
+            await AzureResponseWriter.WritePageRangesAsync(
                 http,
                 page.Where(item => !item.IsClear).Select(item => item.Range).ToArray(),
                 page.Where(item => item.IsClear).Select(item => item.Range).ToArray(),
@@ -2434,7 +2432,9 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             var bytes = buffer.ToArray();
             if (wantMd5)
             {
+#pragma warning disable CA5351 // Azure Content-MD5 is a transactional checksum, never an authentication primitive.
                 http.Response.Headers.ContentMD5 = Convert.ToBase64String(MD5.HashData(bytes));
+#pragma warning restore CA5351
             }
             else
             {
@@ -2992,7 +2992,6 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         HttpContext http,
         StorageRequestContext request,
         BlobService service,
-        AzureResponseWriter writer,
         string? scopedContainer,
         CancellationToken cancellationToken)
     {
@@ -3032,7 +3031,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                     page.Items[^1].GenerationId))
             : string.Empty;
         var endpoint = StorageResourcePath.GetServiceEndpoint(http.Request, request.Account);
-        await writer.WriteXmlAsync(http, xml =>
+        await AzureResponseWriter.WriteXmlAsync(http, xml =>
         {
             xml.WriteStartElement("EnumerationResults");
             xml.WriteAttributeString("ServiceEndpoint", endpoint);
