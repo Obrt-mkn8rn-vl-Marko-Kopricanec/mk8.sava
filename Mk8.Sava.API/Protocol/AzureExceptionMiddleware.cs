@@ -77,10 +77,10 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         AddCommonHeaders(context);
         foreach (var header in exception.ResponseHeaders)
             context.Response.Headers[header.Key] = header.Value;
+        context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
         if (exception.StatusCode == StatusCodes.Status304NotModified)
             return;
 
-        context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
         if (exception.StatusCode == StatusCodes.Status401Unauthorized)
             context.Response.Headers.WWWAuthenticate = "Bearer resource_id=\"https://storage.azure.com/\"";
 

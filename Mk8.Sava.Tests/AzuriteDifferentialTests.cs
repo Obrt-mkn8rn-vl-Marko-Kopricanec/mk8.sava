@@ -266,6 +266,39 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task RangedReadChecksumsAndConditionsMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        using var azuriteTransport = new HttpClient();
+        using var localTransport = new HttpClient(application.Server.CreateHandler());
+        try
+        {
+            var expected = await ExerciseRangedReadAsync(azuriteContainer, azuriteTransport).ConfigureAwait(false);
+            var actual = await ExerciseRangedReadAsync(localContainer, localTransport).ConfigureAwait(false);
+            // Azurite accepts the header without a range, contrary to the published Get Blob contract.
+            Assert.Equal(200, expected.ChecksumWithoutRange.Status);
+            Assert.Equal(400, actual.ChecksumWithoutRange.Status);
+            Assert.Equal("InvalidHeaderValue", actual.ChecksumWithoutRange.ErrorCode);
+            Assert.Equal(expected with { ChecksumWithoutRange = actual.ChecksumWithoutRange }, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -639,6 +672,58 @@ public sealed class AzuriteDifferentialTests
             retained.Value.Content.ToString(), revoked.Status, revoked.ErrorCode);
     }
 
+    private static async Task<RangedReadObservation> ExerciseRangedReadAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("range.bin");
+        var bytes = new byte[8192];
+        DeterministicTestBytes.Fill(0xA20D, bytes);
+        await blob.UploadAsync(BinaryData.FromBytes(bytes)).ConfigureAwait(false);
+        var etag = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag.ToString();
+        var uri = blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+
+        using var rangeRequest = new HttpRequestMessage(HttpMethod.Get, uri);
+        rangeRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        rangeRequest.Headers.TryAddWithoutValidation("Range", "bytes=1024-2047");
+        rangeRequest.Headers.TryAddWithoutValidation("x-ms-range-get-content-md5", "true");
+        using var rangeResponse = await transport.SendAsync(rangeRequest).ConfigureAwait(false);
+        var rangedBytes = await rangeResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        Assert.Equal(bytes.AsSpan(1024, 1024).ToArray(), rangedBytes);
+        Assert.Equal(206, (int)rangeResponse.StatusCode);
+        Assert.Equal("bytes 1024-2047/8192", rangeResponse.Content.Headers.ContentRange?.ToString());
+        var contentMd5 = Assert.IsType<byte[]>(rangeResponse.Content.Headers.ContentMD5);
+        Assert.Equal(AzureProtocolChecksum.Md5(rangedBytes), contentMd5);
+
+        var withoutRange = await GetReadStatusAsync(transport, uri, request =>
+            request.Headers.TryAddWithoutValidation("x-ms-range-get-content-md5", "true")).ConfigureAwait(false);
+        var notModified = await GetReadStatusAsync(transport, uri, request =>
+            request.Headers.TryAddWithoutValidation("If-None-Match", etag)).ConfigureAwait(false);
+        var staleMatch = await GetReadStatusAsync(transport, uri, request =>
+            request.Headers.TryAddWithoutValidation("If-Match", "\"stale\"")).ConfigureAwait(false);
+        var invalidRange = await GetReadStatusAsync(transport, uri, request =>
+            request.Headers.TryAddWithoutValidation("Range", "bytes=9000-9999")).ConfigureAwait(false);
+        Assert.Equal(304, notModified.Status);
+        Assert.Equal(412, staleMatch.Status);
+        Assert.Equal(416, invalidRange.Status);
+        return new RangedReadObservation(
+            (int)rangeResponse.StatusCode, rangeResponse.Content.Headers.ContentRange!.ToString(),
+            Convert.ToBase64String(contentMd5), Convert.ToHexString(SHA256.HashData(rangedBytes)),
+            withoutRange, notModified, staleMatch, invalidRange);
+    }
+
+    private static async Task<(int Status, string? ErrorCode)> GetReadStatusAsync(
+        HttpClient transport, Uri uri, Action<HttpRequestMessage> configure)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        configure(request);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        var errorCode = response.Headers.TryGetValues("x-ms-error-code", out var values)
+            ? values.Single() : null;
+        return ((int)response.StatusCode, errorCode);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -718,4 +803,11 @@ public sealed class AzuriteDifferentialTests
         string Identifier, string Permissions, string ReadBytes,
         int DeniedWriteStatus, string? DeniedWriteCode, string RetainedBytes,
         int RevokedReadStatus, string? RevokedReadCode);
+
+    private sealed record RangedReadObservation(
+        int RangeStatus, string ContentRange, string ContentMd5, string ContentSha256,
+        (int Status, string? ErrorCode) ChecksumWithoutRange,
+        (int Status, string? ErrorCode) NotModified,
+        (int Status, string? ErrorCode) StaleMatch,
+        (int Status, string? ErrorCode) InvalidRange);
 }

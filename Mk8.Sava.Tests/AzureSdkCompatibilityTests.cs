@@ -13150,7 +13150,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
             request.Headers.TryAddWithoutValidation("If-Modified-Since", same);
             using var response = await transport.SendAsync(request);
             Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
-            Assert.False(response.Headers.Contains("x-ms-error-code"));
+            Assert.Equal("ConditionNotMet", response.Headers.GetValues("x-ms-error-code").Single());
         }
 
         using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
@@ -13398,7 +13398,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         conditionalRequest.Headers.IfNoneMatch.Add(new System.Net.Http.Headers.EntityTagHeaderValue(etag.ToString()));
         using var conditionalResponse = await client.SendAsync(conditionalRequest);
         Assert.Equal(HttpStatusCode.NotModified, conditionalResponse.StatusCode);
-        Assert.False(conditionalResponse.Headers.Contains("x-ms-error-code"));
+        Assert.Equal("ConditionNotMet", conditionalResponse.Headers.GetValues("x-ms-error-code").Single());
         Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync());
 
         var invalid = (await service.GetPropertiesAsync()).Value;
