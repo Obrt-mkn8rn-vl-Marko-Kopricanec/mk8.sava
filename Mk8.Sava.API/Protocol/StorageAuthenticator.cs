@@ -9,65 +9,6 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-internal enum StorageAuthorizationKind
-{
-    Anonymous,
-    SharedKey,
-    Sas,
-    Bearer
-}
-
-internal sealed record StorageAuthorization(
-    StorageAuthorizationKind Kind,
-    string Permissions,
-    DateTimeOffset? StartsAt = null,
-    DateTimeOffset? ExpiresAt = null,
-    string? Identifier = null,
-    bool IsAccountSas = false,
-    string? SignedResource = null,
-    string? TenantId = null,
-    bool CanGenerateUserDelegationKey = false,
-    string? ApplicationId = null,
-    string? Audience = null,
-    string? Issuer = null,
-    string? UserPrincipalName = null,
-    string AccountWidePermissions = "",
-    string? DelegatedObjectId = null,
-    bool AclReadChecked = false,
-    string? AclAuthorizedGenerationId = null,
-    bool AclListChecked = false,
-    string? AclListObjectId = null,
-    IReadOnlySet<string>? AclListGroups = null,
-    bool AclMutationChecked = false,
-    string? AclMutationObjectId = null,
-    IReadOnlySet<string>? AclMutationGroups = null,
-    bool AclAppendChecked = false,
-    string? AclAppendObjectId = null,
-    IReadOnlySet<string>? AclAppendGroups = null)
-{
-    public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
-    public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
-
-    public bool Allows(char permission) => Kind == StorageAuthorizationKind.SharedKey || Permissions.Contains(permission, StringComparison.Ordinal);
-
-    public string? CreatorObjectId => Kind switch
-    {
-        StorageAuthorizationKind.Bearer => Identifier,
-        StorageAuthorizationKind.Sas => DelegatedObjectId,
-        _ => null
-    };
-}
-
-internal sealed record UserDelegationKey(
-    string SignedObjectId,
-    string SignedTenantId,
-    string SignedStart,
-    string SignedExpiry,
-    string SignedService,
-    string SignedVersion,
-    string? SignedDelegatedUserTenantId,
-    string Value);
-
 internal sealed class StorageAuthenticator(
     IOptions<SavaOptions> options,
     MetadataStore metadata,
@@ -901,7 +842,7 @@ internal sealed class StorageAuthenticator(
         var builder = new StringBuilder();
         foreach (var header in request.Headers
                      .Where(header => header.Key.StartsWith("x-ms-", StringComparison.OrdinalIgnoreCase))
-                     .Select(header => new { Key = header.Key.ToLowerInvariant(), header.Value })
+                     .Select(header => new { Key = header.Key.ToRequiredLowerInvariant(), header.Value })
                      .OrderBy(header => header.Key, AzureCanonicalHeaderNameComparer.Instance))
         {
             var value = string.Join(',', header.Value.Select(CollapseWhitespace));
@@ -923,7 +864,7 @@ internal sealed class StorageAuthenticator(
                      .OrderBy(parameter => parameter.Key, StringComparer.OrdinalIgnoreCase))
         {
             builder.Append('\n')
-                .Append(parameter.Key.ToLowerInvariant())
+                .Append(parameter.Key.ToRequiredLowerInvariant())
                 .Append(':')
                 .Append(string.Join(',', parameter.Value.OrderBy(value => value, StringComparer.Ordinal)));
         }
@@ -1184,7 +1125,7 @@ internal sealed class StorageAuthenticator(
         var builder = new StringBuilder();
         foreach (var item in names.Split(','))
         {
-            var name = item.ToLowerInvariant();
+            var name = item.ToRequiredLowerInvariant();
             if (string.IsNullOrEmpty(name) ||
                 name.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)) ||
                 !seen.Add(name) ||
@@ -1203,7 +1144,7 @@ internal sealed class StorageAuthenticator(
     private static string BuildSignedRequestQuery(HttpRequest request)
     {
         var names = ReadEncodedCommaSeparatedQueryValue(request, "srq");
-        if (names.Count == 0)
+        if (names.Length == 0)
             return string.Empty;
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -1229,7 +1170,7 @@ internal sealed class StorageAuthenticator(
         return builder.ToString();
     }
 
-    private static IReadOnlyList<string> ReadEncodedCommaSeparatedQueryValue(
+    private static string[] ReadEncodedCommaSeparatedQueryValue(
         HttpRequest request,
         string parameterName)
     {

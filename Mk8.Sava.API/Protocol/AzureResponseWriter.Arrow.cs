@@ -180,8 +180,8 @@ internal sealed partial class AzureResponseWriter
     }
 
     private static void AddStringColumn(
-        ICollection<Field> fields,
-        ICollection<IArrowArray> arrays,
+        List<Field> fields,
+        List<IArrowArray> arrays,
         string name,
         IReadOnlyList<BlobListEntry> items,
         Func<BlobListEntry, string?> select,
@@ -204,8 +204,8 @@ internal sealed partial class AzureResponseWriter
     }
 
     private static void AddTimestampColumn(
-        ICollection<Field> fields,
-        ICollection<IArrowArray> arrays,
+        List<Field> fields,
+        List<IArrowArray> arrays,
         string name,
         IReadOnlyList<BlobListEntry> items,
         Func<BlobListEntry, DateTimeOffset?> select)
@@ -226,8 +226,8 @@ internal sealed partial class AzureResponseWriter
     }
 
     private static void AddUInt64Column(
-        ICollection<Field> fields,
-        ICollection<IArrowArray> arrays,
+        List<Field> fields,
+        List<IArrowArray> arrays,
         string name,
         IReadOnlyList<BlobListEntry> items,
         Func<BlobListEntry, ulong?> select)
@@ -243,8 +243,8 @@ internal sealed partial class AzureResponseWriter
     }
 
     private static void AddBooleanColumn(
-        ICollection<Field> fields,
-        ICollection<IArrowArray> arrays,
+        List<Field> fields,
+        List<IArrowArray> arrays,
         string name,
         IReadOnlyList<BlobListEntry> items,
         Func<BlobListEntry, bool?> select)
@@ -260,8 +260,8 @@ internal sealed partial class AzureResponseWriter
     }
 
     private static void AddMapColumn(
-        ICollection<Field> fields,
-        ICollection<IArrowArray> arrays,
+        List<Field> fields,
+        List<IArrowArray> arrays,
         string name,
         IReadOnlyList<BlobListEntry> items,
         Func<BlobListEntry, IReadOnlyDictionary<string, string>?> select)

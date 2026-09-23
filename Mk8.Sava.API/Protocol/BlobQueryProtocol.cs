@@ -229,7 +229,7 @@ internal static class BlobQueryProtocol
     private static BlobQueryTextFormat ReadFormat(XElement? serialization, bool input)
     {
         var format = serialization is null ? null : Child(serialization, "Format");
-        var type = format is null ? "delimited" : ChildValue(format, "Type")?.ToLowerInvariant();
+        var type = format is null ? "delimited" : ChildValue(format, "Type")?.ToRequiredLowerInvariant();
         if (string.IsNullOrEmpty(type))
             throw InvalidXml("A query serialization format type is required.");
 
@@ -290,7 +290,7 @@ internal static class BlobQueryProtocol
 
     private static QueryArrowColumn ReadArrowField(XElement field, int index)
     {
-        var type = ChildValue(field, "Type")?.ToLowerInvariant();
+        var type = ChildValue(field, "Type")?.ToRequiredLowerInvariant();
         var kind = type switch
         {
             "int64" => BlobQueryArrowFieldKind.Int64,
@@ -388,7 +388,7 @@ internal static class BlobQueryProtocol
         ArrowStreamWriter writer,
         Schema schema,
         IReadOnlyList<QueryArrowColumn> fields,
-        IReadOnlyList<QuerySelection> rows,
+        List<QuerySelection> rows,
         CancellationToken cancellationToken)
     {
         var arrays = fields
@@ -400,7 +400,7 @@ internal static class BlobQueryProtocol
 
     private static IArrowArray BuildArrowArray(
         QueryArrowColumn field,
-        IReadOnlyList<QuerySelection> rows,
+        List<QuerySelection> rows,
         int column)
     {
         try
@@ -1144,7 +1144,7 @@ internal static class BlobQueryProtocol
         return value[0];
     }
 
-    private static bool ParseBoolean(string? value, bool fallback, string name) => value?.ToLowerInvariant() switch
+    private static bool ParseBoolean(string? value, bool fallback, string name) => value?.ToRequiredLowerInvariant() switch
     {
         null or "" => fallback,
         "true" => true,
@@ -2096,7 +2096,7 @@ internal sealed class BlobQueryPlan
         {
             "CHAR_LENGTH" or "CHARACTER_LENGTH" =>
                 new QueryCell((long)first.ToText().EnumerateRunes().Count()),
-            "LOWER" => new QueryCell(first.ToText().ToLowerInvariant()),
+            "LOWER" => new QueryCell(first.ToText().ToRequiredLowerInvariant()),
             "UPPER" => new QueryCell(first.ToText().ToUpperInvariant()),
             "SUBSTRING" => EvaluateSubstring(first, arguments, row),
             "DATE_ADD" => EvaluateDateAdd(first, arguments, row),
@@ -2256,7 +2256,7 @@ internal sealed class BlobQueryPlan
 
     private static string NormalizeDatePart(string part)
     {
-        var normalized = part.Trim().ToLowerInvariant();
+        var normalized = part.Trim().ToRequiredLowerInvariant();
         return normalized.EndsWith('s') ? normalized[..^1] : normalized;
     }
 
@@ -2517,7 +2517,7 @@ internal sealed class BlobQueryPlan
 
     private sealed class QueryParser
     {
-        private readonly IReadOnlyList<QueryToken> _tokens;
+        private readonly List<QueryToken> _tokens;
         private readonly string? _sourceAlias;
         private int _position;
 
@@ -2601,7 +2601,7 @@ internal sealed class BlobQueryPlan
                 splitName);
         }
 
-        private IReadOnlyList<QueryTableSegment> ParseTablePath(int sourcePosition)
+        private List<QueryTableSegment> ParseTablePath(int sourcePosition)
         {
             var rootWildcard = false;
             if (MatchSymbol("["))
@@ -2643,7 +2643,7 @@ internal sealed class BlobQueryPlan
             return path;
         }
 
-        private IReadOnlyList<QueryProjection> ParseProjections()
+        private List<QueryProjection> ParseProjections()
         {
             var projections = new List<QueryProjection>();
             do
@@ -2876,7 +2876,7 @@ internal sealed class BlobQueryPlan
             }
         }
 
-        private QueryExpression ParseAggregateExpression(QueryToken token, string function)
+        private QueryAggregateExpression ParseAggregateExpression(QueryToken token, string function)
         {
             var countStar = string.Equals(function, "COUNT", StringComparison.Ordinal) && MatchSymbol("*");
             QueryExpression? operand = null;
@@ -2975,7 +2975,7 @@ internal sealed class BlobQueryPlan
             return token.Text;
         }
 
-        private static QueryExpression Literal(object? value) =>
+        private static QueryOperand Literal(object? value) =>
             new QueryOperand(null, new QueryCell(value));
 
         private QueryToken Current => _tokens[_position];
@@ -3116,7 +3116,7 @@ string.Equals(_tokens[_position + 2].Text, "(", StringComparison.Ordinal);
             return null;
         }
 
-        private static IReadOnlyList<QueryToken> Tokenize(string expression)
+        private static List<QueryToken> Tokenize(string expression)
         {
             var tokens = new List<QueryToken>();
             for (var index = 0; index < expression.Length;)

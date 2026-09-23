@@ -139,7 +139,7 @@ internal sealed class StorageTelemetryMiddleware(
     {
         if (HttpMethods.IsOptions(http.Method))
             return "PreflightBlobRequest";
-        var comp = http.Query["comp"].ToString().ToLowerInvariant();
+        var comp = http.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(http.Query["restype"], "account", StringComparison.OrdinalIgnoreCase))
             return "GetAccountInformation";
 
@@ -227,7 +227,7 @@ internal sealed class StorageTelemetryMiddleware(
     }
 
     private static string ResolveLeaseOperation(HttpRequest request, string resource) =>
-        request.Headers["x-ms-lease-action"].ToString().ToLowerInvariant() switch
+        request.Headers["x-ms-lease-action"].ToString().ToRequiredLowerInvariant() switch
         {
             "acquire" => $"Acquire{resource}Lease",
             "renew" => $"Renew{resource}Lease",

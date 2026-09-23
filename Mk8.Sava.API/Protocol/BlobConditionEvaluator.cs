@@ -299,7 +299,7 @@ internal static class BlobConditionEvaluator
         ReadDate(headers, names.IfModifiedSince),
         ReadDate(headers, names.IfUnmodifiedSince));
 
-    private static IReadOnlyList<string> ReadEtags(IHeaderDictionary headers, string name)
+    private static List<string> ReadEtags(IHeaderDictionary headers, string name)
     {
         if (!headers.TryGetValue(name, out var values))
             return [];

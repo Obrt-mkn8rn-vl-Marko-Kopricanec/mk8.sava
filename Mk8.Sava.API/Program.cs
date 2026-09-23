@@ -193,9 +193,9 @@ static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
         if (!names.TryGetValue(arguments[index], out var name))
             continue;
         if (command is not null)
-            throw new ArgumentException("Specify only one operator command.");
+            throw new ArgumentException("Specify only one operator command.", nameof(arguments));
         if (++index >= arguments.Length || string.IsNullOrWhiteSpace(arguments[index]))
-            throw new ArgumentException($"The {arguments[index - 1]} command requires a path.");
+            throw new ArgumentException($"The {arguments[index - 1]} command requires a path.", nameof(arguments));
         command = (name, arguments[index]);
     }
     return command;

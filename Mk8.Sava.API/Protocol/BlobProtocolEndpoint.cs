@@ -57,7 +57,7 @@ internal static class BlobProtocolEndpoint
                 await HandleStaticWebsiteAsync(http, request, service, cancellationToken).ConfigureAwait(false);
                 break;
             default:
-                throw new ArgumentOutOfRangeException();
+                throw new InvalidOperationException("Unsupported storage resource kind.");
         }
     }
 
@@ -97,7 +97,7 @@ internal static class BlobProtocolEndpoint
         AzureResponseWriter writer,
         CancellationToken cancellationToken)
     {
-        var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(comp, "userdelegationkey", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Get User Delegation Key");
@@ -235,7 +235,7 @@ internal static class BlobProtocolEndpoint
 
         var requestedPath = request.Blob ?? string.Empty;
         var isDirectoryRequest = requestedPath.Length == 0 ||
-                                 (http.Request.Path.Value?.EndsWith("/", StringComparison.Ordinal) ?? false);
+                                 (http.Request.Path.Value?.EndsWith('/') ?? false);
         var indexDocument = properties.StaticWebsite.IndexDocument;
         var primaryPath = isDirectoryRequest && !string.IsNullOrEmpty(indexDocument)
             ? CombineWebsitePath(requestedPath, indexDocument)
@@ -373,7 +373,7 @@ internal static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
-        var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
@@ -884,7 +884,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                         resolved.Request.ContentId);
 
                 default:
-                    throw new ArgumentOutOfRangeException();
+                    throw new InvalidOperationException("Unsupported batch operation kind.");
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -1017,7 +1017,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         var blobName = request.Blob ?? request.Container ?? throw AzureStorageException.BlobNotFound();
         if (request.Blob is null)
             containerName = "$root";
-        var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
+        var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
@@ -1232,7 +1232,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                              ?? throw AzureStorageException.InvalidHeader("x-ms-range");
             var (start, end) = ParsePageWriteRange(rangeValue, current.Content.Length);
             var rangeLength = checked(end - start + 1);
-            var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToLowerInvariant();
+            var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToRequiredLowerInvariant();
             BlobRecord updated;
             var checksums = TransactionalChecksums.Empty;
             if (string.Equals(operation, "clear", StringComparison.Ordinal))
@@ -1380,7 +1380,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             if (current is null && staged.Count == 0)
                 throw AzureStorageException.BlobNotFound();
-            var listType = http.Request.Query["blocklisttype"].ToString().ToLowerInvariant();
+            var listType = http.Request.Query["blocklisttype"].ToString().ToRequiredLowerInvariant();
             if (listType is not ("all" or "committed" or "uncommitted"))
                 throw AzureStorageException.InvalidQuery("blocklisttype");
             await writer.WriteBlockListAsync(http, current, staged, listType, cancellationToken).ConfigureAwait(false);
@@ -1475,7 +1475,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                 throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", untilValue);
             }
             var mode = ProtocolParsing.First(http.Request.Headers, "x-ms-immutability-policy-mode") ?? "unlocked";
-            var locked = mode.ToLowerInvariant() switch
+            var locked = mode.ToRequiredLowerInvariant() switch
             {
                 "locked" => true,
                 "unlocked" => false,
@@ -2630,7 +2630,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         string sourceValue)
     {
         if (sourceValue.Length > 2048 ||
-            !sourceValue.StartsWith("/", StringComparison.Ordinal) ||
+            !sourceValue.StartsWith('/') ||
             sourceValue.StartsWith("//", StringComparison.Ordinal) ||
             sourceValue.Contains('#', StringComparison.Ordinal))
         {
@@ -3686,7 +3686,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
 
     private static BlobListShowOnly ValidateBlobListFeatures(
         StorageRequestContext request,
-        IReadOnlySet<string> includes,
+        HashSet<string> includes,
         string delimiter,
         string showOnly,
         bool hierarchicalNamespace,
@@ -3801,7 +3801,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
 
     private static void ValidateContainerListFeatures(
         StorageRequestContext request,
-        IReadOnlySet<string> includes)
+        HashSet<string> includes)
     {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -4485,7 +4485,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             if (!DateTimeOffset.TryParse(untilValue, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var parsed))
                 throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-until-date", untilValue);
             until = parsed.ToUniversalTime();
-            locked = (modeValue ?? "unlocked").ToLowerInvariant() switch
+            locked = (modeValue ?? "unlocked").ToRequiredLowerInvariant() switch
             {
                 "locked" => true,
                 "unlocked" => false,
@@ -4838,7 +4838,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         DateTimeOffset metadataNow,
         bool allowRelativeToCreation = true)
     {
-        var option = ProtocolParsing.First(headers, "x-ms-expiry-option")?.ToLowerInvariant()
+        var option = ProtocolParsing.First(headers, "x-ms-expiry-option")?.ToRequiredLowerInvariant()
                      ?? throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
         var value = ProtocolParsing.First(headers, "x-ms-expiry-time");
         switch (option)
