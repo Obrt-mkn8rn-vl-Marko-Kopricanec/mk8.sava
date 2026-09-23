@@ -11,6 +11,62 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageSpaceEfficiencyTests
 {
     [Fact]
+    public async Task PhysicalUsageInventoryDoesNotFollowExternalOrCyclicStorageLinks()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var external = Path.Combine(Path.GetTempPath(), $"mk8-sava-usage-external-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(external);
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:EnableSmallChunkPacking"] = "false",
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        string? chunkLink = null;
+        string? packLink = null;
+        string? cycleLink = null;
+        try
+        {
+            await application.InitializeAsync();
+            var chunks = application.Services.GetRequiredService<ChunkStore>();
+            var content = new byte[80];
+            new Random(0x7600).NextBytes(content);
+            using var pinned = await chunks.StorePinnedAsync(
+                SavaWebApplicationFactory.AccountName,
+                new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null),
+                new MemoryStream(content, writable: false),
+                CancellationToken.None);
+            var before = chunks.MeasurePhysicalUsage();
+            Assert.True(before.ChunkBytes > 0);
+            Assert.Equal(1, before.ChunkCount);
+            await File.WriteAllBytesAsync(Path.Combine(external, "foreign.chunk"), new byte[8192]);
+            await File.WriteAllBytesAsync(Path.Combine(external, "foreign.pack"), new byte[8192]);
+            chunkLink = Path.Combine(application.DataPath, "chunks", "outside");
+            packLink = Path.Combine(application.DataPath, "packs", "outside");
+            cycleLink = Path.Combine(application.DataPath, "chunks", "cycle");
+            Directory.CreateSymbolicLink(chunkLink, external);
+            Directory.CreateSymbolicLink(packLink, external);
+            Directory.CreateSymbolicLink(cycleLink, Path.Combine(application.DataPath, "chunks"));
+
+            var after = chunks.MeasurePhysicalUsage();
+            Assert.Equal(before.ChunkBytes, after.ChunkBytes);
+            Assert.Equal(before.ChunkCount, after.ChunkCount);
+        }
+        finally
+        {
+            if (chunkLink is not null && Directory.Exists(chunkLink))
+                Directory.Delete(chunkLink);
+            if (packLink is not null && Directory.Exists(packLink))
+                Directory.Delete(packLink);
+            if (cycleLink is not null && Directory.Exists(cycleLink))
+                Directory.Delete(cycleLink);
+            if (Directory.Exists(external))
+                Directory.Delete(external, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task LinuxAllocationMeterMatchesFilesystemBlocksWithoutFollowingExternalLinks()
     {
         if (!OperatingSystem.IsLinux())
