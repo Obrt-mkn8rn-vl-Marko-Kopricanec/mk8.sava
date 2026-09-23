@@ -43,15 +43,15 @@ public sealed partial class AzureResponseWriter
         AddStringColumn(fields, arrays, "Etag", items, entry => entry.Blob?.ETag);
         if (hierarchicalNamespace && includes.Contains("permissions"))
         {
-            AddStringColumn(fields, arrays, "Owner", items, entry => entry.Blob is null ? null : "$superuser");
-            AddStringColumn(fields, arrays, "Group", items, entry => entry.Blob is null ? null : "$superuser");
-            AddStringColumn(fields, arrays, "Permissions", items, entry => entry.Blob is null ? null : "rw-r-----");
+            AddStringColumn(fields, arrays, "Owner", items, entry => entry.Blob?.Owner);
+            AddStringColumn(fields, arrays, "Group", items, entry => entry.Blob?.Group);
+            AddStringColumn(fields, arrays, "Permissions", items, entry => entry.Blob?.Permissions);
             AddStringColumn(
                 fields,
                 arrays,
                 "Acl",
                 items,
-                entry => entry.Blob is null ? null : "user::rw-,group::r--,other::---");
+                entry => entry.Blob?.Acl);
         }
         AddUInt64Column(fields, arrays, "Content-Length", items, entry =>
             entry.Blob is { } blob

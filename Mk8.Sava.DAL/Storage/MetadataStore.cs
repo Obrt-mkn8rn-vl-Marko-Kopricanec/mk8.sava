@@ -1584,7 +1584,18 @@ public sealed class MetadataStore(
                 throw new StorageBlobTypeMismatchException();
 
             if (hierarchicalNamespace)
-                await EnsureHierarchicalParentsAsync(connection, transaction, proposed, cancellationToken);
+            {
+                var parentGroup = await EnsureHierarchicalParentsAsync(
+                    connection,
+                    transaction,
+                    proposed,
+                    cancellationToken);
+                proposed = proposed with
+                {
+                    Owner = activeCurrent?.Owner ?? proposed.Owner,
+                    Group = activeCurrent?.Group ?? parentGroup
+                };
+            }
 
             if (stagedBlockSnapshot is not null)
             {
@@ -3421,12 +3432,20 @@ public sealed class MetadataStore(
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
     }
 
-    private static async Task EnsureHierarchicalParentsAsync(
+    private static async Task<string> EnsureHierarchicalParentsAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         BlobRecord path,
         CancellationToken cancellationToken)
     {
+        var root = await GetContainerAsync(
+            connection,
+            transaction,
+            path.Account,
+            path.Container,
+            includeDeleted: false,
+            cancellationToken);
+        var parentGroup = root?.Group ?? "$superuser";
         var separator = path.Name.IndexOf('/', StringComparison.Ordinal);
         while (separator > 0)
         {
@@ -3454,6 +3473,8 @@ public sealed class MetadataStore(
                     ETag = NewETag(),
                     CreatedAt = path.CreatedAt,
                     LastModified = path.CreatedAt,
+                    Owner = path.Owner,
+                    Group = parentGroup,
                     Http = new BlobHttpProperties(),
                     Lease = LeaseRecord.Available,
                     AccessTier = "Hot",
@@ -3465,9 +3486,15 @@ public sealed class MetadataStore(
             {
                 throw new StoragePathConflictException();
             }
+            else
+            {
+                parentGroup = existing.Group;
+            }
 
             separator = path.Name.IndexOf('/', separator + 1);
         }
+
+        return parentGroup;
     }
 
     private static async Task DeleteSoftDeletedBlobRowsAsync(

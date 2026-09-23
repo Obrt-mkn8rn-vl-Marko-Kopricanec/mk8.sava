@@ -233,10 +233,10 @@ public sealed partial class AzureResponseWriter
                             writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
                             if (includes.Contains("permissions"))
                             {
-                                writer.WriteElementString("Owner", "$superuser");
-                                writer.WriteElementString("Group", "$superuser");
-                                writer.WriteElementString("Permissions", "rwxr-x---");
-                                writer.WriteElementString("Acl", "user::rwx,group::r-x,other::---");
+                                writer.WriteElementString("Owner", directory.Owner);
+                                writer.WriteElementString("Group", directory.Group);
+                                writer.WriteElementString("Permissions", directory.Permissions);
+                                writer.WriteElementString("Acl", directory.Acl);
                             }
                         }
                         if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
@@ -331,12 +331,10 @@ public sealed partial class AzureResponseWriter
                 writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
                 if (hierarchicalNamespace && includes.Contains("permissions"))
                 {
-                    writer.WriteElementString("Owner", "$superuser");
-                    writer.WriteElementString("Group", "$superuser");
-                    writer.WriteElementString("Permissions", blob.IsDirectory ? "rwxr-x---" : "rw-r-----");
-                    writer.WriteElementString(
-                        "Acl",
-                        blob.IsDirectory ? "user::rwx,group::r-x,other::---" : "user::rw-,group::r--,other::---");
+                    writer.WriteElementString("Owner", blob.Owner);
+                    writer.WriteElementString("Group", blob.Group);
+                    writer.WriteElementString("Permissions", blob.Permissions);
+                    writer.WriteElementString("Acl", blob.Acl);
                 }
                 if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
                     writer.WriteElementString("ResourceType", blob.IsDirectory ? "directory" : "file");
@@ -773,17 +771,15 @@ public sealed partial class AzureResponseWriter
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
         {
-            response.Headers["x-ms-owner"] = "$superuser";
-            response.Headers["x-ms-group"] = "$superuser";
-            response.Headers["x-ms-permissions"] = blob.IsDirectory ? "rwxr-x---" : "rw-r-----";
+            response.Headers["x-ms-owner"] = blob.Owner;
+            response.Headers["x-ms-group"] = blob.Group;
+            response.Headers["x-ms-permissions"] = blob.Permissions;
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
             response.Headers["x-ms-resource-type"] = blob.IsDirectory ? "directory" : "file";
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2023, 11, 3)))
         {
-            response.Headers["x-ms-acl"] = blob.IsDirectory
-                ? "user::rwx,group::r-x,other::---"
-                : "user::rw-,group::r--,other::---";
+            response.Headers["x-ms-acl"] = blob.Acl;
         }
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))

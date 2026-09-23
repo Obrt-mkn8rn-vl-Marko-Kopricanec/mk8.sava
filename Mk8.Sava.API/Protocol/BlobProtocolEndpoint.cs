@@ -430,7 +430,8 @@ public static class BlobProtocolEndpoint
                 publicAccess,
                 encryptionPolicy.DefaultScope,
                 encryptionPolicy.PreventOverride,
-                cancellationToken);
+                cancellationToken,
+                request.Authorization.CreatorObjectId);
             AzureResponseWriter.AddContainerHeaders(http.Response, created);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
@@ -3400,7 +3401,8 @@ public static class BlobProtocolEndpoint
             generateContentMd5,
             AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
             EncryptionContext: encryptionContext,
-            ExpiresAt: expiresAt);
+            ExpiresAt: expiresAt,
+            CreatorObjectId: StorageRequestContext.Get(request.HttpContext).Authorization.CreatorObjectId);
     }
 
     private static string? ReadEncryptionContext(
@@ -3868,7 +3870,8 @@ public static class BlobProtocolEndpoint
                 : false,
             GenerateContentMd5: true,
             AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
-            ExpiresAt: expiresAt);
+            ExpiresAt: expiresAt,
+            CreatorObjectId: StorageRequestContext.Get(request.HttpContext).Authorization.CreatorObjectId);
     }
 
     private static BlobWriteOptions ReadUrlCopyWriteOptions(
@@ -3904,7 +3907,8 @@ public static class BlobProtocolEndpoint
                 ? destination?.AccessTierInferred
                 : false,
             AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
-            RehydratePriority: rehydratePriority);
+            RehydratePriority: rehydratePriority,
+            CreatorObjectId: StorageRequestContext.Get(request.HttpContext).Authorization.CreatorObjectId);
     }
 
     private static bool ReadCopySourceBlobProperties(HttpRequest request)
@@ -3951,7 +3955,8 @@ public static class BlobProtocolEndpoint
                 ? destination?.AccessTierInferred
                 : false,
             AccessTierSpecified: ProtocolParsing.First(request.Headers, "x-ms-access-tier") is not null,
-            RehydratePriority: rehydratePriority);
+            RehydratePriority: rehydratePriority,
+            CreatorObjectId: StorageRequestContext.Get(request.HttpContext).Authorization.CreatorObjectId);
     }
 
     private static string? ReadCopyRehydratePriority(HttpRequest request, bool synchronous)
