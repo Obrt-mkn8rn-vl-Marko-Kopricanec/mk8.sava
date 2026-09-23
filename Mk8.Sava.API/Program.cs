@@ -114,7 +114,7 @@ try
     var prunedChunkDirectories = app.Services.GetRequiredService<StoragePaths>()
         .PruneLegacyEmptyChunkDirectories();
     if (prunedChunkDirectories > 0)
-        app.Logger.LogInformation("Pruned {DirectoryCount} legacy empty chunk directories.", prunedChunkDirectories);
+        StorageLogMessages.LegacyChunkDirectoriesPruned(app.Logger, prunedChunkDirectories);
 }
 catch
 {

@@ -132,8 +132,9 @@ internal sealed class UrlTransferClient(
             var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             await using (source.ConfigureAwait(false))
             {
+                using var limitedSource = new LengthLimitedReadStream(source, effectiveMaximumBytes);
                 var sourceInfo = new UrlSource(
-                new LengthLimitedReadStream(source, effectiveMaximumBytes),
+                limitedSource,
                 contentLength,
                 ReadHttpProperties(response),
                 ReadMetadata(response),
@@ -878,9 +879,10 @@ internal sealed class UrlTransferClient(
                 using var reader = XmlReader.Create(buffer, new XmlReaderSettings
                 {
                     DtdProcessing = DtdProcessing.Prohibit,
-                    MaxCharactersInDocument = maximumErrorBodyBytes
+                    MaxCharactersInDocument = maximumErrorBodyBytes,
+                    Async = true
                 });
-                var document = XDocument.Load(reader, LoadOptions.None);
+                var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
                 var code = document.Descendants()
                     .FirstOrDefault(element => string.Equals(element.Name.LocalName, "Code", StringComparison.Ordinal))
                     ?.Value;

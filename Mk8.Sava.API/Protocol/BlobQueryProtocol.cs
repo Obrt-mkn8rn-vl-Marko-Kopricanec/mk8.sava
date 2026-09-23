@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -372,7 +373,7 @@ internal static class BlobQueryProtocol
                 case BlobQueryArrowFieldKind.Int64:
                     {
                         var builder = new Int64Array.Builder().Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -389,7 +390,7 @@ internal static class BlobQueryProtocol
                 case BlobQueryArrowFieldKind.Bool:
                     {
                         var builder = new BooleanArray.Builder().Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -407,7 +408,7 @@ internal static class BlobQueryProtocol
                     {
                         var type = new TimestampType(TimeUnit.Millisecond, (string?)null);
                         var builder = new TimestampArray.Builder(type).Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -430,7 +431,7 @@ internal static class BlobQueryProtocol
                 case BlobQueryArrowFieldKind.String:
                     {
                         var builder = new StringArray.Builder().Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -443,7 +444,7 @@ internal static class BlobQueryProtocol
                 case BlobQueryArrowFieldKind.Double:
                     {
                         var builder = new DoubleArray.Builder().Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -462,7 +463,7 @@ internal static class BlobQueryProtocol
                         var builder = new Decimal128Array.Builder(
                             new Decimal128Type(field.Precision, field.Scale));
                         builder.Reserve(rows.Count);
-                        foreach (var row in rows)
+                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
                         {
                             var cell = row.Values[column];
                             if (cell.IsNullLike)
@@ -905,6 +906,8 @@ internal static class BlobQueryProtocol
                 if (read == 0)
                     break;
 
+                // The async iterator must index only the freshly read prefix; span enumeration cannot cross yield return.
+#pragma warning disable HLQ013
                 for (var index = 0; index < read; index++)
                 {
                     var character = buffer[index];
@@ -972,6 +975,7 @@ internal static class BlobQueryProtocol
                         field.Clear();
                     }
                 }
+#pragma warning restore HLQ013
             }
 
             if (inQuotes && !quotePending)
@@ -1004,6 +1008,8 @@ internal static class BlobQueryProtocol
                 var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                     break;
+                // The async iterator must index only the freshly read prefix; span enumeration cannot cross yield return.
+#pragma warning disable HLQ013
                 for (var index = 0; index < read; index++)
                 {
                     record.Append(buffer[index]);
@@ -1017,6 +1023,7 @@ internal static class BlobQueryProtocol
                     yield return record.ToString();
                     record.Clear();
                 }
+#pragma warning restore HLQ013
             }
             if (record.Length > 0)
                 yield return record.ToString();

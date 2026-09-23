@@ -33,13 +33,17 @@ internal sealed class StorageTelemetryMiddleware(
             var elapsed = Stopwatch.GetTimestamp() - started;
             telemetry.RecordRequest(context.Response.StatusCode, elapsed);
             var request = StorageRequestContext.TryGet(context);
-            logger.LogInformation(
-                "Storage request {RequestId} {Method} {ResourceKind} completed with {StatusCode} in {ElapsedMilliseconds:F3} ms.",
-                request?.RequestId ?? context.TraceIdentifier,
-                context.Request.Method,
-                request?.ResourceKind.ToString() ?? "Unknown",
-                context.Response.StatusCode,
-                elapsed * 1000d / Stopwatch.Frequency);
+            if (logger.IsEnabled(LogLevel.Information))
+            {
+                var resourceKind = request?.ResourceKind.ToString() ?? "Unknown";
+                StorageLogMessages.StorageRequestCompleted(
+                    logger,
+                    request?.RequestId ?? context.TraceIdentifier,
+                    context.Request.Method,
+                    resourceKind,
+                    context.Response.StatusCode,
+                    elapsed * 1000d / Stopwatch.Frequency);
+            }
 
             if (request is not null)
             {
@@ -53,10 +57,7 @@ internal sealed class StorageTelemetryMiddleware(
 #pragma warning disable CA1031 // Best-effort analytics must not fail the completed storage request.
                 catch (Exception exception)
                 {
-                    logger.LogWarning(
-                        exception,
-                        "Storage Analytics could not persist request {RequestId}.",
-                        request.RequestId);
+                    StorageLogMessages.StorageAnalyticsPersistenceFailed(logger, exception, request.RequestId);
                 }
 #pragma warning restore CA1031
             }
@@ -270,6 +271,8 @@ internal sealed class StorageTelemetryMiddleware(
             return builder.ToString();
 
         var parts = rawQuery.TrimStart('?').Split('&');
+        // The index is required to replace only the signed query value in its array slot.
+#pragma warning disable HLQ013
         for (var index = 0; index < parts.Length; index++)
         {
             var separator = parts[index].IndexOf('=', StringComparison.Ordinal);
@@ -277,6 +280,7 @@ internal sealed class StorageTelemetryMiddleware(
             if (string.Equals(WebUtility.UrlDecode(encodedName), "sig", StringComparison.OrdinalIgnoreCase))
                 parts[index] = encodedName + "=XXXXX";
         }
+#pragma warning restore HLQ013
         return builder.Append('?').AppendJoin('&', parts).ToString();
     }
 

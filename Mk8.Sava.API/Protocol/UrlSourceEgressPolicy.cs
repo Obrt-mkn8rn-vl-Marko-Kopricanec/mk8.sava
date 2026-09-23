@@ -59,21 +59,21 @@ internal sealed class UrlSourceEgressPolicy(SavaOptions options)
         foreach (var address in permitted)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            Socket? socket = new(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
                 await socket.ConnectAsync(address, endpoint.Port, cancellationToken).ConfigureAwait(false);
-                return new NetworkStream(socket, ownsSocket: true);
+                var stream = new NetworkStream(socket, ownsSocket: true);
+                socket = null;
+                return stream;
             }
             catch (Exception exception) when (exception is SocketException or IOException)
             {
-                socket.Dispose();
                 lastFailure = exception;
             }
-            catch
+            finally
             {
-                socket.Dispose();
-                throw;
+                socket?.Dispose();
             }
         }
 
