@@ -524,6 +524,8 @@ public sealed class BlobService(
             throw AzureStorageException.BlobOperationNotSupported();
         _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken).ConfigureAwait(false);
+        if (IsHierarchicalNamespaceEnabled(account))
+            await EnsureListingPrefixHasDirectoryAncestorsAsync(account, container, prefix, cancellationToken).ConfigureAwait(false);
         var page = await metadata.ListBlobsPageAsync(
             account,
             container,
@@ -570,6 +572,25 @@ public sealed class BlobService(
             effective.Add(item with { Blob = blob });
         }
         return new BlobListPage(effective, page.HasMore);
+    }
+
+    private async Task EnsureListingPrefixHasDirectoryAncestorsAsync(
+        string account,
+        string container,
+        string prefix,
+        CancellationToken cancellationToken)
+    {
+        var separator = prefix.IndexOf('/', StringComparison.Ordinal);
+        while (separator > 0)
+        {
+            var ancestor = await metadata.GetBlobAsync(
+                account, container, prefix[..separator],
+                versionId: null, snapshot: null, includeDeleted: false,
+                cancellationToken).ConfigureAwait(false);
+            if (ancestor is { IsDirectory: false })
+                throw AzureStorageException.PathAlreadyExists();
+            separator = prefix.IndexOf('/', separator + 1);
+        }
     }
 
     internal async Task<TaggedBlobPage> FindBlobsByTagsPageAsync(
