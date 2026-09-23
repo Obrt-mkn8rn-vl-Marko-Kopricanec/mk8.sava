@@ -54,64 +54,73 @@ public sealed class StorageCrashHarnessTests
             await container.CreateIfNotExistsAsync();
             var blob = container.GetBlobClient(BlobName);
             var content = CreateContent();
-
-            switch (scenario)
-            {
-                case "chunk-staging-write":
-                    faultInjector.ArmTermination(StorageFaultPoint.DuringChunkStagingWrite);
-                    await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
-                    break;
-                case "chunk-publication":
-                    faultInjector.ArmTermination(StorageFaultPoint.BeforeChunkPublication);
-                    await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
-                    break;
-                case "metadata-precommit":
-                    faultInjector.ArmTermination(StorageFaultPoint.BeforeBlobMetadataCommit);
-                    await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
-                    break;
-                case "metadata-postcommit":
-                    faultInjector.ArmTermination(StorageFaultPoint.AfterBlobMetadataCommit);
-                    await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
-                    break;
-                case "reclamation-delete":
-                    faultInjector.ArmException(StorageFaultPoint.BeforeBlobMetadataCommit);
-                    var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                        blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true));
-                    Assert.Equal(500, failure.Status);
-                    faultInjector.ArmTermination(StorageFaultPoint.BeforeGarbageCollectionDelete);
-                    await application.Services
-                        .GetRequiredService<BlobService>()
-                        .CollectGarbageAsync(CancellationToken.None);
-                    break;
-                case "pack-metadata-precommit":
-                case "pack-metadata-postcommit":
-                    var discarded = container.GetBlobClient("discarded.bin");
-                    await discarded.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
-                    await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29)));
-                    await discarded.DeleteAsync();
-                    faultInjector.ArmTermination(
-string.Equals(scenario, "pack-metadata-precommit"
-, StringComparison.Ordinal) ? StorageFaultPoint.BeforePackMetadataCommit
-                            : StorageFaultPoint.AfterPackMetadataCommit);
-                    await application.Services
-                        .GetRequiredService<BlobService>()
-                        .RunMaintenanceAsync(CancellationToken.None);
-                    break;
-                case "pack-record-append":
-                    await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29)));
-                    faultInjector.ArmTermination(StorageFaultPoint.DuringPackRecordAppend);
-                    await container.GetBlobClient("interrupted.bin")
-                        .UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
-                    break;
-                default:
-                    throw new InvalidOperationException($"Unknown crash scenario '{scenario}'.");
-            }
+            await ExecuteCrashScenarioAsync(
+                scenario, faultInjector, application, container, blob, content).ConfigureAwait(true);
 
             Assert.Fail($"Crash scenario '{scenario}' returned without terminating the worker process.");
         }
         finally
         {
-            await application.DisposeAsync();
+            await application.DisposeAsync().ConfigureAwait(true);
+        }
+    }
+
+    private static async Task ExecuteCrashScenarioAsync(
+        string scenario,
+        ProcessStorageFaultInjector faultInjector,
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient blob,
+        byte[] content)
+    {
+        switch (scenario)
+        {
+            case "chunk-staging-write":
+                faultInjector.ArmTermination(StorageFaultPoint.DuringChunkStagingWrite);
+                await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
+                break;
+            case "chunk-publication":
+                faultInjector.ArmTermination(StorageFaultPoint.BeforeChunkPublication);
+                await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
+                break;
+            case "metadata-precommit":
+                faultInjector.ArmTermination(StorageFaultPoint.BeforeBlobMetadataCommit);
+                await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
+                break;
+            case "metadata-postcommit":
+                faultInjector.ArmTermination(StorageFaultPoint.AfterBlobMetadataCommit);
+                await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
+                break;
+            case "reclamation-delete":
+                faultInjector.ArmException(StorageFaultPoint.BeforeBlobMetadataCommit);
+                var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                    blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true)).ConfigureAwait(false);
+                Assert.Equal(500, failure.Status);
+                faultInjector.ArmTermination(StorageFaultPoint.BeforeGarbageCollectionDelete);
+                await application.Services.GetRequiredService<BlobService>()
+                    .CollectGarbageAsync(CancellationToken.None).ConfigureAwait(false);
+                break;
+            case "pack-metadata-precommit":
+            case "pack-metadata-postcommit":
+                var discarded = container.GetBlobClient("discarded.bin");
+                await discarded.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17))).ConfigureAwait(false);
+                await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29))).ConfigureAwait(false);
+                await discarded.DeleteAsync().ConfigureAwait(false);
+                faultInjector.ArmTermination(
+                    string.Equals(scenario, "pack-metadata-precommit", StringComparison.Ordinal)
+                        ? StorageFaultPoint.BeforePackMetadataCommit
+                        : StorageFaultPoint.AfterPackMetadataCommit);
+                await application.Services.GetRequiredService<BlobService>()
+                    .RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+                break;
+            case "pack-record-append":
+                await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29))).ConfigureAwait(false);
+                faultInjector.ArmTermination(StorageFaultPoint.DuringPackRecordAppend);
+                await container.GetBlobClient("interrupted.bin")
+                    .UploadAsync(BinaryData.FromBytes(CreateSmallContent(17))).ConfigureAwait(false);
+                break;
+            default:
+                throw new InvalidOperationException($"Unknown crash scenario '{scenario}'.");
         }
     }
 
@@ -135,25 +144,13 @@ string.Equals(scenario, "pack-metadata-precommit"
 
             if (string.Equals(scenario, "pack-record-append", StringComparison.Ordinal))
             {
-                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
-                var interrupted = CreateClient(application)
-                    .GetBlobContainerClient(ContainerName)
-                    .GetBlobClient("interrupted.bin");
-                Assert.False((await interrupted.ExistsAsync()).Value);
-                await interrupted.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
-                Assert.Equal(CreateSmallContent(17), (await interrupted.DownloadContentAsync()).Value.Content.ToArray());
-                Assert.Equal(2, await application.Services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
+                await ValidatePackRecordRecoveryAsync(application, blob).ConfigureAwait(true);
                 return;
             }
 
             if (scenario.StartsWith("pack-", StringComparison.Ordinal))
             {
-                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
-                var packService = application.Services.GetRequiredService<BlobService>();
-                await packService.RunMaintenanceAsync(CancellationToken.None);
-                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
-                Assert.Single(EnumerateContentFiles(dataPath));
-                Assert.Equal(1, await application.Services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
+                await ValidatePackedRecoveryAsync(application, blob, dataPath).ConfigureAwait(true);
                 return;
             }
 
@@ -168,14 +165,7 @@ string.Equals(scenario, "pack-metadata-precommit"
             var service = application.Services.GetRequiredService<BlobService>();
             if (scenario is "chunk-staging-write" or "chunk-publication")
             {
-                var stagingFiles = EnumerateStagingFiles(dataPath);
-                Assert.NotEmpty(stagingFiles);
-                foreach (var stagingFile in stagingFiles)
-                    File.SetLastWriteTimeUtc(stagingFile, DateTime.UtcNow.AddDays(-2));
-                var maintenance = await service.RunMaintenanceAsync(CancellationToken.None);
-                Assert.True(maintenance.ReclaimedStagingFiles > 0);
-                Assert.Empty(EnumerateStagingFiles(dataPath));
-                Assert.Empty(EnumerateContentFiles(dataPath));
+                await ValidateAbandonedStagingRecoveryAsync(service, dataPath).ConfigureAwait(true);
                 return;
             }
 
@@ -187,6 +177,51 @@ string.Equals(scenario, "pack-metadata-precommit"
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static async Task ValidatePackRecordRecoveryAsync(
+        SavaWebApplicationFactory application,
+        BlobClient blob)
+    {
+        Assert.Equal(CreateSmallContent(29),
+            (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var interrupted = CreateClient(application)
+            .GetBlobContainerClient(ContainerName)
+            .GetBlobClient("interrupted.bin");
+        Assert.False((await interrupted.ExistsAsync().ConfigureAwait(false)).Value);
+        await interrupted.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17))).ConfigureAwait(false);
+        Assert.Equal(CreateSmallContent(17),
+            (await interrupted.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Equal(2, await application.Services.GetRequiredService<MetadataStore>()
+            .CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+    }
+
+    private static async Task ValidatePackedRecoveryAsync(
+        SavaWebApplicationFactory application,
+        BlobClient blob,
+        string dataPath)
+    {
+        Assert.Equal(CreateSmallContent(29),
+            (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        await application.Services.GetRequiredService<BlobService>()
+            .RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(CreateSmallContent(29),
+            (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Single(EnumerateContentFiles(dataPath));
+        Assert.Equal(1, await application.Services.GetRequiredService<MetadataStore>()
+            .CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+    }
+
+    private static async Task ValidateAbandonedStagingRecoveryAsync(BlobService service, string dataPath)
+    {
+        var stagingFiles = EnumerateStagingFiles(dataPath);
+        Assert.NotEmpty(stagingFiles);
+        foreach (var stagingFile in stagingFiles)
+            File.SetLastWriteTimeUtc(stagingFile, DateTime.UtcNow.AddDays(-2));
+        var maintenance = await service.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.True(maintenance.ReclaimedStagingFiles > 0);
+        Assert.Empty(EnumerateStagingFiles(dataPath));
+        Assert.Empty(EnumerateContentFiles(dataPath));
     }
 
     private static bool TryReadHarnessEnvironment(out string scenario, out string dataPath)
