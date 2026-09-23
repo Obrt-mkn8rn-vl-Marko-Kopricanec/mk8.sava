@@ -499,25 +499,7 @@ internal sealed class StorageAuthenticator(
             throw AzureStorageException.AuthenticationFailed();
         }
 
-        var protocol = query["spr"].ToString();
-        var signedIp = query["sip"].ToString();
-        if ((!hasSignedVersion || signedVersion < new DateOnly(2015, 4, 5)) &&
-            (!string.IsNullOrEmpty(protocol) || !string.IsNullOrEmpty(signedIp)))
-        {
-            throw AzureStorageException.AuthenticationFailed();
-        }
-        if (protocol is not ("" or "https" or "https,http"))
-            throw AzureStorageException.AuthenticationFailed("The signed protocol field is invalid.");
-        if (string.Equals(protocol, "https", StringComparison.Ordinal) && !context.Request.IsHttps)
-            throw AzureStorageException.AuthorizationProtocolMismatch();
-
-        if (!string.IsNullOrEmpty(signedIp))
-        {
-            if (!TryParseIpRange(signedIp, out var rangeStart, out var rangeEnd))
-                throw AzureStorageException.AuthenticationFailed("The signed IP field is invalid.");
-            if (!MatchesIpRange(context.Connection.RemoteIpAddress, rangeStart, rangeEnd))
-                throw AzureStorageException.AuthorizationSourceIpMismatch(context.Connection.RemoteIpAddress);
-        }
+        var (protocol, signedIp) = ValidateSasTransport(context, query, hasSignedVersion, signedVersion);
 
         var permissions = query["sp"].ToString();
         var signedStartsAt = ParseSasTime(query["st"].ToString());
@@ -535,35 +517,8 @@ internal sealed class StorageAuthenticator(
         string? aclObjectId = null;
         if (isAccountSas)
         {
-            if (!string.IsNullOrEmpty(query["si"].ToString()))
-                throw AzureStorageException.AuthenticationFailed();
-            var services = query["ss"].ToString();
-            var resourceTypes = query["srt"].ToString();
-            ValidateAccountSasFields(
-                services,
-                resourceTypes,
-                permissions,
-                signedVersion,
-                expiresAt);
-            if (!services.Contains('b', StringComparison.Ordinal))
-                throw AzureStorageException.AuthorizationServiceMismatch();
-            if (!AccountSasCoversRequest(resourceTypes, request, context.Request))
-                throw AzureStorageException.AuthorizationResourceTypeMismatch();
-            var fields = new List<string>
-            {
-                request.Account,
-                permissions,
-                services,
-                resourceTypes,
-                query["st"].ToString(),
-                query["se"].ToString(),
-                signedIp,
-                protocol,
-                version
-            };
-            if (signedVersion >= new DateOnly(2020, 12, 6))
-                fields.Add(query["ses"].ToString());
-            stringToSign = string.Join('\n', fields) + "\n";
+            stringToSign = BuildAccountSasStringToSign(
+                context, request, query, permissions, signedVersion, expiresAt, signedIp, protocol, version);
         }
         else if (isUserDelegationSas)
         {
@@ -733,79 +688,12 @@ internal sealed class StorageAuthenticator(
         }
         else
         {
-            var resourceType = query["sr"].ToString();
-            ValidateServiceSasPermissions(permissions, signedVersion);
-            signedResource = resourceType;
-            if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
-                throw AzureStorageException.AuthorizationFailure();
-            if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
-                throw AzureStorageException.AuthorizationFailure();
-            var canonicalizedResource = BuildSasCanonicalResource(
-                request,
-                resourceType,
-                query,
-                signedVersion);
-            var fields = new List<string>
-            {
-                permissions,
-                query["st"].ToString(),
-                query["se"].ToString(),
-                canonicalizedResource,
-                query["si"].ToString()
-            };
-            if (hasSignedVersion)
-            {
-                if (signedVersion >= new DateOnly(2015, 4, 5))
-                {
-                    fields.Add(signedIp);
-                    fields.Add(protocol);
-                }
-                fields.Add(version);
-                if (signedVersion >= new DateOnly(2018, 11, 9))
-                {
-                    fields.Add(resourceType);
-                    fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
-                }
-                if (signedVersion >= new DateOnly(2020, 12, 6))
-                    fields.Add(query["ses"].ToString());
-                if (signedVersion >= new DateOnly(2013, 8, 15))
-                {
-                    fields.Add(query["rscc"].ToString());
-                    fields.Add(query["rscd"].ToString());
-                    fields.Add(query["rsce"].ToString());
-                    fields.Add(query["rscl"].ToString());
-                    fields.Add(query["rsct"].ToString());
-                }
-                else if (HasSasResponseOverrides(query))
-                {
-                    throw AzureStorageException.AuthenticationFailed();
-                }
-            }
-            else if (HasSasResponseOverrides(query))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-            stringToSign = string.Join('\n', fields);
-
-            var identifier = query["si"].ToString();
-            if (!string.IsNullOrEmpty(identifier))
-            {
-                if (request.Container is null)
-                    throw AzureStorageException.AuthorizationFailure();
-                var container = await metadata.GetContainerAsync(request.Account, request.Container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
-                if (container is null || !container.AccessPolicies.TryGetValue(identifier, out var policy))
-                    throw AzureStorageException.AuthorizationFailure();
-                ValidateServiceSasPermissions(policy.Permission, signedVersion);
-                if (!string.IsNullOrEmpty(permissions) && !string.IsNullOrEmpty(policy.Permission))
-                    throw AzureStorageException.InvalidQuery("sp");
-                if (startsAt.HasValue && policy.StartsAt.HasValue)
-                    throw AzureStorageException.InvalidQuery("st");
-                if (expiresAt.HasValue && policy.ExpiresAt.HasValue)
-                    throw AzureStorageException.InvalidQuery("se");
-                permissions = string.IsNullOrEmpty(permissions) ? policy.Permission : permissions;
-                startsAt ??= policy.StartsAt;
-                expiresAt ??= policy.ExpiresAt;
-            }
+            signedResource = query["sr"].ToString();
+            stringToSign = BuildServiceSasStringToSign(
+                request, query, permissions, signedResource, signedVersion,
+                hasSignedVersion, signedIp, protocol, version);
+            (permissions, startsAt, expiresAt) = await ApplyStoredAccessPolicyAsync(
+                request, query, signedVersion, permissions, startsAt, expiresAt, cancellationToken).ConfigureAwait(false);
         }
 
         var expected = Sign(signingKey, stringToSign);
@@ -897,6 +785,162 @@ internal sealed class StorageAuthenticator(
             AclAppendChecked: aclAppendChecked,
             AclAppendObjectId: aclAppendChecked ? aclObjectId : null,
             AclAppendGroups: aclAppendChecked ? NoGroups : null);
+    }
+
+    private static string BuildAccountSasStringToSign(
+        HttpContext context,
+        StorageRequestContext request,
+        IQueryCollection query,
+        string permissions,
+        DateOnly signedVersion,
+        DateTimeOffset? expiresAt,
+        string signedIp,
+        string protocol,
+        string version)
+    {
+        if (!string.IsNullOrEmpty(query["si"].ToString()))
+            throw AzureStorageException.AuthenticationFailed();
+        var services = query["ss"].ToString();
+        var resourceTypes = query["srt"].ToString();
+        ValidateAccountSasFields(services, resourceTypes, permissions, signedVersion, expiresAt);
+        if (!services.Contains('b', StringComparison.Ordinal))
+            throw AzureStorageException.AuthorizationServiceMismatch();
+        if (!AccountSasCoversRequest(resourceTypes, request, context.Request))
+            throw AzureStorageException.AuthorizationResourceTypeMismatch();
+        var fields = new List<string>
+        {
+            request.Account,
+            permissions,
+            services,
+            resourceTypes,
+            query["st"].ToString(),
+            query["se"].ToString(),
+            signedIp,
+            protocol,
+            version
+        };
+        if (signedVersion >= new DateOnly(2020, 12, 6))
+            fields.Add(query["ses"].ToString());
+        return string.Join('\n', fields) + "\n";
+    }
+
+    private static (string Protocol, string SignedIp) ValidateSasTransport(
+        HttpContext context,
+        IQueryCollection query,
+        bool hasSignedVersion,
+        DateOnly signedVersion)
+    {
+        var protocol = query["spr"].ToString();
+        var signedIp = query["sip"].ToString();
+        if ((!hasSignedVersion || signedVersion < new DateOnly(2015, 4, 5)) &&
+            (!string.IsNullOrEmpty(protocol) || !string.IsNullOrEmpty(signedIp)))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        if (protocol is not ("" or "https" or "https,http"))
+            throw AzureStorageException.AuthenticationFailed("The signed protocol field is invalid.");
+        if (string.Equals(protocol, "https", StringComparison.Ordinal) && !context.Request.IsHttps)
+            throw AzureStorageException.AuthorizationProtocolMismatch();
+        if (!string.IsNullOrEmpty(signedIp))
+        {
+            if (!TryParseIpRange(signedIp, out var rangeStart, out var rangeEnd))
+                throw AzureStorageException.AuthenticationFailed("The signed IP field is invalid.");
+            if (!MatchesIpRange(context.Connection.RemoteIpAddress, rangeStart, rangeEnd))
+                throw AzureStorageException.AuthorizationSourceIpMismatch(context.Connection.RemoteIpAddress);
+        }
+        return (protocol, signedIp);
+    }
+
+    private string BuildServiceSasStringToSign(
+        StorageRequestContext request,
+        IQueryCollection query,
+        string permissions,
+        string resourceType,
+        DateOnly signedVersion,
+        bool hasSignedVersion,
+        string signedIp,
+        string protocol,
+        string version)
+    {
+        ValidateServiceSasPermissions(permissions, signedVersion);
+        if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
+            throw AzureStorageException.AuthorizationFailure();
+        if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
+            throw AzureStorageException.AuthorizationFailure();
+        var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query, signedVersion);
+        var fields = new List<string>
+        {
+            permissions,
+            query["st"].ToString(),
+            query["se"].ToString(),
+            canonicalizedResource,
+            query["si"].ToString()
+        };
+        if (hasSignedVersion)
+        {
+            if (signedVersion >= new DateOnly(2015, 4, 5))
+            {
+                fields.Add(signedIp);
+                fields.Add(protocol);
+            }
+            fields.Add(version);
+            if (signedVersion >= new DateOnly(2018, 11, 9))
+            {
+                fields.Add(resourceType);
+                fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
+            }
+            if (signedVersion >= new DateOnly(2020, 12, 6))
+                fields.Add(query["ses"].ToString());
+            if (signedVersion >= new DateOnly(2013, 8, 15))
+            {
+                fields.Add(query["rscc"].ToString());
+                fields.Add(query["rscd"].ToString());
+                fields.Add(query["rsce"].ToString());
+                fields.Add(query["rscl"].ToString());
+                fields.Add(query["rsct"].ToString());
+            }
+            else if (HasSasResponseOverrides(query))
+            {
+                throw AzureStorageException.AuthenticationFailed();
+            }
+        }
+        else if (HasSasResponseOverrides(query))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        return string.Join('\n', fields);
+    }
+
+    private async Task<(string Permissions, DateTimeOffset? StartsAt, DateTimeOffset? ExpiresAt)>
+        ApplyStoredAccessPolicyAsync(
+            StorageRequestContext request,
+            IQueryCollection query,
+            DateOnly signedVersion,
+            string permissions,
+            DateTimeOffset? startsAt,
+            DateTimeOffset? expiresAt,
+            CancellationToken cancellationToken)
+    {
+        var identifier = query["si"].ToString();
+        if (string.IsNullOrEmpty(identifier))
+            return (permissions, startsAt, expiresAt);
+        if (request.Container is null)
+            throw AzureStorageException.AuthorizationFailure();
+        var container = await metadata.GetContainerAsync(
+            request.Account, request.Container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        if (container is null || !container.AccessPolicies.TryGetValue(identifier, out var policy))
+            throw AzureStorageException.AuthorizationFailure();
+        ValidateServiceSasPermissions(policy.Permission, signedVersion);
+        if (!string.IsNullOrEmpty(permissions) && !string.IsNullOrEmpty(policy.Permission))
+            throw AzureStorageException.InvalidQuery("sp");
+        if (startsAt.HasValue && policy.StartsAt.HasValue)
+            throw AzureStorageException.InvalidQuery("st");
+        if (expiresAt.HasValue && policy.ExpiresAt.HasValue)
+            throw AzureStorageException.InvalidQuery("se");
+        permissions = string.IsNullOrEmpty(permissions) ? policy.Permission : permissions;
+        startsAt ??= policy.StartsAt;
+        expiresAt ??= policy.ExpiresAt;
+        return (permissions, startsAt, expiresAt);
     }
 
     private static string BuildSharedKeyString(
