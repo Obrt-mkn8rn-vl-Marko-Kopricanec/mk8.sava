@@ -135,7 +135,9 @@ It starts a disposable, strict-mode Azurite Blob server on loopback, pins
 Azurite `3.35.0` and its dependency graph, and uses the same official .NET
 Blob SDK against Azurite and mk8.sava. It compares container creation,
 block-blob upload, properties, metadata, full and ranged downloads,
-conditional writes, listing, deletion, and missing-resource errors. The
+conditional writes, listing, deletion, and missing-resource errors. Separate
+scenarios compare staged-block commit/order and block lists, snapshots,
+lease-enforced metadata writes, tags, append blobs, and page ranges/clears. The
 script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
@@ -143,7 +145,7 @@ is run with Yarn's `--ignore-engines` because newer transitive Azure packages
 declare Node 22 while this pinned Azurite and exercised lane run on Node 20.
 Azurite is an emulator with documented gaps, especially HNS; a matching
 result is evidence only for operations in its
-[support matrix](https://github.com/Azure/Azurite#support-matrix). The published
+[pinned-version support matrix](https://github.com/Azure/Azurite/blob/v3.35.0/README.md#support-matrix). The published
 [Blob REST specification](https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-rest-api)
 and targeted local tests govern unsupported features.
 Live Azure accounts are not a review prerequisite.
