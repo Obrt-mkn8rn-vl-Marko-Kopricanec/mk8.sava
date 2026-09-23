@@ -1261,19 +1261,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using var web = new HttpClient(factory.Server.CreateHandler());
             var endpoint = $"http://{SavaWebApplicationFactory.AccountName}.z99.web.local";
 
-            using (var root = await web.GetAsync(endpoint + "/"))
+            using (var root = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute)))
             {
                 Assert.Equal(HttpStatusCode.OK, root.StatusCode);
                 Assert.Equal("root index", await root.Content.ReadAsStringAsync());
                 Assert.Equal("text/html", root.Content.Headers.ContentType?.MediaType);
                 Assert.Equal("public, max-age=60", root.Headers.CacheControl?.ToString());
             }
-            using (var folder = await web.GetAsync(endpoint + "/folder/"))
+            using (var folder = await web.GetAsync(new Uri(endpoint + "/folder/", UriKind.RelativeOrAbsolute)))
             {
                 Assert.Equal(HttpStatusCode.OK, folder.StatusCode);
                 Assert.Equal("folder index", await folder.Content.ReadAsStringAsync());
             }
-            using (var missing = await web.GetAsync(endpoint + "/missing"))
+            using (var missing = await web.GetAsync(new Uri(endpoint + "/missing", UriKind.RelativeOrAbsolute)))
             {
                 Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
                 Assert.Equal("custom not found", await missing.Content.ReadAsStringAsync());
@@ -1294,7 +1294,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.Equal(10, head.Content.Headers.ContentLength);
                 Assert.Empty(await head.Content.ReadAsByteArrayAsync());
             }
-            using (var post = await web.PostAsync(endpoint + "/" + assetName, new ByteArrayContent([])))
+            using (var post = await web.PostAsync(new Uri(endpoint + "/" + assetName, UriKind.RelativeOrAbsolute), new ByteArrayContent([])))
             {
                 Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
                 Assert.True(post.Content.Headers.TryGetValues("Allow", out var allowedMethods));
@@ -1309,7 +1309,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             roundTrip = (await service.GetPropertiesAsync()).Value.StaticWebsite;
             Assert.Null(roundTrip.IndexDocument);
             Assert.Equal(defaultName, roundTrip.DefaultIndexDocumentPath);
-            using (var fallback = await web.GetAsync(endpoint + "/client/side/route"))
+            using (var fallback = await web.GetAsync(new Uri(endpoint + "/client/side/route", UriKind.RelativeOrAbsolute)))
             {
                 Assert.Equal(HttpStatusCode.OK, fallback.StatusCode);
                 Assert.Equal("single page fallback", await fallback.Content.ReadAsStringAsync());
@@ -1317,7 +1317,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             configured.StaticWebsite.Enabled = false;
             await service.SetPropertiesAsync(configured);
-            using (var disabled = await web.GetAsync(endpoint + "/"))
+            using (var disabled = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute)))
             {
                 Assert.Equal(HttpStatusCode.NotFound, disabled.StatusCode);
                 Assert.Equal("text/html", disabled.Content.Headers.ContentType?.MediaType);
@@ -2598,27 +2598,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var endpoint = $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}";
         using var transport = new HttpClient(application.Server.CreateHandler());
 
-        using (var root = await transport.GetAsync(
-                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&{sas}"))
+        using (var root = await transport.GetAsync(new Uri(
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&{sas}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.OK, root.StatusCode);
             Assert.Contains("<Name>visible/</Name>", await root.Content.ReadAsStringAsync(), StringComparison.Ordinal);
         }
-        using (var nested = await transport.GetAsync(
-                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&prefix=visible%2F&{sas}"))
+        using (var nested = await transport.GetAsync(new Uri(
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&prefix=visible%2F&{sas}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.OK, nested.StatusCode);
             Assert.Contains("<Name>visible/item.txt</Name>", await nested.Content.ReadAsStringAsync(), StringComparison.Ordinal);
         }
-        using (var unsupported = await transport.GetAsync(
-                   $"{endpoint}?restype=container&comp=list&{sas}"))
+        using (var unsupported = await transport.GetAsync(new Uri(
+                   $"{endpoint}?restype=container&comp=list&{sas}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Forbidden, unsupported.StatusCode);
             Assert.Equal("AuthorizationFailure", unsupported.Headers.GetValues("x-ms-error-code").Single());
         }
-        using (var tampered = await transport.GetAsync(
+        using (var tampered = await transport.GetAsync(new Uri(
                    $"{endpoint}?restype=container&comp=list&delimiter=%2F&" +
-                   sas.Replace(readerObjectId, Guid.NewGuid().ToString(), StringComparison.Ordinal)))
+                   sas.Replace(readerObjectId, Guid.NewGuid().ToString(), StringComparison.Ordinal), UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Forbidden, tampered.StatusCode);
             Assert.Equal("AuthenticationFailed", tampered.Headers.GetValues("x-ms-error-code").Single());
@@ -6034,7 +6034,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(content, (await customerBlob.DownloadContentAsync()).Value.Content.ToArray());
 
             using var operatorClient = application.CreateClient();
-            var metrics = await operatorClient.GetStringAsync("/metrics");
+            var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
             Assert.Contains("mk8_sava_maintenance_recompressed_chunks_total", metrics, StringComparison.Ordinal);
             Assert.Contains("mk8_sava_maintenance_recompression_bytes_saved_total", metrics, StringComparison.Ordinal);
         }
@@ -7022,7 +7022,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             SavaWebApplicationFactory.SecondAccountKey);
         await otherAccount.GetBlobContainerClient($"http-allowed-{Guid.NewGuid():N}").CreateAsync();
 
-        using var health = await rawClient.GetAsync("http://localhost/health/live");
+        using var health = await rawClient.GetAsync(new Uri("http://localhost/health/live", UriKind.RelativeOrAbsolute));
         Assert.Equal(HttpStatusCode.OK, health.StatusCode);
     }
 
@@ -10941,9 +10941,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         await blobService.RunMaintenanceAsync(CancellationToken.None);
         using var operatorClient = factory.CreateClient();
-        var unavailable = await operatorClient.GetAsync("/health/ready");
+        var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute));
         Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
-        var metrics = await operatorClient.GetStringAsync("/metrics");
+        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
         Assert.Contains("mk8_sava_integrity_corrupt_chunks 1", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_storage_physical_chunk_bytes", metrics, StringComparison.Ordinal);
         Assert.Contains(
@@ -10957,7 +10957,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await blob.DeleteAsync();
         await blobService.RunMaintenanceAsync(CancellationToken.None);
         Assert.False(File.Exists(chunkPath));
-        var recovered = await operatorClient.GetAsync("/health/ready");
+        var recovered = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute));
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
 
         var missing = container.GetBlobClient("missing.bin");
@@ -10973,13 +10973,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var missingChunk = missingRecord.Content.Chunks.First(item => !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
         File.Delete(ChunkPath(factory.DataPath, missingChunk.Id));
         await blobService.RunMaintenanceAsync(CancellationToken.None);
-        var missingMetrics = await operatorClient.GetStringAsync("/metrics");
+        var missingMetrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
         Assert.Contains("mk8_sava_integrity_missing_chunks 1", missingMetrics, StringComparison.Ordinal);
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await operatorClient.GetAsync("/health/ready")).StatusCode);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))).StatusCode);
 
         await missing.DeleteAsync();
         await blobService.RunMaintenanceAsync(CancellationToken.None);
-        Assert.Equal(HttpStatusCode.OK, (await operatorClient.GetAsync("/health/ready")).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))).StatusCode);
 
         File.Delete(freshPath);
     }
@@ -12940,20 +12940,20 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         await using var restartedDisposal46 = restarted.ConfigureAwait(false);
         await restarted.InitializeAsync();
         using var anonymous = new HttpClient(restarted.Server.CreateHandler());
-        using (var allowed = await anonymous.GetAsync(
-                   $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}"))
+        using (var allowed = await anonymous.GetAsync(new Uri(
+                   $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
             Assert.Equal(SavaWebApplicationFactory.AccountName, await allowed.Content.ReadAsStringAsync());
         }
-        using (var denied = await anonymous.GetAsync(
-                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}"))
+        using (var denied = await anonymous.GetAsync(new Uri(
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Conflict, denied.StatusCode);
             Assert.Equal("PublicAccessNotPermitted", denied.Headers.GetValues("x-ms-error-code").Single());
         }
-        using (var deniedList = await anonymous.GetAsync(
-                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list"))
+        using (var deniedList = await anonymous.GetAsync(new Uri(
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Conflict, deniedList.StatusCode);
             Assert.Equal("PublicAccessNotPermitted", deniedList.Headers.GetValues("x-ms-error-code").Single());
@@ -12981,8 +12981,8 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         Assert.Equal(409, createDenied.Status);
         Assert.Equal("PublicAccessNotPermitted", createDenied.ErrorCode);
 
-        using var website = await anonymous.GetAsync(
-            $"http://{SavaWebApplicationFactory.SecondAccountName}.z1.web.local/");
+        using var website = await anonymous.GetAsync(new Uri(
+            $"http://{SavaWebApplicationFactory.SecondAccountName}.z1.web.local/", UriKind.RelativeOrAbsolute));
         Assert.Equal(HttpStatusCode.OK, website.StatusCode);
         Assert.Equal("website remains public", await website.Content.ReadAsStringAsync());
     }
