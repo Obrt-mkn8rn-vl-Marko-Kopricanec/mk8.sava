@@ -276,17 +276,16 @@ User-delegation `scid` is signature-validated from version `2020-02-10`.
 when the delegation-key owner has the explicit
 `Sava:BearerAuthentication:Principals:<object-id>:CanManageOwnership` grant;
 it attributes new file ownership to the signed authorized object ID without
-an additional POSIX ACL check. A signed `suoid` currently supports Get Blob,
-Get Blob Properties, Get Blob Metadata, and Query Blob Contents for an existing
-file (or a missing target beneath traversable parents): the impersonated object
-ID needs execute permission on the container root and every parent directory,
-and read permission on the
-file. Owner and stored named-user ACL entries are evaluated, including the
-mask; `suoid` alone does not carry group membership evidence. The
-delegation-key owner still needs the explicit ownership grant and the token
-still needs `r`; signing or changing the object ID cannot bypass the ACL
-check. Other `suoid` operations remain fail-closed pending the full POSIX
-authorization model.
+an additional POSIX ACL check. A signed `suoid` can use the supported Blob ACL
+fallback paths described below. For Get Blob, Get Blob Properties, Get Blob
+Metadata, and Query Blob Contents, the impersonated object ID needs execute
+permission on the container root and every parent directory, plus read
+permission on the file. Owner and stored named-user entries are evaluated,
+including the mask; `suoid` alone does not carry group membership evidence.
+The delegation-key owner still needs the explicit ownership grant, and the
+token needs the operation's signed permission. Signing or changing the object
+ID cannot bypass the ACL check. Unsupported `suoid` operation shapes fail
+closed pending the full POSIX authorization model.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,
@@ -681,6 +680,9 @@ write/execute on the immediate parent directory plus execute on ancestors.
 When the immediate parent has a sticky bit, ACL-only deletion also requires
 the caller to own the child or that parent, per Microsoft's
 [HNS sticky-bit rule](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#the-sticky-bit-in-data-lake-storage).
+Local bearer and signed `suoid` tests cover denial for a foreign child and
+permission for a child owned by the ACL identity; the parent-owner and
+superuser branches remain unqualified.
 Directory property and listing permission strings expose `t` or `T` in the
 last character when the bit is set. Shared Key and configured role grants
 still follow their separate authorization paths.

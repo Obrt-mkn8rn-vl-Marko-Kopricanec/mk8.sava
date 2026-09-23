@@ -2013,55 +2013,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var key = (await bearer.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
 
-        BlobClient WithSuoid(string name, string objectId)
-        {
-            const string signedVersion = "2023-11-03";
-            var signedStart = startsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-            var signedExpiry = expiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-            var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-            var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-            var canonicalResource =
-                $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{name}";
-            var stringToSign = string.Join(
-                '\n',
-                "rw",
-                signedStart,
-                signedExpiry,
-                canonicalResource,
-                key.SignedObjectId,
-                key.SignedTenantId,
-                keyStart,
-                keyExpiry,
-                key.SignedService,
-                key.SignedVersion,
-                string.Empty,
-                objectId,
-                string.Empty,
-                string.Empty,
-                "https,http",
-                signedVersion,
-                "b",
-                string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty,
-                string.Empty);
-            var signature = Convert.ToBase64String(HMACSHA256.HashData(
-                Convert.FromBase64String(key.Value),
-                Encoding.UTF8.GetBytes(stringToSign)));
-            var query =
-                $"sp=rw&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
-                $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
-                $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
-                $"&sks={key.SignedService}&skv={key.SignedVersion}" +
-                $"&suoid={objectId}&spr=https%2Chttp&sv={signedVersion}&sr=b" +
-                $"&sig={Uri.EscapeDataString(signature)}";
-            return CreateBlobClient(
-                application,
-                new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}?{query}"));
-        }
+        BlobClient WithSuoid(string name, string objectId) => CreateSuoidBlobClient(
+            application, key, container.Name, name, objectId, "rw", startsOn, expiresOn);
 
         var owned = WithSuoid("parent/child.txt", ownerObjectId);
         Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
@@ -2188,6 +2141,43 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             target.Revision,
             CancellationToken.None);
         Assert.Equal("changed", (await foreignAgent.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    private static BlobClient CreateSuoidBlobClient(
+        SavaWebApplicationFactory application,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        string containerName,
+        string name,
+        string objectId,
+        string permissions,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
+        const string signedVersion = "2023-11-03";
+        var signedStart = startsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var signedExpiry = expiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{containerName}/{name}";
+        var stringToSign = string.Join('\n',
+            permissions, signedStart, signedExpiry, canonicalResource,
+            key.SignedObjectId, key.SignedTenantId, keyStart, keyExpiry,
+            key.SignedService, key.SignedVersion,
+            string.Empty, objectId, string.Empty, string.Empty,
+            "https,http", signedVersion, "b",
+            string.Empty, string.Empty, string.Empty, string.Empty,
+            string.Empty, string.Empty, string.Empty);
+        var signature = SignUserDelegationSas(key.Value, stringToSign);
+        var query =
+            $"sp={permissions}&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
+            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
+            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
+            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
+            $"&suoid={objectId}&spr=https%2Chttp&sv={signedVersion}&sr=b" +
+            $"&sig={Uri.EscapeDataString(signature)}";
+        return CreateBlobClient(
+            application,
+            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{name}?{query}"));
     }
 
     [Fact]
@@ -2931,6 +2921,79 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await ApplyAclManifestAsync(application, entry with { StickyBit = false }).ConfigureAwait(false);
         await writer.GetBlobClient(foreign.Name).DeleteAsync().ConfigureAwait(false);
         Assert.False((await foreign.ExistsAsync().ConfigureAwait(false)).Value);
+    }
+
+    [Fact]
+    public async Task HierarchicalStickyDirectoryHonorsSignedSuoidOwnership()
+    {
+        const string writerObjectId = "fabcedf4-22e7-45cf-8832-f58f4fe1bd9c";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "d",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-sticky-suoid-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var foreign = container.GetBlobClient("sticky/foreign.txt");
+        await foreign.UploadAsync(BinaryData.FromString("retained"));
+        var rootAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::r-x,other::---";
+        var stickyAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = rootAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "sticky",
+                AccessAcl = stickyAcl,
+                StickyBit = true
+            });
+
+        var writer = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId))
+            .GetBlobContainerClient(container.Name);
+        var owned = writer.GetBlobClient("sticky/owned.txt");
+        await owned.UploadAsync(BinaryData.FromString("owned"));
+        await AssertSignedStickyDeletionAsync(application, container, foreign, owned, writerObjectId);
+    }
+
+    private static async Task AssertSignedStickyDeletionAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient foreign,
+        BlobClient owned,
+        string writerObjectId)
+    {
+        var delegator = CreateBearerClient(application, CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId));
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn }).ConfigureAwait(false)).Value;
+        BlobClient Signed(string name) => CreateSuoidBlobClient(
+            application, key, container.Name, name, writerObjectId, "d", startsOn, expiresOn);
+
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() => Signed(foreign.Name).DeleteAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
+        Assert.Equal("AuthorizationFailure", denied.ErrorCode);
+        Assert.Equal("retained", (await foreign.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+
+        await Signed(owned.Name).DeleteAsync().ConfigureAwait(false);
+        Assert.False((await owned.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     private static async Task AssertParentAclMutationsAsync(
