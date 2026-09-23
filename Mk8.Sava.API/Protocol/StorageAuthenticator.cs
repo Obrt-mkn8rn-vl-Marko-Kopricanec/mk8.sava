@@ -463,6 +463,71 @@ internal sealed class StorageAuthenticator(
         CancellationToken cancellationToken)
     {
         var query = context.Request.Query;
+        var (version, suppliedSignature, hasSignedVersion, signedVersion, encodedKey, isAccountSas, isUserDelegationSas) =
+            ValidateSasRequestIdentity(request, query);
+        var (protocol, signedIp) = ValidateSasTransport(context, query, hasSignedVersion, signedVersion);
+
+        var permissions = query["sp"].ToString();
+        var signedStartsAt = ParseSasTime(query["st"].ToString());
+        var signedExpiresAt = ParseSasTime(query["se"].ToString());
+        var startsAt = signedStartsAt;
+        var expiresAt = signedExpiresAt;
+        var signedEncryptionScope = query["ses"].ToString();
+        if (!string.IsNullOrEmpty(signedEncryptionScope) && signedVersion < new DateOnly(2020, 12, 6))
+            throw AzureStorageException.AuthorizationFailure();
+        string stringToSign;
+        var signedResource = string.Empty;
+        var signingKey = encodedKey;
+        var isCrossTenantUserBoundSas = false;
+        string? delegatedCreatorObjectId = null;
+        string? aclObjectId = null;
+        if (isAccountSas)
+        {
+            stringToSign = BuildAccountSasStringToSign(
+                context, request, query, permissions, signedVersion, expiresAt, signedIp, protocol, version);
+        }
+        else if (isUserDelegationSas)
+        {
+            var plan = BuildUserDelegationSasPlan(
+                context, request, query, signedVersion, version, permissions,
+                startsAt, expiresAt, signedIp, protocol, bearer);
+            stringToSign = plan.StringToSign;
+            signingKey = plan.SigningKey;
+            permissions = plan.Permissions;
+            startsAt = plan.StartsAt;
+            expiresAt = plan.ExpiresAt;
+            signedResource = plan.SignedResource;
+            delegatedCreatorObjectId = plan.CreatorObjectId;
+            aclObjectId = plan.AclObjectId;
+            isCrossTenantUserBoundSas = plan.IsCrossTenantUserBoundSas;
+        }
+        else
+        {
+            signedResource = query["sr"].ToString();
+            stringToSign = BuildServiceSasStringToSign(
+                request, query, permissions, signedResource, signedVersion,
+                hasSignedVersion, signedIp, protocol, version);
+            (permissions, startsAt, expiresAt) = await ApplyStoredAccessPolicyAsync(
+                request, query, signedVersion, permissions, startsAt, expiresAt, cancellationToken).ConfigureAwait(false);
+        }
+
+        VerifySasSignature(signingKey, stringToSign, suppliedSignature);
+        ValidateSasTimeAndPolicies(
+            request, query, permissions, startsAt, expiresAt,
+            signedStartsAt, signedExpiresAt, hasSignedVersion,
+            isAccountSas, isUserDelegationSas, isCrossTenantUserBoundSas);
+        var acl = await EvaluateSasAclAsync(
+            context, request, aclObjectId, permissions, cancellationToken).ConfigureAwait(false);
+        return CreateSasAuthorization(
+            query, permissions, startsAt, expiresAt, isAccountSas, isUserDelegationSas,
+            signedResource, delegatedCreatorObjectId, aclObjectId, acl);
+    }
+
+    private (string Version, string SuppliedSignature, bool HasSignedVersion, DateOnly SignedVersion,
+        string EncodedKey, bool IsAccountSas, bool IsUserDelegationSas) ValidateSasRequestIdentity(
+            StorageRequestContext request,
+            IQueryCollection query)
+    {
         var version = query["sv"].ToString();
         var suppliedSignature = query["sig"].ToString();
         var hasSignedVersion = !string.IsNullOrEmpty(version);
@@ -498,208 +563,29 @@ internal sealed class StorageAuthenticator(
         {
             throw AzureStorageException.AuthenticationFailed();
         }
+        return (version, suppliedSignature, hasSignedVersion, signedVersion, encodedKey, isAccountSas, isUserDelegationSas);
+    }
 
-        var (protocol, signedIp) = ValidateSasTransport(context, query, hasSignedVersion, signedVersion);
-
-        var permissions = query["sp"].ToString();
-        var signedStartsAt = ParseSasTime(query["st"].ToString());
-        var signedExpiresAt = ParseSasTime(query["se"].ToString());
-        var startsAt = signedStartsAt;
-        var expiresAt = signedExpiresAt;
-        var signedEncryptionScope = query["ses"].ToString();
-        if (!string.IsNullOrEmpty(signedEncryptionScope) && signedVersion < new DateOnly(2020, 12, 6))
-            throw AzureStorageException.AuthorizationFailure();
-        string stringToSign;
-        var signedResource = string.Empty;
-        var signingKey = encodedKey;
-        var isCrossTenantUserBoundSas = false;
-        string? delegatedCreatorObjectId = null;
-        string? aclObjectId = null;
-        if (isAccountSas)
-        {
-            stringToSign = BuildAccountSasStringToSign(
-                context, request, query, permissions, signedVersion, expiresAt, signedIp, protocol, version);
-        }
-        else if (isUserDelegationSas)
-        {
-            if (signedVersion < new DateOnly(2018, 11, 9) || !string.IsNullOrEmpty(query["si"]))
-                throw AzureStorageException.AuthenticationFailed();
-
-            var resourceType = query["sr"].ToString();
-            if (string.IsNullOrEmpty(permissions) || expiresAt is null)
-                throw AzureStorageException.AuthenticationFailed();
-            ValidateServiceSasPermissions(permissions, signedVersion);
-            signedResource = resourceType;
-            if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
-                throw AzureStorageException.AuthorizationFailure();
-            if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
-                throw AzureStorageException.AuthorizationFailure();
-            var canonicalizedResource = BuildSasCanonicalResource(
-                request,
-                resourceType,
-                query,
-                signedVersion);
-
-            var objectId = query["skoid"].ToString();
-            delegatedCreatorObjectId = objectId;
-            var tenantId = query["sktid"].ToString();
-            var keyStartText = query["skt"].ToString();
-            var keyExpiryText = query["ske"].ToString();
-            var keyService = query["sks"].ToString();
-            var keyVersion = query["skv"].ToString();
-            if (!Guid.TryParse(objectId, out _) ||
-                !Guid.TryParse(tenantId, out _) ||
-!string.Equals(keyService, "b", StringComparison.Ordinal) ||
-                !DateOnly.TryParseExact(keyVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedKeyVersion) ||
-                parsedKeyVersion < new DateOnly(2018, 11, 9))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-
-            var keyStartsAt = ParseSasTime(keyStartText);
-            var keyExpiresAt = ParseSasTime(keyExpiryText);
-            if (keyStartsAt is null || keyExpiresAt is null ||
-                keyStartsAt >= keyExpiresAt ||
-                keyExpiresAt.Value - keyStartsAt.Value > TimeSpan.FromDays(7))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-
-            if (!_options.BearerAuthentication.Principals.TryGetValue(objectId, out var delegatedPrincipal) ||
-                !Covers(delegatedPrincipal.Accounts, request.Account) ||
-                request.Container is not null && !Covers(delegatedPrincipal.Containers, request.Container))
-            {
-                throw AzureStorageException.AuthorizationFailure();
-            }
-            permissions = IntersectPermissions(permissions, delegatedPrincipal.Permissions);
-            startsAt = Latest(startsAt, keyStartsAt);
-            expiresAt = Earliest(expiresAt, keyExpiresAt);
-
-            var authorizedObjectId = query["saoid"].ToString();
-            var unauthorizedObjectId = query["suoid"].ToString();
-            var correlationId = query["scid"].ToString();
-            var hasAuthorizedObjectId = !string.IsNullOrEmpty(authorizedObjectId);
-            var hasUnauthorizedObjectId = !string.IsNullOrEmpty(unauthorizedObjectId);
-            var hasCorrelationId = !string.IsNullOrEmpty(correlationId);
-            if (hasAuthorizedObjectId && hasUnauthorizedObjectId ||
-                (hasAuthorizedObjectId || hasUnauthorizedObjectId || hasCorrelationId) &&
-                signedVersion < new DateOnly(2020, 2, 10) ||
-                hasAuthorizedObjectId && !Guid.TryParse(authorizedObjectId, out _) ||
-                hasUnauthorizedObjectId && !Guid.TryParse(unauthorizedObjectId, out _) ||
-                hasCorrelationId && !Guid.TryParse(correlationId, out _))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-            if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) &&
-                !IsHierarchicalNamespaceEnabled(request.Account))
-            {
-                throw AzureStorageException.AuthorizationFailure();
-            }
-            if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) &&
-                !delegatedPrincipal.CanManageOwnership)
-                throw AzureStorageException.AuthorizationFailure();
-            if (hasUnauthorizedObjectId)
-            {
-                aclObjectId = unauthorizedObjectId;
-                delegatedCreatorObjectId = unauthorizedObjectId;
-            }
-            if (hasAuthorizedObjectId)
-                delegatedCreatorObjectId = authorizedObjectId;
-
-            var delegatedUserTenantId = query["skdutid"].ToString();
-            var delegatedUserObjectId = query["sduoid"].ToString();
-            if ((!string.IsNullOrEmpty(delegatedUserTenantId) &&
-                 !Guid.TryParse(delegatedUserTenantId, out _)) ||
-                (!string.IsNullOrEmpty(delegatedUserObjectId) &&
-                 !Guid.TryParse(delegatedUserObjectId, out _)))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-            if (!string.IsNullOrEmpty(delegatedUserObjectId))
-            {
-                var expectedBearerTenantId = string.IsNullOrEmpty(delegatedUserTenantId)
-                    ? tenantId
-                    : delegatedUserTenantId;
-                isCrossTenantUserBoundSas = !string.IsNullOrEmpty(delegatedUserTenantId) &&
-                                            !SameTenant(delegatedUserTenantId, tenantId);
-                if (signedVersion < new DateOnly(2025, 7, 5) ||
-                    bearer is null ||
-                    !string.Equals(bearer.Identifier, delegatedUserObjectId, StringComparison.Ordinal) ||
-                    !string.Equals(bearer.TenantId, expectedBearerTenantId, StringComparison.Ordinal))
-                {
-                    throw AzureStorageException.AuthorizationFailure();
-                }
-            }
-            else if (!string.IsNullOrEmpty(delegatedUserTenantId))
-            {
-                throw AzureStorageException.AuthenticationFailed();
-            }
-
-            signingKey = DeriveUserDelegationKey(
-                request.Account,
-                objectId,
-                tenantId,
-                FormatSasTime(keyStartsAt.Value),
-                FormatSasTime(keyExpiresAt.Value),
-                keyService,
-                keyVersion,
-                NullIfEmpty(delegatedUserTenantId));
-
-            var fields = new List<string>
-            {
-                query["sp"].ToString(),
-                query["st"].ToString(),
-                query["se"].ToString(),
-                canonicalizedResource,
-                objectId,
-                tenantId,
-                keyStartText,
-                keyExpiryText,
-                keyService,
-                keyVersion,
-                authorizedObjectId,
-                unauthorizedObjectId,
-                correlationId
-            };
-            if (signedVersion >= new DateOnly(2025, 7, 5))
-            {
-                fields.Add(delegatedUserTenantId);
-                fields.Add(delegatedUserObjectId);
-            }
-            fields.Add(signedIp);
-            fields.Add(protocol);
-            fields.Add(version);
-            fields.Add(resourceType);
-            if (signedVersion >= new DateOnly(2020, 2, 10))
-                fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
-            if (signedVersion >= new DateOnly(2020, 12, 6))
-                fields.Add(query["ses"].ToString());
-            if (signedVersion >= new DateOnly(2026, 4, 6))
-            {
-                fields.Add(BuildSignedRequestHeaders(context.Request, query["srh"].ToString()));
-                fields.Add(BuildSignedRequestQuery(context.Request));
-            }
-            fields.Add(query["rscc"].ToString());
-            fields.Add(query["rscd"].ToString());
-            fields.Add(query["rsce"].ToString());
-            fields.Add(query["rscl"].ToString());
-            fields.Add(query["rsct"].ToString());
-            stringToSign = string.Join('\n', fields);
-        }
-        else
-        {
-            signedResource = query["sr"].ToString();
-            stringToSign = BuildServiceSasStringToSign(
-                request, query, permissions, signedResource, signedVersion,
-                hasSignedVersion, signedIp, protocol, version);
-            (permissions, startsAt, expiresAt) = await ApplyStoredAccessPolicyAsync(
-                request, query, signedVersion, permissions, startsAt, expiresAt, cancellationToken).ConfigureAwait(false);
-        }
-
+    private static void VerifySasSignature(string signingKey, string stringToSign, string suppliedSignature)
+    {
         var expected = Sign(signingKey, stringToSign);
         if (!FixedTimeEquals(expected, suppliedSignature))
             throw AzureStorageException.AuthenticationFailed();
+    }
 
+    private void ValidateSasTimeAndPolicies(
+        StorageRequestContext request,
+        IQueryCollection query,
+        string permissions,
+        DateTimeOffset? startsAt,
+        DateTimeOffset? expiresAt,
+        DateTimeOffset? signedStartsAt,
+        DateTimeOffset? signedExpiresAt,
+        bool hasSignedVersion,
+        bool isAccountSas,
+        bool isUserDelegationSas,
+        bool isCrossTenantUserBoundSas)
+    {
         var now = DateTimeOffset.UtcNow;
         if (!hasSignedVersion &&
             string.IsNullOrEmpty(query["si"].ToString()) &&
@@ -724,46 +610,20 @@ internal sealed class StorageAuthenticator(
         ApplyUserBoundSasPolicy(
             request,
             isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
-        string? aclAuthorizedGenerationId = null;
-        var aclListChecked = false;
-        var aclMutationChecked = false;
-        var aclAppendChecked = false;
-        if (aclObjectId is not null)
-        {
-            if (HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
-            {
-                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
-                    metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken).ConfigureAwait(false);
-                aclAppendChecked = true;
-            }
-            else if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
-            {
-                await HierarchicalAclAuthorization.EnsureParentMutationAsync(
-                    metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken).ConfigureAwait(false);
-                aclMutationChecked = true;
-            }
-            else if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
-            {
-                await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                    metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken).ConfigureAwait(false);
-                aclListChecked = true;
-            }
-            else
-            {
-                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
-                    metadata,
-                    context.Request,
-                    request,
-                    aclObjectId,
-                    NoGroups,
-                    permissions,
-                    cancellationToken).ConfigureAwait(false);
-            }
-        }
+    }
 
+    private static StorageAuthorization CreateSasAuthorization(
+        IQueryCollection query,
+        string permissions,
+        DateTimeOffset? startsAt,
+        DateTimeOffset? expiresAt,
+        bool isAccountSas,
+        bool isUserDelegationSas,
+        string signedResource,
+        string? delegatedCreatorObjectId,
+        string? aclObjectId,
+        SasAclGrant acl)
+    {
         return new StorageAuthorization(
             StorageAuthorizationKind.Sas,
             permissions,
@@ -774,18 +634,65 @@ internal sealed class StorageAuthenticator(
             signedResource,
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
             DelegatedObjectId: delegatedCreatorObjectId,
-            AclReadChecked: aclObjectId is not null && !aclListChecked && !aclMutationChecked && !aclAppendChecked,
-            AclAuthorizedGenerationId: aclAuthorizedGenerationId,
-            AclListChecked: aclListChecked,
-            AclListObjectId: aclListChecked ? aclObjectId : null,
-            AclListGroups: aclListChecked ? NoGroups : null,
-            AclMutationChecked: aclMutationChecked,
-            AclMutationObjectId: aclMutationChecked ? aclObjectId : null,
-            AclMutationGroups: aclMutationChecked ? NoGroups : null,
-            AclAppendChecked: aclAppendChecked,
-            AclAppendObjectId: aclAppendChecked ? aclObjectId : null,
-            AclAppendGroups: aclAppendChecked ? NoGroups : null);
+            AclReadChecked: aclObjectId is not null && !acl.ListChecked && !acl.MutationChecked && !acl.AppendChecked,
+            AclAuthorizedGenerationId: acl.AuthorizedGenerationId,
+            AclListChecked: acl.ListChecked,
+            AclListObjectId: acl.ListChecked ? aclObjectId : null,
+            AclListGroups: acl.ListChecked ? NoGroups : null,
+            AclMutationChecked: acl.MutationChecked,
+            AclMutationObjectId: acl.MutationChecked ? aclObjectId : null,
+            AclMutationGroups: acl.MutationChecked ? NoGroups : null,
+            AclAppendChecked: acl.AppendChecked,
+            AclAppendObjectId: acl.AppendChecked ? aclObjectId : null,
+            AclAppendGroups: acl.AppendChecked ? NoGroups : null);
     }
+
+    private async Task<SasAclGrant> EvaluateSasAclAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        string? aclObjectId,
+        string permissions,
+        CancellationToken cancellationToken)
+    {
+        if (aclObjectId is null)
+            return new SasAclGrant(null, false, false, false);
+        if (HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
+        {
+            var generationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
+                metadata, context.Request, request, aclObjectId, NoGroups,
+                permissions, cancellationToken).ConfigureAwait(false);
+            return new SasAclGrant(generationId, false, false, true);
+        }
+        if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
+        {
+            await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+                metadata, context.Request, request, aclObjectId, NoGroups,
+                permissions, cancellationToken).ConfigureAwait(false);
+            return new SasAclGrant(null, false, true, false);
+        }
+        if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
+        {
+            await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
+                metadata, context.Request, request, aclObjectId, NoGroups,
+                permissions, cancellationToken).ConfigureAwait(false);
+            return new SasAclGrant(null, true, false, false);
+        }
+        var readGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
+            metadata,
+            context.Request,
+            request,
+            aclObjectId,
+            NoGroups,
+            permissions,
+            cancellationToken).ConfigureAwait(false);
+        return new SasAclGrant(readGenerationId, false, false, false);
+    }
+
+    private readonly record struct SasAclGrant(
+        string? AuthorizedGenerationId,
+        bool ListChecked,
+        bool MutationChecked,
+        bool AppendChecked);
 
     private static string BuildAccountSasStringToSign(
         HttpContext context,
@@ -942,6 +849,277 @@ internal sealed class StorageAuthenticator(
         expiresAt ??= policy.ExpiresAt;
         return (permissions, startsAt, expiresAt);
     }
+
+    private UserDelegationKeyValues ReadUserDelegationKeyValues(
+        StorageRequestContext request,
+        IQueryCollection query)
+    {
+        var objectId = query["skoid"].ToString();
+        var tenantId = query["sktid"].ToString();
+        var keyStartText = query["skt"].ToString();
+        var keyExpiryText = query["ske"].ToString();
+        var keyService = query["sks"].ToString();
+        var keyVersion = query["skv"].ToString();
+        if (!Guid.TryParse(objectId, out _) ||
+            !Guid.TryParse(tenantId, out _) ||
+            !string.Equals(keyService, "b", StringComparison.Ordinal) ||
+            !DateOnly.TryParseExact(keyVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedKeyVersion) ||
+            parsedKeyVersion < new DateOnly(2018, 11, 9))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        var keyStartsAt = ParseSasTime(keyStartText);
+        var keyExpiresAt = ParseSasTime(keyExpiryText);
+        if (keyStartsAt is null || keyExpiresAt is null ||
+            keyStartsAt >= keyExpiresAt ||
+            keyExpiresAt.Value - keyStartsAt.Value > TimeSpan.FromDays(7))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        if (!_options.BearerAuthentication.Principals.TryGetValue(objectId, out var delegatedPrincipal) ||
+            !Covers(delegatedPrincipal.Accounts, request.Account) ||
+            request.Container is not null && !Covers(delegatedPrincipal.Containers, request.Container))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        return new UserDelegationKeyValues(
+            objectId,
+            tenantId,
+            keyStartText,
+            keyExpiryText,
+            keyService,
+            keyVersion,
+            keyStartsAt.Value,
+            keyExpiresAt.Value,
+            delegatedPrincipal.Permissions,
+            delegatedPrincipal.CanManageOwnership);
+    }
+
+    private sealed record UserDelegationKeyValues(
+        string ObjectId,
+        string TenantId,
+        string StartText,
+        string ExpiryText,
+        string Service,
+        string Version,
+        DateTimeOffset StartsAt,
+        DateTimeOffset ExpiresAt,
+        string GrantedPermissions,
+        bool CanManageOwnership);
+
+    private UserDelegationIdentityValues ValidateUserDelegationIdentity(
+        StorageRequestContext request,
+        IQueryCollection query,
+        DateOnly signedVersion,
+        UserDelegationKeyValues key,
+        StorageAuthorization? bearer)
+    {
+        var authorizedObjectId = query["saoid"].ToString();
+        var unauthorizedObjectId = query["suoid"].ToString();
+        var correlationId = query["scid"].ToString();
+        var hasAuthorizedObjectId = !string.IsNullOrEmpty(authorizedObjectId);
+        var hasUnauthorizedObjectId = !string.IsNullOrEmpty(unauthorizedObjectId);
+        var hasCorrelationId = !string.IsNullOrEmpty(correlationId);
+        if (hasAuthorizedObjectId && hasUnauthorizedObjectId ||
+            (hasAuthorizedObjectId || hasUnauthorizedObjectId || hasCorrelationId) &&
+            signedVersion < new DateOnly(2020, 2, 10) ||
+            hasAuthorizedObjectId && !Guid.TryParse(authorizedObjectId, out _) ||
+            hasUnauthorizedObjectId && !Guid.TryParse(unauthorizedObjectId, out _) ||
+            hasCorrelationId && !Guid.TryParse(correlationId, out _))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) &&
+            !IsHierarchicalNamespaceEnabled(request.Account))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) && !key.CanManageOwnership)
+            throw AzureStorageException.AuthorizationFailure();
+        var creatorObjectId = hasAuthorizedObjectId
+            ? authorizedObjectId
+            : hasUnauthorizedObjectId ? unauthorizedObjectId : key.ObjectId;
+        var aclObjectId = hasUnauthorizedObjectId ? unauthorizedObjectId : null;
+
+        var (delegatedUserTenantId, delegatedUserObjectId, isCrossTenantUserBoundSas) =
+            ValidateUserBoundDelegation(query, signedVersion, key.TenantId, bearer);
+        return new UserDelegationIdentityValues(
+            authorizedObjectId,
+            unauthorizedObjectId,
+            correlationId,
+            delegatedUserTenantId,
+            delegatedUserObjectId,
+            creatorObjectId,
+            aclObjectId,
+            isCrossTenantUserBoundSas);
+    }
+
+    private sealed record UserDelegationIdentityValues(
+        string AuthorizedObjectId,
+        string UnauthorizedObjectId,
+        string CorrelationId,
+        string DelegatedUserTenantId,
+        string DelegatedUserObjectId,
+        string CreatorObjectId,
+        string? AclObjectId,
+        bool IsCrossTenantUserBoundSas);
+
+    private static (string TenantId, string ObjectId, bool IsCrossTenant) ValidateUserBoundDelegation(
+        IQueryCollection query,
+        DateOnly signedVersion,
+        string keyTenantId,
+        StorageAuthorization? bearer)
+    {
+        var delegatedUserTenantId = query["skdutid"].ToString();
+        var delegatedUserObjectId = query["sduoid"].ToString();
+        if ((!string.IsNullOrEmpty(delegatedUserTenantId) &&
+             !Guid.TryParse(delegatedUserTenantId, out _)) ||
+            (!string.IsNullOrEmpty(delegatedUserObjectId) &&
+             !Guid.TryParse(delegatedUserObjectId, out _)))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        var isCrossTenantUserBoundSas = false;
+        if (!string.IsNullOrEmpty(delegatedUserObjectId))
+        {
+            var expectedBearerTenantId = string.IsNullOrEmpty(delegatedUserTenantId)
+                ? keyTenantId
+                : delegatedUserTenantId;
+            isCrossTenantUserBoundSas = !string.IsNullOrEmpty(delegatedUserTenantId) &&
+                                        !SameTenant(delegatedUserTenantId, keyTenantId);
+            if (signedVersion < new DateOnly(2025, 7, 5) ||
+                bearer is null ||
+                !string.Equals(bearer.Identifier, delegatedUserObjectId, StringComparison.Ordinal) ||
+                !string.Equals(bearer.TenantId, expectedBearerTenantId, StringComparison.Ordinal))
+            {
+                throw AzureStorageException.AuthorizationFailure();
+            }
+        }
+        else if (!string.IsNullOrEmpty(delegatedUserTenantId))
+        {
+            throw AzureStorageException.AuthenticationFailed();
+        }
+        return (delegatedUserTenantId, delegatedUserObjectId, isCrossTenantUserBoundSas);
+    }
+
+    private static string BuildUserDelegationSasStringToSign(
+        HttpContext context,
+        IQueryCollection query,
+        DateOnly signedVersion,
+        string version,
+        string resourceType,
+        string canonicalizedResource,
+        string signedIp,
+        string protocol,
+        UserDelegationKeyValues key,
+        UserDelegationIdentityValues identity)
+    {
+        var fields = new List<string>
+        {
+            query["sp"].ToString(),
+            query["st"].ToString(),
+            query["se"].ToString(),
+            canonicalizedResource,
+            key.ObjectId,
+            key.TenantId,
+            key.StartText,
+            key.ExpiryText,
+            key.Service,
+            key.Version,
+            identity.AuthorizedObjectId,
+            identity.UnauthorizedObjectId,
+            identity.CorrelationId
+        };
+        if (signedVersion >= new DateOnly(2025, 7, 5))
+        {
+            fields.Add(identity.DelegatedUserTenantId);
+            fields.Add(identity.DelegatedUserObjectId);
+        }
+        fields.Add(signedIp);
+        fields.Add(protocol);
+        fields.Add(version);
+        fields.Add(resourceType);
+        if (signedVersion >= new DateOnly(2020, 2, 10))
+            fields.Add(GetSignedSnapshotOrVersion(query, resourceType));
+        if (signedVersion >= new DateOnly(2020, 12, 6))
+            fields.Add(query["ses"].ToString());
+        if (signedVersion >= new DateOnly(2026, 4, 6))
+        {
+            fields.Add(BuildSignedRequestHeaders(context.Request, query["srh"].ToString()));
+            fields.Add(BuildSignedRequestQuery(context.Request));
+        }
+        fields.Add(query["rscc"].ToString());
+        fields.Add(query["rscd"].ToString());
+        fields.Add(query["rsce"].ToString());
+        fields.Add(query["rscl"].ToString());
+        fields.Add(query["rsct"].ToString());
+        return string.Join('\n', fields);
+    }
+
+    private UserDelegationSasPlan BuildUserDelegationSasPlan(
+        HttpContext context,
+        StorageRequestContext request,
+        IQueryCollection query,
+        DateOnly signedVersion,
+        string version,
+        string permissions,
+        DateTimeOffset? startsAt,
+        DateTimeOffset? expiresAt,
+        string signedIp,
+        string protocol,
+        StorageAuthorization? bearer)
+    {
+        if (signedVersion < new DateOnly(2018, 11, 9) || !string.IsNullOrEmpty(query["si"]))
+            throw AzureStorageException.AuthenticationFailed();
+        var resourceType = query["sr"].ToString();
+        if (string.IsNullOrEmpty(permissions) || expiresAt is null)
+            throw AzureStorageException.AuthenticationFailed();
+        ValidateServiceSasPermissions(permissions, signedVersion);
+        if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
+            throw AzureStorageException.AuthorizationFailure();
+        if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
+            throw AzureStorageException.AuthorizationFailure();
+        var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query, signedVersion);
+
+        var key = ReadUserDelegationKeyValues(request, query);
+        permissions = IntersectPermissions(permissions, key.GrantedPermissions);
+        startsAt = Latest(startsAt, key.StartsAt);
+        expiresAt = Earliest(expiresAt, key.ExpiresAt);
+        var identity = ValidateUserDelegationIdentity(request, query, signedVersion, key, bearer);
+        var signingKey = DeriveUserDelegationKey(
+            request.Account,
+            key.ObjectId,
+            key.TenantId,
+            FormatSasTime(key.StartsAt),
+            FormatSasTime(key.ExpiresAt),
+            key.Service,
+            key.Version,
+            NullIfEmpty(identity.DelegatedUserTenantId));
+        var stringToSign = BuildUserDelegationSasStringToSign(
+            context, query, signedVersion, version, resourceType, canonicalizedResource,
+            signedIp, protocol, key, identity);
+        return new UserDelegationSasPlan(
+            stringToSign,
+            signingKey,
+            permissions,
+            startsAt,
+            expiresAt,
+            resourceType,
+            identity.CreatorObjectId,
+            identity.AclObjectId,
+            identity.IsCrossTenantUserBoundSas);
+    }
+
+    private sealed record UserDelegationSasPlan(
+        string StringToSign,
+        string SigningKey,
+        string Permissions,
+        DateTimeOffset? StartsAt,
+        DateTimeOffset? ExpiresAt,
+        string SignedResource,
+        string CreatorObjectId,
+        string? AclObjectId,
+        bool IsCrossTenantUserBoundSas);
 
     private static string BuildSharedKeyString(
         HttpRequest request,
