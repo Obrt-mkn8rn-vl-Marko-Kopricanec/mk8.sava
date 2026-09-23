@@ -2845,6 +2845,84 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalAclAuthorizesTierAndExpiryWritesThroughTheParentDirectory()
+    {
+        const string writerObjectId = "ad1a3990-f8ca-4d15-a42d-4cadca6ef8e6";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var applicationDisposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application).GetBlobContainerClient($"hns-tier-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var target = container.GetBlobClient("folder/target.bin");
+        await target.UploadAsync(BinaryData.FromString("unchanged"));
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::r-x,other::---"
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder",
+                AccessAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---"
+            });
+
+        var token = CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId);
+        var bearerTarget = CreateBearerClient(application, token)
+            .GetBlobContainerClient(container.Name).GetBlobClient(target.Name);
+        await bearerTarget.SetAccessTierAsync(AccessTier.Cool);
+        using (var allowedExpiry = await SendBearerExpiryAsync(application, target.Uri, token, "RelativeToNow", "3600000"))
+            Assert.Equal(HttpStatusCode.OK, allowedExpiry.StatusCode);
+        Assert.Equal(AccessTier.Cool, (await target.GetPropertiesAsync()).Value.AccessTier);
+        var before = await application.Services.GetRequiredService<MetadataStore>().GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, target.Name,
+            null, null, false, CancellationToken.None);
+        Assert.NotNull(before?.ExpiresAt);
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "folder",
+            AccessAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::r-x,other::---"
+        });
+        var deniedTier = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            bearerTarget.SetAccessTierAsync(AccessTier.Hot));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedTier.Status);
+        using (var deniedExpiry = await SendBearerExpiryAsync(application, target.Uri, token, "NeverExpire", null))
+            Assert.Equal(HttpStatusCode.Forbidden, deniedExpiry.StatusCode);
+        Assert.Equal(AccessTier.Cool, (await target.GetPropertiesAsync()).Value.AccessTier);
+        var after = await application.Services.GetRequiredService<MetadataStore>().GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, target.Name,
+            null, null, false, CancellationToken.None);
+        Assert.Equal(before.ExpiresAt, after?.ExpiresAt);
+        Assert.Equal("unchanged", (await target.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    private static async Task<HttpResponseMessage> SendBearerExpiryAsync(
+        SavaWebApplicationFactory application, Uri blobUri, string token, string option, string? expiryTime)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Put, AppendQuery(blobUri, "comp=expiry"))
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        request.Headers.TryAddWithoutValidation("x-ms-expiry-option", option);
+        if (expiryTime is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", expiryTime);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    [Fact]
     public async Task HierarchicalAclRequiresFileReadAndWriteForAppendBlock()
     {
         const string appenderObjectId = "321c78dd-64e5-439f-bf30-748d84eea652";

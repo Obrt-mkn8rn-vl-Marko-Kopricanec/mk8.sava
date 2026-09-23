@@ -2343,6 +2343,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                    ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
         ValidateAccessTierVersion(http.Request, tier);
         var rehydratePriority = ReadRehydratePriority(http.Request);
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
         var updated = await service.SetTierAsync(
             blob,
             tier,
@@ -2371,6 +2372,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         EnsureLease(http.Request, blob.Lease, "blob");
         var now = http.RequestServices.GetRequiredService<TimeProvider>().GetUtcNow();
         var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, now);
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
         var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
         http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);

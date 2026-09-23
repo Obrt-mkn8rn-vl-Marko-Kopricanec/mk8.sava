@@ -650,9 +650,10 @@ entries; group memberships absent from the token are not resolved. Bearer ACL
 fallback for other operations remains incomplete.
 For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
-Set Blob Properties, and Delete Blob through write/execute on the immediate
-parent directory plus execute on ancestors. Metadata and property mutations
-recheck that parent permission immediately before storage mutation. These
+Set Blob Properties, Set Blob Tier, Set Blob Expiry, and Delete Blob through
+write/execute on the immediate parent directory plus execute on ancestors.
+Metadata, property, tier, and expiry mutations recheck that parent permission
+immediately before storage mutation. These
 rules follow Microsoft's documented
 [HNS ACL create/update/delete permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions).
 Unsupported ACL-only mutation shapes still fail closed.
