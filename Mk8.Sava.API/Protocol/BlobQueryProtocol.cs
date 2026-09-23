@@ -368,114 +368,16 @@ internal static class BlobQueryProtocol
     {
         try
         {
-            switch (field.Kind)
+            return field.Kind switch
             {
-                case BlobQueryArrowFieldKind.Int64:
-                    {
-                        var builder = new Int64Array.Builder().Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else if (cell.Value is long integer)
-                                builder.Append(integer);
-                            else if (long.TryParse(cell.ToText(), NumberStyles.Integer, CultureInfo.InvariantCulture, out integer))
-                                builder.Append(integer);
-                            else
-                                throw InvalidArrowValue(field, cell);
-                        }
-                        return builder.Build();
-                    }
-                case BlobQueryArrowFieldKind.Bool:
-                    {
-                        var builder = new BooleanArray.Builder().Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else if (cell.Value is bool boolean)
-                                builder.Append(boolean);
-                            else if (bool.TryParse(cell.ToText(), out boolean))
-                                builder.Append(boolean);
-                            else
-                                throw InvalidArrowValue(field, cell);
-                        }
-                        return builder.Build();
-                    }
-                case BlobQueryArrowFieldKind.Timestamp:
-                    {
-                        var type = new TimestampType(TimeUnit.Millisecond, (string?)null);
-                        var builder = new TimestampArray.Builder(type).Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else if (cell.Value is DateTimeOffset timestamp)
-                                builder.Append(timestamp);
-                            else if (DateTimeOffset.TryParse(
-                                         cell.ToText(),
-                                         CultureInfo.InvariantCulture,
-                                         DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                                         out timestamp))
-                            {
-                                builder.Append(timestamp);
-                            }
-                            else
-                                throw InvalidArrowValue(field, cell);
-                        }
-                        return builder.Build();
-                    }
-                case BlobQueryArrowFieldKind.String:
-                    {
-                        var builder = new StringArray.Builder().Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else
-                                builder.Append(cell.ToText());
-                        }
-                        return builder.Build();
-                    }
-                case BlobQueryArrowFieldKind.Double:
-                    {
-                        var builder = new DoubleArray.Builder().Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else if (cell.Value is double floating)
-                                builder.Append(floating);
-                            else if (double.TryParse(cell.ToText(), NumberStyles.Float, CultureInfo.InvariantCulture, out floating))
-                                builder.Append(floating);
-                            else
-                                throw InvalidArrowValue(field, cell);
-                        }
-                        return builder.Build();
-                    }
-                case BlobQueryArrowFieldKind.Decimal:
-                    {
-                        var builder = new Decimal128Array.Builder(
-                            new Decimal128Type(field.Precision, field.Scale));
-                        builder.Reserve(rows.Count);
-                        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
-                        {
-                            var cell = row.Values[column];
-                            if (cell.IsNullLike)
-                                builder.AppendNull();
-                            else
-                                builder.Append(cell.ToText());
-                        }
-                        return builder.Build();
-                    }
-                default:
-                    throw new InvalidOperationException("Unknown Arrow field type.");
-            }
+                BlobQueryArrowFieldKind.Int64 => BuildInt64ArrowArray(field, rows, column),
+                BlobQueryArrowFieldKind.Bool => BuildBoolArrowArray(field, rows, column),
+                BlobQueryArrowFieldKind.Timestamp => BuildTimestampArrowArray(field, rows, column),
+                BlobQueryArrowFieldKind.String => BuildStringArrowArray(rows, column),
+                BlobQueryArrowFieldKind.Double => BuildDoubleArrowArray(field, rows, column),
+                BlobQueryArrowFieldKind.Decimal => BuildDecimalArrowArray(field, rows, column),
+                _ => throw new InvalidOperationException("Unknown Arrow field type.")
+            };
         }
         catch (BlobQueryDataException)
         {
@@ -488,6 +390,114 @@ internal static class BlobQueryProtocol
                 $"A value could not be represented by Arrow field '{field.Name}' as {ArrowTypeName(field.Kind)}.",
                 0);
         }
+    }
+
+    private static Int64Array BuildInt64ArrowArray(QueryArrowColumn field, List<QuerySelection> rows, int column)
+    {
+        var builder = new Int64Array.Builder().Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else if (cell.Value is long integer)
+                builder.Append(integer);
+            else if (long.TryParse(cell.ToText(), NumberStyles.Integer, CultureInfo.InvariantCulture, out integer))
+                builder.Append(integer);
+            else
+                throw InvalidArrowValue(field, cell);
+        }
+        return builder.Build();
+    }
+
+    private static BooleanArray BuildBoolArrowArray(QueryArrowColumn field, List<QuerySelection> rows, int column)
+    {
+        var builder = new BooleanArray.Builder().Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else if (cell.Value is bool boolean)
+                builder.Append(boolean);
+            else if (bool.TryParse(cell.ToText(), out boolean))
+                builder.Append(boolean);
+            else
+                throw InvalidArrowValue(field, cell);
+        }
+        return builder.Build();
+    }
+
+    private static TimestampArray BuildTimestampArrowArray(QueryArrowColumn field, List<QuerySelection> rows, int column)
+    {
+        var type = new TimestampType(TimeUnit.Millisecond, (string?)null);
+        var builder = new TimestampArray.Builder(type).Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else if (cell.Value is DateTimeOffset timestamp)
+                builder.Append(timestamp);
+            else if (DateTimeOffset.TryParse(
+                         cell.ToText(),
+                         CultureInfo.InvariantCulture,
+                         DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                         out timestamp))
+            {
+                builder.Append(timestamp);
+            }
+            else
+                throw InvalidArrowValue(field, cell);
+        }
+        return builder.Build();
+    }
+
+    private static StringArray BuildStringArrowArray(List<QuerySelection> rows, int column)
+    {
+        var builder = new StringArray.Builder().Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else
+                builder.Append(cell.ToText());
+        }
+        return builder.Build();
+    }
+
+    private static DoubleArray BuildDoubleArrowArray(QueryArrowColumn field, List<QuerySelection> rows, int column)
+    {
+        var builder = new DoubleArray.Builder().Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else if (cell.Value is double floating)
+                builder.Append(floating);
+            else if (double.TryParse(cell.ToText(), NumberStyles.Float, CultureInfo.InvariantCulture, out floating))
+                builder.Append(floating);
+            else
+                throw InvalidArrowValue(field, cell);
+        }
+        return builder.Build();
+    }
+
+    private static Decimal128Array BuildDecimalArrowArray(QueryArrowColumn field, List<QuerySelection> rows, int column)
+    {
+        var builder = new Decimal128Array.Builder(new Decimal128Type(field.Precision, field.Scale));
+        builder.Reserve(rows.Count);
+        foreach (ref readonly var row in CollectionsMarshal.AsSpan(rows))
+        {
+            var cell = row.Values[column];
+            if (cell.IsNullLike)
+                builder.AppendNull();
+            else
+                builder.Append(cell.ToText());
+        }
+        return builder.Build();
     }
 
     private static BlobQueryDataException InvalidArrowValue(QueryArrowColumn field, QueryCell cell) => new(

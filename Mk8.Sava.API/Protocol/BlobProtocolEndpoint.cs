@@ -98,23 +98,7 @@ internal static class BlobProtocolEndpoint
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(comp, "userdelegationkey", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
-            RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Get User Delegation Key");
-            if (!http.Request.IsHttps)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "InvalidRequest",
-                    "Get User Delegation Key requires HTTPS.");
-            }
-            if (request.Authorization.Kind != StorageAuthorizationKind.Bearer)
-                throw AzureStorageException.AuthorizationFailure();
-            var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(
-                http.Request.Body,
-                request.ServiceVersion,
-                cancellationToken).ConfigureAwait(false);
-            var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
-            var key = authenticator.IssueUserDelegationKey(request, keyRequest);
-            await AzureResponseWriter.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
+            await HandleUserDelegationKeyAsync(http, request, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -122,29 +106,7 @@ internal static class BlobProtocolEndpoint
             throw AzureStorageException.AuthorizationFailure();
         if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "list", StringComparison.Ordinal))
         {
-            Require(request, 'l');
-            var prefix = http.Request.Query["prefix"].ToString();
-            var marker = http.Request.Query["marker"].ToString();
-            var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
-            var includes = SplitCsv(http.Request.Query["include"].ToString());
-            ValidateContainerListFeatures(request, includes);
-            var containers = await service.ListContainersPageAsync(
-                request.Account,
-                includes.Contains("deleted"),
-                includes.Contains("system"),
-                prefix,
-                marker,
-                maxResults,
-                cancellationToken).ConfigureAwait(false);
-            await AzureResponseWriter.WriteContainersAsync(
-                http,
-                containers,
-                prefix,
-                marker,
-                maxResults,
-                includes.Contains("metadata"),
-                includes.Contains("deleted"),
-                cancellationToken).ConfigureAwait(false);
+            await ListContainersAsync(http, request, service, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -158,15 +120,7 @@ internal static class BlobProtocolEndpoint
 
         if (string.Equals(comp, "properties", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
-            Require(request, 'w');
-            var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
-            var updated = await ProtocolParsing.ReadServicePropertiesAsync(
-                http.Request.Body,
-                current,
-                request.ServiceVersion,
-                cancellationToken).ConfigureAwait(false);
-            await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken).ConfigureAwait(false);
-            http.Response.StatusCode = StatusCodes.Status202Accepted;
+            await PutServicePropertiesAsync(http, request, service, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -200,6 +154,78 @@ internal static class BlobProtocolEndpoint
         }
 
         throw UnsupportedOperation();
+    }
+
+    private static async Task HandleUserDelegationKeyAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        CancellationToken cancellationToken)
+    {
+        RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Get User Delegation Key");
+        if (!http.Request.IsHttps)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidRequest",
+                "Get User Delegation Key requires HTTPS.");
+        }
+        if (request.Authorization.Kind != StorageAuthorizationKind.Bearer)
+            throw AzureStorageException.AuthorizationFailure();
+        var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(
+            http.Request.Body,
+            request.ServiceVersion,
+            cancellationToken).ConfigureAwait(false);
+        var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
+        var key = authenticator.IssueUserDelegationKey(request, keyRequest);
+        await AzureResponseWriter.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ListContainersAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        CancellationToken cancellationToken)
+    {
+        Require(request, 'l');
+        var prefix = http.Request.Query["prefix"].ToString();
+        var marker = http.Request.Query["marker"].ToString();
+        var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+        var includes = SplitCsv(http.Request.Query["include"].ToString());
+        ValidateContainerListFeatures(request, includes);
+        var containers = await service.ListContainersPageAsync(
+            request.Account,
+            includes.Contains("deleted"),
+            includes.Contains("system"),
+            prefix,
+            marker,
+            maxResults,
+            cancellationToken).ConfigureAwait(false);
+        await AzureResponseWriter.WriteContainersAsync(
+            http,
+            containers,
+            prefix,
+            marker,
+            maxResults,
+            includes.Contains("metadata"),
+            includes.Contains("deleted"),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task PutServicePropertiesAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        CancellationToken cancellationToken)
+    {
+        Require(request, 'w');
+        var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
+        var updated = await ProtocolParsing.ReadServicePropertiesAsync(
+            http.Request.Body,
+            current,
+            request.ServiceVersion,
+            cancellationToken).ConfigureAwait(false);
+        await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken).ConfigureAwait(false);
+        http.Response.StatusCode = StatusCodes.Status202Accepted;
     }
 
     private static async Task HandleStaticWebsiteAsync(
@@ -2709,9 +2735,49 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         bool requireTagsPermission = false)
     {
         using var sourceScope = destination.RequestServices.CreateScope();
+        var (sourceHttp, sourceContext) = CreateCopySourceContext(
+            destination,
+            destinationRequest,
+            source,
+            sourceScope.ServiceProvider);
+        await AuthenticateCopySourceAsync(
+            destination,
+            destinationRequest,
+            source,
+            sourceHttp,
+            sourceContext,
+            cancellationToken).ConfigureAwait(false);
+        await AuthorizeCopySourceAsync(
+            service,
+            source,
+            sourceContext,
+            requireTagsPermission,
+            cancellationToken).ConfigureAwait(false);
+
+        var sourceBlob = await service.GetBlobAsync(
+            source.Account,
+            source.Container,
+            source.Blob,
+            source.VersionId,
+            source.Snapshot,
+            false,
+            cancellationToken).ConfigureAwait(false);
+        HierarchicalAclAuthorization.EnsureAuthorizedGeneration(
+            sourceContext.Authorization,
+            sourceBlob.GenerationId);
+        ValidateBlobTypeVersion(destinationRequest, sourceBlob.Kind);
+        return sourceBlob;
+    }
+
+    private static (DefaultHttpContext Http, StorageRequestContext Context) CreateCopySourceContext(
+        HttpContext destination,
+        StorageRequestContext destinationRequest,
+        ResolvedInternalCopySource source,
+        IServiceProvider sourceServices)
+    {
         var sourceHttp = new DefaultHttpContext
         {
-            RequestServices = sourceScope.ServiceProvider
+            RequestServices = sourceServices
         };
         sourceHttp.Request.Scheme = source.Uri.Scheme;
         sourceHttp.Request.Host = HostString.FromUriComponent(source.Uri);
@@ -2736,7 +2802,17 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         };
         StorageRequestContext.Set(sourceHttp, sourceContext);
         ValidateBlobVersionRequest(sourceContext);
+        return (sourceHttp, sourceContext);
+    }
 
+    private static async Task AuthenticateCopySourceAsync(
+        HttpContext destination,
+        StorageRequestContext destinationRequest,
+        ResolvedInternalCopySource source,
+        HttpContext sourceHttp,
+        StorageRequestContext sourceContext,
+        CancellationToken cancellationToken)
+    {
         var sourceAuthorization = ProtocolParsing.First(
             destination.Request.Headers,
             "x-ms-copy-source-authorization");
@@ -2761,13 +2837,21 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         }
         else
         {
-            var authenticator = sourceScope.ServiceProvider.GetRequiredService<StorageAuthenticator>();
+            var authenticator = sourceHttp.RequestServices.GetRequiredService<StorageAuthenticator>();
             sourceContext.Authorization = await authenticator.AuthenticateAsync(
                 sourceHttp,
                 sourceContext,
                 cancellationToken).ConfigureAwait(false);
         }
+    }
 
+    private static async Task AuthorizeCopySourceAsync(
+        BlobService service,
+        ResolvedInternalCopySource source,
+        StorageRequestContext sourceContext,
+        bool requireTagsPermission,
+        CancellationToken cancellationToken)
+    {
         if (sourceContext.Authorization.Kind == StorageAuthorizationKind.Anonymous)
         {
             if (requireTagsPermission)
@@ -2789,20 +2873,6 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
 
         if (source.Snapshot is not null)
             RequireBlobSnapshots(sourceContext, service, source.Account);
-
-        var sourceBlob = await service.GetBlobAsync(
-            source.Account,
-            source.Container,
-            source.Blob,
-            source.VersionId,
-            source.Snapshot,
-            false,
-            cancellationToken).ConfigureAwait(false);
-        HierarchicalAclAuthorization.EnsureAuthorizedGeneration(
-            sourceContext.Authorization,
-            sourceBlob.GenerationId);
-        ValidateBlobTypeVersion(destinationRequest, sourceBlob.Kind);
-        return sourceBlob;
     }
 
     private static async Task HandleContainerLeaseAsync(
