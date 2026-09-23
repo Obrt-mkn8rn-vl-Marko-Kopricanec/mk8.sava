@@ -142,7 +142,7 @@ string.Equals(scenario, "pack-metadata-precommit"
                 Assert.False((await interrupted.ExistsAsync()).Value);
                 await interrupted.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
                 Assert.Equal(CreateSmallContent(17), (await interrupted.DownloadContentAsync()).Value.Content.ToArray());
-                Assert.Equal(2, application.Services.GetRequiredService<MetadataStore>().CountPackedChunks());
+                Assert.Equal(2, await application.Services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
                 return;
             }
 
@@ -153,7 +153,7 @@ string.Equals(scenario, "pack-metadata-precommit"
                 await packService.RunMaintenanceAsync(CancellationToken.None);
                 Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
                 Assert.Single(EnumerateContentFiles(dataPath));
-                Assert.Equal(1, application.Services.GetRequiredService<MetadataStore>().CountPackedChunks());
+                Assert.Equal(1, await application.Services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
                 return;
             }
 

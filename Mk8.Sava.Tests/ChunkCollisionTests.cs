@@ -55,7 +55,7 @@ public sealed class ChunkCollisionTests
         Assert.EndsWith("-1024-1", secondId, StringComparison.Ordinal);
         Assert.Equal(
             packed ? 2 : 0,
-            services.GetRequiredService<MetadataStore>().CountPackedChunks());
+            await services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
         Assert.Equal(
             packed ? 0 : 2,
             Directory.EnumerateFiles(
@@ -67,12 +67,12 @@ public sealed class ChunkCollisionTests
             SavaWebApplicationFactory.AccountName,
             encryption,
             new MemoryStream(firstBytes, writable: false),
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(true);
         using var repeatedSecond = await chunks.StorePinnedAsync(
             SavaWebApplicationFactory.AccountName,
             encryption,
             new MemoryStream(secondBytes, writable: false),
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(true);
         Assert.Equal(firstId, Assert.Single(repeatedFirst.Manifest.Chunks).Id);
         Assert.Equal(secondId, Assert.Single(repeatedSecond.Manifest.Chunks).Id);
 
@@ -84,14 +84,14 @@ public sealed class ChunkCollisionTests
             0,
             firstBytes.Length,
             firstOutput,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(true);
         await chunks.WriteRangeAsync(
             second.Manifest,
             encryption,
             0,
             secondBytes.Length,
             secondOutput,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(true);
         Assert.Equal(firstBytes, firstOutput.ToArray());
         Assert.Equal(secondBytes, secondOutput.ToArray());
     }

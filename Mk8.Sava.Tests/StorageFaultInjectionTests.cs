@@ -150,16 +150,16 @@ public sealed class StorageFaultInjectionTests
             Assert.Equal(retryBytes, (await retried.DownloadContentAsync()).Value.Content.ToArray());
 
             var metadata = restarted.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(2, metadata.CountPackedChunks());
+            Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
             var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
             Assert.Equal(
-                await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None),
+                await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None).ConfigureAwait(true),
                 new FileInfo(packPath).Length);
             Assert.Empty(EnumerateStagingFiles(dataPath));
         }
         finally
         {
-            await restarted.DisposeAsync();
+            await restarted.DisposeAsync().ConfigureAwait(true);
         }
     }
 
@@ -316,7 +316,7 @@ public sealed class StorageFaultInjectionTests
                 Assert.Equal(chunkId, Assert.Single(stored[1].Manifest.Chunks).Id);
                 var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
                 Assert.NotNull(location);
-                Assert.Equal(1, metadata.CountPackedChunks());
+                Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
                 var packPath = Path.Combine(
                     application.DataPath,
                     "packs",
@@ -330,7 +330,7 @@ public sealed class StorageFaultInjectionTests
                     0,
                     payload.Length,
                     reconstructed,
-                    CancellationToken.None);
+                    CancellationToken.None).ConfigureAwait(true);
                 Assert.Equal(payload, reconstructed.ToArray());
             }
             finally
@@ -341,7 +341,7 @@ public sealed class StorageFaultInjectionTests
         }
         finally
         {
-            await application.DisposeAsync();
+            await application.DisposeAsync().ConfigureAwait(true);
         }
     }
 

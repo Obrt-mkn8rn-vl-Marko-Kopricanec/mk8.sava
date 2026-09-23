@@ -54,6 +54,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private static readonly DateTime[] SecondParquetObserved =
         [new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc)];
 
+    private static string SignUserDelegationSas(string base64Key, string stringToSign) =>
+        Convert.ToBase64String(HMACSHA256.HashData(
+            Convert.FromBase64String(base64Key), Encoding.UTF8.GetBytes(stringToSign)));
+
     [Fact]
     public async Task PathStyleServiceEndpointAcceptsTerminalAccountSeparator()
     {
@@ -2607,8 +2611,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             "https,http", signedVersion, "c",
             string.Empty, string.Empty, string.Empty, string.Empty,
             string.Empty, string.Empty, string.Empty);
-        var signature = Convert.ToBase64String(HMACSHA256.HashData(
-            Convert.FromBase64String(key.Value), Encoding.UTF8.GetBytes(stringToSign)));
+        var signature = SignUserDelegationSas(key.Value, stringToSign);
         var sas =
             $"sp=l&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
             $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
@@ -2864,7 +2867,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             var reopened = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false);
             await using var reopenedDisposal14 = reopened.ConfigureAwait(false);
-            await reopened.InitializeAsync();
+            await reopened.InitializeAsync().ConfigureAwait(true);
             var root = await reopened.Services.GetRequiredService<MetadataStore>().GetContainerAsync(
                 SavaWebApplicationFactory.AccountName, containerName, includeDeleted: false, CancellationToken.None).ConfigureAwait(true);
             Assert.NotNull(root);
@@ -3597,7 +3600,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
             using var response = await transport.SendAsync(request).ConfigureAwait(true);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(true));
             var listed = document.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, direct.Name, StringComparison.Ordinal));
             Assert.Equal(
                 absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
@@ -6879,7 +6882,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             Assert.Equal(HttpStatusCode.OK, modern.StatusCode);
             Assert.Contains($"<Permission>{permission}</Permission>",
-                await modern.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+                await modern.Content.ReadAsStringAsync().ConfigureAwait(true), StringComparison.Ordinal);
         }
 
         await SetPolicyAsync("r").ConfigureAwait(true);
@@ -11103,56 +11106,56 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await second.UploadAsync(BinaryData.FromBytes(secondBytes));
 
             var metadata = initial.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(2, metadata.CountPackedChunks());
+            Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
             Assert.Empty(EnumerateChunkFiles(dataPath));
             Assert.Single(EnumeratePackFiles(dataPath));
-            Assert.Equal(firstBytes, (await duplicate.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.Equal(firstBytes, (await duplicate.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
             var range = await second.DownloadContentAsync(new BlobDownloadOptions
             {
                 Range = new HttpRange(123, 456)
-            });
+            }).ConfigureAwait(true);
             Assert.Equal(secondBytes.AsSpan(123, 456).ToArray(), range.Value.Content.ToArray());
 
-            await initial.DisposeAsync();
+            await initial.DisposeAsync().ConfigureAwait(true);
             initialDisposed = true;
 
             restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
-            await restarted.InitializeAsync();
+            await restarted.InitializeAsync().ConfigureAwait(true);
             var restartedContainer = CreateClient(restarted).GetBlobContainerClient(containerName);
             first = restartedContainer.GetBlobClient(first.Name);
             duplicate = restartedContainer.GetBlobClient(duplicate.Name);
             second = restartedContainer.GetBlobClient(second.Name);
-            Assert.Equal(secondBytes, (await second.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.Equal(secondBytes, (await second.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
 
-            await first.DeleteAsync();
-            await duplicate.DeleteAsync();
+            await first.DeleteAsync().ConfigureAwait(true);
+            await duplicate.DeleteAsync().ConfigureAwait(true);
             var blobs = restarted.Services.GetRequiredService<BlobService>();
-            var maintenance = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            var maintenance = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(true);
             Assert.Equal(1, maintenance.ReclaimedChunks);
             Assert.Equal(1, maintenance.CompactedChunkPacks);
             Assert.True(maintenance.PackCompactionBytesSaved > 0);
             metadata = restarted.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(1, metadata.CountPackedChunks());
+            Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
             Assert.Empty(EnumerateChunkFiles(dataPath));
             Assert.Single(EnumeratePackFiles(dataPath));
-            Assert.Equal(secondBytes, (await second.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.Equal(secondBytes, (await second.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
 
             var orphanPath = Path.Combine(
                 dataPath,
                 "packs",
                 SavaWebApplicationFactory.AccountName,
                 $"orphan-{Guid.NewGuid():N}.pack");
-            await File.WriteAllBytesAsync(orphanPath, RandomNumberGenerator.GetBytes(257));
+            await File.WriteAllBytesAsync(orphanPath, RandomNumberGenerator.GetBytes(257)).ConfigureAwait(true);
             File.SetLastWriteTimeUtc(orphanPath, DateTime.UtcNow.AddMinutes(-1));
-            var recovery = await blobs.RunMaintenanceAsync(CancellationToken.None);
+            var recovery = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(true);
             Assert.Equal(1, recovery.CompactedChunkPacks);
             Assert.True(recovery.PackCompactionBytesSaved >= 257);
             Assert.False(File.Exists(orphanPath));
 
             var backup = restarted.Services.GetRequiredService<StorageBackupService>();
-            var created = await backup.CreateAsync(backupPath, CancellationToken.None);
+            var created = await backup.CreateAsync(backupPath, CancellationToken.None).ConfigureAwait(true);
             Assert.Equal(1, created.ChunkCount);
-            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
+            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(true));
             Assert.Single(EnumerateChunkFiles(backupPath));
             Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
             {
@@ -11160,11 +11163,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                              $"Data Source={Path.Combine(backupPath, "metadata.db")}");
                 await using (connection.ConfigureAwait(false))
                 {
-                    await connection.OpenAsync();
-                    await using var command = connection.CreateCommand();
-                    command.CommandText =
+                    await connection.OpenAsync().ConfigureAwait(true);
+                    var command = connection.CreateCommand();
+                    await using (command.ConfigureAwait(false))
+                    {
+                        command.CommandText =
                         "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
-                    Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync().ConfigureAwait(true), CultureInfo.InvariantCulture));
+                    }
                 }
             }
 
@@ -11193,19 +11199,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 versionId: null,
                 snapshot: null,
                 includeDeleted: false,
-                CancellationToken.None);
+                CancellationToken.None).ConfigureAwait(true);
             var chunkId = Assert.Single(record.Content.Chunks).Id;
             Assert.Equal(
                 ChunkIntegrityStatus.Corrupt,
                 await restarted.Services.GetRequiredService<ChunkStore>()
-                    .VerifyChunkAsync(chunkId, CancellationToken.None));
+                    .VerifyChunkAsync(chunkId, CancellationToken.None).ConfigureAwait(true));
         }
         finally
         {
             if (restarted is not null)
-                await restarted.DisposeAsync();
+                await restarted.DisposeAsync().ConfigureAwait(true);
             if (!initialDisposed)
-                await initial.DisposeAsync();
+                await initial.DisposeAsync().ConfigureAwait(true);
             if (Directory.Exists(dataPath))
                 Directory.Delete(dataPath, recursive: true);
             if (Directory.Exists(backupPath))

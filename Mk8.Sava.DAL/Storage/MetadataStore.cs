@@ -850,6 +850,16 @@ public sealed partial class MetadataStore(
         return Convert.ToInt32(command.ExecuteScalar(), CultureInfo.InvariantCulture);
     }
 
+    internal async Task<int> CountPackedChunksAsync(CancellationToken cancellationToken)
+    {
+        var connection = await OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        command.CommandText = "SELECT COUNT(*) FROM packed_chunks;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
+    }
+
     internal async Task<PackedChunkLocation?> GetPackedChunkLocationAsync(
         string chunkId,
         CancellationToken cancellationToken)

@@ -445,7 +445,7 @@ public sealed class StorageSpaceEfficiencyTests
         }
 
         var metadata = application.Services.GetRequiredService<MetadataStore>();
-        Assert.Equal(32, metadata.CountPackedChunks());
+        Assert.Equal(32, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
         Assert.Empty(Directory.EnumerateDirectories(
             Path.Combine(application.DataPath, "chunks"),
             "*",
