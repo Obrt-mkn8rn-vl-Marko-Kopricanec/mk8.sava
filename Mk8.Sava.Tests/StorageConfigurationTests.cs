@@ -6,6 +6,25 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageConfigurationTests
 {
     [Theory]
+    [InlineData("00:00:00")]
+    [InlineData("-00:00:01")]
+    public void PhysicalUsageScanIntervalMustBePositive(string interval)
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
+            },
+            PhysicalUsageScanInterval = TimeSpan.Parse(interval, System.Globalization.CultureInfo.InvariantCulture)
+        };
+
+        Assert.Contains(
+            options.Validate(new ValidationContext(options)),
+            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageScanInterval)));
+    }
+
+    [Theory]
     [InlineData("")]
     [InlineData(" localhost ")]
     [InlineData("https://example.com")]

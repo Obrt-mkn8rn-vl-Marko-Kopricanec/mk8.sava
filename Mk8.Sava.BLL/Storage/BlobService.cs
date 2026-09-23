@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -33,6 +34,9 @@ public sealed class BlobService(
     private string? _recompressionCursor;
     private string? _packCompactionCursor;
     private ObjectReplicationStateKey? _objectReplicationStateCursor;
+    private StoragePhysicalUsage? _lastPhysicalUsage;
+    private long _lastPhysicalScanTicks;
+    private long _lastPhysicalScanUnixSeconds;
 
     public bool AllowsAnonymousPublicAccess(string account) =>
         _options.AccountCapabilities.TryGetValue(account, out var capabilities)
@@ -2617,7 +2621,14 @@ public sealed class BlobService(
         var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken);
         await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken);
         var recompression = await RecompressColdChunksAsync(now, cancellationToken);
-        var physical = chunks.MeasurePhysicalUsage();
+        if (_lastPhysicalUsage is null ||
+            Stopwatch.GetElapsedTime(_lastPhysicalScanTicks) >= _options.PhysicalUsageScanInterval)
+        {
+            _lastPhysicalUsage = chunks.MeasurePhysicalUsage();
+            _lastPhysicalScanTicks = Stopwatch.GetTimestamp();
+            _lastPhysicalScanUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        }
+        var physical = _lastPhysicalUsage;
         var usage = new StorageUsageSnapshot(
             summary.LogicalBlobBytes,
             summary.LogicalStagedBlockBytes,
@@ -2628,7 +2639,8 @@ public sealed class BlobService(
             summary.StagedBlockCount,
             physical.ChunkCount,
             summary.ReachableChunkCount,
-            physical.AllocatedRootBytes);
+            physical.AllocatedRootBytes,
+            _lastPhysicalScanUnixSeconds);
         var result = new StorageMaintenanceResult(
             completedCopies,
             completedObjectReplications,
