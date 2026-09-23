@@ -106,21 +106,25 @@ through ASP.NET's in-memory test server.
 
 An opt-in live differential test uses the .NET Azure Blob SDK pinned to service
 version `2023-11-03`. Set `MK8_SAVA_LIVE_AZURE_BLOB_CONNECTION_STRING` in the
-test process environment to a **disposable flat-namespace Azure account** and
+test process environment to a **disposable flat-namespace Azure account** using
+an account-key connection string (the SAS comparison must sign test URLs), and
 run `dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj --filter Category=LiveAzure`.
 Without that variable, xUnit reports the lane as skipped, not passed. It
 creates a unique `mk8diff-` container in Azure and mk8.sava, compares the same
 upload, properties, tags, full/ranged reads, snapshot/overwrite, block/append/
 page blob, listing, and missing-blob error observations, then deletes only those
-two containers. The connection string is never printed. A separate local-only
-test always exercises the scenario so the harness cannot silently rot. A
-second opt-in lane uses
+two containers. A second flat-account scenario creates a separate unique
+`mk8diff-auth-` container and compares read-only service SAS access, denied
+SAS mutation, stale ETag conditions, lease-enforced metadata writes, and final
+state. The connection string is never printed. Separate local-only tests always
+exercise both scenarios so the harness cannot silently rot. A second opt-in
+lane uses
 `MK8_SAVA_LIVE_AZURE_HNS_CONNECTION_STRING` for a disposable HNS-enabled Azure
 account. It compares Shared Key nested-path creation, directory/file identity
 and permissions, bytes, listing order, and nonempty-directory errors; a local
-only test exercises that scenario in every normal run. Both live lanes remain
-skipped until their respective account variables are supplied; even when run,
-they cover only a subset of the full Azure conformance matrix.
+only test exercises that scenario in every normal run. All live scenarios
+remain skipped until their respective account variables are supplied; even
+when run, they cover only a subset of the full Azure conformance matrix.
 
 ## SAS authorization boundaries
 

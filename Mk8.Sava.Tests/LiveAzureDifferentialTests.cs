@@ -4,6 +4,7 @@ using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
+using Azure.Storage.Sas;
 using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
@@ -69,6 +70,37 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         }
     }
 
+    [Fact]
+    public async Task FlatAuthorizationDifferentialScenarioRunsAgainstLocalService()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var client = CreateLocalClient(application);
+        var container = client.GetBlobContainerClient($"mk8diff-auth-local-{Guid.NewGuid():N}");
+        try
+        {
+            var observation = await ExerciseAuthorizationAsync(
+                container,
+                uri => CreateLocalSasClient(application, uri));
+            Assert.Equal("original-content", observation.SasReadBytes);
+            Assert.Equal(403, observation.DeniedSasWriteStatus);
+            Assert.Equal("AuthorizationPermissionMismatch", observation.DeniedSasWriteCode);
+            Assert.Equal(412, observation.StaleConditionStatus);
+            Assert.Equal("ConditionNotMet", observation.StaleConditionCode);
+            Assert.Equal(412, observation.MissingLeaseStatus);
+            Assert.Equal("LeaseIdMissing", observation.MissingLeaseCode);
+            Assert.Equal("authorized", observation.FinalMetadata);
+            Assert.Equal("original-content", observation.FinalBytes);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(container);
+        }
+    }
+
     [LiveAzureFact]
     [Trait("Category", "LiveAzure")]
     public async Task FlatNamespaceSdkStateAndErrorsMatchLiveAzure()
@@ -81,6 +113,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         {
             Retry = { MaxRetries = 0 }
         });
+        Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
         await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -142,6 +175,48 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         }
     }
 
+    [LiveAzureFact]
+    [Trait("Category", "LiveAzure")]
+    public async Task FlatAuthorizationAndConcurrencyMatchLiveAzure()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(LiveAzureFactAttribute.ConnectionStringVariable)
+                               ?? throw new InvalidOperationException("The live Azure test account was removed after discovery.");
+        var remote = new BlobServiceClient(connectionString, new BlobClientOptions(
+            BlobClientOptions.ServiceVersion.V2023_11_03)
+        {
+            Retry = { MaxRetries = 0 }
+        });
+        Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
+        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await localApplication.InitializeAsync();
+        var local = CreateLocalClient(localApplication);
+        var containerName = $"mk8diff-auth-{Guid.NewGuid():N}";
+        var remoteContainer = remote.GetBlobContainerClient(containerName);
+        var localContainer = local.GetBlobContainerClient(containerName);
+        try
+        {
+            var expected = await ExerciseAuthorizationAsync(
+                remoteContainer,
+                uri => new BlobClient(uri, new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03)
+                {
+                    Retry = { MaxRetries = 0 }
+                }));
+            var actual = await ExerciseAuthorizationAsync(
+                localContainer,
+                uri => CreateLocalSasClient(localApplication, uri));
+            Assert.Equal(expected, actual);
+            output.WriteLine("Live Azure and mk8.sava matched the pinned flat-account SAS/condition/lease scenario.");
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer);
+            await DeleteIfExistsAsync(remoteContainer);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
@@ -158,6 +233,66 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
                 }),
                 Retry = { MaxRetries = 0 }
             });
+    }
+
+    private static BlobClient CreateLocalSasClient(SavaWebApplicationFactory application, Uri uri) =>
+        new(uri, new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03)
+        {
+            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+            {
+                BaseAddress = uri
+            }),
+            Retry = { MaxRetries = 0 }
+        });
+
+    private static async Task<AuthorizationObservation> ExerciseAuthorizationAsync(
+        BlobContainerClient container,
+        Func<Uri, BlobClient> createSasClient)
+    {
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("protected.txt");
+        await blob.UploadAsync(BinaryData.FromString("original-content"));
+        Assert.True(blob.CanGenerateSasUri);
+        var sas = createSasClient(blob.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(10)));
+        var sasBytes = (await sas.DownloadContentAsync()).Value.Content.ToString();
+        var deniedSasWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sas.UploadAsync(BinaryData.FromString("blocked"), overwrite: true));
+        var staleCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.GetPropertiesAsync(new BlobRequestConditions
+            {
+                IfMatch = new ETag("\"not-the-current-etag\"")
+            }));
+
+        var lease = blob.GetBlobLeaseClient();
+        var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+        RequestFailedException missingLease;
+        try
+        {
+            missingLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                blob.SetMetadataAsync(new Dictionary<string, string> { ["state"] = "blocked" }));
+            await blob.SetMetadataAsync(
+                new Dictionary<string, string> { ["state"] = "authorized" },
+                new BlobRequestConditions { LeaseId = acquired.Value.LeaseId });
+        }
+        finally
+        {
+            await lease.ReleaseAsync();
+        }
+
+        var properties = await blob.GetPropertiesAsync();
+        var finalBytes = (await blob.DownloadContentAsync()).Value.Content.ToString();
+        return new AuthorizationObservation(
+            sasBytes,
+            deniedSasWrite.Status,
+            deniedSasWrite.ErrorCode ?? string.Empty,
+            staleCondition.Status,
+            staleCondition.ErrorCode ?? string.Empty,
+            missingLease.Status,
+            missingLease.ErrorCode ?? string.Empty,
+            properties.Value.Metadata["state"],
+            finalBytes);
     }
 
     private static async Task<HierarchicalObservation> ExerciseHierarchicalAsync(BlobContainerClient container)
@@ -317,6 +452,17 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         int MissingStatus,
         string MissingCode,
         string ListedNames);
+
+    private sealed record AuthorizationObservation(
+        string SasReadBytes,
+        int DeniedSasWriteStatus,
+        string DeniedSasWriteCode,
+        int StaleConditionStatus,
+        string StaleConditionCode,
+        int MissingLeaseStatus,
+        string MissingLeaseCode,
+        string FinalMetadata,
+        string FinalBytes);
 
     private sealed record HierarchicalObservation(
         string DirectoryOwner,
