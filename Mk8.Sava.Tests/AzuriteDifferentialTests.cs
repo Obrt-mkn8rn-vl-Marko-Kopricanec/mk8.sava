@@ -13,6 +13,29 @@ public sealed class AzuriteDifferentialTests
 {
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task AccountInformationShapeMatchesAzuriteWithSkuDivergence()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var missingName = $"mk8-azurite-account-info-{Guid.NewGuid():N}";
+
+        var expected = await ObserveAccountInformationAsync(azurite, missingName).ConfigureAwait(false);
+        var actual = await ObserveAccountInformationAsync(local, missingName).ConfigureAwait(false);
+        Assert.Equal(SkuName.StandardRagrs, expected.SkuName);
+        Assert.Equal(SkuName.StandardLrs, actual.SkuName);
+        Assert.Equal(expected with { SkuName = SkuName.StandardLrs }, actual);
+        Assert.Equal(200, expected.ServiceStatus);
+        Assert.Equal(AccountKind.StorageV2, expected.AccountKind);
+        Assert.False(expected.IsHierarchicalNamespaceEnabled);
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SupportedFlatBlobSdkOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -369,6 +392,31 @@ public sealed class AzuriteDifferentialTests
 
     private static BlobClientOptions CreateOptions() =>
         new(BlobClientOptions.ServiceVersion.V2023_11_03) { Retry = { MaxRetries = 0 } };
+
+    private static async Task<AccountInformationObservation> ObserveAccountInformationAsync(
+        BlobServiceClient service, string missingName)
+    {
+        var serviceResponse = await service.GetAccountInfoAsync().ConfigureAwait(false);
+        var containerResponse = await service.GetBlobContainerClient(missingName)
+            .GetAccountInfoAsync().ConfigureAwait(false);
+        var blobResponse = await service.GetBlobContainerClient(missingName)
+            .GetBlobClient("missing.bin").GetAccountInfoAsync().ConfigureAwait(false);
+        Assert.Equal(serviceResponse.Value.SkuName, containerResponse.Value.SkuName);
+        Assert.Equal(serviceResponse.Value.AccountKind, containerResponse.Value.AccountKind);
+        Assert.Equal(serviceResponse.Value.IsHierarchicalNamespaceEnabled,
+            containerResponse.Value.IsHierarchicalNamespaceEnabled);
+        Assert.Equal(serviceResponse.Value.SkuName, blobResponse.Value.SkuName);
+        Assert.Equal(serviceResponse.Value.AccountKind, blobResponse.Value.AccountKind);
+        Assert.Equal(serviceResponse.Value.IsHierarchicalNamespaceEnabled,
+            blobResponse.Value.IsHierarchicalNamespaceEnabled);
+        return new AccountInformationObservation(
+            serviceResponse.GetRawResponse().Status,
+            containerResponse.GetRawResponse().Status,
+            blobResponse.GetRawResponse().Status,
+            serviceResponse.Value.SkuName,
+            serviceResponse.Value.AccountKind,
+            serviceResponse.Value.IsHierarchicalNamespaceEnabled);
+    }
 
     private static async Task<FlatBlobObservation> ExerciseAsync(BlobContainerClient container)
     {
@@ -913,6 +961,10 @@ public sealed class AzuriteDifferentialTests
         int MissingStatus,
         string? MissingCode,
         string ListedNames);
+
+    private sealed record AccountInformationObservation(
+        int ServiceStatus, int ContainerStatus, int BlobStatus,
+        SkuName SkuName, AccountKind AccountKind, bool IsHierarchicalNamespaceEnabled);
 
     private sealed record StagedBlobObservation(
         int UncommittedBlocks,
