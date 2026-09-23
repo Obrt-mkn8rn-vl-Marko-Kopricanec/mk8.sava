@@ -11,11 +11,12 @@ namespace Mk8.Sava.Tests;
 public sealed class LiveAzureFactAttribute : FactAttribute
 {
     public const string ConnectionStringVariable = "MK8_SAVA_LIVE_AZURE_BLOB_CONNECTION_STRING";
+    public const string HnsConnectionStringVariable = "MK8_SAVA_LIVE_AZURE_HNS_CONNECTION_STRING";
 
-    public LiveAzureFactAttribute()
+    public LiveAzureFactAttribute(string connectionStringVariable = ConnectionStringVariable)
     {
-        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(ConnectionStringVariable)))
-            Skip = $"Set {ConnectionStringVariable} to a disposable flat-namespace test account.";
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(connectionStringVariable)))
+            Skip = $"Set {connectionStringVariable} to a disposable Azure test account.";
     }
 }
 
@@ -36,6 +37,31 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
             var observation = await ExerciseAsync(container);
             Assert.Equal(404, observation.MissingStatus);
             Assert.Equal("BlobNotFound", observation.MissingCode);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(container);
+        }
+    }
+
+    [Fact]
+    public async Task HierarchicalNamespaceDifferentialScenarioRunsAgainstLocalService()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var client = CreateLocalClient(application);
+        var container = client.GetBlobContainerClient($"mk8diff-hns-local-{Guid.NewGuid():N}");
+        try
+        {
+            var observation = await ExerciseHierarchicalAsync(container);
+            Assert.Equal("$superuser", observation.FileOwner);
+            Assert.Equal("rwxr-x---", observation.DirectoryPermissions);
+            Assert.Equal("rw-r-----", observation.FilePermissions);
+            Assert.Equal(409, observation.NonemptyDirectoryDeleteStatus);
         }
         finally
         {
@@ -79,6 +105,43 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         }
     }
 
+    [LiveAzureFact(LiveAzureFactAttribute.HnsConnectionStringVariable)]
+    [Trait("Category", "LiveAzure")]
+    public async Task HierarchicalNamespaceSdkStateAndErrorsMatchLiveAzure()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(
+            LiveAzureFactAttribute.HnsConnectionStringVariable)
+                               ?? throw new InvalidOperationException("The live HNS account was removed after discovery.");
+        var remote = new BlobServiceClient(connectionString, new BlobClientOptions(
+            BlobClientOptions.ServiceVersion.V2023_11_03)
+        {
+            Retry = { MaxRetries = 0 }
+        });
+        Assert.True((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
+        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await localApplication.InitializeAsync();
+        var local = CreateLocalClient(localApplication);
+        var containerName = $"mk8diff-hns-{Guid.NewGuid():N}";
+        var remoteContainer = remote.GetBlobContainerClient(containerName);
+        var localContainer = local.GetBlobContainerClient(containerName);
+        try
+        {
+            var expected = await ExerciseHierarchicalAsync(remoteContainer);
+            var actual = await ExerciseHierarchicalAsync(localContainer);
+            Assert.Equal(expected, actual);
+            output.WriteLine("Live Azure and mk8.sava matched the pinned HNS Shared Key SDK scenario.");
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer);
+            await DeleteIfExistsAsync(remoteContainer);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
@@ -95,6 +158,49 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
                 }),
                 Retry = { MaxRetries = 0 }
             });
+    }
+
+    private static async Task<HierarchicalObservation> ExerciseHierarchicalAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync();
+        var file = container.GetBlobClient("alpha/beta/file.txt");
+        await file.UploadAsync(BinaryData.FromString("nested HNS content"));
+        await container.GetBlobClient("zeta.txt").UploadAsync(BinaryData.FromString("root content"));
+        var alpha = await container.GetBlobClient("alpha").GetPropertiesAsync();
+        var beta = await container.GetBlobClient("alpha/beta").GetPropertiesAsync();
+        var fileProperties = await file.GetPropertiesAsync();
+        var downloaded = await file.DownloadContentAsync();
+        var names = new List<string>();
+        await foreach (var item in container.GetBlobsAsync())
+            names.Add(item.Name);
+        var notEmpty = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("alpha").DeleteAsync());
+
+        Assert.Equal("directory", RequiredHeader(alpha, "x-ms-resource-type"));
+        Assert.Equal("directory", RequiredHeader(beta, "x-ms-resource-type"));
+        Assert.Equal("file", RequiredHeader(fileProperties, "x-ms-resource-type"));
+        Assert.Equal("nested HNS content", downloaded.Value.Content.ToString());
+
+        return new HierarchicalObservation(
+            RequiredHeader(alpha, "x-ms-owner"),
+            RequiredHeader(alpha, "x-ms-group"),
+            RequiredHeader(alpha, "x-ms-permissions"),
+            RequiredHeader(beta, "x-ms-owner"),
+            RequiredHeader(beta, "x-ms-group"),
+            RequiredHeader(fileProperties, "x-ms-owner"),
+            RequiredHeader(fileProperties, "x-ms-group"),
+            RequiredHeader(fileProperties, "x-ms-permissions"),
+            RequiredHeader(fileProperties, "x-ms-acl"),
+            downloaded.Value.Content.ToString(),
+            string.Join(',', names),
+            notEmpty.Status,
+            notEmpty.ErrorCode ?? string.Empty);
+    }
+
+    private static string RequiredHeader(Response<BlobProperties> response, string name)
+    {
+        Assert.True(response.GetRawResponse().Headers.TryGetValue(name, out var value));
+        return value;
     }
 
     private static async Task<FlatObservation> ExerciseAsync(BlobContainerClient container)
@@ -211,4 +317,19 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         int MissingStatus,
         string MissingCode,
         string ListedNames);
+
+    private sealed record HierarchicalObservation(
+        string DirectoryOwner,
+        string DirectoryGroup,
+        string DirectoryPermissions,
+        string NestedDirectoryOwner,
+        string NestedDirectoryGroup,
+        string FileOwner,
+        string FileGroup,
+        string FilePermissions,
+        string FileAcl,
+        string FileBytes,
+        string ListedNames,
+        int NonemptyDirectoryDeleteStatus,
+        string NonemptyDirectoryDeleteCode);
 }

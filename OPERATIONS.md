@@ -113,9 +113,14 @@ creates a unique `mk8diff-` container in Azure and mk8.sava, compares the same
 upload, properties, tags, full/ranged reads, snapshot/overwrite, block/append/
 page blob, listing, and missing-blob error observations, then deletes only those
 two containers. The connection string is never printed. A separate local-only
-test always exercises the scenario so the harness cannot silently rot. This
-is an initial differential lane, not evidence for the full Azure conformance
-matrix or HNS behavior.
+test always exercises the scenario so the harness cannot silently rot. A
+second opt-in lane uses
+`MK8_SAVA_LIVE_AZURE_HNS_CONNECTION_STRING` for a disposable HNS-enabled Azure
+account. It compares Shared Key nested-path creation, directory/file identity
+and permissions, bytes, listing order, and nonempty-directory errors; a local
+only test exercises that scenario in every normal run. Both live lanes remain
+skipped until their respective account variables are supplied; even when run,
+they cover only a subset of the full Azure conformance matrix.
 
 ## SAS authorization boundaries
 
