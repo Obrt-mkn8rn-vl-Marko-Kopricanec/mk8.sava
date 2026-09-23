@@ -95,10 +95,7 @@ public sealed class StorageUsageSamplingTests
                 new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
                 new BlobClientOptions
                 {
-                    Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                    {
-                        BaseAddress = endpoint
-                    }),
+                    Transport = new HttpClientTransport(application.Server.CreateHandler()),
                     Retry = { MaxRetries = 0 }
                 });
             var container = client.GetBlobContainerClient($"usage-sample-{Guid.NewGuid():N}");

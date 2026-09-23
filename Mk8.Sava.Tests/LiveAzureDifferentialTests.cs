@@ -233,10 +233,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
                 SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03)
             {
-                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }
@@ -244,10 +241,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     private static BlobClient CreateLocalSasClient(SavaWebApplicationFactory application, Uri uri) =>
         new(uri, new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03)
         {
-            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-            {
-                BaseAddress = uri
-            }),
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
 

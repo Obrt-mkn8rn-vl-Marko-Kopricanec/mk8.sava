@@ -129,10 +129,7 @@ public sealed class StorageAccountModeContinuityTests
             new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(app.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }

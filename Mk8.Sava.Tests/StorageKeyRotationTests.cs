@@ -389,10 +389,7 @@ public sealed class StorageKeyRotationTests
             new StorageSharedKeyCredential(account, credential),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(app.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }

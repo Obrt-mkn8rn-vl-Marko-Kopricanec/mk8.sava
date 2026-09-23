@@ -426,7 +426,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
     [Fact]
     public async Task ExternalAsynchronousCopyPreservesTheCompleteAzureBlobShape()
     {
-        var sourceHandler = new CopyShapeSourceHandler();
+        using var sourceHandler = new CopyShapeSourceHandler();
         var application = new SavaWebApplicationFactory(() => sourceHandler);
         try
         {
@@ -818,18 +818,15 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory application)
     {
-        var transportClient = new HttpClient(application.Server.CreateHandler())
-        {
-            BaseAddress = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost")
-        };
+        var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
         return new BlobServiceClient(
-            transportClient.BaseAddress,
+            endpoint,
             new StorageSharedKeyCredential(
                 SavaWebApplicationFactory.AccountName,
                 SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(transportClient),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }

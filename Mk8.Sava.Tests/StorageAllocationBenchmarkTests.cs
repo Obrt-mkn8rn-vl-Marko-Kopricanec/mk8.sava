@@ -46,10 +46,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
                 new BlobClientOptions
                 {
-                    Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                    {
-                        BaseAddress = endpoint
-                    }),
+                    Transport = new HttpClientTransport(application.Server.CreateHandler()),
                     Retry = { MaxRetries = 0 }
                 });
             var container = client.GetBlobContainerClient($"allocation-{Guid.NewGuid():N}");

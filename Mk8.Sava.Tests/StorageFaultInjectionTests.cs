@@ -430,10 +430,6 @@ public sealed class StorageFaultInjectionTests
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory application)
     {
         var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
-        var transportClient = new HttpClient(application.Server.CreateHandler())
-        {
-            BaseAddress = endpoint
-        };
         return new BlobServiceClient(
             endpoint,
             new StorageSharedKeyCredential(
@@ -441,7 +437,7 @@ public sealed class StorageFaultInjectionTests
                 SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(transportClient),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }
