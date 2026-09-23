@@ -201,4 +201,6 @@ static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
     return command;
 }
 
+#pragma warning disable CA1515 // Public test host entry point is required by WebApplicationFactory<Program> fixtures.
 public partial class Program;
+#pragma warning restore CA1515

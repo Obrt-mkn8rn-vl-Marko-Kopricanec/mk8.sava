@@ -4,7 +4,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public enum StorageResourceKind
+internal enum StorageResourceKind
 {
     Service,
     Container,
@@ -12,7 +12,7 @@ public enum StorageResourceKind
     StaticWebsite
 }
 
-public sealed record StorageRequestContext
+internal sealed record StorageRequestContext
 {
     private const string ItemKey = "Mk8.Sava.RequestContext";
 
@@ -36,7 +36,7 @@ public sealed record StorageRequestContext
     public static void Set(HttpContext context, StorageRequestContext value) => context.Items[ItemKey] = value;
 }
 
-public sealed class RequestContextMiddleware(
+internal sealed class RequestContextMiddleware(
     RequestDelegate next,
     IOptions<SavaOptions> options,
     StorageAuthenticator authenticator,
@@ -57,8 +57,8 @@ public sealed class RequestContextMiddleware(
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (context.Request.Path.StartsWithSegments("/health") ||
-            context.Request.Path.StartsWithSegments("/metrics"))
+        if (context.Request.Path.StartsWithSegments("/health", StringComparison.OrdinalIgnoreCase) ||
+            context.Request.Path.StartsWithSegments("/metrics", StringComparison.OrdinalIgnoreCase))
         {
             await next(context).ConfigureAwait(false);
             return;

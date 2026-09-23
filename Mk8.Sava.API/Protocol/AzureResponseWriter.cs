@@ -9,7 +9,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public sealed partial class AzureResponseWriter
+internal sealed partial class AzureResponseWriter
 {
     private const string LegacyBlobMarkerPrefix = "mk8s1.";
     private const string BlobMarkerPrefix = "mk8s2.";

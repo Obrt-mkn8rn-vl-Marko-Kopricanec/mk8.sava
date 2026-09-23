@@ -87,7 +87,7 @@ internal static class BlobBatchProtocol
 
             partHeaders.TryGetValue("Content-ID", out var contentId);
             var requestLine = reader.ReadLine();
-            var firstSpace = requestLine.IndexOf(' ');
+            var firstSpace = requestLine.IndexOf(' ', StringComparison.Ordinal);
             var lastSpace = requestLine.LastIndexOf(' ');
             if (firstSpace <= 0 || lastSpace <= firstSpace + 1 ||
                 !string.Equals(requestLine[(lastSpace + 1)..], "HTTP/1.1", StringComparison.Ordinal))
@@ -110,9 +110,9 @@ internal static class BlobBatchProtocol
             if (!target.StartsWith("/", StringComparison.Ordinal) ||
                 target.StartsWith("//", StringComparison.Ordinal) ||
                 target.Contains("://", StringComparison.Ordinal) ||
-                target.Contains('#'))
+                target.Contains('#', StringComparison.Ordinal))
                 throw InvalidBatch("A batch subrequest URI must contain only an absolute path and query.");
-            var queryOffset = target.IndexOf('?');
+            var queryOffset = target.IndexOf('?', StringComparison.Ordinal);
             var rawPath = queryOffset < 0 ? target : target[..queryOffset];
             var queryString = queryOffset < 0 ? QueryString.Empty : new QueryString(target[queryOffset..]);
             var subrequestHeaders = ReadHeaders(reader);
@@ -197,7 +197,7 @@ internal static class BlobBatchProtocol
             var line = reader.ReadLine();
             if (line.Length == 0)
                 return headers;
-            var colon = line.IndexOf(':');
+            var colon = line.IndexOf(':', StringComparison.Ordinal);
             if (colon <= 0 || line[..colon].Any(character => !char.IsAsciiLetterOrDigit(character) && character != '-'))
                 throw InvalidBatch("A batch part contains a malformed HTTP header.");
             var name = line[..colon];

@@ -9,7 +9,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public enum StorageAuthorizationKind
+internal enum StorageAuthorizationKind
 {
     Anonymous,
     SharedKey,
@@ -17,7 +17,7 @@ public enum StorageAuthorizationKind
     Bearer
 }
 
-public sealed record StorageAuthorization(
+internal sealed record StorageAuthorization(
     StorageAuthorizationKind Kind,
     string Permissions,
     DateTimeOffset? StartsAt = null,
@@ -58,7 +58,7 @@ public sealed record StorageAuthorization(
     };
 }
 
-public sealed record UserDelegationKey(
+internal sealed record UserDelegationKey(
     string SignedObjectId,
     string SignedTenantId,
     string SignedStart,
@@ -68,7 +68,7 @@ public sealed record UserDelegationKey(
     string? SignedDelegatedUserTenantId,
     string Value);
 
-public sealed class StorageAuthenticator(
+internal sealed class StorageAuthenticator(
     IOptions<SavaOptions> options,
     MetadataStore metadata,
     ILogger<StorageAuthenticator> logger)
@@ -399,9 +399,9 @@ public sealed class StorageAuthenticator(
         string authorization,
         bool lite)
     {
-        var separator = authorization.IndexOf(' ');
+        var separator = authorization.IndexOf(' ', StringComparison.Ordinal);
         var value = authorization[(separator + 1)..];
-        var colon = value.IndexOf(':');
+        var colon = value.IndexOf(':', StringComparison.Ordinal);
         if (colon <= 0 || colon == value.Length - 1)
             throw AzureStorageException.AuthenticationFailed();
 
@@ -513,7 +513,7 @@ public sealed class StorageAuthenticator(
                 permissions,
                 signedVersion,
                 expiresAt);
-            if (!services.Contains('b'))
+            if (!services.Contains('b', StringComparison.Ordinal))
                 throw AzureStorageException.AuthorizationServiceMismatch();
             if (!AccountSasCoversRequest(resourceTypes, request, context.Request))
                 throw AzureStorageException.AuthorizationResourceTypeMismatch();
@@ -1009,24 +1009,24 @@ public sealed class StorageAuthenticator(
         if (HttpMethods.IsPost(httpRequest.Method) &&
             string.Equals(component, "batch", StringComparison.OrdinalIgnoreCase))
         {
-            return resourceTypes.Contains('o');
+            return resourceTypes.Contains('o', StringComparison.Ordinal);
         }
         if (request.ResourceKind == StorageResourceKind.Service &&
             HttpMethods.IsGet(httpRequest.Method) &&
             string.Equals(component, "blobs", StringComparison.OrdinalIgnoreCase))
         {
-            return resourceTypes.Contains('o');
+            return resourceTypes.Contains('o', StringComparison.Ordinal);
         }
 
         return request.ResourceKind switch
         {
-            StorageResourceKind.Service => resourceTypes.Contains('s'),
-            StorageResourceKind.Container => resourceTypes.Contains('c'),
+            StorageResourceKind.Service => resourceTypes.Contains('s', StringComparison.Ordinal),
+            StorageResourceKind.Container => resourceTypes.Contains('c', StringComparison.Ordinal),
             StorageResourceKind.Blob when
                 HttpMethods.IsPut(httpRequest.Method) &&
                 string.Equals(httpRequest.Query["comp"], "undelete", StringComparison.OrdinalIgnoreCase) =>
-                resourceTypes.Contains('c'),
-            StorageResourceKind.Blob => resourceTypes.Contains('o'),
+                resourceTypes.Contains('c', StringComparison.Ordinal),
+            StorageResourceKind.Blob => resourceTypes.Contains('o', StringComparison.Ordinal),
             _ => false
         };
     }
@@ -1167,7 +1167,7 @@ public sealed class StorageAuthenticator(
         var previous = -1;
         foreach (var character in value)
         {
-            var current = order.IndexOf(character);
+            var current = order.IndexOf(character, StringComparison.Ordinal);
             if (current <= previous)
                 return false;
             previous = current;
@@ -1240,7 +1240,7 @@ public sealed class StorageAuthenticator(
         string? encodedValue = null;
         foreach (var pair in rawQuery.AsSpan(1).ToString().Split('&'))
         {
-            var separator = pair.IndexOf('=');
+            var separator = pair.IndexOf('=', StringComparison.Ordinal);
             var encodedName = separator < 0 ? pair : pair[..separator];
             if (!string.Equals(WebUtility.UrlDecode(encodedName), parameterName, StringComparison.Ordinal))
                 continue;

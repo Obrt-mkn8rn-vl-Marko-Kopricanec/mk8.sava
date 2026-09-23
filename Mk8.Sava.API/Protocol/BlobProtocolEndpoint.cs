@@ -11,7 +11,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public static class BlobProtocolEndpoint
+internal static class BlobProtocolEndpoint
 {
     private static readonly IReadOnlyDictionary<string, string> EmptyBlobTags =
         new Dictionary<string, string>(StringComparer.Ordinal);
@@ -621,7 +621,8 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             ValidateOptionalLease(http.Request, container.Lease, "container");
             if (!IsServiceVersionAtLeast(request, new DateOnly(2015, 4, 5)) &&
                 container.AccessPolicies.Values.Any(policy =>
-                    policy.Permission.Contains('a') || policy.Permission.Contains('c')))
+                    policy.Permission.Contains('a', StringComparison.Ordinal) ||
+                    policy.Permission.Contains('c', StringComparison.Ordinal)))
             {
                 throw AzureStorageException.FeatureVersionMismatch(
                     "Stored access policy contains a permission that is not supported by this version.");
@@ -2636,7 +2637,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source", sourceValue);
         }
 
-        var queryOffset = sourceValue.IndexOf('?');
+        var queryOffset = sourceValue.IndexOf('?', StringComparison.Ordinal);
         var escapedPath = queryOffset < 0 ? sourceValue : sourceValue[..queryOffset];
         var queryText = queryOffset < 0 ? string.Empty : sourceValue[queryOffset..];
         string[] segments;

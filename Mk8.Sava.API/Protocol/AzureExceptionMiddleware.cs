@@ -6,7 +6,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<AzureExceptionMiddleware> logger)
+internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<AzureExceptionMiddleware> logger)
 {
     public async Task InvokeAsync(HttpContext context)
     {
