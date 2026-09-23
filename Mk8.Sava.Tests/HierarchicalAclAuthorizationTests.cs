@@ -135,6 +135,9 @@ public sealed class HierarchicalAclAuthorizationTests
         Assert.False(PosixAccessControl.Allows(acl, "owner", "owning-group", "member", team, 'r'));
         Assert.True(PosixAccessControl.Allows(acl, "owner", "owning-group", "stranger", noGroups, 'x'));
         Assert.Equal("rw-r----x", PosixAccessControl.FormatMode(acl));
+        Assert.Equal("rw-r----t", PosixAccessControl.FormatMode(acl, stickyBit: true));
+        Assert.Equal("rwxr-x--T", PosixAccessControl.FormatMode(
+            "user::rwx,group::r-x,other::---", stickyBit: true));
 
         const string permissiveOther = "user::---,group::---,group:team:---,mask::---,other::rwx";
         Assert.True(PosixAccessControl.Allows(

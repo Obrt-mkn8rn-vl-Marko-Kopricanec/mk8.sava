@@ -630,7 +630,8 @@ dotnet Mk8.Sava.API.dll --hns-acl-apply /path/to/hns-acls.json
       "account": "datalakeaccount",
       "container": "documents",
       "path": "reports",
-      "accessAcl": "user::rwx,user:reader-object-id:--x,group::r-x,mask::r-x,other::---"
+      "accessAcl": "user::rwx,user:reader-object-id:--x,group::r-x,mask::r-x,other::---",
+      "stickyBit": true
     },
     {
       "account": "datalakeaccount",
@@ -648,10 +649,13 @@ may include a complete set of `default:` ACL entries. Those entries template
 the access ACL of subsequently created children, and new directories also
 inherit the default ACL. They do not retroactively change existing children;
 files cannot carry default entries. The command rejects non-HNS accounts,
-malformed ACLs, duplicate targets, and manifests larger than 4 MiB or 4,096
+malformed ACLs, sticky-bit settings on files, duplicate targets, and manifests
+larger than 4 MiB or 4,096
 entries. It commits all changes or none,
-and a changed ACL advances that target's ETag and Last-Modified timestamp.
-An unchanged ACL is idempotent. The command holds the data-root process lease,
+and a changed ACL or sticky bit advances that target's ETag and Last-Modified
+timestamp. Omitted `stickyBit` preserves the current value; `true` enables it
+and `false` clears it on an existing directory or root. An unchanged entry is
+idempotent. The command holds the data-root process lease,
 so it cannot run alongside a live service on that root. This is not an
 application-facing API or the separate `dfs` ACL mutation protocol. Blob-surface
 list/mutation authorization remains incomplete. Live Azure validation is
@@ -669,6 +673,12 @@ For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
 Set Blob Properties, Set Blob Tier, Set Blob Expiry, and Delete Blob through
 write/execute on the immediate parent directory plus execute on ancestors.
+When the immediate parent has a sticky bit, ACL-only deletion also requires
+the caller to own the child or that parent, per Microsoft's
+[HNS sticky-bit rule](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#the-sticky-bit-in-data-lake-storage).
+Directory property and listing permission strings expose `t` or `T` in the
+last character when the bit is set. Shared Key and configured role grants
+still follow their separate authorization paths.
 Metadata, property, tier, and expiry mutations recheck that parent permission
 immediately before storage mutation. These
 rules follow Microsoft's documented
