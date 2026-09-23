@@ -26,10 +26,11 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task FlatNamespaceDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
+        await using var applicationDisposal1 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var client = CreateLocalClient(application);
         var container = client.GetBlobContainerClient($"mk8diff-local-{Guid.NewGuid():N}");
@@ -48,11 +49,12 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task HierarchicalNamespaceDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
+        await using var applicationDisposal2 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var client = CreateLocalClient(application);
         var container = client.GetBlobContainerClient($"mk8diff-hns-local-{Guid.NewGuid():N}");
@@ -73,10 +75,11 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task FlatAuthorizationDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
+        await using var applicationDisposal3 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var client = CreateLocalClient(application);
         var container = client.GetBlobContainerClient($"mk8diff-auth-local-{Guid.NewGuid():N}");
@@ -113,12 +116,13 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         {
             Retry = { MaxRetries = 0 }
         });
-        Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        Assert.False((await remote.GetAccountInfoAsync().ConfigureAwait(false)).Value.IsHierarchicalNamespaceEnabled);
+        var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
-        await localApplication.InitializeAsync();
+        await using var localApplicationDisposal4 = localApplication.ConfigureAwait(false);
+        await localApplication.InitializeAsync().ConfigureAwait(false);
         var local = CreateLocalClient(localApplication);
 
         var containerName = $"mk8diff-{Guid.NewGuid():N}";
@@ -126,15 +130,15 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         var localContainer = local.GetBlobContainerClient(containerName);
         try
         {
-            var expected = await ExerciseAsync(remoteContainer);
-            var actual = await ExerciseAsync(localContainer);
+            var expected = await ExerciseAsync(remoteContainer).ConfigureAwait(false);
+            var actual = await ExerciseAsync(localContainer).ConfigureAwait(false);
             Assert.Equal(expected, actual);
             output.WriteLine("Live Azure and mk8.sava matched the pinned flat-account SDK scenario.");
         }
         finally
         {
-            await DeleteIfExistsAsync(localContainer);
-            await DeleteIfExistsAsync(remoteContainer);
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(remoteContainer).ConfigureAwait(false);
         }
     }
 
@@ -150,28 +154,29 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         {
             Retry = { MaxRetries = 0 }
         });
-        Assert.True((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        Assert.True((await remote.GetAccountInfoAsync().ConfigureAwait(false)).Value.IsHierarchicalNamespaceEnabled);
+        var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
-        await localApplication.InitializeAsync();
+        await using var localApplicationDisposal5 = localApplication.ConfigureAwait(false);
+        await localApplication.InitializeAsync().ConfigureAwait(false);
         var local = CreateLocalClient(localApplication);
         var containerName = $"mk8diff-hns-{Guid.NewGuid():N}";
         var remoteContainer = remote.GetBlobContainerClient(containerName);
         var localContainer = local.GetBlobContainerClient(containerName);
         try
         {
-            var expected = await ExerciseHierarchicalAsync(remoteContainer);
-            var actual = await ExerciseHierarchicalAsync(localContainer);
+            var expected = await ExerciseHierarchicalAsync(remoteContainer).ConfigureAwait(false);
+            var actual = await ExerciseHierarchicalAsync(localContainer).ConfigureAwait(false);
             Assert.Equal(expected, actual);
             output.WriteLine("Live Azure and mk8.sava matched the pinned HNS Shared Key SDK scenario.");
         }
         finally
         {
-            await DeleteIfExistsAsync(localContainer);
-            await DeleteIfExistsAsync(remoteContainer);
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(remoteContainer).ConfigureAwait(false);
         }
     }
 
@@ -186,12 +191,13 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         {
             Retry = { MaxRetries = 0 }
         });
-        Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        Assert.False((await remote.GetAccountInfoAsync().ConfigureAwait(false)).Value.IsHierarchicalNamespaceEnabled);
+        var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
-        await localApplication.InitializeAsync();
+        await using var localApplicationDisposal6 = localApplication.ConfigureAwait(false);
+        await localApplication.InitializeAsync().ConfigureAwait(false);
         var local = CreateLocalClient(localApplication);
         var containerName = $"mk8diff-auth-{Guid.NewGuid():N}";
         var remoteContainer = remote.GetBlobContainerClient(containerName);
@@ -203,17 +209,17 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
                 uri => new BlobClient(uri, new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03)
                 {
                     Retry = { MaxRetries = 0 }
-                }));
+                })).ConfigureAwait(false);
             var actual = await ExerciseAuthorizationAsync(
                 localContainer,
-                uri => CreateLocalSasClient(localApplication, uri));
+                uri => CreateLocalSasClient(localApplication, uri)).ConfigureAwait(false);
             Assert.Equal(expected, actual);
             output.WriteLine("Live Azure and mk8.sava matched the pinned flat-account SAS/condition/lease scenario.");
         }
         finally
         {
-            await DeleteIfExistsAsync(localContainer);
-            await DeleteIfExistsAsync(remoteContainer);
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(remoteContainer).ConfigureAwait(false);
         }
     }
 

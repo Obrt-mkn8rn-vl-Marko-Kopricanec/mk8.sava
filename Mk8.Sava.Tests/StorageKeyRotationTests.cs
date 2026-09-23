@@ -30,16 +30,20 @@ public sealed class StorageKeyRotationTests
                 ["Sava:EnableSmallChunkPacking"] = "false",
                 ["Sava:MaintenanceScanInterval"] = "01:00:00"
             };
-            await using (var first = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false))
             {
-                await first.InitializeAsync();
-                var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
-                    .GetBlobContainerClient(containerName);
-                await container.CreateAsync();
-                await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(retainedBytes));
+                var first = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false);
+                await using (first.ConfigureAwait(false))
+                {
+                    await first.InitializeAsync();
+                    var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
+                        .GetBlobContainerClient(containerName);
+                    await container.CreateAsync();
+                    await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(retainedBytes));
+                }
             }
 
-            await using (var foreign = new SavaWebApplicationFactory(
+            {
+                var foreign = new SavaWebApplicationFactory(
                              foreignPath,
                              new NullStorageFaultInjector(),
                              analyticsSink: null,
@@ -48,39 +52,48 @@ public sealed class StorageKeyRotationTests
                                  [$"Sava:DataEncryptionKeys:{account}"] = foreignKey
                              },
                              deleteDataPath: false,
-                             disableMaintenance: true))
-            {
-                await foreign.InitializeAsync();
-                var chunks = foreign.Services.GetRequiredService<ChunkStore>();
-                using var stored = await chunks.StorePinnedAsync(
-                    account,
-                    new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null),
-                    new MemoryStream(orphanBytes, writable: false),
-                    CancellationToken.None);
-                var id = Assert.Single(stored.Manifest.Chunks).Id;
-                var relative = id.Replace('/', Path.DirectorySeparatorChar) + ".chunk";
-                orphanChunkPath = Path.Combine(dataPath, "chunks", relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(orphanChunkPath)!);
-                File.Copy(Path.Combine(foreignPath, "chunks", relative), orphanChunkPath);
+                             disableMaintenance: true);
+                await using (foreign.ConfigureAwait(false))
+                {
+                    await foreign.InitializeAsync();
+                    var chunks = foreign.Services.GetRequiredService<ChunkStore>();
+                    using var stored = await chunks.StorePinnedAsync(
+                        account,
+                        new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null),
+                        new MemoryStream(orphanBytes, writable: false),
+                        CancellationToken.None);
+                    var id = Assert.Single(stored.Manifest.Chunks).Id;
+                    var relative = id.Replace('/', Path.DirectorySeparatorChar) + ".chunk";
+                    orphanChunkPath = Path.Combine(dataPath, "chunks", relative);
+                    Directory.CreateDirectory(Path.GetDirectoryName(orphanChunkPath)!);
+                    File.Copy(Path.Combine(foreignPath, "chunks", relative), orphanChunkPath);
+                }
             }
 
-            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
             {
-                await connection.OpenAsync();
-                await using var clear = connection.CreateCommand();
-                clear.CommandText = "DELETE FROM data_encryption_keys;";
-                await clear.ExecuteNonQueryAsync();
+                var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var clear = connection.CreateCommand();
+                    clear.CommandText = "DELETE FROM data_encryption_keys;";
+                    await clear.ExecuteNonQueryAsync();
+                }
             }
 
-            await using (var rejected = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false))
             {
-                var failure = await Assert.ThrowsAsync<InvalidDataException>(rejected.InitializeAsync);
-                Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
-                Assert.Contains("Corrupt", failure.Message, StringComparison.Ordinal);
+                var rejected = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false);
+                await using (rejected.ConfigureAwait(false))
+                {
+                    var failure = await Assert.ThrowsAsync<InvalidDataException>(rejected.InitializeAsync);
+                    Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
+                    Assert.Contains("Corrupt", failure.Message, StringComparison.Ordinal);
+                }
             }
 
             File.Delete(orphanChunkPath);
-            await using var recovered = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false);
+            var recovered = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false);
+            await using var recoveredDisposal1 = recovered.ConfigureAwait(false);
             await recovered.InitializeAsync();
             var retained = await CreateClient(recovered, SavaWebApplicationFactory.AccountKey)
                 .GetBlobContainerClient(containerName)
@@ -107,7 +120,8 @@ public sealed class StorageKeyRotationTests
         try
         {
             var injector = new SingleMetadataCommitFaultInjector();
-            await using (var first = new SavaWebApplicationFactory(
+            {
+                var first = new SavaWebApplicationFactory(
                              dataPath,
                              injector,
                              analyticsSink: null,
@@ -117,62 +131,71 @@ public sealed class StorageKeyRotationTests
                                  ["Sava:MaintenanceScanInterval"] = "01:00:00"
                              },
                              deleteDataPath: false,
-                             disableMaintenance: true))
-            {
-                await first.InitializeAsync();
-                var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
-                    .GetBlobContainerClient(containerName);
-                await container.CreateAsync();
-                injector.Arm();
-                var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                    container.GetBlobClient("payload.bin").UploadAsync(BinaryData.FromBytes(content)));
-                Assert.Equal(500, rejected.Status);
-                Assert.False((await container.GetBlobClient("payload.bin").ExistsAsync()).Value);
-                Assert.Empty((await first.Services.GetRequiredService<MetadataStore>()
-                    .GetStorageInventoryAsync(CancellationToken.None)).ReachableChunkIds);
-                Assert.NotEmpty(Directory.EnumerateFiles(
-                    Path.Combine(dataPath, "chunks"),
-                    "*.chunk",
-                    SearchOption.AllDirectories));
+                             disableMaintenance: true);
+                await using (first.ConfigureAwait(false))
+                {
+                    await first.InitializeAsync();
+                    var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
+                        .GetBlobContainerClient(containerName);
+                    await container.CreateAsync();
+                    injector.Arm();
+                    var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                        container.GetBlobClient("payload.bin").UploadAsync(BinaryData.FromBytes(content)));
+                    Assert.Equal(500, rejected.Status);
+                    Assert.False((await container.GetBlobClient("payload.bin").ExistsAsync()).Value);
+                    Assert.Empty((await first.Services.GetRequiredService<MetadataStore>()
+                        .GetStorageInventoryAsync(CancellationToken.None)).ReachableChunkIds);
+                    Assert.NotEmpty(Directory.EnumerateFiles(
+                        Path.Combine(dataPath, "chunks"),
+                        "*.chunk",
+                        SearchOption.AllDirectories));
+                }
             }
 
-            await using (var wrong = new SavaWebApplicationFactory(
+            {
+                var wrong = new SavaWebApplicationFactory(
                              dataPath,
                              new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] =
                                      rotatedDataKey
                              },
-                             deleteDataPath: false))
-            {
-                var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
-                Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
+                             deleteDataPath: false);
+                await using (wrong.ConfigureAwait(false))
+                {
+                    var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
+                    Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
+                }
             }
 
-            await using (var cleanup = new SavaWebApplicationFactory(
+            {
+                var cleanup = new SavaWebApplicationFactory(
                              dataPath,
                              new NullStorageFaultInjector(),
                              analyticsSink: null,
                              configurationOverrides: null,
                              deleteDataPath: false,
-                             disableMaintenance: true))
-            {
-                await cleanup.InitializeAsync();
-                var service = cleanup.Services.GetRequiredService<BlobService>();
-                Assert.True(await service.CollectGarbageAsync(CancellationToken.None) > 0);
-                Assert.Empty(Directory.EnumerateFiles(
-                    Path.Combine(dataPath, "chunks"),
-                    "*.chunk",
-                    SearchOption.AllDirectories));
+                             disableMaintenance: true);
+                await using (cleanup.ConfigureAwait(false))
+                {
+                    await cleanup.InitializeAsync();
+                    var service = cleanup.Services.GetRequiredService<BlobService>();
+                    Assert.True(await service.CollectGarbageAsync(CancellationToken.None) > 0);
+                    Assert.Empty(Directory.EnumerateFiles(
+                        Path.Combine(dataPath, "chunks"),
+                        "*.chunk",
+                        SearchOption.AllDirectories));
+                }
             }
 
-            await using var rotated = new SavaWebApplicationFactory(
+            var rotated = new SavaWebApplicationFactory(
                 dataPath,
                 new Dictionary<string, string?>(StringComparer.Ordinal)
                 {
                     [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] = rotatedDataKey
                 },
                 deleteDataPath: true);
+            await using var rotatedDisposal2 = rotated.ConfigureAwait(false);
             await rotated.InitializeAsync();
             var blob = CreateClient(rotated, SavaWebApplicationFactory.AccountKey)
                 .GetBlobContainerClient(containerName)
@@ -198,18 +221,22 @@ public sealed class StorageKeyRotationTests
         var content = RandomNumberGenerator.GetBytes(64 * 1024);
         try
         {
-            await using (var initial = new SavaWebApplicationFactory(dataPath, deleteDataPath: false))
             {
-                await initial.InitializeAsync();
-                var container = CreateClient(initial, SavaWebApplicationFactory.AccountKey)
-                    .GetBlobContainerClient(containerName);
-                await container.CreateAsync();
-                await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(content));
+                var initial = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+                await using (initial.ConfigureAwait(false))
+                {
+                    await initial.InitializeAsync();
+                    var container = CreateClient(initial, SavaWebApplicationFactory.AccountKey)
+                        .GetBlobContainerClient(containerName);
+                    await container.CreateAsync();
+                    await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(content));
+                }
             }
 
             if (fingerprintRecorded)
             {
-                await using var recorded = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+                var recorded = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+                await using var recordedDisposal3 = recorded.ConfigureAwait(false);
                 await recorded.InitializeAsync();
                 Assert.Equal(content, (await CreateClient(recorded, SavaWebApplicationFactory.AccountKey)
                     .GetBlobContainerClient(containerName)
@@ -217,20 +244,24 @@ public sealed class StorageKeyRotationTests
                     .DownloadContentAsync()).Value.Content.ToArray());
             }
 
-            await using (var wrong = new SavaWebApplicationFactory(
+            {
+                var wrong = new SavaWebApplicationFactory(
                              dataPath,
                              new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  [$"Sava:DataEncryptionKeys:{account}"] =
                                      Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
                              },
-                             deleteDataPath: false))
-            {
-                var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
-                Assert.Contains("data encryption key", failure.Message, StringComparison.OrdinalIgnoreCase);
+                             deleteDataPath: false);
+                await using (wrong.ConfigureAwait(false))
+                {
+                    var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
+                    Assert.Contains("data encryption key", failure.Message, StringComparison.OrdinalIgnoreCase);
+                }
             }
 
-            await using var recovered = new SavaWebApplicationFactory(dataPath, deleteDataPath: true);
+            var recovered = new SavaWebApplicationFactory(dataPath, deleteDataPath: true);
+            await using var recoveredDisposal4 = recovered.ConfigureAwait(false);
             await recovered.InitializeAsync();
             Assert.Equal(content, (await CreateClient(recovered, SavaWebApplicationFactory.AccountKey)
                 .GetBlobContainerClient(containerName)
@@ -269,18 +300,22 @@ public sealed class StorageKeyRotationTests
 
         try
         {
-            await using (var first = new SavaWebApplicationFactory(
+            {
+                var first = new SavaWebApplicationFactory(
                              dataPath,
                              firstConfiguration,
-                             deleteDataPath: false))
-            {
-                await first.InitializeAsync();
-                var container = CreateClient(first, oldCredential).GetBlobContainerClient(containerName);
-                await container.CreateAsync();
-                await container.GetBlobClient("before.bin").UploadAsync(BinaryData.FromBytes(content));
+                             deleteDataPath: false);
+                await using (first.ConfigureAwait(false))
+                {
+                    await first.InitializeAsync();
+                    var container = CreateClient(first, oldCredential).GetBlobContainerClient(containerName);
+                    await container.CreateAsync();
+                    await container.GetBlobClient("before.bin").UploadAsync(BinaryData.FromBytes(content));
+                }
             }
 
-            await using (var restarted = new SavaWebApplicationFactory(
+            {
+                var restarted = new SavaWebApplicationFactory(
                              dataPath,
                              new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
@@ -288,50 +323,52 @@ public sealed class StorageKeyRotationTests
                                  [$"Sava:DataEncryptionKeys:{account}"] = dataKey,
                                  ["Sava:MaintenanceScanInterval"] = "01:00:00"
                              },
-                             deleteDataPath: true))
-            {
-                await restarted.InitializeAsync();
-                var client = CreateClient(restarted, newCredential);
-                var container = client.GetBlobContainerClient(containerName);
-                var before = container.GetBlobClient("before.bin");
-                Assert.Equal(content, (await before.DownloadContentAsync()).Value.Content.ToArray());
-
-                var inventoryBefore = await restarted.Services
-                    .GetRequiredService<MetadataStore>()
-                    .GetStorageInventoryAsync(CancellationToken.None);
-                await container.GetBlobClient("after.bin").UploadAsync(BinaryData.FromBytes(content));
-                var inventoryAfter = await restarted.Services
-                    .GetRequiredService<MetadataStore>()
-                    .GetStorageInventoryAsync(CancellationToken.None);
-                Assert.True(inventoryBefore.ReachableChunkIds.SetEquals(inventoryAfter.ReachableChunkIds));
-                Assert.Equal(content, (await container.GetBlobClient("after.bin").DownloadContentAsync())
-                    .Value.Content.ToArray());
-
-                var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                    CreateClient(restarted, oldCredential)
-                        .GetBlobContainerClient(containerName)
-                        .GetBlobClient("before.bin")
-                        .DownloadContentAsync());
-                Assert.Equal(403, denied.Status);
-
-                var backup = restarted.Services.GetRequiredService<StorageBackupService>();
-                await backup.CreateAsync(backupPath, CancellationToken.None);
-                var validOptions = new SavaOptions
+                             deleteDataPath: true);
+                await using (restarted.ConfigureAwait(false))
                 {
-                    Accounts = new Dictionary<string, string>(StringComparer.Ordinal) { [account] = newCredential },
-                    DataEncryptionKeys = new Dictionary<string, string>(StringComparer.Ordinal) { [account] = dataKey }
-                };
-                await StorageBackupService.ValidateBackupAsync(backupPath, validOptions, CancellationToken.None);
-                var wrongOptions = new SavaOptions
-                {
-                    Accounts = validOptions.Accounts,
-                    DataEncryptionKeys = new Dictionary<string, string>(StringComparer.Ordinal)
+                    await restarted.InitializeAsync();
+                    var client = CreateClient(restarted, newCredential);
+                    var container = client.GetBlobContainerClient(containerName);
+                    var before = container.GetBlobClient("before.bin");
+                    Assert.Equal(content, (await before.DownloadContentAsync()).Value.Content.ToArray());
+
+                    var inventoryBefore = await restarted.Services
+                        .GetRequiredService<MetadataStore>()
+                        .GetStorageInventoryAsync(CancellationToken.None);
+                    await container.GetBlobClient("after.bin").UploadAsync(BinaryData.FromBytes(content));
+                    var inventoryAfter = await restarted.Services
+                        .GetRequiredService<MetadataStore>()
+                        .GetStorageInventoryAsync(CancellationToken.None);
+                    Assert.True(inventoryBefore.ReachableChunkIds.SetEquals(inventoryAfter.ReachableChunkIds));
+                    Assert.Equal(content, (await container.GetBlobClient("after.bin").DownloadContentAsync())
+                        .Value.Content.ToArray());
+
+                    var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                        CreateClient(restarted, oldCredential)
+                            .GetBlobContainerClient(containerName)
+                            .GetBlobClient("before.bin")
+                            .DownloadContentAsync());
+                    Assert.Equal(403, denied.Status);
+
+                    var backup = restarted.Services.GetRequiredService<StorageBackupService>();
+                    await backup.CreateAsync(backupPath, CancellationToken.None);
+                    var validOptions = new SavaOptions
                     {
-                        [account] = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
-                    }
-                };
-                await Assert.ThrowsAsync<InvalidDataException>(() =>
-                    StorageBackupService.ValidateBackupAsync(backupPath, wrongOptions, CancellationToken.None));
+                        Accounts = new Dictionary<string, string>(StringComparer.Ordinal) { [account] = newCredential },
+                        DataEncryptionKeys = new Dictionary<string, string>(StringComparer.Ordinal) { [account] = dataKey }
+                    };
+                    await StorageBackupService.ValidateBackupAsync(backupPath, validOptions, CancellationToken.None);
+                    var wrongOptions = new SavaOptions
+                    {
+                        Accounts = validOptions.Accounts,
+                        DataEncryptionKeys = new Dictionary<string, string>(StringComparer.Ordinal)
+                        {
+                            [account] = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                        }
+                    };
+                    await Assert.ThrowsAsync<InvalidDataException>(() =>
+                        StorageBackupService.ValidateBackupAsync(backupPath, wrongOptions, CancellationToken.None));
+                }
             }
         }
         finally
