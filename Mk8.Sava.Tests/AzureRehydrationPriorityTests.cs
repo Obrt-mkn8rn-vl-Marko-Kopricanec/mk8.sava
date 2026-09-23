@@ -59,33 +59,48 @@ public sealed class AzureRehydrationPriorityTests
             destination.DownloadContentAsync());
         Assert.Equal("BlobArchived", offline.ErrorCode);
 
+        await AssertPriorityUpgradeAsync(clock, destination, payload).ConfigureAwait(true);
+        await AssertDefaultPriorityAbortAsync(container, source).ConfigureAwait(true);
+    }
+
+    private static async Task AssertPriorityUpgradeAsync(
+        AdjustableTimeProvider clock,
+        BlockBlobClient destination,
+        byte[] payload)
+    {
         var upgraded = await destination.SetAccessTierAsync(
             AccessTier.Hot,
-            rehydratePriority: RehydratePriority.High);
+            rehydratePriority: RehydratePriority.High).ConfigureAwait(false);
         Assert.Equal(202, upgraded.Status);
         Assert.Equal(
             "High",
-            (await destination.GetPropertiesAsync()).Value.RehydratePriority);
+            (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value.RehydratePriority);
 
         clock.Advance(TimeSpan.FromSeconds(1));
-        var online = (await destination.GetPropertiesAsync()).Value;
+        var online = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(CopyStatus.Success, online.CopyStatus);
         Assert.Equal(AccessTier.Hot, online.AccessTier);
         Assert.Null(online.ArchiveStatus);
         Assert.Null(online.RehydratePriority);
-        Assert.Equal(payload, (await destination.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(payload,
+            (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertDefaultPriorityAbortAsync(
+        BlobContainerClient container,
+        BlockBlobClient source)
+    {
         var defaultPriority = container.GetBlockBlobClient("default-priority.bin");
         var defaultCopy = await defaultPriority.StartCopyFromUriAsync(
             source.Uri,
-            new BlobCopyFromUriOptions { AccessTier = AccessTier.Cool });
-        var defaultPending = (await defaultPriority.GetPropertiesAsync()).Value;
+            new BlobCopyFromUriOptions { AccessTier = AccessTier.Cool }).ConfigureAwait(false);
+        var defaultPending = (await defaultPriority.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(AccessTier.Archive, defaultPending.AccessTier);
         Assert.Equal("rehydrate-pending-to-cool", defaultPending.ArchiveStatus);
         Assert.Equal("Standard", defaultPending.RehydratePriority);
 
-        await defaultPriority.AbortCopyFromUriAsync(defaultCopy.Id);
-        var aborted = (await defaultPriority.GetPropertiesAsync()).Value;
+        await defaultPriority.AbortCopyFromUriAsync(defaultCopy.Id).ConfigureAwait(false);
+        var aborted = (await defaultPriority.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(CopyStatus.Aborted, aborted.CopyStatus);
         Assert.Equal(AccessTier.Cool, aborted.AccessTier);
         Assert.Null(aborted.ArchiveStatus);
@@ -149,7 +164,12 @@ public sealed class AzureRehydrationPriorityTests
         await source.UploadAsync(BinaryData.FromString("copy source").ToStream());
         var sourceUri = source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddHours(1));
         using var transport = new HttpClient(application.Server.CreateHandler());
+        await AssertRejectedPutOperationsAsync(container, transport).ConfigureAwait(true);
+        await AssertRejectedCopyOperationsAsync(container, transport, sourceUri).ConfigureAwait(true);
+    }
 
+    private static async Task AssertRejectedPutOperationsAsync(BlobContainerClient container, HttpClient transport)
+    {
         var putDestination = container.GetBlockBlobClient("put.bin");
         using (var put = new HttpRequestMessage(HttpMethod.Put, WriteUri(putDestination))
         {
@@ -159,12 +179,14 @@ public sealed class AzureRehydrationPriorityTests
             put.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             put.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             put.Headers.TryAddWithoutValidation("x-ms-rehydrate-priority", "High");
-            await AssertErrorAsync(transport, put, HttpStatusCode.BadRequest, "UnsupportedHeader");
+            await AssertErrorAsync(transport, put, HttpStatusCode.BadRequest, "UnsupportedHeader")
+                .ConfigureAwait(false);
         }
-        Assert.False((await putDestination.ExistsAsync()).Value);
+        Assert.False((await putDestination.ExistsAsync().ConfigureAwait(false)).Value);
 
         var blockListDestination = container.GetBlockBlobClient("block-list.bin");
-        await blockListDestination.UploadAsync(BinaryData.FromString("original").ToStream());
+        await blockListDestination.UploadAsync(BinaryData.FromString("original").ToStream())
+            .ConfigureAwait(false);
         using (var blockList = new HttpRequestMessage(
                    HttpMethod.Put,
                    AppendQuery(WriteUri(blockListDestination), "comp=blocklist"))
@@ -174,12 +196,19 @@ public sealed class AzureRehydrationPriorityTests
         {
             blockList.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             blockList.Headers.TryAddWithoutValidation("x-ms-rehydrate-priority", "High");
-            await AssertErrorAsync(transport, blockList, HttpStatusCode.BadRequest, "UnsupportedHeader");
+            await AssertErrorAsync(transport, blockList, HttpStatusCode.BadRequest, "UnsupportedHeader")
+                .ConfigureAwait(false);
         }
         Assert.Equal(
             "original",
-            (await blockListDestination.DownloadContentAsync()).Value.Content.ToString());
+            (await blockListDestination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+    }
 
+    private static async Task AssertRejectedCopyOperationsAsync(
+        BlobContainerClient container,
+        HttpClient transport,
+        Uri sourceUri)
+    {
         var putFromUrlDestination = container.GetBlockBlobClient("put-from-url.bin");
         using (var putFromUrl = CopyRequest(
                    putFromUrlDestination,
@@ -188,9 +217,10 @@ public sealed class AzureRehydrationPriorityTests
                    "High"))
         {
             putFromUrl.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            await AssertErrorAsync(transport, putFromUrl, HttpStatusCode.BadRequest, "UnsupportedHeader");
+            await AssertErrorAsync(transport, putFromUrl, HttpStatusCode.BadRequest, "UnsupportedHeader")
+                .ConfigureAwait(false);
         }
-        Assert.False((await putFromUrlDestination.ExistsAsync()).Value);
+        Assert.False((await putFromUrlDestination.ExistsAsync().ConfigureAwait(false)).Value);
 
         var synchronousDestination = container.GetBlockBlobClient("synchronous.bin");
         using (var synchronous = CopyRequest(
@@ -200,9 +230,10 @@ public sealed class AzureRehydrationPriorityTests
                    "High"))
         {
             synchronous.Headers.TryAddWithoutValidation("x-ms-requires-sync", "true");
-            await AssertErrorAsync(transport, synchronous, HttpStatusCode.BadRequest, "UnsupportedHeader");
+            await AssertErrorAsync(transport, synchronous, HttpStatusCode.BadRequest, "UnsupportedHeader")
+                .ConfigureAwait(false);
         }
-        Assert.False((await synchronousDestination.ExistsAsync()).Value);
+        Assert.False((await synchronousDestination.ExistsAsync().ConfigureAwait(false)).Value);
 
         var oldVersionDestination = container.GetBlockBlobClient("old-version.bin");
         using (var oldVersion = CopyRequest(
@@ -211,9 +242,10 @@ public sealed class AzureRehydrationPriorityTests
                    "2018-11-09",
                    "High"))
         {
-            await AssertErrorAsync(transport, oldVersion, HttpStatusCode.Conflict, "FeatureVersionMismatch");
+            await AssertErrorAsync(transport, oldVersion, HttpStatusCode.Conflict, "FeatureVersionMismatch")
+                .ConfigureAwait(false);
         }
-        Assert.False((await oldVersionDestination.ExistsAsync()).Value);
+        Assert.False((await oldVersionDestination.ExistsAsync().ConfigureAwait(false)).Value);
 
         var invalidDestination = container.GetBlockBlobClient("invalid.bin");
         using (var invalid = CopyRequest(
@@ -222,9 +254,10 @@ public sealed class AzureRehydrationPriorityTests
                    "2023-11-03",
                    "Urgent"))
         {
-            await AssertErrorAsync(transport, invalid, HttpStatusCode.BadRequest, "InvalidHeaderValue");
+            await AssertErrorAsync(transport, invalid, HttpStatusCode.BadRequest, "InvalidHeaderValue")
+                .ConfigureAwait(false);
         }
-        Assert.False((await invalidDestination.ExistsAsync()).Value);
+        Assert.False((await invalidDestination.ExistsAsync().ConfigureAwait(false)).Value);
 
         var onlineCopyDestination = container.GetBlockBlobClient("online-copy.bin");
         using (var onlineCopy = CopyRequest(
@@ -232,9 +265,9 @@ public sealed class AzureRehydrationPriorityTests
                    sourceUri,
                    "2023-11-03",
                    "High"))
-        using (var response = await transport.SendAsync(onlineCopy))
+        using (var response = await transport.SendAsync(onlineCopy).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-        Assert.Null((await onlineCopyDestination.GetPropertiesAsync()).Value.RehydratePriority);
+        Assert.Null((await onlineCopyDestination.GetPropertiesAsync().ConfigureAwait(false)).Value.RehydratePriority);
     }
 
     private static HttpRequestMessage TierRequest(Uri uri, string version, string priority)
