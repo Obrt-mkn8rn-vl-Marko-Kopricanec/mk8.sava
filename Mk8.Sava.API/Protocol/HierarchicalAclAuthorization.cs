@@ -4,6 +4,81 @@ namespace Mk8.Sava.Protocol;
 
 internal static class HierarchicalAclAuthorization
 {
+    internal static bool IsDirectoryListOperation(HttpRequest http, StorageRequestContext request)
+    {
+        if (request.ResourceKind != StorageResourceKind.Container ||
+            !HttpMethods.IsGet(http.Method) ||
+            !http.Query["comp"].ToString().Equals("list", StringComparison.OrdinalIgnoreCase) ||
+            http.Query["delimiter"].ToString() != "/")
+            return false;
+
+        var prefix = http.Query["prefix"].ToString();
+        if (prefix.Length > 0 &&
+            (!prefix.EndsWith("/", StringComparison.Ordinal) ||
+             prefix.StartsWith("/", StringComparison.Ordinal) ||
+             prefix.Contains("//", StringComparison.Ordinal)))
+            return false;
+
+        if (http.Query["showonly"].ToString().Equals("deleted", StringComparison.OrdinalIgnoreCase))
+            return false;
+        return !http.Query["include"].ToString().Split(',', StringSplitOptions.TrimEntries)
+            .Any(value => value.Equals("deleted", StringComparison.OrdinalIgnoreCase) ||
+                          value.Equals("deletedwithversions", StringComparison.OrdinalIgnoreCase) ||
+                          value.Equals("tags", StringComparison.OrdinalIgnoreCase));
+    }
+
+    internal static async Task EnsureDirectoryListAsync(
+        MetadataStore metadata,
+        HttpRequest http,
+        StorageRequestContext request,
+        string objectId,
+        IReadOnlySet<string> groups,
+        string signedPermissions,
+        CancellationToken cancellationToken)
+    {
+        if (!IsDirectoryListOperation(http, request) ||
+            request.Container is null ||
+            !signedPermissions.Contains('l', StringComparison.Ordinal))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var root = await metadata.GetContainerAsync(
+            request.Account, request.Container, includeDeleted: false, cancellationToken);
+        if (root is null ||
+            !PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'x'))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var prefix = http.Query["prefix"].ToString();
+        if (prefix.Length == 0)
+        {
+            if (!PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'r'))
+                throw AzureStorageException.AuthorizationFailure();
+            return;
+        }
+
+        await metadata.EnsureHierarchicalDirectoriesAsync(
+            request.Account, request.Container, cancellationToken);
+        var target = prefix[..^1];
+        var separator = target.IndexOf('/', StringComparison.Ordinal);
+        while (separator > 0)
+        {
+            var parent = await metadata.GetBlobAsync(
+                request.Account, request.Container, target[..separator],
+                versionId: null, snapshot: null, includeDeleted: false, cancellationToken);
+            if (parent is null || !parent.IsDirectory ||
+                !PosixAccessControl.Allows(parent.Acl, parent.Owner, parent.Group, objectId, groups, 'x'))
+                throw AzureStorageException.AuthorizationFailure();
+            separator = target.IndexOf('/', separator + 1);
+        }
+
+        var directory = await metadata.GetBlobAsync(
+            request.Account, request.Container, target,
+            versionId: null, snapshot: null, includeDeleted: false, cancellationToken);
+        if (directory is null || !directory.IsDirectory ||
+            !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'r') ||
+            !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'x'))
+            throw AzureStorageException.AuthorizationFailure();
+    }
+
     internal static bool IsBlobReadOperation(HttpRequest http)
     {
         var component = http.Query["comp"].ToString();

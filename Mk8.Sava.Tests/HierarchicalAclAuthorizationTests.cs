@@ -7,6 +7,38 @@ namespace Mk8.Sava.Tests;
 public sealed class HierarchicalAclAuthorizationTests
 {
     [Theory]
+    [InlineData("GET", "/", "", "", "", true)]
+    [InlineData("GET", "/", "one/two/", "files", "metadata", true)]
+    [InlineData("GET", "", "", "", "", false)]
+    [InlineData("GET", "/", "one", "", "", false)]
+    [InlineData("GET", "/", "/one/", "", "", false)]
+    [InlineData("GET", "/", "one//two/", "", "", false)]
+    [InlineData("GET", "/", "", "deleted", "", false)]
+    [InlineData("GET", "/", "", "", "deleted", false)]
+    [InlineData("GET", "/", "", "", "tags", false)]
+    [InlineData("POST", "/", "", "", "", false)]
+    public void AclListFallbackRequiresAPlainHierarchicalDirectoryListing(
+        string method, string delimiter, string prefix, string showOnly, string include, bool expected)
+    {
+        var request = new DefaultHttpContext().Request;
+        request.Method = method;
+        request.QueryString = new QueryString(
+            $"?comp=list&delimiter={Uri.EscapeDataString(delimiter)}" +
+            $"&prefix={Uri.EscapeDataString(prefix)}&showonly={showOnly}&include={include}");
+        var resource = new StorageRequestContext
+        {
+            RequestId = "test",
+            Account = "account",
+            Container = "container",
+            ResourceKind = StorageResourceKind.Container,
+            CanonicalResourcePath = "/account/container",
+            ServiceVersion = "2023-11-03",
+            Authorization = StorageAuthorization.Anonymous
+        };
+        Assert.Equal(expected, HierarchicalAclAuthorization.IsDirectoryListOperation(request, resource));
+    }
+
+    [Theory]
     [InlineData("GET", "", true)]
     [InlineData("HEAD", "metadata", true)]
     [InlineData("GET", "metadata", true)]

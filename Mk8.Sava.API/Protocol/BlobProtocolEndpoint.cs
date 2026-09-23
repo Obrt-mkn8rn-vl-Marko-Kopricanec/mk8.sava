@@ -560,6 +560,17 @@ public static class BlobProtocolEndpoint
                 decodedMarker,
                 maxResults,
                 cancellationToken);
+            if (request.Authorization.AclListChecked)
+            {
+                await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
+                    http.RequestServices.GetRequiredService<MetadataStore>(),
+                    http.Request,
+                    request,
+                    request.Authorization.AclListObjectId!,
+                    request.Authorization.AclListGroups!,
+                    request.Authorization.Permissions,
+                    cancellationToken);
+            }
             ValidateListedBlobTypes(request, blobs);
             await writer.WriteBlobsAsync(
                 http,
