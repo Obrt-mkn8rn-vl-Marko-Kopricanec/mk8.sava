@@ -9,6 +9,49 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageSpaceEfficiencyTests
 {
     [Fact]
+    public async Task PackedSmallChunksDoNotAllocateUnusedHashDirectories()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var account = SavaWebApplicationFactory.AccountName;
+        var endpoint = new Uri($"http://{account}.localhost");
+        var client = new BlobServiceClient(
+            endpoint,
+            new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
+            new BlobClientOptions
+            {
+                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+                {
+                    BaseAddress = endpoint
+                }),
+                Retry = { MaxRetries = 0 }
+            });
+        var container = client.GetBlobContainerClient($"packed-directories-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+
+        for (var index = 0; index < 32; index++)
+        {
+            var bytes = new byte[80];
+            new Random(0x6100 + index).NextBytes(bytes);
+            await container.GetBlobClient($"small-{index}.bin").UploadAsync(BinaryData.FromBytes(bytes));
+        }
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        Assert.Equal(32, metadata.CountPackedChunks());
+        Assert.Empty(Directory.EnumerateDirectories(
+            Path.Combine(application.DataPath, "chunks"),
+            "*",
+            SearchOption.AllDirectories));
+        Assert.NotEmpty(Directory.EnumerateFiles(
+            Path.Combine(application.DataPath, "packs"),
+            "*.pack",
+            SearchOption.AllDirectories));
+    }
+
+    [Fact]
     public async Task ContentDefinedChunksRemainSharedAfterAnEarlyInsertion()
     {
         await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>

@@ -538,6 +538,30 @@ than `Sava:ChunkPackSealAge` are sealed; maintenance considers at most
 unreachable bytes meet both `Sava:ChunkPackCompactionMinimumSavingsBytes` and
 `Sava:ChunkPackCompactionMinimumDeadRatio`. Locator replacement is atomic, and
 the old pack is deleted only after that transaction commits.
+Packed-only chunks do not create unused hash directories under `chunks/`;
+standalone chunk publication creates those directories only when needed.
+
+SQLite connections use WAL mode with `synchronous=FULL` for durable commits.
+After a WAL reset, `journal_size_limit` bounds retained WAL allocation to 1 MiB;
+an active transaction can still make the WAL temporarily larger. The storage
+byte gauges in `/metrics` sum serialized file lengths, not filesystem blocks.
+For measured allocation, run the Linux benchmark below, which uses GNU `du`
+over the complete live root and a raw-file baseline, including directory,
+SQLite, chunk, pack, and staging allocation:
+
+```bash
+dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj \
+  --filter FullyQualifiedName~StorageAllocationBenchmarkTests \
+  --logger 'console;verbosity=detailed'
+```
+
+The benchmark uses ordinary .NET Azure Blob SDK calls with production chunk
+sizes and reports cumulative logical bytes, allocated bytes per storage
+component, upload/read latency, process CPU time, and process working set after
+exact duplicates, shifted partial sharing, retained versions, small files, and
+incompressible files. Timings are an in-process diagnostic, not a network or
+MSAVA production-performance claim; rerun them on the target filesystem and
+with a separately characterized MSAVA baseline before setting release budgets.
 
 ## Create and validate a backup
 
@@ -598,11 +622,12 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 6 and the backup container format is version 1. Schema 2 adds
+version 7 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
 schema 3 adds a transactional blob-tag search index; schema 4 adds authoritative
 pack and packed-chunk locator tables; schema 5 adds object-replication state;
-schema 6 adds durable data-key fingerprints for reachable encryption domains.
+schema 6 adds durable data-key fingerprints for reachable encryption domains;
+schema 7 records each configured account's hierarchical-namespace mode.
 The JSON blob/block manifests remain
 authoritative and startup and backup validation check the derived indexes against
 them. The service migrates schema 1, 2, or 3 on startup and can validate or

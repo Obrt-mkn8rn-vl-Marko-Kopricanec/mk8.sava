@@ -11,6 +11,7 @@ public sealed class MetadataStore(
     TimeProvider? timeProvider = null)
 {
     public const int CurrentSchemaVersion = 7;
+    private const int RetainedWalLimitBytes = 1024 * 1024;
     private const int ChunkIndexSchemaVersion = 2;
     private const int TagIndexSchemaVersion = 3;
     private const int PackIndexSchemaVersion = 4;
@@ -40,8 +41,6 @@ public sealed class MetadataStore(
             await using var connection = await OpenAsync(cancellationToken);
             await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode=WAL;", cancellationToken);
             await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken);
             var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
             if (schemaVersion > CurrentSchemaVersion)
             {
@@ -3212,6 +3211,11 @@ public sealed class MetadataStore(
     {
         var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
+        await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken);
+        await ExecuteNonQueryAsync(
+            connection,
+            $"PRAGMA journal_size_limit={RetainedWalLimitBytes};",
+            cancellationToken);
         await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken);
         await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken);
         return connection;

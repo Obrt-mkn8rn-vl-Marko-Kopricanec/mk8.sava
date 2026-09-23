@@ -1197,7 +1197,6 @@ public sealed class ChunkStore
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         var baseName = $"{hash}-{bytes.Length}";
         var directory = Path.Combine(_paths.Chunks, domain, hash[..2], hash[2..4]);
-        _paths.EnsureDurableDirectory(directory);
 
         for (var collision = 0; ; collision++)
         {
@@ -1269,6 +1268,8 @@ public sealed class ChunkStore
                         }
                         continue;
                     }
+
+                    _paths.EnsureDurableDirectory(directory);
 
                     Task? reservationCompletion = null;
                     var created = false;
