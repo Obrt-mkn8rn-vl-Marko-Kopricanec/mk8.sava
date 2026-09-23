@@ -1,3 +1,9 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Mk8.Sava.Configuration;
+using Mk8.Sava.Storage;
+
 namespace Mk8.Sava.Tests;
 
 public sealed class StorageRootLeaseTests
@@ -14,8 +20,9 @@ public sealed class StorageRootLeaseTests
             await first.InitializeAsync();
             Assert.True(File.Exists(Path.Combine(dataPath, ".mk8-sava.lock")));
 
-            await using var second = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
-            await Assert.ThrowsAsync<IOException>(second.InitializeAsync);
+            var environment = first.Services.GetRequiredService<IHostEnvironment>();
+            var options = first.Services.GetRequiredService<IOptions<SavaOptions>>();
+            Assert.Throws<IOException>(() => new StoragePaths(environment, options));
         }
 
         await using (var reopened = new SavaWebApplicationFactory(dataPath, deleteDataPath: true))
