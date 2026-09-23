@@ -57,8 +57,7 @@ internal static class StorageServiceVersions
         "2026-02-06",
         "2026-04-06",
         "2026-06-06",
-        "2026-10-06",
-        "2026-12-06"
+        "2026-10-06"
     };
 
     public static bool TryParse(string value, out DateOnly version)

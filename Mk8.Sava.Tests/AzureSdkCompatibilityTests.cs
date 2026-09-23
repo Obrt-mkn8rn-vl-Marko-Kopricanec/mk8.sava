@@ -3424,10 +3424,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var currentBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
             {
                 currentBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                currentBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2026-12-06");
+                currentBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2026-10-06");
                 using var response = await transport.SendAsync(currentBearerVersion);
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal("2026-12-06", response.Headers.GetValues("x-ms-version").Single());
+                Assert.Equal("2026-10-06", response.Headers.GetValues("x-ms-version").Single());
+            }
+            using (var unknownFutureVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+            {
+                unknownFutureVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+                unknownFutureVersion.Headers.TryAddWithoutValidation("x-ms-version", "2026-12-06");
+                using var response = await transport.SendAsync(unknownFutureVersion);
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
             }
         }
         finally
