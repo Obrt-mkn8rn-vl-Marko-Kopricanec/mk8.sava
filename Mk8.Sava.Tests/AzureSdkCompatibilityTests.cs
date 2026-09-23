@@ -8106,6 +8106,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UrlTransferRequiresExplicitTrustForPrivateResolvedSource()
+    {
+        await using var source = await LoopbackSource.StartAsync("trusted loopback"u8.ToArray());
+        await using var application = new SavaWebApplicationFactory();
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"url-egress-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var destination = container.GetBlockBlobClient("copied.bin");
+        var untrustedAlias = new UriBuilder(source.Uri) { Host = "localhost" }.Uri;
+
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            destination.SyncUploadFromUriAsync(untrustedAlias));
+        Assert.Equal(500, denied.Status);
+        Assert.Equal("CannotVerifyCopySource", denied.ErrorCode);
+        Assert.Equal(0, source.SourceRequestCount);
+        Assert.False((await destination.ExistsAsync()).Value);
+
+        await destination.SyncUploadFromUriAsync(source.Uri);
+        Assert.Equal(1, source.SourceRequestCount);
+        Assert.Equal("trusted loopback", (await destination.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task FileRequestIntentIsValidatedAndForwardedForEverySupportedUrlOperation()
     {
         var sourceBytes = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
@@ -13499,21 +13523,25 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     private sealed class LoopbackSource(
         WebApplication application,
         Uri uri,
+        int[] sourceRequests,
         int[] redirectTargetRequests) : IAsyncDisposable
     {
         public Uri Uri { get; } = uri;
         public Uri MissingUri { get; } = new(uri, "/missing");
         public Uri RedirectUri { get; } = new(uri, "/redirect");
+        public int SourceRequestCount => Volatile.Read(ref sourceRequests[0]);
         public int RedirectTargetRequests => Volatile.Read(ref redirectTargetRequests[0]);
 
         public static async Task<LoopbackSource> StartAsync(byte[] content)
         {
+            var sourceRequests = new int[1];
             var redirectTargetRequests = new int[1];
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
             var application = builder.Build();
             application.MapGet("/source", async context =>
             {
+                Interlocked.Increment(ref sourceRequests[0]);
                 const string sourceEtag = "\"source-etag\"";
                 var ifMatch = context.Request.Headers.IfMatch.ToString();
                 if (!string.IsNullOrEmpty(ifMatch) &&
@@ -13576,6 +13604,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             return new LoopbackSource(
                 application,
                 new Uri(new Uri(address), "/source"),
+                sourceRequests,
                 redirectTargetRequests);
         }
 

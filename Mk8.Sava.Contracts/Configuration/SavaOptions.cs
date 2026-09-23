@@ -43,6 +43,7 @@ public sealed class SavaOptions : IValidatableObject
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 5_000L * 1024 * 1024;
+    public List<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
@@ -395,6 +396,18 @@ public sealed class SavaOptions : IValidatableObject
 
         if (MaximumRequestBodyBytes <= 0)
             yield return new ValidationResult("MaximumRequestBodyBytes must be positive.", [nameof(MaximumRequestBodyBytes)]);
+
+        foreach (var host in UrlTransferAllowedPrivateHosts)
+        {
+            if (string.IsNullOrWhiteSpace(host) ||
+                !string.Equals(host, host.Trim(), StringComparison.Ordinal) ||
+                Uri.CheckHostName(host) == UriHostNameType.Unknown)
+            {
+                yield return new ValidationResult(
+                    "UrlTransferAllowedPrivateHosts entries must be exact DNS names or IP addresses without schemes, ports, or wildcards.",
+                    [nameof(UrlTransferAllowedPrivateHosts)]);
+            }
+        }
 
         if (StandardRehydrationDelay < TimeSpan.Zero ||
             HighPriorityRehydrationDelay < TimeSpan.Zero ||

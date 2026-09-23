@@ -6,6 +6,28 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageConfigurationTests
 {
     [Theory]
+    [InlineData("")]
+    [InlineData(" localhost ")]
+    [InlineData("https://example.com")]
+    [InlineData("example.com:443")]
+    [InlineData("*.example.com")]
+    public void PrivateUrlSourceExceptionsRequireExactHostNames(string host)
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
+            },
+            UrlTransferAllowedPrivateHosts = [host]
+        };
+
+        Assert.Contains(
+            options.Validate(new ValidationContext(options)),
+            error => error.MemberNames.Contains(nameof(SavaOptions.UrlTransferAllowedPrivateHosts)));
+    }
+
+    [Theory]
     [InlineData("ab")]
     [InlineData("abcdefghijklmnopqrstuvwxy")]
     [InlineData("Uppercase")]
