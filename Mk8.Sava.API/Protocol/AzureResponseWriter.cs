@@ -3,6 +3,8 @@ using System.Text;
 using System.Text.Json;
 using System.Xml;
 using Microsoft.AspNetCore.WebUtilities;
+using Microsoft.Extensions.Options;
+using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -11,6 +13,21 @@ public sealed partial class AzureResponseWriter
 {
     private const string LegacyBlobMarkerPrefix = "mk8s1.";
     private const string BlobMarkerPrefix = "mk8s2.";
+
+    private static string ProjectHnsIdentity(HttpContext context, string objectId)
+    {
+        if (!bool.TryParse(context.Request.Headers["x-ms-upn"], out var projectUpn) ||
+            !projectUpn ||
+            objectId == "$superuser")
+            return objectId;
+
+        var principals = context.RequestServices
+            .GetRequiredService<IOptions<SavaOptions>>().Value.BearerAuthentication.Principals;
+        return principals.TryGetValue(objectId, out var principal) &&
+               !string.IsNullOrWhiteSpace(principal.UserPrincipalName)
+            ? principal.UserPrincipalName
+            : objectId;
+    }
 
     public async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
     {
@@ -233,8 +250,8 @@ public sealed partial class AzureResponseWriter
                             writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
                             if (includes.Contains("permissions"))
                             {
-                                writer.WriteElementString("Owner", directory.Owner);
-                                writer.WriteElementString("Group", directory.Group);
+                                writer.WriteElementString("Owner", ProjectHnsIdentity(context, directory.Owner));
+                                writer.WriteElementString("Group", ProjectHnsIdentity(context, directory.Group));
                                 writer.WriteElementString("Permissions", directory.Permissions);
                                 writer.WriteElementString("Acl", directory.Acl);
                             }
@@ -331,8 +348,8 @@ public sealed partial class AzureResponseWriter
                 writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
                 if (hierarchicalNamespace && includes.Contains("permissions"))
                 {
-                    writer.WriteElementString("Owner", blob.Owner);
-                    writer.WriteElementString("Group", blob.Group);
+                    writer.WriteElementString("Owner", ProjectHnsIdentity(context, blob.Owner));
+                    writer.WriteElementString("Group", ProjectHnsIdentity(context, blob.Group));
                     writer.WriteElementString("Permissions", blob.Permissions);
                     writer.WriteElementString("Acl", blob.Acl);
                 }
@@ -771,8 +788,8 @@ public sealed partial class AzureResponseWriter
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
         {
-            response.Headers["x-ms-owner"] = blob.Owner;
-            response.Headers["x-ms-group"] = blob.Group;
+            response.Headers["x-ms-owner"] = ProjectHnsIdentity(response.HttpContext, blob.Owner);
+            response.Headers["x-ms-group"] = ProjectHnsIdentity(response.HttpContext, blob.Group);
             response.Headers["x-ms-permissions"] = blob.Permissions;
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
