@@ -8086,6 +8086,26 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task UrlTransferRejectsRedirectWithoutContactingRedirectTarget()
+    {
+        await using var source = await LoopbackSource.StartAsync("redirect target content"u8.ToArray());
+        await using var application = new SavaWebApplicationFactory();
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"url-redirect-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var destination = container.GetBlockBlobClient("must-not-exist.bin");
+
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            destination.SyncUploadFromUriAsync(source.RedirectUri));
+
+        Assert.Equal(500, rejected.Status);
+        Assert.Equal("CannotVerifyCopySource", rejected.ErrorCode);
+        Assert.Equal(0, source.RedirectTargetRequests);
+        Assert.False((await destination.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task FileRequestIntentIsValidatedAndForwardedForEverySupportedUrlOperation()
     {
         var sourceBytes = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
@@ -13476,13 +13496,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
-    private sealed class LoopbackSource(WebApplication application, Uri uri) : IAsyncDisposable
+    private sealed class LoopbackSource(
+        WebApplication application,
+        Uri uri,
+        int[] redirectTargetRequests) : IAsyncDisposable
     {
         public Uri Uri { get; } = uri;
         public Uri MissingUri { get; } = new(uri, "/missing");
+        public Uri RedirectUri { get; } = new(uri, "/redirect");
+        public int RedirectTargetRequests => Volatile.Read(ref redirectTargetRequests[0]);
 
         public static async Task<LoopbackSource> StartAsync(byte[] content)
         {
+            var redirectTargetRequests = new int[1];
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
             var application = builder.Build();
@@ -13529,6 +13555,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             });
             application.MapGet("/missing", context =>
                 WriteSourceErrorAsync(context, StatusCodes.Status404NotFound, "BlobNotFound"));
+            application.MapGet("/redirect", context =>
+            {
+                context.Response.Redirect("/redirect-target");
+                return Task.CompletedTask;
+            });
+            application.MapGet("/redirect-target", async context =>
+            {
+                Interlocked.Increment(ref redirectTargetRequests[0]);
+                context.Response.ContentLength = content.Length;
+                await context.Response.Body.WriteAsync(content);
+            });
             await application.StartAsync();
             var addresses = application.Services
                 .GetRequiredService<IServer>()
@@ -13536,7 +13573,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 .Get<IServerAddressesFeature>()
                 ?.Addresses;
             var address = addresses?.Single() ?? throw new InvalidOperationException("The source server did not publish an address.");
-            return new LoopbackSource(application, new Uri(new Uri(address), "/source"));
+            return new LoopbackSource(
+                application,
+                new Uri(new Uri(address), "/source"),
+                redirectTargetRequests);
         }
 
         private static async Task WriteSourceErrorAsync(HttpContext context, int statusCode, string errorCode)

@@ -210,6 +210,11 @@ token on every source request. It remains optional for public/SAS Azure Files
 sources and for bearer-authenticated non-File URLs; asynchronous and incremental
 Copy Blob reject it because Azure exposes the header only on Put Blob, synchronous
 Copy Blob, Put Block, Put Page, and Append Block from URL.
+Outbound URL-source requests do not follow HTTP redirects. A redirected source
+fails with `CannotVerifyCopySource` without contacting the redirect target, so
+source bearer tokens and customer-provided encryption-key headers cannot be
+forwarded to an authority selected by the source. This fail-closed behavior
+needs differential validation against Azure before claiming redirect parity.
 
 Version-aware Get Blob and Get Blob Properties responses expose both
 `x-ms-version-id` and `x-ms-is-current-version` from service version
