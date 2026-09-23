@@ -203,295 +203,421 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
                 lastAccessTimeTracking,
                 cancellationToken);
         }
-        var serviceEndpoint = StorageResourcePath.GetServiceEndpoint(context.Request, request.Account);
-        var containerEndpoint = StorageResourcePath.GetContainerEndpoint(
-            context.Request,
-            request.Account,
-            request.Container!);
         var usesModernEndpointShape = IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15));
         var usesModernPropertyShape = IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19));
 
         return WriteXmlAsync(context, writer =>
         {
-            writer.WriteStartElement("EnumerationResults");
-            if (usesModernEndpointShape)
-            {
-                writer.WriteAttributeString("ServiceEndpoint", serviceEndpoint);
-                writer.WriteAttributeString("ContainerName", request.Container);
-            }
-            else
-            {
-                writer.WriteAttributeString("ContainerName", containerEndpoint);
-            }
-            if (context.Request.Query.ContainsKey("prefix"))
-                writer.WriteElementString("Prefix", prefix);
-            if (context.Request.Query.ContainsKey("marker"))
-                writer.WriteElementString("Marker", marker);
-            if (context.Request.Query.ContainsKey("delimiter"))
-                writer.WriteElementString("Delimiter", delimiter);
-            if (context.Request.Query.ContainsKey("maxresults"))
-                writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
+            WriteBlobListingEnvelopeStartXml(
+                writer,
+                context,
+                request,
+                prefix,
+                delimiter,
+                marker,
+                maxResults,
+                usesModernEndpointShape);
             writer.WriteStartElement("Blobs");
             foreach (var entry in listing.Items)
             {
-                if (entry.Prefix is not null)
-                {
-                    writer.WriteStartElement("BlobPrefix");
-                    writer.WriteElementString("Name", entry.Prefix);
-                    if (hierarchicalNamespace &&
-                        IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
-                    {
-                        var directory = entry.Blob;
-                        writer.WriteStartElement("Properties");
-                        if (directory is not null)
-                        {
-                            if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
-                            {
-                                writer.WriteElementString(
-                                    "Creation-Time",
-                                    directory.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
-                            }
-                            writer.WriteElementString(
-                                "Last-Modified",
-                                directory.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                            writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
-                            if (includes.Contains("permissions"))
-                            {
-                                writer.WriteElementString("Owner", ProjectHnsIdentity(context, directory.Owner));
-                                writer.WriteElementString("Group", ProjectHnsIdentity(context, directory.Group));
-                                writer.WriteElementString("Permissions", directory.Permissions);
-                                writer.WriteElementString("Acl", directory.Acl);
-                            }
-                        }
-                        if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
-                            writer.WriteElementString("ResourceType", "directory");
-                        if (directory is null &&
-                            string.Equals(
-                                context.Request.Query["showonly"],
-                                "deleted",
-                                StringComparison.Ordinal) &&
-                            IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
-                        {
-                            writer.WriteElementString("Placeholder", "true");
-                        }
-                        writer.WriteElementString("Content-Length", "0");
-                        writer.WriteElementString("BlobType", "BlockBlob");
-                        if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
-                            writer.WriteElementString("ServerEncrypted", "true");
-                        writer.WriteEndElement();
-                    }
-                    writer.WriteEndElement();
-                    continue;
-                }
-
-                if (entry.IsUncommitted)
-                {
-                    writer.WriteStartElement("Blob");
-                    writer.WriteElementString("Name", entry.Name);
-                    if (!usesModernEndpointShape)
-                    {
-                        writer.WriteElementString(
-                            "Url",
-                            StorageResourcePath.GetBlobEndpoint(
-                                context.Request,
-                                request.Account,
-                                request.Container!,
-                                entry.Name));
-                    }
-                    writer.WriteStartElement("Properties");
-                    writer.WriteElementString("Content-Length", "0");
-                    writer.WriteElementString("BlobType", "BlockBlob");
-                    writer.WriteEndElement();
-                    writer.WriteEndElement();
-                    continue;
-                }
-
-                var blob = entry.Blob!;
-                writer.WriteStartElement("Blob");
-                writer.WriteElementString("Name", blob.Name);
-                if (!usesModernEndpointShape)
-                {
-                    writer.WriteElementString(
-                        "Url",
-                        StorageResourcePath.GetBlobEndpoint(
-                            context.Request,
-                            request.Account,
-                            request.Container!,
-                            blob.Name));
-                }
-                if (blob.Snapshot is not null)
-                    writer.WriteElementString("Snapshot", blob.Snapshot);
-                if (includes.Contains("versions") && blob.VersionId is not null)
-                {
-                    writer.WriteElementString("VersionId", blob.VersionId);
-                    writer.WriteElementString("IsCurrentVersion", blob.IsCurrent ? "true" : "false");
-                }
-                if (blob.IsDeleted &&
-                    (hierarchicalNamespace ||
-                     includes.Contains("deleted") ||
-                     includes.Contains("deletedwithversions")))
-                {
-                    writer.WriteElementString("Deleted", "true");
-                }
-                if (hierarchicalNamespace &&
-                    blob.IsDeleted &&
-                    blob.DeletionId.HasValue &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2020, 8, 4)))
-                {
-                    writer.WriteElementString(
-                        "DeletionId",
-                        blob.DeletionId.Value.ToString(CultureInfo.InvariantCulture));
-                }
-                if (!usesModernPropertyShape)
-                {
-                    WriteLegacyBlobProperties(writer, request, blob);
-                    writer.WriteEndElement();
-                    continue;
-                }
-                writer.WriteStartElement("Properties");
-                if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
-                    writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Last-Modified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
-                if (hierarchicalNamespace && includes.Contains("permissions"))
-                {
-                    writer.WriteElementString("Owner", ProjectHnsIdentity(context, blob.Owner));
-                    writer.WriteElementString("Group", ProjectHnsIdentity(context, blob.Group));
-                    writer.WriteElementString("Permissions", blob.Permissions);
-                    writer.WriteElementString("Acl", blob.Acl);
-                }
-                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
-                    writer.WriteElementString("ResourceType", blob.IsDirectory ? "directory" : "file");
-                writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
-                writer.WriteElementString("Content-Type", blob.Http.ContentType);
-                writer.WriteElementString("Content-Encoding", blob.Http.ContentEncoding ?? string.Empty);
-                writer.WriteElementString("Content-Language", blob.Http.ContentLanguage ?? string.Empty);
-                WriteOptional(writer, "Content-MD5", blob.Http.ContentMd5);
-                writer.WriteElementString("Cache-Control", blob.Http.CacheControl ?? string.Empty);
-                if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
-                    writer.WriteElementString("Content-Disposition", blob.Http.ContentDisposition ?? string.Empty);
-                writer.WriteElementString("BlobType", BlobType(blob.Kind));
-                if (blob.Kind == Storage.BlobKind.BlockBlob &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
-                {
-                    writer.WriteElementString("AccessTier", blob.AccessTier);
-                    if (blob.AccessTierInferred)
-                        writer.WriteElementString("AccessTierInferred", "true");
-                    if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
-                        IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
-                    {
-                        WriteOptional(writer, "SmartAccessTier", blob.SmartAccessTier);
-                    }
-                    WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
-                    WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
-                }
-                if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
-                    writer.WriteElementString("ServerEncrypted", "true");
-                if (IsServiceVersionAtLeast(request, new DateOnly(2019, 2, 2)))
-                {
-                    WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
-                    WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
-                }
-                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
-                    WriteOptional(writer, "EncryptionContext", blob.EncryptionContext);
-                if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
-                    WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
-                if (lastAccessTimeTracking &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
-                {
-                    WriteOptional(
-                        writer,
-                        "LastAccessTime",
-                        blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
-                }
-                if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
-                    WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
-                if (blob.IsDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
-                {
-                    WriteOptional(writer, "DeletedTime", blob.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
-                    if (blob.DeleteRetentionUntil.HasValue)
-                    {
-                        writer.WriteElementString(
-                            "RemainingRetentionDays",
-                            RemainingRetentionDays(blob.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
-                    }
-                }
-                if (blob.Snapshot is null &&
-                    !blob.IsDeleted &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)))
-                {
-                    writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
-                    if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
-                    {
-                        writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
-                        if (blob.Lease.State == Storage.LeaseState.Leased)
-                        {
-                            writer.WriteElementString(
-                                "LeaseDuration",
-                                blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
-                        }
-                    }
-                }
-                if (blob.Kind == Storage.BlobKind.PageBlob)
-                {
-                    writer.WriteElementString(
-                        "x-ms-blob-sequence-number",
-                        blob.SequenceNumber.ToString(CultureInfo.InvariantCulture));
-                }
-                if (blob.Kind == Storage.BlobKind.AppendBlob)
-                {
-                    writer.WriteElementString("CommittedBlockCount", blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture));
-                    if (blob.IsSealed && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
-                        writer.WriteElementString("Sealed", "true");
-                }
-                if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
-                    writer.WriteElementString("TagCount", blob.Tags.Count.ToString(CultureInfo.InvariantCulture));
-                if (includes.Contains("immutabilitypolicy") && blob.ImmutabilityUntil.HasValue)
-                {
-                    writer.WriteElementString("ImmutabilityPolicyUntilDate", blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture));
-                    writer.WriteElementString("ImmutabilityPolicyMode", blob.ImmutabilityLocked ? "locked" : "unlocked");
-                }
-                if (includes.Contains("legalhold"))
-                    writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
-                if (includes.Contains("copy") &&
-                    blob.Copy is not null &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
-                {
-                    writer.WriteElementString("CopyId", blob.Copy.Id);
-                    writer.WriteElementString("CopySource", blob.Copy.Source);
-                    writer.WriteElementString("CopyStatus", blob.Copy.Status);
-                    writer.WriteElementString("CopyProgress", $"{blob.Copy.BytesCopied}/{blob.Copy.TotalBytes}");
-                    WriteOptional(writer, "CopyCompletionTime", blob.Copy.CompletedAt?.ToString("R", CultureInfo.InvariantCulture));
-                    WriteOptional(writer, "CopyStatusDescription", blob.Copy.Description);
-                }
-                if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
-                    writer.WriteElementString("IncrementalCopy", "true");
-                if (string.Equals(blob.Copy?.Status, "success", StringComparison.Ordinal) && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
-                    WriteOptional(writer, "DestinationSnapshot", blob.CopyDestinationSnapshot);
-                writer.WriteEndElement();
-                if (includes.Contains("metadata"))
-                    WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
-                if (includes.Contains("tags") && blob.Tags.Count > 0)
-                    WriteTags(writer, blob.Tags);
-                if (blob.Kind == Storage.BlobKind.BlockBlob &&
-                    blob.ObjectReplicationStatuses.Count > 0 &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
-                {
-                    writer.WriteStartElement("OrMetadata");
-                    foreach (var status in blob.ObjectReplicationStatuses.OrderBy(
-                                 pair => pair.Key,
-                                 StringComparer.Ordinal))
-                    {
-                        writer.WriteElementString($"or-{status.Key}", status.Value.Status);
-                    }
-                    writer.WriteEndElement();
-                }
-                writer.WriteEndElement();
+                WriteBlobListEntryXml(
+                    writer,
+                    context,
+                    request,
+                    entry,
+                    includes,
+                    usesModernEndpointShape,
+                    usesModernPropertyShape,
+                    hierarchicalNamespace,
+                    lastAccessTimeTracking);
             }
             writer.WriteEndElement();
             writer.WriteElementString("NextMarker", nextMarker);
             writer.WriteEndElement();
         }, cancellationToken);
+    }
+
+    private static void WriteBlobListingEnvelopeStartXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        string prefix,
+        string delimiter,
+        string marker,
+        int maxResults,
+        bool usesModernEndpointShape)
+    {
+        writer.WriteStartElement("EnumerationResults");
+        if (usesModernEndpointShape)
+        {
+            writer.WriteAttributeString(
+                "ServiceEndpoint",
+                StorageResourcePath.GetServiceEndpoint(context.Request, request.Account));
+            writer.WriteAttributeString("ContainerName", request.Container);
+        }
+        else
+        {
+            writer.WriteAttributeString(
+                "ContainerName",
+                StorageResourcePath.GetContainerEndpoint(context.Request, request.Account, request.Container!));
+        }
+        if (context.Request.Query.ContainsKey("prefix"))
+            writer.WriteElementString("Prefix", prefix);
+        if (context.Request.Query.ContainsKey("marker"))
+            writer.WriteElementString("Marker", marker);
+        if (context.Request.Query.ContainsKey("delimiter"))
+            writer.WriteElementString("Delimiter", delimiter);
+        if (context.Request.Query.ContainsKey("maxresults"))
+            writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static void WriteBlobListEntryXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        BlobListEntry entry,
+        IReadOnlySet<string> includes,
+        bool usesModernEndpointShape,
+        bool usesModernPropertyShape,
+        bool hierarchicalNamespace,
+        bool lastAccessTimeTracking)
+    {
+        if (entry.Prefix is not null)
+        {
+            WriteBlobPrefixXml(writer, context, request, entry, includes, hierarchicalNamespace);
+            return;
+        }
+        if (entry.IsUncommitted)
+        {
+            WriteUncommittedBlobXml(writer, context, request, entry, usesModernEndpointShape);
+            return;
+        }
+
+        var blob = entry.Blob!;
+        WriteListedBlobIdentityXml(
+            writer,
+            context,
+            request,
+            blob,
+            includes,
+            usesModernEndpointShape,
+            hierarchicalNamespace);
+        if (!usesModernPropertyShape)
+        {
+            WriteLegacyBlobProperties(writer, request, blob);
+            writer.WriteEndElement();
+            return;
+        }
+        writer.WriteStartElement("Properties");
+        WriteListedBlobCorePropertiesXml(writer, context, request, blob, includes, hierarchicalNamespace);
+        WriteListedBlobTierAndEncryptionXml(writer, request, blob, hierarchicalNamespace, lastAccessTimeTracking);
+        WriteListedBlobStateXml(writer, request, blob);
+        WriteListedBlobRetentionAndCopyXml(writer, request, blob, includes);
+        writer.WriteEndElement();
+        WriteListedBlobIncludedXml(writer, request, blob, includes);
+        writer.WriteEndElement();
+    }
+
+    private static void WriteBlobPrefixXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        BlobListEntry entry,
+        IReadOnlySet<string> includes,
+        bool hierarchicalNamespace)
+    {
+        writer.WriteStartElement("BlobPrefix");
+        writer.WriteElementString("Name", entry.Prefix);
+        if (hierarchicalNamespace &&
+            IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
+        {
+            var directory = entry.Blob;
+            writer.WriteStartElement("Properties");
+            if (directory is not null)
+            {
+                if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+                {
+                    writer.WriteElementString(
+                        "Creation-Time",
+                        directory.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
+                }
+                writer.WriteElementString(
+                    "Last-Modified",
+                    directory.LastModified.ToString("R", CultureInfo.InvariantCulture));
+                writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
+                if (includes.Contains("permissions"))
+                {
+                    writer.WriteElementString("Owner", ProjectHnsIdentity(context, directory.Owner));
+                    writer.WriteElementString("Group", ProjectHnsIdentity(context, directory.Group));
+                    writer.WriteElementString("Permissions", directory.Permissions);
+                    writer.WriteElementString("Acl", directory.Acl);
+                }
+            }
+            if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+                writer.WriteElementString("ResourceType", "directory");
+            if (directory is null &&
+                string.Equals(
+                    context.Request.Query["showonly"],
+                    "deleted",
+                    StringComparison.Ordinal) &&
+                IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
+            {
+                writer.WriteElementString("Placeholder", "true");
+            }
+            writer.WriteElementString("Content-Length", "0");
+            writer.WriteElementString("BlobType", "BlockBlob");
+            if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+                writer.WriteElementString("ServerEncrypted", "true");
+            writer.WriteEndElement();
+        }
+        writer.WriteEndElement();
+    }
+
+    private static void WriteUncommittedBlobXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        BlobListEntry entry,
+        bool usesModernEndpointShape)
+    {
+        writer.WriteStartElement("Blob");
+        writer.WriteElementString("Name", entry.Name);
+        if (!usesModernEndpointShape)
+        {
+            writer.WriteElementString(
+                "Url",
+                StorageResourcePath.GetBlobEndpoint(
+                    context.Request,
+                    request.Account,
+                    request.Container!,
+                    entry.Name));
+        }
+        writer.WriteStartElement("Properties");
+        writer.WriteElementString("Content-Length", "0");
+        writer.WriteElementString("BlobType", "BlockBlob");
+        writer.WriteEndElement();
+        writer.WriteEndElement();
+    }
+
+    private static void WriteListedBlobIdentityXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        BlobRecord blob,
+        IReadOnlySet<string> includes,
+        bool usesModernEndpointShape,
+        bool hierarchicalNamespace)
+    {
+        writer.WriteStartElement("Blob");
+        writer.WriteElementString("Name", blob.Name);
+        if (!usesModernEndpointShape)
+        {
+            writer.WriteElementString(
+                "Url",
+                StorageResourcePath.GetBlobEndpoint(
+                    context.Request,
+                    request.Account,
+                    request.Container!,
+                    blob.Name));
+        }
+        if (blob.Snapshot is not null)
+            writer.WriteElementString("Snapshot", blob.Snapshot);
+        if (includes.Contains("versions") && blob.VersionId is not null)
+        {
+            writer.WriteElementString("VersionId", blob.VersionId);
+            writer.WriteElementString("IsCurrentVersion", blob.IsCurrent ? "true" : "false");
+        }
+        if (blob.IsDeleted &&
+            (hierarchicalNamespace ||
+             includes.Contains("deleted") ||
+             includes.Contains("deletedwithversions")))
+        {
+            writer.WriteElementString("Deleted", "true");
+        }
+        if (hierarchicalNamespace &&
+            blob.IsDeleted &&
+            blob.DeletionId.HasValue &&
+            IsServiceVersionAtLeast(request, new DateOnly(2020, 8, 4)))
+        {
+            writer.WriteElementString(
+                "DeletionId",
+                blob.DeletionId.Value.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    private static void WriteListedBlobCorePropertiesXml(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        BlobRecord blob,
+        IReadOnlySet<string> includes,
+        bool hierarchicalNamespace)
+    {
+        if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+            writer.WriteElementString("Creation-Time", blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture));
+        writer.WriteElementString("Last-Modified", blob.LastModified.ToString("R", CultureInfo.InvariantCulture));
+        writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
+        if (hierarchicalNamespace && includes.Contains("permissions"))
+        {
+            writer.WriteElementString("Owner", ProjectHnsIdentity(context, blob.Owner));
+            writer.WriteElementString("Group", ProjectHnsIdentity(context, blob.Group));
+            writer.WriteElementString("Permissions", blob.Permissions);
+            writer.WriteElementString("Acl", blob.Acl);
+        }
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+            writer.WriteElementString("ResourceType", blob.IsDirectory ? "directory" : "file");
+        writer.WriteElementString("Content-Length", blob.Content.Length.ToString(CultureInfo.InvariantCulture));
+        writer.WriteElementString("Content-Type", blob.Http.ContentType);
+        writer.WriteElementString("Content-Encoding", blob.Http.ContentEncoding ?? string.Empty);
+        writer.WriteElementString("Content-Language", blob.Http.ContentLanguage ?? string.Empty);
+        WriteOptional(writer, "Content-MD5", blob.Http.ContentMd5);
+        writer.WriteElementString("Cache-Control", blob.Http.CacheControl ?? string.Empty);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+            writer.WriteElementString("Content-Disposition", blob.Http.ContentDisposition ?? string.Empty);
+        writer.WriteElementString("BlobType", BlobType(blob.Kind));
+    }
+
+    private static void WriteListedBlobTierAndEncryptionXml(
+        XmlWriter writer,
+        StorageRequestContext request,
+        BlobRecord blob,
+        bool hierarchicalNamespace,
+        bool lastAccessTimeTracking)
+    {
+        if (blob.Kind == Storage.BlobKind.BlockBlob &&
+            IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
+        {
+            writer.WriteElementString("AccessTier", blob.AccessTier);
+            if (blob.AccessTierInferred)
+                writer.WriteElementString("AccessTierInferred", "true");
+            if (string.Equals(blob.AccessTier, "Smart", StringComparison.Ordinal) &&
+                IsServiceVersionAtLeast(request, new DateOnly(2026, 2, 6)))
+            {
+                WriteOptional(writer, "SmartAccessTier", blob.SmartAccessTier);
+            }
+            WriteOptional(writer, "ArchiveStatus", blob.ArchiveStatus);
+            WriteOptional(writer, "AccessTierChangeTime", blob.AccessTierChangedAt?.ToString("R", CultureInfo.InvariantCulture));
+        }
+        if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
+            writer.WriteElementString("ServerEncrypted", "true");
+        if (IsServiceVersionAtLeast(request, new DateOnly(2019, 2, 2)))
+        {
+            WriteOptional(writer, "CustomerProvidedKeySha256", blob.CustomerProvidedKeySha256);
+            WriteOptional(writer, "EncryptionScope", blob.EncryptionScope);
+        }
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2021, 6, 8)))
+            WriteOptional(writer, "EncryptionContext", blob.EncryptionContext);
+        if (IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+            WriteOptional(writer, "RehydratePriority", blob.RehydratePriority);
+        if (lastAccessTimeTracking &&
+            IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+        {
+            WriteOptional(
+                writer,
+                "LastAccessTime",
+                blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
+        }
+        if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
+            WriteOptional(writer, "Expiry-Time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
+    }
+
+    private static void WriteListedBlobStateXml(XmlWriter writer, StorageRequestContext request, BlobRecord blob)
+    {
+        if (blob.IsDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
+        {
+            WriteOptional(writer, "DeletedTime", blob.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
+            if (blob.DeleteRetentionUntil.HasValue)
+            {
+                writer.WriteElementString(
+                    "RemainingRetentionDays",
+                    RemainingRetentionDays(blob.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
+            }
+        }
+        if (blob.Snapshot is null &&
+            !blob.IsDeleted &&
+            IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)))
+        {
+            writer.WriteElementString("LeaseStatus", LeaseStatus(blob.Lease));
+            if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+            {
+                writer.WriteElementString("LeaseState", LeaseStateValue(blob.Lease));
+                if (blob.Lease.State == Storage.LeaseState.Leased)
+                {
+                    writer.WriteElementString(
+                        "LeaseDuration",
+                        blob.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+                }
+            }
+        }
+        if (blob.Kind == Storage.BlobKind.PageBlob)
+        {
+            writer.WriteElementString(
+                "x-ms-blob-sequence-number",
+                blob.SequenceNumber.ToString(CultureInfo.InvariantCulture));
+        }
+        if (blob.Kind == Storage.BlobKind.AppendBlob)
+        {
+            writer.WriteElementString("CommittedBlockCount", blob.AppendBlockCount.ToString(CultureInfo.InvariantCulture));
+            if (blob.IsSealed && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+                writer.WriteElementString("Sealed", "true");
+        }
+        if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+            writer.WriteElementString("TagCount", blob.Tags.Count.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static void WriteListedBlobRetentionAndCopyXml(
+        XmlWriter writer,
+        StorageRequestContext request,
+        BlobRecord blob,
+        IReadOnlySet<string> includes)
+    {
+        if (includes.Contains("immutabilitypolicy") && blob.ImmutabilityUntil.HasValue)
+        {
+            writer.WriteElementString("ImmutabilityPolicyUntilDate", blob.ImmutabilityUntil.Value.ToString("R", CultureInfo.InvariantCulture));
+            writer.WriteElementString("ImmutabilityPolicyMode", blob.ImmutabilityLocked ? "locked" : "unlocked");
+        }
+        if (includes.Contains("legalhold"))
+            writer.WriteElementString("LegalHold", blob.HasLegalHold ? "true" : "false");
+        if (includes.Contains("copy") &&
+            blob.Copy is not null &&
+            IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+        {
+            writer.WriteElementString("CopyId", blob.Copy.Id);
+            writer.WriteElementString("CopySource", blob.Copy.Source);
+            writer.WriteElementString("CopyStatus", blob.Copy.Status);
+            writer.WriteElementString("CopyProgress", $"{blob.Copy.BytesCopied}/{blob.Copy.TotalBytes}");
+            WriteOptional(writer, "CopyCompletionTime", blob.Copy.CompletedAt?.ToString("R", CultureInfo.InvariantCulture));
+            WriteOptional(writer, "CopyStatusDescription", blob.Copy.Description);
+        }
+        if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+            writer.WriteElementString("IncrementalCopy", "true");
+        if (string.Equals(blob.Copy?.Status, "success", StringComparison.Ordinal) && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+            WriteOptional(writer, "DestinationSnapshot", blob.CopyDestinationSnapshot);
+    }
+
+    private static void WriteListedBlobIncludedXml(
+        XmlWriter writer,
+        StorageRequestContext request,
+        BlobRecord blob,
+        IReadOnlySet<string> includes)
+    {
+        if (includes.Contains("metadata"))
+            WriteMetadata(writer, blob.Metadata, blob.CustomerProvidedKeySha256 is not null);
+        if (includes.Contains("tags") && blob.Tags.Count > 0)
+            WriteTags(writer, blob.Tags);
+        if (blob.Kind == Storage.BlobKind.BlockBlob &&
+            blob.ObjectReplicationStatuses.Count > 0 &&
+            IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
+        {
+            writer.WriteStartElement("OrMetadata");
+            foreach (var status in blob.ObjectReplicationStatuses.OrderBy(
+                         pair => pair.Key,
+                         StringComparer.Ordinal))
+            {
+                writer.WriteElementString($"or-{status.Key}", status.Value.Status);
+            }
+            writer.WriteEndElement();
+        }
     }
 
     public static Task WriteTagsAsync(HttpContext context, IReadOnlyDictionary<string, string> tags, CancellationToken cancellationToken) =>
