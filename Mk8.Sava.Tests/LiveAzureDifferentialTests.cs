@@ -26,7 +26,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task FlatNamespaceDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -48,7 +48,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task HierarchicalNamespaceDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -73,7 +73,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Fact]
     public async Task FlatAuthorizationDifferentialScenarioRunsAgainstLocalService()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -114,7 +114,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
             Retry = { MaxRetries = 0 }
         });
         Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -151,7 +151,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
             Retry = { MaxRetries = 0 }
         });
         Assert.True((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -187,7 +187,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
             Retry = { MaxRetries = 0 }
         });
         Assert.False((await remote.GetAccountInfoAsync()).Value.IsHierarchicalNamespaceEnabled);
-        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var localApplication = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -249,40 +249,40 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         BlobContainerClient container,
         Func<Uri, BlobClient> createSasClient)
     {
-        await container.CreateAsync();
+        await container.CreateAsync().ConfigureAwait(false);
         var blob = container.GetBlobClient("protected.txt");
-        await blob.UploadAsync(BinaryData.FromString("original-content"));
+        await blob.UploadAsync(BinaryData.FromString("original-content")).ConfigureAwait(false);
         Assert.True(blob.CanGenerateSasUri);
         var sas = createSasClient(blob.GenerateSasUri(
             BlobSasPermissions.Read,
             DateTimeOffset.UtcNow.AddMinutes(10)));
-        var sasBytes = (await sas.DownloadContentAsync()).Value.Content.ToString();
+        var sasBytes = (await sas.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
         var deniedSasWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            sas.UploadAsync(BinaryData.FromString("blocked"), overwrite: true));
+            sas.UploadAsync(BinaryData.FromString("blocked"), overwrite: true)).ConfigureAwait(false);
         var staleCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
             blob.GetPropertiesAsync(new BlobRequestConditions
             {
                 IfMatch = new ETag("\"not-the-current-etag\"")
-            }));
+            })).ConfigureAwait(false);
 
         var lease = blob.GetBlobLeaseClient();
-        var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15));
+        var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
         RequestFailedException missingLease;
         try
         {
             missingLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                blob.SetMetadataAsync(new Dictionary<string, string> { ["state"] = "blocked" }));
+                blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "blocked" })).ConfigureAwait(false);
             await blob.SetMetadataAsync(
-                new Dictionary<string, string> { ["state"] = "authorized" },
-                new BlobRequestConditions { LeaseId = acquired.Value.LeaseId });
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "authorized" },
+                new BlobRequestConditions { LeaseId = acquired.Value.LeaseId }).ConfigureAwait(false);
         }
         finally
         {
-            await lease.ReleaseAsync();
+            await lease.ReleaseAsync().ConfigureAwait(false);
         }
 
-        var properties = await blob.GetPropertiesAsync();
-        var finalBytes = (await blob.DownloadContentAsync()).Value.Content.ToString();
+        var properties = await blob.GetPropertiesAsync().ConfigureAwait(false);
+        var finalBytes = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
         return new AuthorizationObservation(
             sasBytes,
             deniedSasWrite.Status,
@@ -297,19 +297,19 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
 
     private static async Task<HierarchicalObservation> ExerciseHierarchicalAsync(BlobContainerClient container)
     {
-        await container.CreateAsync();
+        await container.CreateAsync().ConfigureAwait(false);
         var file = container.GetBlobClient("alpha/beta/file.txt");
-        await file.UploadAsync(BinaryData.FromString("nested HNS content"));
-        await container.GetBlobClient("zeta.txt").UploadAsync(BinaryData.FromString("root content"));
-        var alpha = await container.GetBlobClient("alpha").GetPropertiesAsync();
-        var beta = await container.GetBlobClient("alpha/beta").GetPropertiesAsync();
-        var fileProperties = await file.GetPropertiesAsync();
-        var downloaded = await file.DownloadContentAsync();
+        await file.UploadAsync(BinaryData.FromString("nested HNS content")).ConfigureAwait(false);
+        await container.GetBlobClient("zeta.txt").UploadAsync(BinaryData.FromString("root content")).ConfigureAwait(false);
+        var alpha = await container.GetBlobClient("alpha").GetPropertiesAsync().ConfigureAwait(false);
+        var beta = await container.GetBlobClient("alpha/beta").GetPropertiesAsync().ConfigureAwait(false);
+        var fileProperties = await file.GetPropertiesAsync().ConfigureAwait(false);
+        var downloaded = await file.DownloadContentAsync().ConfigureAwait(false);
         var names = new List<string>();
-        await foreach (var item in container.GetBlobsAsync())
+        await foreach (var item in container.GetBlobsAsync().ConfigureAwait(false))
             names.Add(item.Name);
         var notEmpty = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient("alpha").DeleteAsync());
+            container.GetBlobClient("alpha").DeleteAsync()).ConfigureAwait(false);
 
         Assert.Equal("directory", RequiredHeader(alpha, "x-ms-resource-type"));
         Assert.Equal("directory", RequiredHeader(beta, "x-ms-resource-type"));
@@ -340,7 +340,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
 
     private static async Task<FlatObservation> ExerciseAsync(BlobContainerClient container)
     {
-        var created = await container.CreateAsync();
+        var created = await container.CreateAsync().ConfigureAwait(false);
         var bytes = new byte[128 * 1024];
         new Random(0x4D4B38).NextBytes(bytes);
         var blob = container.GetBlobClient("nested/original.bin");
@@ -350,50 +350,50 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
             {
                 ContentType = "application/x-mk8-differential"
             },
-            Metadata = new Dictionary<string, string> { ["case"] = "flat" },
-            Tags = new Dictionary<string, string> { ["phase"] = "initial" }
-        });
-        var properties = await blob.GetPropertiesAsync();
-        var tags = await blob.GetTagsAsync();
-        var downloaded = await blob.DownloadContentAsync();
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["case"] = "flat" },
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "initial" }
+        }).ConfigureAwait(false);
+        var properties = await blob.GetPropertiesAsync().ConfigureAwait(false);
+        var tags = await blob.GetTagsAsync().ConfigureAwait(false);
+        var downloaded = await blob.DownloadContentAsync().ConfigureAwait(false);
         var ranged = await blob.DownloadStreamingAsync(new BlobDownloadOptions
         {
             Range = new HttpRange(4093, 8195)
-        });
+        }).ConfigureAwait(false);
         using var rangeBuffer = new MemoryStream();
-        await ranged.Value.Content.CopyToAsync(rangeBuffer);
+        await ranged.Value.Content.CopyToAsync(rangeBuffer).ConfigureAwait(false);
 
-        var snapshot = await blob.CreateSnapshotAsync();
-        await blob.UploadAsync(BinaryData.FromString("replacement"), overwrite: true);
-        var snapshotContent = await blob.WithSnapshot(snapshot.Value.Snapshot).DownloadContentAsync();
+        var snapshot = await blob.CreateSnapshotAsync().ConfigureAwait(false);
+        await blob.UploadAsync(BinaryData.FromString("replacement"), overwrite: true).ConfigureAwait(false);
+        var snapshotContent = await blob.WithSnapshot(snapshot.Value.Snapshot).DownloadContentAsync().ConfigureAwait(false);
 
         var block = container.GetBlockBlobClient("blocks.bin");
         var firstBlockId = Convert.ToBase64String("000001"u8);
         var secondBlockId = Convert.ToBase64String("000002"u8);
-        await block.StageBlockAsync(firstBlockId, BinaryData.FromString("alpha").ToStream());
-        await block.StageBlockAsync(secondBlockId, BinaryData.FromString("beta").ToStream());
-        await block.CommitBlockListAsync([secondBlockId, firstBlockId]);
-        var blockContent = await block.DownloadContentAsync();
-        var blockList = await block.GetBlockListAsync(BlockListTypes.Committed);
+        await block.StageBlockAsync(firstBlockId, BinaryData.FromString("alpha").ToStream()).ConfigureAwait(false);
+        await block.StageBlockAsync(secondBlockId, BinaryData.FromString("beta").ToStream()).ConfigureAwait(false);
+        await block.CommitBlockListAsync([secondBlockId, firstBlockId]).ConfigureAwait(false);
+        var blockContent = await block.DownloadContentAsync().ConfigureAwait(false);
+        var blockList = await block.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false);
 
         var append = container.GetAppendBlobClient("append.log");
-        await append.CreateAsync();
-        await append.AppendBlockAsync(BinaryData.FromString("first|").ToStream());
-        await append.AppendBlockAsync(BinaryData.FromString("second").ToStream());
-        var appendContent = await append.DownloadContentAsync();
+        await append.CreateAsync().ConfigureAwait(false);
+        await append.AppendBlockAsync(BinaryData.FromString("first|").ToStream()).ConfigureAwait(false);
+        await append.AppendBlockAsync(BinaryData.FromString("second").ToStream()).ConfigureAwait(false);
+        var appendContent = await append.DownloadContentAsync().ConfigureAwait(false);
 
         var page = container.GetPageBlobClient("page.bin");
-        await page.CreateAsync(1024);
+        await page.CreateAsync(1024).ConfigureAwait(false);
         var pageBytes = new byte[512];
         new Random(0x50414745).NextBytes(pageBytes);
-        await page.UploadPagesAsync(new MemoryStream(pageBytes, writable: false), 512);
-        var pageContent = await page.DownloadContentAsync();
+        await page.UploadPagesAsync(new MemoryStream(pageBytes, writable: false), 512).ConfigureAwait(false);
+        var pageContent = await page.DownloadContentAsync().ConfigureAwait(false);
 
         var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient("missing.bin").GetPropertiesAsync());
+            container.GetBlobClient("missing.bin").GetPropertiesAsync()).ConfigureAwait(false);
         Assert.NotNull(missing.ErrorCode);
         var names = new List<string>();
-        await foreach (var item in container.GetBlobsAsync())
+        await foreach (var item in container.GetBlobsAsync().ConfigureAwait(false))
             names.Add(item.Name);
 
         Assert.Equal(bytes, downloaded.Value.Content.ToArray());
@@ -403,7 +403,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         Assert.Equal("first|second", appendContent.Value.Content.ToString());
         Assert.Equal(pageBytes, pageContent.Value.Content.ToArray().AsSpan(512, 512).ToArray());
         Assert.Equal(new[] { firstBlockId, secondBlockId },
-            blockList.Value.CommittedBlocks.Select(item => item.Name).Order(StringComparer.Ordinal));
+            blockList.Value.CommittedBlocks.Select(item => item.Name).Order(StringComparer.Ordinal), StringComparer.Ordinal);
 
         return new FlatObservation(
             created.GetRawResponse().Status,
@@ -428,7 +428,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     {
         try
         {
-            await container.DeleteIfExistsAsync();
+            await container.DeleteIfExistsAsync().ConfigureAwait(false);
         }
         catch (RequestFailedException exception) when (exception.Status == 404)
         {

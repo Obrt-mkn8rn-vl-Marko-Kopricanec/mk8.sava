@@ -16,7 +16,7 @@ public sealed class StorageCrashHarnessTests
     private const string BlobName = "durable.bin";
 
     private static readonly IReadOnlyDictionary<string, string?> CrashConfiguration =
-        new Dictionary<string, string?>
+        new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
@@ -24,7 +24,7 @@ public sealed class StorageCrashHarnessTests
         };
 
     private static readonly IReadOnlyDictionary<string, string?> PackCrashConfiguration =
-        new Dictionary<string, string?>
+        new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:SmallChunkPackingThresholdBytes"] = "4096",

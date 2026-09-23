@@ -21,7 +21,7 @@ public sealed class StorageConfigurationTests
 
         Assert.Contains(
             options.Validate(new ValidationContext(options)),
-            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageScanInterval)));
+            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageScanInterval), StringComparer.Ordinal));
     }
 
     [Fact]
@@ -38,7 +38,7 @@ public sealed class StorageConfigurationTests
 
         Assert.Contains(
             options.Validate(new ValidationContext(options)),
-            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageEntriesPerMaintenancePass)));
+            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageEntriesPerMaintenancePass), StringComparer.Ordinal));
     }
 
     [Theory]
@@ -60,7 +60,7 @@ public sealed class StorageConfigurationTests
 
         Assert.Contains(
             options.Validate(new ValidationContext(options)),
-            error => error.MemberNames.Contains(nameof(SavaOptions.UrlTransferAllowedPrivateHosts)));
+            error => error.MemberNames.Contains(nameof(SavaOptions.UrlTransferAllowedPrivateHosts), StringComparer.Ordinal));
     }
 
     [Theory]
@@ -83,7 +83,7 @@ public sealed class StorageConfigurationTests
 
         var errors = options.Validate(new ValidationContext(options)).ToArray();
 
-        Assert.Contains(errors, error => error.MemberNames.Contains(nameof(SavaOptions.Accounts)) &&
+        Assert.Contains(errors, error => error.MemberNames.Contains(nameof(SavaOptions.Accounts), StringComparer.Ordinal) &&
                                          error.ErrorMessage!.Contains("Storage account name", StringComparison.Ordinal));
     }
 

@@ -16,7 +16,7 @@ public sealed class ChunkCollisionTests
             Path.Combine(Path.GetTempPath(), $"mk8-sava-collision-{Guid.NewGuid():N}"),
             new NullStorageFaultInjector(),
             analyticsSink: null,
-            configurationOverrides: new Dictionary<string, string?>
+            configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:EnableSmallChunkPacking"] = packed.ToString(),
                 ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -49,7 +49,7 @@ public sealed class ChunkCollisionTests
             CancellationToken.None);
         var firstId = Assert.Single(first.Manifest.Chunks).Id;
         var secondId = Assert.Single(second.Manifest.Chunks).Id;
-        Assert.NotEqual(firstId, secondId);
+        Assert.NotEqual(firstId, secondId, StringComparer.Ordinal);
         Assert.EndsWith("-1024", firstId, StringComparison.Ordinal);
         Assert.EndsWith("-1024-1", secondId, StringComparison.Ordinal);
         Assert.Equal(

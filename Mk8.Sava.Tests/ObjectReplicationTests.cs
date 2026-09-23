@@ -39,8 +39,8 @@ public sealed class ObjectReplicationTests
         await sourceBlob.UploadAsync(BinaryData.FromBytes(bytes), new BlobUploadOptions
         {
             HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-object-replication" },
-            Metadata = new Dictionary<string, string> { ["owner"] = "source" },
-            Tags = new Dictionary<string, string> { ["replicated"] = "yes" }
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["owner"] = "source" },
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["replicated"] = "yes" }
         });
 
         var maintenance = await factory.Services.GetRequiredService<BlobService>()
@@ -99,7 +99,7 @@ public sealed class ObjectReplicationTests
         var sourceBlob = sourceContainer.GetBlobClient("blob.bin");
         await sourceBlob.UploadAsync(BinaryData.FromString("replicated"), new BlobUploadOptions
         {
-            Tags = new Dictionary<string, string> { ["source-only"] = "true" }
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["source-only"] = "true" }
         });
         var service = factory.Services.GetRequiredService<BlobService>();
         _ = await service.RunMaintenanceAsync(CancellationToken.None);
@@ -107,11 +107,11 @@ public sealed class ObjectReplicationTests
         Assert.Empty((await destinationBlob.GetTagsAsync()).Value.Tags);
 
         var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            destinationBlob.SetMetadataAsync(new Dictionary<string, string> { ["forbidden"] = "true" }));
+            destinationBlob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["forbidden"] = "true" }));
         Assert.Equal(409, rejected.Status);
         Assert.Equal("BlobOperationNotSupported", rejected.ErrorCode);
         await destinationBlob.SetAccessTierAsync(AccessTier.Archive);
-        await sourceBlob.SetMetadataAsync(new Dictionary<string, string> { ["archive_trigger"] = "true" });
+        await sourceBlob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["archive_trigger"] = "true" });
         var archivedDestination = await service.RunMaintenanceAsync(CancellationToken.None);
         Assert.Equal(2, archivedDestination.FailedObjectReplications);
         var failedRule = Assert.Single(Assert.Single(
@@ -122,7 +122,7 @@ public sealed class ObjectReplicationTests
         _ = await service.RunMaintenanceAsync(CancellationToken.None);
         Assert.False(await destinationBlob.ExistsAsync());
 
-        await sourceBlob.SetMetadataAsync(new Dictionary<string, string> { ["changed"] = "true" });
+        await sourceBlob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["changed"] = "true" });
         var changed = await service.RunMaintenanceAsync(CancellationToken.None);
         Assert.Equal(2, changed.CompletedObjectReplications);
         Assert.True(await destinationBlob.ExistsAsync());
@@ -313,7 +313,7 @@ public sealed class ObjectReplicationTests
         string sourceContainer,
         string destinationContainer,
         bool replicateTags) =>
-        new()
+        new(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "1.00:00:00",
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",

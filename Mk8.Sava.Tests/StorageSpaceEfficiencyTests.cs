@@ -16,7 +16,7 @@ public sealed class StorageSpaceEfficiencyTests
     [Fact]
     public async Task LegacyMsavaMarkerCannotProveEqualityOrChangeClientBytes()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -37,7 +37,7 @@ public sealed class StorageSpaceEfficiencyTests
         await original.UploadAsync(BinaryData.FromBytes(originalBytes));
         await marked.UploadAsync(BinaryData.FromBytes(markedBytes), new BlobUploadOptions
         {
-            Metadata = new Dictionary<string, string> { ["MsavaSignature"] = marker }
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["MsavaSignature"] = marker }
         });
 
         Assert.Equal(originalBytes, (await original.DownloadContentAsync()).Value.Content.ToArray());
@@ -60,7 +60,7 @@ public sealed class StorageSpaceEfficiencyTests
             snapshot: null,
             includeDeleted: false,
             CancellationToken.None);
-        Assert.NotEqual(originalRecord.Content.Sha256, markedRecord.Content.Sha256);
+        Assert.NotEqual(originalRecord.Content.Sha256, markedRecord.Content.Sha256, StringComparer.Ordinal);
         Assert.Equal(markedBytes.Length, markedRecord.Content.Length);
     }
 
@@ -72,7 +72,7 @@ public sealed class StorageSpaceEfficiencyTests
 
         var external = Path.Combine(Path.GetTempPath(), $"mk8-sava-usage-external-{Guid.NewGuid():N}");
         Directory.CreateDirectory(external);
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -202,7 +202,7 @@ public sealed class StorageSpaceEfficiencyTests
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-legacy-chunk-dirs-{Guid.NewGuid():N}");
         var externalPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-external-dir-{Guid.NewGuid():N}");
         var containerName = $"legacy-directories-{Guid.NewGuid():N}";
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         };
@@ -271,7 +271,7 @@ public sealed class StorageSpaceEfficiencyTests
     [Fact]
     public async Task GarbageCollectionReclaimsEmptyStandaloneChunkDirectoriesAndCanRecreateThem()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -342,7 +342,7 @@ public sealed class StorageSpaceEfficiencyTests
     [Fact]
     public async Task ConcurrentStandalonePublicationAndDirectoryPruningKeepPinnedBytesReadable()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -358,7 +358,7 @@ public sealed class StorageSpaceEfficiencyTests
             {
                 while (!stop.IsCancellationRequested)
                 {
-                    await service.CollectGarbageAsync(stop.Token);
+                    await service.CollectGarbageAsync(stop.Token).ConfigureAwait(false);
                     await Task.Yield();
                 }
             }
@@ -377,7 +377,7 @@ public sealed class StorageSpaceEfficiencyTests
                     SavaWebApplicationFactory.AccountName,
                     encryption,
                     new MemoryStream(bytes, writable: false),
-                    CancellationToken.None);
+                    CancellationToken.None).ConfigureAwait(false);
                 using var output = new MemoryStream();
                 await chunks.WriteRangeAsync(
                     stored.Manifest,
@@ -385,7 +385,7 @@ public sealed class StorageSpaceEfficiencyTests
                     0,
                     bytes.Length,
                     output,
-                    CancellationToken.None);
+                    CancellationToken.None).ConfigureAwait(false);
                 Assert.Equal(bytes, output.ToArray());
             }));
         }
@@ -405,7 +405,7 @@ public sealed class StorageSpaceEfficiencyTests
     [Fact]
     public async Task PackedSmallChunksDoNotAllocateUnusedHashDirectories()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         });
@@ -448,7 +448,7 @@ public sealed class StorageSpaceEfficiencyTests
     [Fact]
     public async Task ContentDefinedChunksRemainSharedAfterAnEarlyInsertion()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"

@@ -59,7 +59,7 @@ public sealed class AzureOperationResponseShapeTests(SavaWebApplicationFactory f
             new BlobUploadOptions
             {
                 Metadata = MarkerMetadata(),
-                Tags = new Dictionary<string, string> { ["class"] = "write" },
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["class"] = "write" },
                 HttpHeaders = new BlobHttpHeaders
                 {
                     ContentType = "application/x-operation-response",
@@ -144,7 +144,7 @@ public sealed class AzureOperationResponseShapeTests(SavaWebApplicationFactory f
         AssertNoReadOnlyHeaders(ranges.GetRawResponse(), "Content-Type");
     }
 
-    private static Dictionary<string, string> MarkerMetadata() => new() { ["marker"] = "must-not-leak" };
+    private static Dictionary<string, string> MarkerMetadata() => new(StringComparer.Ordinal) { ["marker"] = "must-not-leak" };
 
     private static void AssertEntityResponse(Response response)
     {

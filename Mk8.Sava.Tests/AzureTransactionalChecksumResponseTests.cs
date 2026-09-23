@@ -93,7 +93,7 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
         };
         request.Headers.TryAddWithoutValidation("x-ms-version", version);
         request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-        return await transport.SendAsync(request);
+        return await transport.SendAsync(request).ConfigureAwait(false);
     }
 
     private static async Task<HttpResponseMessage> PutBlockAsync(
@@ -116,7 +116,7 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
         request.Headers.TryAddWithoutValidation("x-ms-version", version);
         if (sendMd5)
             request.Content.Headers.ContentMD5 = MD5.HashData(content);
-        return await transport.SendAsync(request);
+        return await transport.SendAsync(request).ConfigureAwait(false);
     }
 
     private static void AssertChecksums(

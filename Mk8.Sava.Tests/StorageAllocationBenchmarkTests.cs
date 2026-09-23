@@ -27,7 +27,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
         Directory.CreateDirectory(rawRoot);
         try
         {
-            await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+            await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
@@ -81,7 +81,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                         peakWorkingSet = Math.Max(peakWorkingSet, sampledProcess.WorkingSet64);
                         try
                         {
-                            await Task.Delay(TimeSpan.FromMilliseconds(10), samplingCancellation.Token);
+                            await Task.Delay(TimeSpan.FromMilliseconds(10), samplingCancellation.Token).ConfigureAwait(false);
                         }
                         catch (OperationCanceledException) when (samplingCancellation.IsCancellationRequested)
                         {
@@ -92,12 +92,12 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 (double UploadMs, double ReadMs) timing;
                 try
                 {
-                    timing = await operation();
+                    timing = await operation().ConfigureAwait(false);
                 }
                 finally
                 {
                     samplingCancellation.Cancel();
-                    await sampler;
+                    await sampler.ConfigureAwait(false);
                 }
                 var process = Process.GetCurrentProcess();
                 peakWorkingSet = Math.Max(peakWorkingSet, process.WorkingSet64);
@@ -105,17 +105,17 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 output.WriteLine(string.Join(',',
                     workload,
                     logicalBytes.ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(application.DataPath)).ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(rawRoot)).ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db")) +
-                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")) +
-                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")))
+                    (await MeasureAllocatedBytesAsync(application.DataPath).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(rawRoot).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db")).ConfigureAwait(false) +
+                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")).ConfigureAwait(false) +
+                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")).ConfigureAwait(false))
                     .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")))
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")).ConfigureAwait(false))
                     .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "packs")))
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "packs")).ConfigureAwait(false))
                     .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "staging")))
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "staging")).ConfigureAwait(false))
                     .ToString(CultureInfo.InvariantCulture),
                     timing.UploadMs.ToString("F3", CultureInfo.InvariantCulture),
                     timing.ReadMs.ToString("F3", CultureInfo.InvariantCulture),
@@ -128,9 +128,9 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
             {
                 var watch = Stopwatch.StartNew();
-                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromBytes(content), overwrite: true);
+                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
                 watch.Stop();
-                await File.WriteAllBytesAsync(Path.Combine(rawRoot, rawName), content);
+                await File.WriteAllBytesAsync(Path.Combine(rawRoot, rawName), content).ConfigureAwait(false);
                 logicalBytes = checked(logicalBytes + content.Length);
                 return watch.Elapsed.TotalMilliseconds;
             }
@@ -138,7 +138,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             async Task<double> VerifyAsync(string blobName, byte[] expected)
             {
                 var watch = Stopwatch.StartNew();
-                var actual = await container.GetBlobClient(blobName).DownloadContentAsync();
+                var actual = await container.GetBlobClient(blobName).DownloadContentAsync().ConfigureAwait(false);
                 watch.Stop();
                 Assert.Equal(expected, actual.Value.Content.ToArray());
                 return watch.Elapsed.TotalMilliseconds;
@@ -150,7 +150,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             {
                 double write = 0;
                 for (var index = 0; index < 8; index++)
-                    write += await UploadAsync($"duplicate-{index}.bin", $"duplicate-{index}.bin", duplicate);
+                    write += await UploadAsync($"duplicate-{index}.bin", $"duplicate-{index}.bin", duplicate).ConfigureAwait(false);
                 return (write, await VerifyAsync("duplicate-7.bin", duplicate));
             });
 
@@ -166,7 +166,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     sharedBase.AsSpan(0, 2048).CopyTo(latest);
                     new Random(0x5200 + index).NextBytes(latest.AsSpan(2048, 4096));
                     sharedBase.AsSpan(2048).CopyTo(latest.AsSpan(6144));
-                    write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest);
+                    write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("partial-4.bin", latest));
             });
@@ -179,7 +179,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 {
                     latest = new byte[128 * 1024];
                     latest.AsSpan().Fill((byte)('A' + index));
-                    write += await UploadAsync("versioned.bin", $"version-{index}.bin", latest);
+                    write += await UploadAsync("versioned.bin", $"version-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("versioned.bin", latest));
             });
@@ -192,7 +192,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 {
                     latest = new byte[80];
                     new Random(0x5300 + index).NextBytes(latest);
-                    write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest);
+                    write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("small-127.bin", latest));
             });
@@ -205,7 +205,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 {
                     latest = new byte[512 * 1024];
                     new Random(0x5400 + index).NextBytes(latest);
-                    write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest);
+                    write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("random-3.bin", latest));
             });
@@ -235,9 +235,9 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
         using (process)
         {
             process.Start();
-            var output = await process.StandardOutput.ReadToEndAsync();
-            var error = await process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
+            var output = await process.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+            var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+            await process.WaitForExitAsync().ConfigureAwait(false);
             if (process.ExitCode != 0)
                 throw new InvalidOperationException($"du failed while measuring filesystem allocation: {error}");
             var separator = output.IndexOf('\t');

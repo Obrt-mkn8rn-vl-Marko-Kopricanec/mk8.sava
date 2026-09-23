@@ -17,7 +17,7 @@ public sealed class AzureRehydrationPriorityTests
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 12, 0, 0, TimeSpan.Zero));
         await using var application = new SavaWebApplicationFactory(
             clock,
-            new Dictionary<string, string?>
+            new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
@@ -97,7 +97,7 @@ public sealed class AzureRehydrationPriorityTests
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 13, 0, 0, TimeSpan.Zero));
         await using var application = new SavaWebApplicationFactory(
             clock,
-            new Dictionary<string, string?>
+            new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:StandardRehydrationDelay"] = "00:00:05",
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:01",
@@ -268,7 +268,7 @@ public sealed class AzureRehydrationPriorityTests
         HttpStatusCode status,
         string errorCode)
     {
-        using var response = await transport.SendAsync(request);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
         Assert.Equal(status, response.StatusCode);
         Assert.Equal(errorCode, response.Headers.GetValues("x-ms-error-code").Single());
     }

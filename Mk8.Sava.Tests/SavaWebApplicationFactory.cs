@@ -130,7 +130,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     {
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
-            configuration.AddInMemoryCollection(new Dictionary<string, string?>
+            configuration.AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:DataPath"] = DataPath,
                 ["Sava:DefaultAccount"] = AccountName,
@@ -224,7 +224,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 
     public new async Task DisposeAsync()
     {
-        await base.DisposeAsync();
+        await base.DisposeAsync().ConfigureAwait(false);
         if (_deleteDataPath && Directory.Exists(DataPath))
             Directory.Delete(DataPath, recursive: true);
     }

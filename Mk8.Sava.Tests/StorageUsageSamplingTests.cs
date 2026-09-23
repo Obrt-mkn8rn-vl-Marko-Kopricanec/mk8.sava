@@ -16,7 +16,7 @@ public sealed class StorageUsageSamplingTests
             Path.Combine(Path.GetTempPath(), $"mk8-sava-usage-budget-{Guid.NewGuid():N}"),
             new NullStorageFaultInjector(),
             analyticsSink: null,
-            configurationOverrides: new Dictionary<string, string?>
+            configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
                 ["Sava:PhysicalUsageScanInterval"] = "01:00:00",
@@ -70,7 +70,7 @@ public sealed class StorageUsageSamplingTests
             Path.Combine(Path.GetTempPath(), $"mk8-sava-usage-sample-{Guid.NewGuid():N}"),
             new NullStorageFaultInjector(),
             analyticsSink: null,
-            configurationOverrides: new Dictionary<string, string?>
+            configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
                 ["Sava:PhysicalUsageScanInterval"] = scanInterval,
