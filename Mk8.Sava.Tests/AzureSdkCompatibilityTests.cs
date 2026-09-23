@@ -1739,9 +1739,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             [$"Sava:BearerAuthentication:Principals:{creatorId}:Accounts:0"] = SavaWebApplicationFactory.AccountName,
             [$"Sava:BearerAuthentication:Principals:{creatorId}:Permissions"] = "racwdxltmeop",
+            [$"Sava:BearerAuthentication:Principals:{creatorId}:UserPrincipalName"] = "creator@example.test",
             [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:Accounts:0"] =
                 SavaWebApplicationFactory.AccountName,
             [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:Permissions"] = "cw",
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:UserPrincipalName"] =
+                "delegated@example.test",
             [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:CanGenerateUserDelegationKey"] = "true"
         };
 
@@ -1835,6 +1838,42 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var directory = Assert.Single(document.Descendants("BlobPrefix"));
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Owner")?.Value);
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Group")?.Value);
+
+            using var head = new HttpRequestMessage(
+                HttpMethod.Head,
+                container.GetBlobClient("parent/delegated.txt").GenerateSasUri(
+                    BlobSasPermissions.Read,
+                    DateTimeOffset.UtcNow.AddMinutes(5)));
+            head.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            head.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+            using var projectedHead = await transport.SendAsync(head);
+            Assert.Equal(HttpStatusCode.OK, projectedHead.StatusCode);
+            Assert.Equal("delegated@example.test", GetResponseHeader(projectedHead, "x-ms-owner"));
+            Assert.Equal("creator@example.test", GetResponseHeader(projectedHead, "x-ms-group"));
+
+            using var projectedListRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
+            projectedListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            projectedListRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+            using var projectedListResponse = await transport.SendAsync(projectedListRequest);
+            Assert.Equal(HttpStatusCode.OK, projectedListResponse.StatusCode);
+            var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync());
+            var projectedDirectory = Assert.Single(projectedList.Descendants("BlobPrefix"));
+            Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Owner")?.Value);
+            Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Group")?.Value);
+
+            var recursiveUri = AppendQuery(
+                container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "restype=container&comp=list&include=permissions");
+            using var recursiveRequest = new HttpRequestMessage(HttpMethod.Get, recursiveUri);
+            recursiveRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            recursiveRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+            using var recursiveResponse = await transport.SendAsync(recursiveRequest);
+            Assert.Equal(HttpStatusCode.OK, recursiveResponse.StatusCode);
+            var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync());
+            var delegatedEntry = recursive.Descendants("Blob").Single(element =>
+                element.Element("Name")?.Value == "parent/delegated.txt");
+            Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
+            Assert.Equal("creator@example.test", delegatedEntry.Element("Properties")?.Element("Group")?.Value);
         }
     }
 

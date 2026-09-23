@@ -576,4 +576,5 @@ public sealed class BearerPrincipalAccess
     public List<string> Accounts { get; init; } = [];
     public List<string> Containers { get; init; } = [];
     public bool CanGenerateUserDelegationKey { get; init; }
+    public string? UserPrincipalName { get; init; }
 }

@@ -457,9 +457,11 @@ directories; it does not implement the separate `dfs` ACL mutation protocol.
 HNS identity projection follows the Blob REST request shape. List Blobs accepts
 `x-ms-upn` only when `include=permissions` is present. Get Blob and Get Blob
 Properties accept it only from service version 2023-11-03. The value must be a
-Boolean and the header is rejected for flat-namespace accounts. A request with
-`x-ms-upn=true` currently returns object IDs for Entra-owned paths rather than
-resolving them to user-principal names; `$superuser` is unchanged.
+Boolean and the header is rejected for flat-namespace accounts. Configure
+`Sava:BearerAuthentication:Principals:<object-id>:UserPrincipalName` for each
+user whose object ID should be projected when `x-ms-upn=true`; unknown object
+IDs and `$superuser` remain unchanged. The mapping is evaluated when a response
+is written, so changing a configured name does not rewrite stored paths.
 
 Blob expiry is likewise confined to HNS files. Set Blob Expiry is available
 from service version 2020-02-10 and rejects directories. Put Blob, Put Block
