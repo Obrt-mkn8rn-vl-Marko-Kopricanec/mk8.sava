@@ -124,7 +124,7 @@ public sealed class AzurePutBlobTypeSemanticsTests(SavaWebApplicationFactory fac
         byte[] content)
     {
         using var request = CreatePutRequest(blob, requestedType, content);
-        if (requestedType == "PageBlob")
+        if (string.Equals(requestedType, "PageBlob", StringComparison.Ordinal))
             request.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
         using var response = await transport.SendAsync(request).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);

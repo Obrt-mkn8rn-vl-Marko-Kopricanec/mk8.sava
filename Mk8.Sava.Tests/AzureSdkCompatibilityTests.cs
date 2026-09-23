@@ -798,7 +798,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     includeSnapshots: true,
                     includeDeleted: false,
                     CancellationToken.None))
-                .Where(item => item.Name == versioned.Name)
+                .Where(item => string.Equals(item.Name, versioned.Name, StringComparison.Ordinal))
                 .ToArray();
             var listed = new List<BlobItem>();
             var flatTokens = new HashSet<string>(StringComparer.Ordinal);
@@ -1139,13 +1139,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
         Assert.Equal(pendingNames.Append(committed.Name).Order(StringComparer.Ordinal), listed.Select(item => item.Name), StringComparer.Ordinal);
         Assert.Equal(listed.Count - 1, markers.Count);
-        foreach (var pending in listed.Where(item => item.Name != committed.Name))
+        foreach (var pending in listed.Where(item => !string.Equals(item.Name, committed.Name, StringComparison.Ordinal)))
         {
             Assert.Equal(BlobType.Block, pending.Properties.BlobType);
             Assert.Equal(0, pending.Properties.ContentLength);
             Assert.Null(pending.Properties.ContentType);
         }
-        Assert.Equal("committed"u8.Length, listed.Single(item => item.Name == committed.Name).Properties.ContentLength);
+        Assert.Equal("committed"u8.Length, listed.Single(item => string.Equals(item.Name, committed.Name, StringComparison.Ordinal)).Properties.ContentLength);
 
         var hierarchical = new List<string>();
         await foreach (var item in container.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
@@ -1183,7 +1183,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.OK, rawResponse.StatusCode);
             var document = System.Xml.Linq.XDocument.Parse(await rawResponse.Content.ReadAsStringAsync());
             var pending = document.Descendants("Blob")
-                .Single(element => element.Element("Name")?.Value == pendingNames[0]);
+                .Single(element => string.Equals(element.Element("Name")?.Value, pendingNames[0], StringComparison.Ordinal));
             var properties = Assert.IsType<System.Xml.Linq.XElement>(pending.Element("Properties"));
             Assert.Equal("0", properties.Element("Content-Length")?.Value);
             Assert.Equal("BlockBlob", properties.Element("BlobType")?.Value);
@@ -1557,7 +1557,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(HttpStatusCode.OK, listResponse.StatusCode);
         var document = System.Xml.Linq.XDocument.Parse(await listResponse.Content.ReadAsStringAsync());
         var deleted = document.Descendants("Blob")
-            .Where(element => element.Element("Name")?.Value == blob.Name)
+            .Where(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal))
             .ToArray();
         Assert.Equal(2, deleted.Length);
         var deletionIds = deleted
@@ -1904,8 +1904,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using var recursiveResponse = await transport.SendAsync(recursiveRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, recursiveResponse.StatusCode);
             var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
-            var delegatedEntry = recursive.Descendants("Blob").Single(element =>
-                element.Element("Name")?.Value == "parent/delegated.txt");
+            var delegatedEntry = recursive.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, "parent/delegated.txt", StringComparison.Ordinal));
             Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
             Assert.Equal("creator@example.test", delegatedEntry.Element("Properties")?.Element("Group")?.Value);
         }
@@ -2950,7 +2949,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }).SingleAsync();
         Assert.Equal("updated", listed.Tags["state"]);
         var found = await service.FindBlobsByTagsAsync("\"state\" = 'updated'").ToListAsync();
-        Assert.Contains(found, item => item.BlobContainerName == container.Name && item.BlobName == blob.Name);
+        Assert.Contains(found, item => string.Equals(item.BlobContainerName, container.Name, StringComparison.Ordinal) && string.Equals(item.BlobName, blob.Name, StringComparison.Ordinal));
 
         var tagSas = blob.GenerateSasUri(
             BlobSasPermissions.Tag,
@@ -3056,7 +3055,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             States = BlobStates.Snapshots,
             Prefix = blob.Name
         }).ToListAsync();
-        Assert.Contains(listed, item => item.Snapshot == snapshotInfo.Snapshot);
+        Assert.Contains(listed, item => string.Equals(item.Snapshot, snapshotInfo.Snapshot, StringComparison.Ordinal));
 
         var family = await metadata.ListBlobFamilyAsync(
             SavaWebApplicationFactory.SecondAccountName,
@@ -3065,7 +3064,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             includeDeleted: true,
             CancellationToken.None);
         Assert.All(family, item => Assert.Null(item.VersionId));
-        Assert.Single(family, item => item.Snapshot == snapshotInfo.Snapshot);
+        Assert.Single(family, item => string.Equals(item.Snapshot, snapshotInfo.Snapshot, StringComparison.Ordinal));
 
         await snapshot.DeleteAsync();
         var deletedSnapshot = await metadata.GetBlobAsync(
@@ -3229,12 +3228,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
 
         var modernListing = await ListAsync("2021-06-08");
-        var modernEntry = modernListing.Descendants("Blob").Single(element =>
-            element.Element("Name")?.Value == blob.Name);
+        var modernEntry = modernListing.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
         Assert.Equal(context, modernEntry.Element("Properties")?.Element("EncryptionContext")?.Value);
         var legacyListing = await ListAsync("2021-04-10");
-        var legacyEntry = legacyListing.Descendants("Blob").Single(element =>
-            element.Element("Name")?.Value == blob.Name);
+        var legacyEntry = legacyListing.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
         Assert.Null(legacyEntry.Element("Properties")?.Element("EncryptionContext"));
 
         var block = container.GetBlockBlobClient("folder/committed.bin");
@@ -3360,8 +3357,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             Assert.Equal(HttpStatusCode.OK, projected.StatusCode);
             var document = System.Xml.Linq.XDocument.Parse(await projected.Content.ReadAsStringAsync());
-            var properties = document.Descendants("Blob").Single(element =>
-                element.Element("Name")?.Value == blob.Name).Element("Properties");
+            var properties = document.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal)).Element("Properties");
             Assert.Equal("$superuser", properties?.Element("Owner")?.Value);
             Assert.Equal("$superuser", properties?.Element("Group")?.Value);
             Assert.NotNull(properties?.Element("Acl"));
@@ -3581,8 +3577,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using var response = await transport.SendAsync(request).ConfigureAwait(true);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
-            var listed = document.Descendants("Blob").Single(element =>
-                element.Element("Name")?.Value == direct.Name);
+            var listed = document.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, direct.Name, StringComparison.Ordinal));
             Assert.Equal(
                 absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
                 listed.Element("Properties")?.Element("Expiry-Time")?.Value);
@@ -4095,7 +4090,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Contains("SetBlobServiceProperties", operations, StringComparer.Ordinal);
         Assert.Contains("CreateContainer", operations, StringComparer.Ordinal);
         Assert.Contains("PutBlob", operations, StringComparer.Ordinal);
-        Assert.True(operations.Count(operation => operation == "PutBlob") >= 9);
+        Assert.True(operations.Count(operation => string.Equals(operation, "PutBlob", StringComparison.Ordinal)) >= 9);
         Assert.Contains("GetBlob", operations, StringComparer.Ordinal);
         Assert.Contains("DeleteBlob", operations, StringComparer.Ordinal);
 
@@ -4770,7 +4765,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.Equal("5000", document.Root?.Element("MaxResults")?.Value);
 
                 var active = document.Descendants("Container")
-                    .Single(item => item.Element("Name")?.Value == containerName);
+                    .Single(item => string.Equals(item.Element("Name")?.Value, containerName, StringComparison.Ordinal));
                 Assert.Null(active.Element("Url"));
                 Assert.Null(active.Element("Deleted"));
                 Assert.Equal("blob", active.Element("Properties")?.Element("PublicAccess")?.Value);
@@ -4782,7 +4777,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.Equal("listing", active.Element("Metadata")?.Element("purpose")?.Value);
 
                 var deleted = document.Descendants("Container")
-                    .Single(item => item.Element("Name")?.Value == deletedContainer.Name);
+                    .Single(item => string.Equals(item.Element("Name")?.Value, deletedContainer.Name, StringComparison.Ordinal));
                 Assert.Equal("true", deleted.Element("Deleted")?.Value);
                 Assert.NotEmpty(Assert.IsType<string>(deleted.Element("Version")?.Value));
                 Assert.Null(deleted.Element("Properties")?.Element("Deleted"));
@@ -5011,7 +5006,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             .GetBlockListAsync(BlockListTypes.Uncommitted)).Value;
         Assert.Equal(blockId, Assert.Single(renamedBlocks.UncommittedBlocks).Name);
         var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'renamed'").ToListAsync();
-        Assert.Equal(destinationName, Assert.Single(tagged, item => item.BlobName == committed.Name).BlobContainerName);
+        Assert.Equal(destinationName, Assert.Single(tagged, item => string.Equals(item.BlobName, committed.Name, StringComparison.Ordinal)).BlobContainerName);
 
         var after = await metadata.GetStorageInventoryAsync(CancellationToken.None);
         Assert.Equal(before.LogicalBlobBytes, after.LogicalBlobBytes);
@@ -5148,7 +5143,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("committed", (await restoredBlob.GetPropertiesAsync()).Value.Metadata["state"]);
             Assert.Equal("restored", (await restoredBlob.GetTagsAsync()).Value.Tags["kind"]);
             var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'restored'").ToListAsync();
-            var restoredTag = Assert.Single(tagged, item => item.BlobName == committed.Name);
+            var restoredTag = Assert.Single(tagged, item => string.Equals(item.BlobName, committed.Name, StringComparison.Ordinal));
             Assert.Equal(destinationName, restoredTag.BlobContainerName);
             var restoredBlocks = (await destination.GetBlockBlobClient(staged.Name)
                 .GetBlockListAsync(BlockListTypes.Uncommitted)).Value;
@@ -10060,7 +10055,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.NotNull(batch);
                 var names = Assert.IsType<Apache.Arrow.StringArray>(batch.Column("Name", StringComparer.Ordinal));
                 var accesses = Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("LastAccessTime", StringComparer.Ordinal));
-                var sourceIndex = Enumerable.Range(0, batch.Length).Single(index => names.GetString(index) == blob.Name);
+                var sourceIndex = Enumerable.Range(0, batch.Length).Single(index => string.Equals(names.GetString(index), blob.Name, StringComparison.Ordinal));
                 Assert.Equal(copiedAt, accesses.GetTimestamp(sourceIndex));
             }
 
@@ -10593,10 +10588,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(
                            new GetBlobsOptions { Traits = BlobTraits.Metadata }))
             listed.Add(item);
-        var listedKeyed = Assert.Single(listed, item => item.Name == "keyed.bin");
+        var listedKeyed = Assert.Single(listed, item => string.Equals(item.Name, "keyed.bin", StringComparison.Ordinal));
         Assert.Equal(expectedHash, listedKeyed.Properties.CustomerProvidedKeySha256);
         Assert.Empty(listedKeyed.Metadata);
-        Assert.Equal(scope, Assert.Single(listed, item => item.Name == "scoped.bin").Properties.EncryptionScope);
+        Assert.Equal(scope, Assert.Single(listed, item => string.Equals(item.Name, "scoped.bin", StringComparison.Ordinal)).Properties.EncryptionScope);
         Assert.True(chunksAfterKeyed > chunksBefore);
         Assert.True(chunksAfterScoped > chunksAfterKeyed);
         var metadataBytes = await File.ReadAllBytesAsync(Path.Combine(factory.DataPath, "metadata.db"));
@@ -10625,7 +10620,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         BlobContainerItem? listedContainer = null;
         await foreach (var item in service.GetBlobContainersAsync(prefix: container.Name))
         {
-            if (item.Name == container.Name)
+            if (string.Equals(item.Name, container.Name, StringComparison.Ordinal))
                 listedContainer = item;
         }
         Assert.NotNull(listedContainer);
@@ -11730,7 +11725,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Prefix = recreated.Name
             }))
             {
-                if (item.Name == recreated.Name && item.Snapshot is not null)
+                if (string.Equals(item.Name, recreated.Name, StringComparison.Ordinal) && item.Snapshot is not null)
                     recreatedSnapshot = item;
             }
             Assert.NotNull(recreatedSnapshot);
@@ -11752,7 +11747,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Prefix = typeChangedName
             }))
             {
-                if (item.Name == typeChangedName && item.Deleted)
+                if (string.Equals(item.Name, typeChangedName, StringComparison.Ordinal) && item.Deleted)
                     retainedDifferentType.Add(item);
             }
             Assert.Empty(retainedDifferentType);
@@ -11783,7 +11778,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Prefix = versioned.Name
             }))
             {
-                if (item.Name == versioned.Name && item.VersionId is not null)
+                if (string.Equals(item.Name, versioned.Name, StringComparison.Ordinal) && item.VersionId is not null)
                     versions.Add(item);
             }
             Assert.Equal(4, versions.Count);
@@ -12864,11 +12859,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             .ToArray();
         var sdk = constructor.Invoke(arguments);
         var methods = implementationType.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
-        var append = methods.Single(method =>
-            method.Name == "Append" &&
+        var append = methods.Single(method => string.Equals(method.Name, "Append", StringComparison.Ordinal) &&
             method.GetParameters() is [{ ParameterType: var parameterType }] &&
             parameterType == typeof(byte[]));
-        var getHash = methods.Single(method => method.Name == "GetHashAndReset" && method.GetParameters().Length == 0);
+        var getHash = methods.Single(method => string.Equals(method.Name, "GetHashAndReset", StringComparison.Ordinal) && method.GetParameters().Length == 0);
         append.Invoke(sdk, [content]);
         var expected = (byte[]?)getHash.Invoke(sdk, null)
                        ?? throw new InvalidOperationException("The Azure SDK CRC64 implementation returned no hash.");
@@ -12914,8 +12908,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     var client = CreateClient(initial, account, key);
                     var container = client.GetBlobContainerClient(containerName);
                     await container.CreateAsync(
-                        account == SavaWebApplicationFactory.AccountName
-                            ? PublicAccessType.Blob
+string.Equals(account, SavaWebApplicationFactory.AccountName
+, StringComparison.Ordinal) ? PublicAccessType.Blob
                             : PublicAccessType.BlobContainer);
                     await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account));
                 }
@@ -14324,13 +14318,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             cancellationToken.ThrowIfCancellationRequested();
             var sourceUri = Assert.IsType<Uri>(request.RequestUri);
-            if (sourceUri.AbsolutePath == "/share/anonymous.bin")
+            if (string.Equals(sourceUri.AbsolutePath, "/share/anonymous.bin", StringComparison.Ordinal))
             {
                 Assert.Equal("source.file.core.windows.net", sourceUri.Host);
                 Assert.Null(request.Headers.Authorization);
                 Assert.False(request.Headers.Contains("x-ms-file-request-intent"));
             }
-            else if (sourceUri.Host == "source.blob.core.windows.net")
+            else if (string.Equals(sourceUri.Host, "source.blob.core.windows.net", StringComparison.Ordinal))
             {
                 Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
                 Assert.Equal("azure-files-source-token", request.Headers.Authorization?.Parameter);
@@ -14460,8 +14454,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         private static async Task WriteSourceErrorAsync(HttpContext context, int statusCode, string errorCode)
         {
-            var message = errorCode == "BlobNotFound"
-                ? "The specified blob does not exist."
+            var message = string.Equals(errorCode, "BlobNotFound"
+, StringComparison.Ordinal) ? "The specified blob does not exist."
                 : "The condition specified using HTTP conditional header(s) is not met.";
             context.Response.StatusCode = statusCode;
             context.Response.ContentType = "application/xml";
