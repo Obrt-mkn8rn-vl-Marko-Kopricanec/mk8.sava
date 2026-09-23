@@ -45,6 +45,7 @@ public sealed class StorageTelemetry : IStorageTelemetry
 
     public void RecordMaintenance(StorageMaintenanceResult result, StorageUsageSnapshot usage)
     {
+        ArgumentNullException.ThrowIfNull(result);
         Interlocked.Increment(ref _maintenancePasses);
         Interlocked.Add(ref _completedCopies, result.CompletedCopies);
         Interlocked.Add(ref _completedObjectReplications, result.CompletedObjectReplications);

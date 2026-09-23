@@ -28,7 +28,7 @@ public sealed class StorageDataKeyContinuity(
         var fingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var keyId in requiredKeys)
         {
-            var encoded = keyId == "cross-account"
+            var encoded = string.Equals(keyId, "cross-account", StringComparison.Ordinal)
                 ? _options.CrossAccountEncryptionKey
                   ?? throw new InvalidDataException("The cross-account data encryption key is missing for stored content.")
                 : _options.ResolveAccountDataEncryptionKey(keyId["account:".Length..]);
@@ -41,12 +41,12 @@ public sealed class StorageDataKeyContinuity(
             {
                 foreach (var id in inventory.ReachableChunkIds)
                 {
-                    if (KeyIdForChunk(id) == keyId)
+                    if (string.Equals(KeyIdForChunk(id), keyId, StringComparison.Ordinal))
                         await VerifyAsync(id, keyId, token).ConfigureAwait(false);
                 }
                 await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(token).ConfigureAwait(false))
                 {
-                    if (!inventory.ReachableChunkIds.Contains(id) && KeyIdForChunk(id) == keyId)
+                    if (!inventory.ReachableChunkIds.Contains(id) && string.Equals(KeyIdForChunk(id), keyId, StringComparison.Ordinal))
                         await VerifyAsync(id, keyId, token).ConfigureAwait(false);
                 }
             },
@@ -71,7 +71,7 @@ public sealed class StorageDataKeyContinuity(
         var domain = ChunkStore.GetDomainFromChunkId(id);
         if (domain.Contains("/$cpk-", StringComparison.Ordinal))
             return null;
-        return domain == "$global"
+        return string.Equals(domain, "$global", StringComparison.Ordinal)
             ? "cross-account"
             : $"account:{domain.Split('/', 2)[0]}";
     }

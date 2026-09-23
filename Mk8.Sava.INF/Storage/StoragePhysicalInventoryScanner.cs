@@ -22,8 +22,7 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
 
     public bool Advance(int maximumSteps)
     {
-        if (maximumSteps <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximumSteps));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumSteps);
 
         LastPassSteps = 0;
         while (LastPassSteps < maximumSteps && (_nextPath is not null || _directories.Count > 0))
@@ -116,9 +115,9 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
             }
         }
 
-        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        if ((attributes & FileAttributes.ReparsePoint) != FileAttributes.None)
             return;
-        if ((attributes & FileAttributes.Directory) != 0)
+        if ((attributes & FileAttributes.Directory) != FileAttributes.None)
         {
             try
             {
