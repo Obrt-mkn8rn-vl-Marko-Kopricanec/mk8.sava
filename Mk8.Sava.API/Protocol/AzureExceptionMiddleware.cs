@@ -77,7 +77,8 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         AddCommonHeaders(context);
         foreach (var header in exception.ResponseHeaders)
             context.Response.Headers[header.Key] = header.Value;
-        context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
+        if (SupportsErrorCodeHeader(context))
+            context.Response.Headers["x-ms-error-code"] = exception.ErrorCode;
         if (exception.StatusCode == StatusCodes.Status304NotModified)
             return;
 
@@ -117,6 +118,14 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         }
 
         await context.Response.WriteAsync(builder.ToString(), context.RequestAborted).ConfigureAwait(false);
+    }
+
+    private static bool SupportsErrorCodeHeader(HttpContext context)
+    {
+        var request = StorageRequestContext.TryGet(context);
+        return request is null ||
+               !StorageServiceVersions.TryParse(request.ServiceVersion, out var version) ||
+               version >= new DateOnly(2017, 7, 29);
     }
 
     public static void AddCommonHeaders(HttpContext context)

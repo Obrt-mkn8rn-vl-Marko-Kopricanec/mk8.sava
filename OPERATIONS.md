@@ -168,6 +168,9 @@ stale copy-source ETag; mk8.sava retains the published Blob-specific
 `SourceConditionNotMet` code. The published common error catalog and modern
 error-header contract also require `ConditionNotMet` in `x-ms-error-code` on
 conditional 304 reads; mk8.sava now emits it with an empty response body.
+The header is emitted for service versions `2017-07-29` and later, matching
+the published version boundary; older versions omit it. Conditional 304
+responses remain bodyless, while ordinary error responses retain XML bodies.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
