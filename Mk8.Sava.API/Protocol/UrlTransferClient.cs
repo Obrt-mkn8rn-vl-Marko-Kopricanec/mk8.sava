@@ -29,6 +29,101 @@ internal sealed class UrlTransferClient(
         bool copySourceTags = false,
         bool preserveSourceShape = false)
     {
+        var (sourceUri, effectiveMaximumBytes) = ValidateReadSourceRequest(
+            destinationRequest,
+            sourceValue,
+            maximumBytes,
+            allowFileRequestIntent);
+
+        var sourceTags = copySourceTags
+            ? await ReadSourceTagsAsync(destinationRequest, sourceUri, cancellationToken)
+.ConfigureAwait(false) : new Dictionary<string, string>(StringComparer.Ordinal);
+
+        using var sourceRequest = CreateReadSourceRequest(
+            destinationRequest,
+            sourceUri,
+            sourceRange,
+            allowSourceCustomerProvidedKey);
+
+        var response = await SendReadSourceRequestAsync(sourceRequest, cancellationToken).ConfigureAwait(false);
+        using (response)
+        {
+            var contentLength = await ValidateReadSourceResponseAsync(
+                destinationRequest,
+                response,
+                sourceRange,
+                effectiveMaximumBytes,
+                sourceLengthConflict,
+                cancellationToken).ConfigureAwait(false);
+            return await ConsumeValidatedSourceAsync(
+                destinationRequest,
+                sourceUri,
+                response,
+                sourceTags,
+                effectiveMaximumBytes,
+                contentLength,
+                preserveSourceShape,
+                consume,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<UrlTransferResult<TResult>> ConsumeValidatedSourceAsync<TResult>(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        HttpResponseMessage response,
+        Dictionary<string, string> sourceTags,
+        long effectiveMaximumBytes,
+        long contentLength,
+        bool preserveSourceShape,
+        Func<UrlSource, Task<TResult>> consume,
+        CancellationToken cancellationToken)
+    {
+        var kind = ReadBlobKind(response);
+        var etag = response.Headers.ETag?.ToString();
+        var sourceShape = preserveSourceShape
+            ? await ReadSourceShapeAsync(
+                destinationRequest,
+                sourceUri,
+                response,
+                kind,
+                etag,
+                contentLength,
+                cancellationToken).ConfigureAwait(false)
+            : UrlSourceShape.Empty;
+        var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using (source.ConfigureAwait(false))
+        {
+            using var limitedSource = new LengthLimitedReadStream(source, effectiveMaximumBytes);
+            var sourceInfo = new UrlSource(
+                limitedSource,
+                contentLength,
+                ReadHttpProperties(response),
+                ReadMetadata(response),
+                sourceTags,
+                kind,
+                ReadSingleHeader(response, "x-ms-access-tier"),
+                etag,
+                sourceShape.SequenceNumber,
+                sourceShape.IsSealed,
+                sourceShape.AppendBlockCount,
+                sourceShape.CommittedBlocks,
+                sourceShape.PageRanges);
+            return await ConsumeWithChecksumValidationAsync(
+                destinationRequest,
+                sourceInfo,
+                effectiveMaximumBytes,
+                consume,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private (Uri SourceUri, long MaximumBytes) ValidateReadSourceRequest(
+        HttpRequest destinationRequest,
+        string sourceValue,
+        long maximumBytes,
+        bool allowFileRequestIntent)
+    {
         var effectiveMaximumBytes = Math.Min(maximumBytes, _options.MaximumRequestBodyBytes);
         if (effectiveMaximumBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(maximumBytes));
@@ -44,29 +139,42 @@ internal sealed class UrlTransferClient(
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
         ValidateFileRequestIntent(destinationRequest, sourceUri, allowFileRequestIntent);
+        return (sourceUri, effectiveMaximumBytes);
+    }
 
-        var sourceTags = copySourceTags
-            ? await ReadSourceTagsAsync(destinationRequest, sourceUri, cancellationToken)
-.ConfigureAwait(false) : new Dictionary<string, string>(StringComparer.Ordinal);
-
-        using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
-        AddSourceAuthenticationHeaders(destinationRequest, sourceRequest);
-        AddSourceConditions(destinationRequest, sourceRequest);
-        sourceRequest.Headers.TryAddWithoutValidation(
-            "x-ms-version",
-            StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
-        AddSourceCustomerProvidedKey(
-            destinationRequest,
-            sourceRequest,
-            sourceUri,
-            allowSourceCustomerProvidedKey);
-        if (sourceRange is not null)
-            sourceRequest.Headers.TryAddWithoutValidation("Range", sourceRange);
-
-        HttpResponseMessage response;
+    private static HttpRequestMessage CreateReadSourceRequest(
+        HttpRequest destinationRequest,
+        Uri sourceUri,
+        string? sourceRange,
+        bool allowSourceCustomerProvidedKey)
+    {
+        var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         try
         {
-            response = await client.SendAsync(
+            AddSourceAuthenticationHeaders(destinationRequest, sourceRequest);
+            AddSourceConditions(destinationRequest, sourceRequest);
+            sourceRequest.Headers.TryAddWithoutValidation(
+                "x-ms-version",
+                StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
+            AddSourceCustomerProvidedKey(destinationRequest, sourceRequest, sourceUri, allowSourceCustomerProvidedKey);
+            if (sourceRange is not null)
+                sourceRequest.Headers.TryAddWithoutValidation("Range", sourceRange);
+            return sourceRequest;
+        }
+        catch
+        {
+            sourceRequest.Dispose();
+            throw;
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendReadSourceRequestAsync(
+        HttpRequestMessage sourceRequest,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await client.SendAsync(
                 sourceRequest,
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken).ConfigureAwait(false);
@@ -79,82 +187,51 @@ internal sealed class UrlTransferClient(
         {
             throw CannotVerifyCopySource("The source did not complete the request before the transfer timeout.");
         }
-        using (response)
-        {
-            if (!response.IsSuccessStatusCode)
-            {
-                if (HasSourceConditions(destinationRequest) &&
-                    response.StatusCode is HttpStatusCode.NotModified or HttpStatusCode.PreconditionFailed)
-                {
-                    throw AzureStorageException.SourceConditionNotMet();
-                }
-                throw await CreateSourceFailureAsync(
-                    destinationRequest,
-                    response,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
-            {
-                throw CannotVerifyCopySource("The source did not honor the requested byte range.");
-            }
+    }
 
-            var contentLength = response.Content.Headers.ContentLength;
-            if (!contentLength.HasValue &&
-                response.Content.Headers.ContentRange is { From: { } from, To: { } to })
+    private static async Task<long> ValidateReadSourceResponseAsync(
+        HttpRequest destinationRequest,
+        HttpResponseMessage response,
+        string? sourceRange,
+        long effectiveMaximumBytes,
+        bool sourceLengthConflict,
+        CancellationToken cancellationToken)
+    {
+        if (!response.IsSuccessStatusCode)
+        {
+            if (HasSourceConditions(destinationRequest) &&
+                response.StatusCode is HttpStatusCode.NotModified or HttpStatusCode.PreconditionFailed)
             {
-                contentLength = checked(to - from + 1);
+                throw AzureStorageException.SourceConditionNotMet();
             }
-            if (!contentLength.HasValue)
-                throw CannotVerifyCopySource("The source did not return a valid Content-Length value.");
-            if (contentLength.Value > effectiveMaximumBytes)
-            {
-                if (sourceLengthConflict)
-                {
-                    throw new AzureStorageException(
-                        StatusCodes.Status409Conflict,
-                        "CannotVerifyCopySource",
-                        $"The source exceeds the maximum permitted length of {effectiveMaximumBytes} bytes.");
-                }
-                throw new RequestBodyTooLargeException(effectiveMaximumBytes);
-            }
-            var kind = ReadBlobKind(response);
-            var etag = response.Headers.ETag?.ToString();
-            var sourceShape = preserveSourceShape
-                ? await ReadSourceShapeAsync(
-                    destinationRequest,
-                    sourceUri,
-                    response,
-                    kind,
-                    etag,
-                    contentLength.Value,
-                    cancellationToken)
-.ConfigureAwait(false) : UrlSourceShape.Empty;
-            var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            await using (source.ConfigureAwait(false))
-            {
-                using var limitedSource = new LengthLimitedReadStream(source, effectiveMaximumBytes);
-                var sourceInfo = new UrlSource(
-                limitedSource,
-                contentLength,
-                ReadHttpProperties(response),
-                ReadMetadata(response),
-                sourceTags,
-                kind,
-                ReadSingleHeader(response, "x-ms-access-tier"),
-                etag,
-                sourceShape.SequenceNumber,
-                sourceShape.IsSealed,
-                sourceShape.AppendBlockCount,
-                sourceShape.CommittedBlocks,
-                sourceShape.PageRanges);
-                return await ConsumeWithChecksumValidationAsync(
-                    destinationRequest,
-                    sourceInfo,
-                    effectiveMaximumBytes,
-                    consume,
-                    cancellationToken).ConfigureAwait(false);
-            }
+            throw await CreateSourceFailureAsync(
+                destinationRequest,
+                response,
+                cancellationToken).ConfigureAwait(false);
         }
+        if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
+            throw CannotVerifyCopySource("The source did not honor the requested byte range.");
+
+        var contentLength = response.Content.Headers.ContentLength;
+        if (!contentLength.HasValue &&
+            response.Content.Headers.ContentRange is { From: { } from, To: { } to })
+        {
+            contentLength = checked(to - from + 1);
+        }
+        if (!contentLength.HasValue)
+            throw CannotVerifyCopySource("The source did not return a valid Content-Length value.");
+        if (contentLength.Value > effectiveMaximumBytes)
+        {
+            if (sourceLengthConflict)
+            {
+                throw new AzureStorageException(
+                    StatusCodes.Status409Conflict,
+                    "CannotVerifyCopySource",
+                    $"The source exceeds the maximum permitted length of {effectiveMaximumBytes} bytes.");
+            }
+            throw new RequestBodyTooLargeException(effectiveMaximumBytes);
+        }
+        return contentLength.Value;
     }
 
     private async Task<UrlTransferResult<TResult>> ConsumeWithChecksumValidationAsync<TResult>(
