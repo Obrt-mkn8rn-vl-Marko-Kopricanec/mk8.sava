@@ -6,26 +6,6 @@ using Microsoft.Net.Http.Headers;
 
 namespace Mk8.Sava.Protocol;
 
-internal enum BlobBatchOperationKind
-{
-    Delete,
-    SetTier
-}
-
-internal sealed record BlobBatchSubrequest(
-    BlobBatchOperationKind Kind,
-    string Method,
-    string RawPath,
-    QueryString QueryString,
-    IReadOnlyDictionary<string, StringValues> Headers,
-    string? ContentId);
-
-internal sealed record BlobBatchSubresponse(
-    int StatusCode,
-    IReadOnlyDictionary<string, string> Headers,
-    byte[] Body,
-    string? ContentId);
-
 internal static class BlobBatchProtocol
 {
     public const int MaximumBodyBytes = 4 * 1024 * 1024;
@@ -107,7 +87,7 @@ internal static class BlobBatchProtocol
                 throw InvalidBatch("All blob batch subrequests must use the same operation type.");
             commonKind = kind;
 
-            if (!target.StartsWith("/", StringComparison.Ordinal) ||
+            if (!target.StartsWith('/') ||
                 target.StartsWith("//", StringComparison.Ordinal) ||
                 target.Contains("://", StringComparison.Ordinal) ||
                 target.Contains('#', StringComparison.Ordinal))

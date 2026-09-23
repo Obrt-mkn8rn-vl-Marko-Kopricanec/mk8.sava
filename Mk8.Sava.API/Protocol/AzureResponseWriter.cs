@@ -1172,6 +1172,6 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
     private static string LeaseStatus(LeaseRecord lease) =>
         lease.State is Storage.LeaseState.Leased or Storage.LeaseState.Breaking ? "locked" : "unlocked";
 
-    private static string LeaseStateValue(LeaseRecord lease) => lease.State.ToString().ToLowerInvariant();
+    private static string LeaseStateValue(LeaseRecord lease) => lease.State.ToString().ToRequiredLowerInvariant();
 
 }

@@ -7,11 +7,6 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-internal sealed record UserDelegationKeyRequest(
-    DateTimeOffset StartsAt,
-    DateTimeOffset ExpiresAt,
-    string? DelegatedUserTenantId);
-
 internal static class ProtocolParsing
 {
     private const long MaximumBlockListXmlCharacters = 8L * 1024 * 1024;
@@ -856,7 +851,7 @@ string.Equals(uri.AbsolutePath, "/", StringComparison.Ordinal) &&
     private static AzureStorageException InvalidServicePropertiesXml(string message) =>
         new(StatusCodes.Status400BadRequest, "InvalidXmlDocument", message);
 
-    private static bool ParseBool(string? value, bool defaultValue) => value?.ToLowerInvariant() switch
+    private static bool ParseBool(string? value, bool defaultValue) => value?.ToRequiredLowerInvariant() switch
     {
         null or "" => defaultValue,
         "true" => true,

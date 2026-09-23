@@ -130,8 +130,8 @@ internal static class HierarchicalAclAuthorization
 
         var prefix = http.Query["prefix"].ToString();
         if (prefix.Length > 0 &&
-            (!prefix.EndsWith("/", StringComparison.Ordinal) ||
-             prefix.StartsWith("/", StringComparison.Ordinal) ||
+            (!prefix.EndsWith('/') ||
+             prefix.StartsWith('/') ||
              prefix.Contains("//", StringComparison.Ordinal)))
             return false;
 

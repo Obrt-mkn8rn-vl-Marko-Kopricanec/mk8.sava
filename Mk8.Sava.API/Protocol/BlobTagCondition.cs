@@ -114,7 +114,7 @@ internal static class BlobTagCondition
                 Comparison.GreaterThanOrEqual => order >= 0,
                 Comparison.LessThan => order < 0,
                 Comparison.LessThanOrEqual => order <= 0,
-                _ => throw new ArgumentOutOfRangeException(nameof(comparison))
+                _ => throw InvalidExpression()
             };
         }
 

@@ -9,33 +9,6 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-internal sealed record UrlSource(
-    Stream Content,
-    long? ContentLength,
-    BlobHttpProperties Http,
-    Dictionary<string, string> Metadata,
-    Dictionary<string, string> Tags,
-    BlobKind? Kind,
-    string? AccessTier,
-    string? ETag,
-    long SequenceNumber,
-    bool IsSealed,
-    int AppendBlockCount,
-    IReadOnlyList<CopySourceBlock> CommittedBlocks,
-    IReadOnlyList<PageRange> PageRanges);
-
-internal sealed record UrlTransferResult<TResult>(TResult Value, TransactionalChecksums Checksums);
-
-internal sealed class SourceCustomerProvidedKey(
-    string encodedKey,
-    string encodedHash,
-    string algorithm)
-{
-    public string EncodedKey { get; } = encodedKey;
-    public string EncodedHash { get; } = encodedHash;
-    public string Algorithm { get; } = algorithm;
-}
-
 internal sealed class UrlTransferClient(
     HttpClient client,
     StoragePaths paths,

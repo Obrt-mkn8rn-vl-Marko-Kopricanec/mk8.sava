@@ -42,7 +42,7 @@ internal static class StorageResourcePath
         var rawTarget = request.HttpContext.Features.Get<IHttpRequestFeature>()?.RawTarget;
         if (!string.IsNullOrEmpty(rawTarget))
         {
-            if (!rawTarget.StartsWith("/", StringComparison.Ordinal) &&
+            if (!rawTarget.StartsWith('/') &&
                 Uri.TryCreate(rawTarget, UriKind.Absolute, out var absolute))
             {
                 escapedPath = absolute.AbsolutePath;
@@ -66,7 +66,7 @@ internal static class StorageResourcePath
 
     private static string[] SplitPath(string path)
     {
-        var normalized = path.StartsWith("/", StringComparison.Ordinal) ? path[1..] : path;
+        var normalized = path.StartsWith('/') ? path[1..] : path;
         return normalized.Length == 0 ? [] : normalized.Split('/', StringSplitOptions.None);
     }
 
