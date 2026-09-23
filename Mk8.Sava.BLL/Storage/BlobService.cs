@@ -852,6 +852,32 @@ public sealed class BlobService(
             current).ConfigureAwait(false);
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
+        var selected = SelectBlockListEntries(account, encryption, blockList, staged, current);
+
+        var content = await chunks.ComposeAsync(account, encryption, selected.Select(item => item.Content).ToArray(), cancellationToken).ConfigureAwait(false);
+        using var contentPin = chunks.Pin(content);
+        var now = metadata.GetUtcNow();
+        var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
+        {
+            Lease = current is null ? LeaseRecord.Available : leases.ResetAfterBlobWrite(current.Lease),
+            CommittedBlocks = selected
+        };
+        return await metadata.PublishBlockListAsync(
+            proposed,
+            expectedGeneration,
+            expectedRevision,
+            staged,
+            IsHierarchicalNamespaceEnabled(account),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private List<CommittedBlockRecord> SelectBlockListEntries(
+        string account,
+        BlobEncryption encryption,
+        IReadOnlyList<BlockListEntry> blockList,
+        IReadOnlyList<StagedBlockRecord> staged,
+        BlobRecord? current)
+    {
         var stagedById = staged.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
         var committedById = current?.CommittedBlocks
             .GroupBy(item => item.Id, StringComparer.Ordinal)
@@ -883,22 +909,7 @@ public sealed class BlobService(
                 throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
             selected.Add(new CommittedBlockRecord(blockId, resolved));
         }
-
-        var content = await chunks.ComposeAsync(account, encryption, selected.Select(item => item.Content).ToArray(), cancellationToken).ConfigureAwait(false);
-        using var contentPin = chunks.Pin(content);
-        var now = metadata.GetUtcNow();
-        var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
-        {
-            Lease = current is null ? LeaseRecord.Available : leases.ResetAfterBlobWrite(current.Lease),
-            CommittedBlocks = selected
-        };
-        return await metadata.PublishBlockListAsync(
-            proposed,
-            expectedGeneration,
-            expectedRevision,
-            staged,
-            IsHierarchicalNamespaceEnabled(account),
-            cancellationToken).ConfigureAwait(false);
+        return selected;
     }
 
     public async Task<BlobRecord> AppendBlockAsync(
@@ -1027,20 +1038,7 @@ public sealed class BlobService(
     {
         ArgumentNullException.ThrowIfNull(previous);
         ArgumentNullException.ThrowIfNull(current);
-        if (current.Kind != BlobKind.PageBlob || previous.Kind != BlobKind.PageBlob)
-            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
-        if (current.CreatedAt != previous.CreatedAt ||
-            !string.Equals(current.Content.Domain, previous.Content.Domain, StringComparison.Ordinal))
-        {
-            throw new AzureStorageException(
-                StatusCodes.Status409Conflict,
-                "BlobOverwritten",
-                "The page blob was overwritten after the previous snapshot was created.");
-        }
-        if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
-            throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
-        if (!chunks.IsInDomain(current.Account, encryption, current.Content))
-            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
+        ValidatePageRangeDiff(current, previous, encryption, start, end);
 
         var changed = new List<PageRange>();
         var cleared = new List<PageRange>();
@@ -1092,6 +1090,29 @@ public sealed class BlobService(
         }
 
         return new PageRangeDiff(changed, cleared);
+    }
+
+    private void ValidatePageRangeDiff(
+        BlobRecord current,
+        BlobRecord previous,
+        BlobEncryption encryption,
+        long start,
+        long end)
+    {
+        if (current.Kind != BlobKind.PageBlob || previous.Kind != BlobKind.PageBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
+        if (current.CreatedAt != previous.CreatedAt ||
+            !string.Equals(current.Content.Domain, previous.Content.Domain, StringComparison.Ordinal))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobOverwritten",
+                "The page blob was overwritten after the previous snapshot was created.");
+        }
+        if (start < 0 || end < start || start % 512 != 0 || (end + 1) % 512 != 0 || end >= current.Content.Length)
+            throw AzureStorageException.InvalidHeader("x-ms-range", $"bytes={start}-{end}");
+        if (!chunks.IsInDomain(current.Account, encryption, current.Content))
+            throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
     }
 
     public async Task WriteContentAsync(
@@ -1180,22 +1201,7 @@ public sealed class BlobService(
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
-        var nextSequence = current.SequenceNumber;
-        if (sequenceNumber.HasValue || sequenceAction is not null)
-        {
-            if (current.Kind != BlobKind.PageBlob)
-                throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The sequence number is only valid for page blobs.");
-            if (sequenceNumber < 0)
-                throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.Value.ToString(CultureInfo.InvariantCulture));
-            nextSequence = (sequenceAction is null ? null : ProtocolLowercase(sequenceAction)) switch
-            {
-                "max" when sequenceNumber.HasValue => Math.Max(nextSequence, sequenceNumber.Value),
-                "increment" => checked(nextSequence + 1),
-                "update" when sequenceNumber.HasValue => sequenceNumber.Value,
-                null when sequenceNumber.HasValue => sequenceNumber.Value,
-                _ => throw AzureStorageException.InvalidHeader("x-ms-sequence-number-action", sequenceAction)
-            };
-        }
+        var nextSequence = ResolvePageSequenceNumber(current, sequenceNumber, sequenceAction);
 
         var content = current.Content;
         StoredContent? resized = null;
@@ -1237,6 +1243,27 @@ public sealed class BlobService(
         {
             resized?.Dispose();
         }
+    }
+
+    private static long ResolvePageSequenceNumber(
+        BlobRecord current,
+        long? sequenceNumber,
+        string? sequenceAction)
+    {
+        if (!sequenceNumber.HasValue && sequenceAction is null)
+            return current.SequenceNumber;
+        if (current.Kind != BlobKind.PageBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The sequence number is only valid for page blobs.");
+        if (sequenceNumber < 0)
+            throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.Value.ToString(CultureInfo.InvariantCulture));
+        return (sequenceAction is null ? null : ProtocolLowercase(sequenceAction)) switch
+        {
+            "max" when sequenceNumber.HasValue => Math.Max(current.SequenceNumber, sequenceNumber.Value),
+            "increment" => checked(current.SequenceNumber + 1),
+            "update" when sequenceNumber.HasValue => sequenceNumber.Value,
+            null when sequenceNumber.HasValue => sequenceNumber.Value,
+            _ => throw AzureStorageException.InvalidHeader("x-ms-sequence-number-action", sequenceAction)
+        };
     }
 
     public async Task<BlobRecord> SealAppendBlobAsync(
@@ -1287,69 +1314,84 @@ public sealed class BlobService(
         if (rehydratePriority is not null && rehydratePriority is not ("Standard" or "High"))
             throw AzureStorageException.InvalidHeader("x-ms-rehydrate-priority", rehydratePriority);
 
-        var now = metadata.GetUtcNow();
-        BlobRecord updated;
-        var pending = false;
-        if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal) && !string.Equals(tier, "Archive", StringComparison.Ordinal))
-        {
-            if (!current.IsCurrent || current.Snapshot is not null)
-                throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobArchived", "This operation is not permitted on an archived blob.");
+        var update = PrepareTierUpdate(current, tier, rehydratePriority, allowRehydratePriorityUpdate, metadata.GetUtcNow());
+        await metadata.PutBlobRecordAsync(update.Blob, current.Revision, cancellationToken).ConfigureAwait(false);
+        return update;
+    }
 
-            var requestedStatus = $"rehydrate-pending-to-{ProtocolLowercase(tier)}";
-            if (current.ArchiveStatus is not null && !string.Equals(current.ArchiveStatus, requestedStatus, StringComparison.Ordinal))
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status409Conflict,
-                    "BlobBeingRehydrated",
-                    "This operation is not permitted because the blob is being rehydrated.");
-            }
+    private BlobTierUpdate PrepareTierUpdate(
+        BlobRecord current,
+        string tier,
+        string? rehydratePriority,
+        bool allowRehydratePriorityUpdate,
+        DateTimeOffset now) =>
+        string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal) &&
+        !string.Equals(tier, "Archive", StringComparison.Ordinal)
+            ? PrepareRehydrationUpdate(current, tier, rehydratePriority, allowRehydratePriorityUpdate, now)
+            : PrepareImmediateTierUpdate(current, tier, now);
 
-            var priority = current.RehydratePriority switch
-            {
-                "High" => "High",
-                "Standard" when allowRehydratePriorityUpdate && string.Equals(rehydratePriority, "High", StringComparison.Ordinal) => "High",
-                "Standard" => "Standard",
-                _ => rehydratePriority ?? "Standard"
-            };
-            var delay = string.Equals(priority, "High", StringComparison.Ordinal) ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
-            var completion = now.Add(delay);
-            if (current.RehydrateCompleteAt.HasValue && current.RehydrateCompleteAt.Value < completion)
-            {
-                completion = current.RehydrateCompleteAt.Value;
-            }
-            updated = current with
-            {
-                ArchiveStatus = requestedStatus,
-                RehydratePriority = priority,
-                RehydrateCompleteAt = completion,
-                Revision = MetadataStore.NewRevision()
-            };
-            pending = true;
-        }
-        else
+    private BlobTierUpdate PrepareRehydrationUpdate(
+        BlobRecord current,
+        string tier,
+        string? rehydratePriority,
+        bool allowRehydratePriorityUpdate,
+        DateTimeOffset now)
+    {
+        if (!current.IsCurrent || current.Snapshot is not null)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobArchived", "This operation is not permitted on an archived blob.");
+
+        var requestedStatus = $"rehydrate-pending-to-{ProtocolLowercase(tier)}";
+        if (current.ArchiveStatus is not null && !string.Equals(current.ArchiveStatus, requestedStatus, StringComparison.Ordinal))
         {
-            if (current.ArchiveStatus is not null)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status409Conflict,
-                    "BlobBeingRehydrated",
-                    "This operation is not permitted because the blob is being rehydrated.");
-            }
-            updated = current with
-            {
-                AccessTier = tier,
-                AccessTierInferred = false,
-                SmartAccessTier = string.Equals(tier, "Smart", StringComparison.Ordinal) ? "Hot" : null,
-                SmartTierLastAccessedAt = string.Equals(tier, "Smart", StringComparison.Ordinal) ? now : null,
-                ArchiveStatus = null,
-                RehydratePriority = null,
-                RehydrateCompleteAt = null,
-                Revision = MetadataStore.NewRevision(),
-                AccessTierChangedAt = now
-            };
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobBeingRehydrated",
+                "This operation is not permitted because the blob is being rehydrated.");
         }
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
-        return new BlobTierUpdate(updated, pending);
+
+        var priority = current.RehydratePriority switch
+        {
+            "High" => "High",
+            "Standard" when allowRehydratePriorityUpdate && string.Equals(rehydratePriority, "High", StringComparison.Ordinal) => "High",
+            "Standard" => "Standard",
+            _ => rehydratePriority ?? "Standard"
+        };
+        var delay = string.Equals(priority, "High", StringComparison.Ordinal) ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
+        var completion = now.Add(delay);
+        if (current.RehydrateCompleteAt.HasValue && current.RehydrateCompleteAt.Value < completion)
+            completion = current.RehydrateCompleteAt.Value;
+        var updated = current with
+        {
+            ArchiveStatus = requestedStatus,
+            RehydratePriority = priority,
+            RehydrateCompleteAt = completion,
+            Revision = MetadataStore.NewRevision()
+        };
+        return new BlobTierUpdate(updated, Pending: true);
+    }
+
+    private static BlobTierUpdate PrepareImmediateTierUpdate(BlobRecord current, string tier, DateTimeOffset now)
+    {
+        if (current.ArchiveStatus is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlobBeingRehydrated",
+                "This operation is not permitted because the blob is being rehydrated.");
+        }
+        var updated = current with
+        {
+            AccessTier = tier,
+            AccessTierInferred = false,
+            SmartAccessTier = string.Equals(tier, "Smart", StringComparison.Ordinal) ? "Hot" : null,
+            SmartTierLastAccessedAt = string.Equals(tier, "Smart", StringComparison.Ordinal) ? now : null,
+            ArchiveStatus = null,
+            RehydratePriority = null,
+            RehydrateCompleteAt = null,
+            Revision = MetadataStore.NewRevision(),
+            AccessTierChangedAt = now
+        };
+        return new BlobTierUpdate(updated, Pending: false);
     }
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
@@ -1512,7 +1554,26 @@ public sealed class BlobService(
             current.Name,
             includeDeleted: true,
             cancellationToken).ConfigureAwait(false);
-        var relatedSnapshots = records.Where(item => string.Equals(item.Name, current.Name, StringComparison.Ordinal) && item.Snapshot is not null && !item.IsDeleted).ToArray();
+        var targets = SelectBlobDeletionTargets(current, records, hasExplicitSnapshotOrVersion, deleteSnapshots);
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
+        var mutations = BuildBlobDeletionMutations(
+            records, targets, hasExplicitSnapshotOrVersion, properties,
+            IsHierarchicalNamespaceEnabled(current.Account));
+        await metadata.ApplyBlobRecordMutationsAsync(
+            mutations,
+            cancellationToken,
+            clearStagedBlocksForCurrentBlobs: true).ConfigureAwait(false);
+    }
+
+    private List<BlobRecord> SelectBlobDeletionTargets(
+        BlobRecord current,
+        IReadOnlyList<BlobRecord> records,
+        bool hasExplicitSnapshotOrVersion,
+        BlobDeleteSnapshotsOption deleteSnapshots)
+    {
+        var relatedSnapshots = records.Where(item =>
+            string.Equals(item.Name, current.Name, StringComparison.Ordinal) &&
+            item.Snapshot is not null && !item.IsDeleted).ToArray();
         if (!hasExplicitSnapshotOrVersion &&
             relatedSnapshots.Length > 0 &&
             deleteSnapshots == BlobDeleteSnapshotsOption.Unspecified)
@@ -1535,9 +1596,16 @@ public sealed class BlobService(
 
         for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
             EnsureBlobMutable(targets[targetIndex]);
+        return targets;
+    }
 
-        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
-        var hierarchicalNamespace = IsHierarchicalNamespaceEnabled(current.Account);
+    private List<BlobRecordMutation> BuildBlobDeletionMutations(
+        IReadOnlyList<BlobRecord> records,
+        List<BlobRecord> targets,
+        bool hasExplicitSnapshotOrVersion,
+        ServiceProperties properties,
+        bool hierarchicalNamespace)
+    {
         var deletionIds = records
             .Where(item => item.DeletionId.HasValue)
             .Select(item => item.DeletionId!.Value)
@@ -1546,60 +1614,62 @@ public sealed class BlobService(
         for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
         {
             var target = targets[targetIndex];
-            BlobRecord? replacement;
-            if (!hasExplicitSnapshotOrVersion &&
-                target.IsCurrent &&
-                target.Snapshot is null &&
-                properties.VersioningEnabled &&
-                !hierarchicalNamespace)
-            {
-                replacement = target with
-                {
-                    IsCurrent = false,
-                    IsDeleted = false,
-                    DeletedAt = null,
-                    DeleteRetentionUntil = null,
-                    VersionId = target.VersionId ?? MetadataStore.CreateVersionId(target.LastModified),
-                    Lease = LeaseRecord.Available,
-                    Revision = MetadataStore.NewRevision()
-                };
-            }
-            else if (properties.BlobSoftDeleteEnabled)
-            {
-                var deletedAt = metadata.GetUtcNow();
-                ulong? deletionId = null;
-                var hierarchicalPathDelete = hierarchicalNamespace && target.Snapshot is null;
-                if (hierarchicalPathDelete)
-                {
-                    do
-                    {
-                        deletionId = MetadataStore.NewDeletionId();
-                    }
-                    while (!deletionIds.Add(deletionId.Value));
-                }
-                replacement = target with
-                {
-                    IsDeleted = true,
-                    DeletionId = deletionId,
-                    DeletedAt = deletedAt,
-                    DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
-                    IsCurrent = !hierarchicalNamespace && target.IsCurrent,
-                    VersionId = hierarchicalNamespace ? null : target.VersionId,
-                    Snapshot = hierarchicalPathDelete ? null : target.Snapshot,
-                    Lease = LeaseRecord.Available,
-                    Revision = MetadataStore.NewRevision()
-                };
-            }
-            else
-            {
-                replacement = null;
-            }
+            var replacement = CreateBlobDeletionReplacement(
+                target, hasExplicitSnapshotOrVersion, properties,
+                hierarchicalNamespace, deletionIds);
             mutations.Add(new BlobRecordMutation(target.GenerationId, target.Revision, replacement));
         }
-        await metadata.ApplyBlobRecordMutationsAsync(
-            mutations,
-            cancellationToken,
-            clearStagedBlocksForCurrentBlobs: true).ConfigureAwait(false);
+        return mutations;
+    }
+
+    private BlobRecord? CreateBlobDeletionReplacement(
+        BlobRecord target,
+        bool hasExplicitSnapshotOrVersion,
+        ServiceProperties properties,
+        bool hierarchicalNamespace,
+        HashSet<ulong> deletionIds)
+    {
+        if (!hasExplicitSnapshotOrVersion &&
+            target.IsCurrent && target.Snapshot is null &&
+            properties.VersioningEnabled && !hierarchicalNamespace)
+        {
+            return target with
+            {
+                IsCurrent = false,
+                IsDeleted = false,
+                DeletedAt = null,
+                DeleteRetentionUntil = null,
+                VersionId = target.VersionId ?? MetadataStore.CreateVersionId(target.LastModified),
+                Lease = LeaseRecord.Available,
+                Revision = MetadataStore.NewRevision()
+            };
+        }
+        if (!properties.BlobSoftDeleteEnabled)
+            return null;
+
+        var deletedAt = metadata.GetUtcNow();
+        ulong? deletionId = null;
+        var hierarchicalPathDelete = hierarchicalNamespace && target.Snapshot is null;
+        if (hierarchicalPathDelete)
+        {
+            do
+            {
+                deletionId = MetadataStore.NewDeletionId();
+            }
+            while (!deletionIds.Add(deletionId.Value));
+        }
+        return target with
+        {
+            IsDeleted = true,
+            DeletionId = deletionId,
+            DeletedAt = deletedAt,
+            DeleteRetentionUntil = deletedAt.AddDays(properties.BlobSoftDeleteRetentionDays),
+            IsCurrent = !hierarchicalNamespace && target.IsCurrent,
+            VersionId = hierarchicalNamespace ? null : target.VersionId,
+            Snapshot = hierarchicalPathDelete ? null : target.Snapshot,
+            Lease = LeaseRecord.Available,
+            Revision = MetadataStore.NewRevision()
+        };
     }
 
     public async Task PermanentlyDeleteBlobAsync(
@@ -1944,6 +2014,86 @@ public sealed class BlobService(
             options,
             cancellationToken,
             current).ConfigureAwait(false);
+        var (sourceIdentity, preparedCurrent, encryption) =
+            PrepareIncrementalCopyDestination(source, current, options);
+        current = preparedCurrent;
+        using var prepared = await PrepareCopyContentAsync(
+            account,
+            source,
+            encryption,
+            preserveCommittedBlocks: false,
+            cancellationToken).ConfigureAwait(false);
+        var now = metadata.GetUtcNow();
+        var pending = CreatePendingIncrementalCopy(
+            account, container, name, source, options, sourceUri, current,
+            encryption, prepared.Content, sourceIdentity, now);
+
+        if (current is null)
+            return await metadata.PublishBlobAsync(
+                pending,
+                null,
+                null,
+                IsHierarchicalNamespaceEnabled(account),
+                cancellationToken).ConfigureAwait(false);
+        await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken).ConfigureAwait(false);
+        return pending;
+    }
+
+    private BlobRecord CreatePendingIncrementalCopy(
+        string account,
+        string container,
+        string name,
+        BlobRecord source,
+        BlobWriteOptions options,
+        string sourceUri,
+        BlobRecord? current,
+        BlobEncryption encryption,
+        ContentManifest preparedContent,
+        string sourceIdentity,
+        DateTimeOffset now)
+    {
+        var copyId = Guid.NewGuid().ToString();
+        return (current ?? NewBlob(
+            account,
+            container,
+            name,
+            BlobKind.PageBlob,
+            chunks.Empty(account, encryption),
+            options,
+            now)) with
+        {
+            Revision = MetadataStore.NewRevision(),
+            ETag = MetadataStore.NewETag(),
+            LastModified = now,
+            LastAccessedAt = IsLastAccessTimeTrackingEnabled(account)
+                ? now
+                : current?.LastAccessedAt,
+            SequenceNumber = source.SequenceNumber,
+            IsIncrementalCopy = true,
+            IncrementalCopySource = sourceIdentity,
+            IncrementalCopySourceCreatedAt = source.CreatedAt,
+            PendingCopyContent = preparedContent,
+            PendingCopyPageRanges = [.. source.PageRanges],
+            Copy = new CopyState
+            {
+                Id = copyId,
+                Source = sourceUri,
+                Status = "pending",
+                BytesCopied = 0,
+                TotalBytes = preparedContent.Length,
+                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
+                ExpiresAt = now.AddDays(14),
+                IsIncremental = true,
+                SourceSnapshot = source.Snapshot
+            }
+        };
+    }
+
+    private (string SourceIdentity, BlobRecord? Current, BlobEncryption Encryption) PrepareIncrementalCopyDestination(
+        BlobRecord source,
+        BlobRecord? current,
+        BlobWriteOptions options)
+    {
         if (source.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidSourceBlobType", "The source blob type is invalid for incremental copy.");
         if (source.Snapshot is null)
@@ -1983,58 +2133,7 @@ public sealed class BlobService(
         {
             encryption = EncryptionOf(options);
         }
-        using var prepared = await PrepareCopyContentAsync(
-            account,
-            source,
-            encryption,
-            preserveCommittedBlocks: false,
-            cancellationToken).ConfigureAwait(false);
-        var now = metadata.GetUtcNow();
-        var copyId = Guid.NewGuid().ToString();
-        var pending = (current ?? NewBlob(
-            account,
-            container,
-            name,
-            BlobKind.PageBlob,
-            chunks.Empty(account, encryption),
-            options,
-            now)) with
-        {
-            Revision = MetadataStore.NewRevision(),
-            ETag = MetadataStore.NewETag(),
-            LastModified = now,
-            LastAccessedAt = IsLastAccessTimeTrackingEnabled(account)
-                ? now
-                : current?.LastAccessedAt,
-            SequenceNumber = source.SequenceNumber,
-            IsIncrementalCopy = true,
-            IncrementalCopySource = sourceIdentity,
-            IncrementalCopySourceCreatedAt = source.CreatedAt,
-            PendingCopyContent = prepared.Content,
-            PendingCopyPageRanges = [.. source.PageRanges],
-            Copy = new CopyState
-            {
-                Id = copyId,
-                Source = sourceUri,
-                Status = "pending",
-                BytesCopied = 0,
-                TotalBytes = prepared.Content.Length,
-                ReadyAt = now.Add(_options.AsyncCopyCompletionDelay),
-                ExpiresAt = now.AddDays(14),
-                IsIncremental = true,
-                SourceSnapshot = source.Snapshot
-            }
-        };
-
-        if (current is null)
-            return await metadata.PublishBlobAsync(
-                pending,
-                null,
-                null,
-                IsHierarchicalNamespaceEnabled(account),
-                cancellationToken).ConfigureAwait(false);
-        await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken).ConfigureAwait(false);
-        return pending;
+        return (sourceIdentity, current, encryption);
     }
 
     // Preserve the exact x-ms-copy-source text in the stored copy state.
@@ -2145,17 +2244,8 @@ public sealed class BlobService(
         using var sourcePin = chunks.Pin(sourceContent);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
-        var copyReadyAt = now.Add(_options.AsyncCopyCompletionDelay);
-        var rehydratePriority = sourceIsArchived
-            ? options.RehydratePriority ?? "Standard"
-            : null;
-        var rehydrateCompleteAt = sourceIsArchived
-            ? now.Add(string.Equals(rehydratePriority, "High"
-, StringComparison.Ordinal) ? _options.HighPriorityRehydrationDelay
-                : _options.StandardRehydrationDelay)
-            : (DateTimeOffset?)null;
-        if (rehydrateCompleteAt < copyReadyAt)
-            rehydrateCompleteAt = copyReadyAt;
+        var (copyReadyAt, rehydratePriority, rehydrateCompleteAt) =
+            ComputeCopyTiming(sourceIsArchived, options, now);
         var visibleContent = sourceKind == BlobKind.PageBlob
             ? chunks.Sparse(account, encryption, sourceContent.Length)
             : chunks.Empty(account, encryption);
@@ -2196,6 +2286,23 @@ public sealed class BlobService(
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private (DateTimeOffset CopyReadyAt, string? RehydratePriority, DateTimeOffset? RehydrateCompleteAt) ComputeCopyTiming(
+        bool sourceIsArchived,
+        BlobWriteOptions options,
+        DateTimeOffset now)
+    {
+        var copyReadyAt = now.Add(_options.AsyncCopyCompletionDelay);
+        var rehydratePriority = sourceIsArchived ? options.RehydratePriority ?? "Standard" : null;
+        var rehydrateCompleteAt = sourceIsArchived
+            ? now.Add(string.Equals(rehydratePriority, "High", StringComparison.Ordinal)
+                ? _options.HighPriorityRehydrationDelay
+                : _options.StandardRehydrationDelay)
+            : (DateTimeOffset?)null;
+        if (rehydrateCompleteAt < copyReadyAt)
+            rehydrateCompleteAt = copyReadyAt;
+        return (copyReadyAt, rehydratePriority, rehydrateCompleteAt);
     }
 
     private static void ValidateCopyRehydrationOptions(

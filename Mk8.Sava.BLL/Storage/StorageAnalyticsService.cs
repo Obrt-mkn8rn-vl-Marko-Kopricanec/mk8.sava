@@ -44,30 +44,7 @@ public sealed class StorageAnalyticsService(
                 cancellationToken).ConfigureAwait(false);
             var counter = NextCounter(prefix, lastName);
             var now = metadata.GetUtcNow();
-            var proposed = new BlobRecord
-            {
-                Account = request.Account,
-                Container = LogsContainerName,
-                Name = $"{prefix}{counter:D6}.log",
-                GenerationId = Guid.NewGuid().ToString("N"),
-                Revision = MetadataStore.NewRevision(),
-                IsCurrent = true,
-                Kind = BlobKind.BlockBlob,
-                Content = content.Manifest,
-                ETag = MetadataStore.NewETag(),
-                CreatedAt = now,
-                LastModified = now,
-                Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-                {
-                    ["LogType"] = CategoryName(request.Category),
-                    ["StartTime"] = FormatMetadataTime(request.StartedAt),
-                    ["EndTime"] = FormatMetadataTime(request.CompletedAt),
-                    ["LogVersion"] = logging.Version
-                },
-                Http = new BlobHttpProperties { ContentType = "application/octet-stream" },
-                AccessTier = "Hot",
-                AccessTierInferred = true
-            };
+            var proposed = CreateLogRecord(request, logging.Version, prefix, counter, content.Manifest, now);
 
             try
             {
@@ -85,6 +62,37 @@ public sealed class StorageAnalyticsService(
             }
         }
     }
+
+    private static BlobRecord CreateLogRecord(
+        StorageAnalyticsRequest request,
+        string version,
+        string prefix,
+        int counter,
+        ContentManifest content,
+        DateTimeOffset now) => new()
+        {
+            Account = request.Account,
+            Container = LogsContainerName,
+            Name = $"{prefix}{counter:D6}.log",
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = MetadataStore.NewRevision(),
+            IsCurrent = true,
+            Kind = BlobKind.BlockBlob,
+            Content = content,
+            ETag = MetadataStore.NewETag(),
+            CreatedAt = now,
+            LastModified = now,
+            Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["LogType"] = CategoryName(request.Category),
+                ["StartTime"] = FormatMetadataTime(request.StartedAt),
+                ["EndTime"] = FormatMetadataTime(request.CompletedAt),
+                ["LogVersion"] = version
+            },
+            Http = new BlobHttpProperties { ContentType = "application/octet-stream" },
+            AccessTier = "Hot",
+            AccessTierInferred = true
+        };
 
     public async Task EnsureContainerAsync(string account, CancellationToken cancellationToken)
     {
