@@ -2646,6 +2646,61 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalAclAuthorizesMetadataAndPropertiesFromTheParentDirectory()
+    {
+        const string writerObjectId = "10f03e3f-27ca-4e69-adad-e02c964aa1e2";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-properties-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var nested = container.GetBlobClient("folder/item.txt");
+        var root = container.GetBlobClient("root.txt");
+        await nested.UploadAsync(BinaryData.FromString("nested"));
+        await root.UploadAsync(BinaryData.FromString("root"));
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::-wx,other::---"
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder",
+                AccessAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---"
+            });
+
+        var writer = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId))
+            .GetBlobContainerClient(container.Name);
+        var writable = writer.GetBlobClient(nested.Name);
+        await writable.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["status"] = "updated"
+        });
+        await writable.SetHttpHeadersAsync(new BlobHttpHeaders { ContentType = "text/plain" });
+        var properties = (await nested.GetPropertiesAsync()).Value;
+        Assert.Equal("updated", properties.Metadata["status"]);
+        Assert.Equal("text/plain", properties.ContentType);
+
+        var deniedMetadata = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient(root.Name).SetMetadataAsync(
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["status"] = "forbidden" }));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedMetadata.Status);
+        var deniedProperties = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient(root.Name).SetHttpHeadersAsync(new BlobHttpHeaders { ContentType = "text/plain" }));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedProperties.Status);
+    }
+
+    [Fact]
     public async Task HierarchicalAclAuthorizesPutAndDeleteFromTheParentDirectory()
     {
         const string writerObjectId = "97f5af62-55de-46b3-86b5-151988d1ae11";

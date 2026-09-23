@@ -596,7 +596,8 @@ and a changed ACL advances that target's ETag and Last-Modified timestamp.
 An unchanged ACL is idempotent. The command holds the data-root process lease,
 so it cannot run alongside a live service on that root. This is not an
 application-facing API or the separate `dfs` ACL mutation protocol. Blob-surface
-list/mutation authorization and live Azure validation remain incomplete.
+list/mutation authorization remains incomplete. Live Azure validation is
+optional, not a review prerequisite.
 For Get Blob, Get Blob Properties, Get Blob Metadata, and Query Blob Contents,
 a trusted bearer principal without a configured RBAC read grant can fall back
 to the same root/parent
@@ -606,6 +607,14 @@ ACL identity. A configured RBAC read grant still authorizes without an ACL
 check. Signed bearer `groups` claims can satisfy stored owning/named-group
 entries; group memberships absent from the token are not resolved. Bearer ACL
 fallback for other operations remains incomplete.
+For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
+fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
+Set Blob Properties, and Delete Blob through write/execute on the immediate
+parent directory plus execute on ancestors. Metadata and property mutations
+recheck that parent permission immediately before storage mutation. These
+rules follow Microsoft's documented
+[HNS ACL create/update/delete permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions).
+Unsupported ACL-only mutation shapes still fail closed.
 For both bearer fallback and signed `suoid` reads, the ACL decision is bound to
 the blob generation served by the endpoint. A replacement or a blob created
 after authorization cannot turn an allowed read of an older or missing target

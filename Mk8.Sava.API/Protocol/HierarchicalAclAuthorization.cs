@@ -18,7 +18,9 @@ internal static class HierarchicalAclAuthorization
         if (HttpMethods.IsPut(http.Method) &&
             (component.Length == 0 ||
              component.Equals("block", StringComparison.OrdinalIgnoreCase) ||
-             component.Equals("blocklist", StringComparison.OrdinalIgnoreCase)))
+             component.Equals("blocklist", StringComparison.OrdinalIgnoreCase) ||
+             component.Equals("metadata", StringComparison.OrdinalIgnoreCase) ||
+             component.Equals("properties", StringComparison.OrdinalIgnoreCase)))
             return 'w';
         return HttpMethods.IsDelete(http.Method) && component.Length == 0 ? 'd' : null;
     }
