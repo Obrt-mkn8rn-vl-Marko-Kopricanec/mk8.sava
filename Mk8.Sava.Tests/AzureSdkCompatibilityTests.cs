@@ -1941,41 +1941,47 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Owner")?.Value);
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Group")?.Value);
 
-            using var head = new HttpRequestMessage(
-                HttpMethod.Head,
-                container.GetBlobClient("parent/delegated.txt").GenerateSasUri(
-                    BlobSasPermissions.Read,
-                    DateTimeOffset.UtcNow.AddMinutes(5)));
-            head.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            head.Headers.TryAddWithoutValidation("x-ms-upn", "true");
-            using var projectedHead = await transport.SendAsync(head).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, projectedHead.StatusCode);
-            Assert.Equal("delegated@example.test", GetResponseHeader(projectedHead, "x-ms-owner"));
-            Assert.Equal("creator@example.test", GetResponseHeader(projectedHead, "x-ms-group"));
-
-            using var projectedListRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
-            projectedListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            projectedListRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
-            using var projectedListResponse = await transport.SendAsync(projectedListRequest).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, projectedListResponse.StatusCode);
-            var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
-            var projectedDirectory = Assert.Single(projectedList.Descendants("BlobPrefix"));
-            Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Owner")?.Value);
-            Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Group")?.Value);
-
-            var recursiveUri = AppendQuery(
-                container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
-                "restype=container&comp=list&include=permissions");
-            using var recursiveRequest = new HttpRequestMessage(HttpMethod.Get, recursiveUri);
-            recursiveRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            recursiveRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
-            using var recursiveResponse = await transport.SendAsync(recursiveRequest).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, recursiveResponse.StatusCode);
-            var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
-            var delegatedEntry = recursive.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, "parent/delegated.txt", StringComparison.Ordinal));
-            Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
-            Assert.Equal("creator@example.test", delegatedEntry.Element("Properties")?.Element("Group")?.Value);
+            await AssertProjectedOwnerNamesAsync(container, transport, listUri, creatorId).ConfigureAwait(false);
         }
+    }
+
+    private static async Task AssertProjectedOwnerNamesAsync(
+        BlobContainerClient container, HttpClient transport, Uri listUri, string creatorId)
+    {
+        using var head = new HttpRequestMessage(
+            HttpMethod.Head,
+            container.GetBlobClient("parent/delegated.txt").GenerateSasUri(
+                BlobSasPermissions.Read,
+                DateTimeOffset.UtcNow.AddMinutes(5)));
+        head.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        head.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+        using var projectedHead = await transport.SendAsync(head).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, projectedHead.StatusCode);
+        Assert.Equal("delegated@example.test", GetResponseHeader(projectedHead, "x-ms-owner"));
+        Assert.Equal("creator@example.test", GetResponseHeader(projectedHead, "x-ms-group"));
+
+        using var projectedListRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
+        projectedListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        projectedListRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+        using var projectedListResponse = await transport.SendAsync(projectedListRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, projectedListResponse.StatusCode);
+        var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var projectedDirectory = Assert.Single(projectedList.Descendants("BlobPrefix"));
+        Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Owner")?.Value);
+        Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Group")?.Value);
+
+        var recursiveUri = AppendQuery(
+            container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "restype=container&comp=list&include=permissions");
+        using var recursiveRequest = new HttpRequestMessage(HttpMethod.Get, recursiveUri);
+        recursiveRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        recursiveRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+        using var recursiveResponse = await transport.SendAsync(recursiveRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, recursiveResponse.StatusCode);
+        var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var delegatedEntry = recursive.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, "parent/delegated.txt", StringComparison.Ordinal));
+        Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
+        Assert.Equal("creator@example.test", delegatedEntry.Element("Properties")?.Element("Group")?.Value);
     }
 
     [Fact]
@@ -2473,19 +2479,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await nested.UploadAsync(BinaryData.FromString("new"));
         Assert.Equal("new", (await reader.GetBlobClient(nested.Name).DownloadContentAsync())
             .Value.Content.ToString());
-        var metadata = application.Services.GetRequiredService<MetadataStore>();
-        var one = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
-            container.Name, "one", null, null, includeDeleted: false, CancellationToken.None);
-        var two = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
-            container.Name, "one/two", null, null, includeDeleted: false, CancellationToken.None);
-        var file = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
-            container.Name, nested.Name, null, null, includeDeleted: false, CancellationToken.None);
-        Assert.NotNull(one);
-        Assert.NotNull(two);
-        Assert.NotNull(file);
-        Assert.Equal(defaultAcl, string.Join(',', one.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
-        Assert.Equal(defaultAcl, string.Join(',', two.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
-        Assert.DoesNotContain("default:", file.Acl, StringComparison.Ordinal);
+        await AssertInheritedDirectoryAclsAsync(application, container, nested, defaultAcl);
 
         await ApplyAclManifestAsync(application, entry with
         {
@@ -2497,6 +2491,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var deniedLater = await Assert.ThrowsAsync<RequestFailedException>(() =>
             reader.GetBlobClient("later.txt").DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedLater.Status);
+    }
+
+    private static async Task AssertInheritedDirectoryAclsAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient nested,
+        string defaultAcl)
+    {
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var one = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, "one", null, null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        var two = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, "one/two", null, null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        var file = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, nested.Name, null, null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        Assert.NotNull(one);
+        Assert.NotNull(two);
+        Assert.NotNull(file);
+        Assert.Equal(defaultAcl, string.Join(',', one.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
+        Assert.Equal(defaultAcl, string.Join(',', two.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
+        Assert.DoesNotContain("default:", file.Acl, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -5777,29 +5792,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.True((await blob.ExistsAsync()).Value);
 
             var currentVersion = blob.WithVersion(currentVersionId);
-            using var transport = new HttpClient(factory.Server.CreateHandler());
-            using (var ordinaryDelete = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       currentVersion.GenerateSasUri(
-                           BlobSasPermissions.Delete,
-                           DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                ordinaryDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(ordinaryDelete);
-                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            }
-            Assert.True((await currentVersion.ExistsAsync()).Value);
-
-            var versionDeleteUri = currentVersion.GenerateSasUri(
-                BlobSasPermissions.DeleteBlobVersion,
-                DateTimeOffset.UtcNow.AddMinutes(5));
-            using (var versionDelete = new HttpRequestMessage(HttpMethod.Delete, versionDeleteUri))
-            {
-                versionDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(versionDelete);
-                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-                Assert.Equal("true", response.Headers.GetValues("x-ms-delete-type-permanent").Single());
-            }
+            await AssertVersionDeletePermissionAsync(currentVersion, factory);
             Assert.False((await currentVersion.ExistsAsync()).Value);
             Assert.False((await blob.ExistsAsync()).Value);
             Assert.True((await snapshot.ExistsAsync()).Value);
@@ -5811,6 +5804,34 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
                 original,
                 CancellationToken.None);
+        }
+    }
+
+    private static async Task AssertVersionDeletePermissionAsync(
+        BlobClient currentVersion, SavaWebApplicationFactory application)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using (var ordinaryDelete = new HttpRequestMessage(
+                   HttpMethod.Delete,
+                   currentVersion.GenerateSasUri(
+                       BlobSasPermissions.Delete,
+                       DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            ordinaryDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(ordinaryDelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        }
+        Assert.True((await currentVersion.ExistsAsync().ConfigureAwait(false)).Value);
+
+        var versionDeleteUri = currentVersion.GenerateSasUri(
+            BlobSasPermissions.DeleteBlobVersion,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using (var versionDelete = new HttpRequestMessage(HttpMethod.Delete, versionDeleteUri))
+        {
+            versionDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(versionDelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.Equal("true", response.Headers.GetValues("x-ms-delete-type-permanent").Single());
         }
     }
 
@@ -6209,12 +6230,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             new BlobRequestConditions { LeaseId = acquired.Value.LeaseId });
         await lease.ReleaseAsync();
 
-        var beforeSeal = (await append.GetPropertiesAsync()).Value;
+        await AssertAppendSealConditionsAsync(append, factory);
+    }
+
+    private static async Task AssertAppendSealConditionsAsync(
+        AppendBlobClient append, SavaWebApplicationFactory application)
+    {
+        var beforeSeal = (await append.GetPropertiesAsync().ConfigureAwait(false)).Value;
         var wrongPosition = await Assert.ThrowsAsync<RequestFailedException>(() =>
             append.SealAsync(new AppendBlobRequestConditions
             {
                 IfAppendPositionEqual = beforeSeal.ContentLength + 1
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status412PreconditionFailed, wrongPosition.Status);
         Assert.Equal("AppendPositionConditionNotMet", wrongPosition.ErrorCode);
 
@@ -6222,21 +6249,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             append.SealAsync(new AppendBlobRequestConditions
             {
                 IfMatch = new ETag("\"not-the-current-etag\"")
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status412PreconditionFailed, wrongEtag.Status);
         Assert.Equal("ConditionNotMet", wrongEtag.ErrorCode);
 
         var sealUri = AppendQuery(
             append.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
             "comp=seal");
-        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        using (var transport = new HttpClient(application.Server.CreateHandler()))
         using (var bodyRequest = new HttpRequestMessage(HttpMethod.Put, sealUri)
         {
             Content = new ByteArrayContent([1])
         })
         {
             bodyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var bodyResponse = await transport.SendAsync(bodyRequest);
+            using var bodyResponse = await transport.SendAsync(bodyRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, bodyResponse.StatusCode);
             Assert.Equal("InvalidHeaderValue", bodyResponse.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -6244,8 +6271,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await append.SealAsync(new AppendBlobRequestConditions
         {
             IfAppendPositionEqual = beforeSeal.ContentLength
-        });
-        Assert.True((await append.GetPropertiesAsync()).Value.IsSealed);
+        }).ConfigureAwait(false);
+        Assert.True((await append.GetPropertiesAsync().ConfigureAwait(false)).Value.IsSealed);
     }
 
     [Fact]
@@ -6893,26 +6920,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 $"?{builder.ToSasQueryParameters(credential)}");
         }
 
-        static Uri ReplaceQueryValue(Uri uri, string name, string value)
-        {
-            var pairs = uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries);
-            var replaced = false;
-            for (var index = 0; index < pairs.Length; index++)
-            {
-                var separator = pairs[index].IndexOf('=', StringComparison.Ordinal);
-                var encodedName = separator < 0 ? pairs[index] : pairs[index][..separator];
-                if (!string.Equals(Uri.UnescapeDataString(encodedName), name, StringComparison.Ordinal))
-                    continue;
-
-                pairs[index] = $"{encodedName}={Uri.EscapeDataString(value)}";
-                replaced = true;
-                break;
-            }
-
-            Assert.True(replaced, $"The {name} query parameter was not present.");
-            return new UriBuilder(uri) { Query = string.Join('&', pairs) }.Uri;
-        }
-
         async Task AssertErrorAsync(Uri uri, string code)
         {
             var client = CreateBlobClient(factory, uri);
@@ -6925,14 +6932,34 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         protocolBuilder.Protocol = SasProtocol.Https;
         var protocolUri = CreateUri(protocolBuilder);
         await AssertErrorAsync(protocolUri, "AuthorizationProtocolMismatch");
-        await AssertErrorAsync(ReplaceQueryValue(protocolUri, "spr", "ftp"), "AuthenticationFailed");
+        await AssertErrorAsync(ReplaceSasQueryValue(protocolUri, "spr", "ftp"), "AuthenticationFailed");
 
         var ipBuilder = CreateBuilder();
         ipBuilder.Protocol = SasProtocol.HttpsAndHttp;
         ipBuilder.IPRange = new SasIPRange(IPAddress.Parse("203.0.113.10"), IPAddress.None);
         var ipUri = CreateUri(ipBuilder);
         await AssertErrorAsync(ipUri, "AuthorizationSourceIPMismatch");
-        await AssertErrorAsync(ReplaceQueryValue(ipUri, "sip", "not-an-ip"), "AuthenticationFailed");
+        await AssertErrorAsync(ReplaceSasQueryValue(ipUri, "sip", "not-an-ip"), "AuthenticationFailed");
+    }
+
+    private static Uri ReplaceSasQueryValue(Uri uri, string name, string value)
+    {
+        var pairs = uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries);
+        var replaced = false;
+        for (var index = 0; index < pairs.Length; index++)
+        {
+            var separator = pairs[index].IndexOf('=', StringComparison.Ordinal);
+            var encodedName = separator < 0 ? pairs[index] : pairs[index][..separator];
+            if (!string.Equals(Uri.UnescapeDataString(encodedName), name, StringComparison.Ordinal))
+                continue;
+
+            pairs[index] = $"{encodedName}={Uri.EscapeDataString(value)}";
+            replaced = true;
+            break;
+        }
+
+        Assert.True(replaced, $"The {name} query parameter was not present.");
+        return new UriBuilder(uri) { Query = string.Join('&', pairs) }.Uri;
     }
 
     [Theory]
@@ -9716,26 +9743,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "mutable" });
         Assert.Equal("mutable", (await blob.GetPropertiesAsync()).Value.Metadata["state"]);
 
+        await AssertLockedImmutabilityCannotBeRemovedAsync(container, expiresOn);
+    }
+
+    private static async Task AssertLockedImmutabilityCannotBeRemovedAsync(
+        BlobContainerClient container, DateTimeOffset expiresOn)
+    {
         var locked = container.GetBlobClient("locked.txt");
-        await locked.UploadAsync(BinaryData.FromString("locked payload"));
+        await locked.UploadAsync(BinaryData.FromString("locked payload")).ConfigureAwait(false);
         await locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
         {
             ExpiresOn = expiresOn,
             PolicyMode = BlobImmutabilityPolicyMode.Unlocked
-        });
+        }).ConfigureAwait(false);
         await locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
         {
             ExpiresOn = expiresOn.AddHours(1),
             PolicyMode = BlobImmutabilityPolicyMode.Locked
-        });
+        }).ConfigureAwait(false);
         var cannotUnlock = await Assert.ThrowsAsync<RequestFailedException>(() =>
             locked.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
             {
                 ExpiresOn = expiresOn.AddHours(2),
                 PolicyMode = BlobImmutabilityPolicyMode.Unlocked
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal("BlobImmutableDueToPolicy", cannotUnlock.ErrorCode);
-        var cannotDelete = await Assert.ThrowsAsync<RequestFailedException>(() => locked.DeleteImmutabilityPolicyAsync());
+        var cannotDelete = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            locked.DeleteImmutabilityPolicyAsync()).ConfigureAwait(false);
         Assert.Equal("BlobImmutableDueToPolicy", cannotDelete.ErrorCode);
     }
 
