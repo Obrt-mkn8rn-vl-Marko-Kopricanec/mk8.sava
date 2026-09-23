@@ -7,13 +7,42 @@ namespace Mk8.Sava.Tests;
 public sealed class HierarchicalAclAuthorizationTests
 {
     [Theory]
+    [InlineData("PUT", "appendblock", "", true)]
+    [InlineData("PUT", "AppendBlock", "", true)]
+    [InlineData("PUT", "appendblock", "snapshot=2026-01-01", false)]
+    [InlineData("GET", "appendblock", "", false)]
+    [InlineData("PUT", "block", "", false)]
+    public void AppendFallbackOnlyTargetsTheCurrentBlobAppendOperation(
+        string method, string component, string additionalQuery, bool expected)
+    {
+        var request = new DefaultHttpContext().Request;
+        request.Method = method;
+        request.QueryString = new QueryString(
+            $"?comp={component}" + (additionalQuery.Length == 0 ? string.Empty : $"&{additionalQuery}"));
+        var resource = new StorageRequestContext
+        {
+            RequestId = "test",
+            Account = "account",
+            Container = "container",
+            Blob = "blob",
+            ResourceKind = StorageResourceKind.Blob,
+            CanonicalResourcePath = "/account/container/blob",
+            ServiceVersion = "2023-11-03",
+            Authorization = StorageAuthorization.Anonymous
+        };
+        Assert.Equal(expected, HierarchicalAclAuthorization.IsAppendOperation(request, resource));
+    }
+
+    [Theory]
     [InlineData("PUT", "", "", 'w')]
+    [InlineData("PUT", "block", "", 'w')]
+    [InlineData("PUT", "blocklist", "", 'w')]
     [InlineData("DELETE", "", "", 'd')]
     [InlineData("GET", "", "", null)]
     [InlineData("PUT", "metadata", "", null)]
     [InlineData("DELETE", "", "deletetype=permanent", null)]
     [InlineData("DELETE", "", "snapshot=2026-01-01", null)]
-    public void ParentMutationFallbackOnlyTargetsCurrentBlobPutAndDelete(
+    public void ParentMutationFallbackTargetsCurrentBlobPutBlockWriteAndDelete(
         string method, string component, string additionalQuery, char? expected)
     {
         var request = new DefaultHttpContext().Request;

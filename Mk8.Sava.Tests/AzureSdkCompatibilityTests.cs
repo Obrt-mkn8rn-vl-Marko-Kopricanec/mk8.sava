@@ -1919,6 +1919,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = bearer.GetBlobContainerClient($"suoid-{Guid.NewGuid():N}");
         await container.CreateAsync();
         await container.GetBlobClient("parent/child.txt").UploadAsync(BinaryData.FromString("owned-content"));
+        await container.GetAppendBlobClient("parent/log.txt").CreateAsync();
 
         var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
         var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
@@ -1996,6 +1997,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Contains("owned-content", await reader.ReadToEndAsync(), StringComparison.Ordinal);
         await owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true);
         Assert.Equal("changed", (await owned.DownloadContentAsync()).Value.Content.ToString());
+        var signedAppendUri = WithSuoid("parent/log.txt", ownerObjectId).Uri;
+        var signedAppend = new AppendBlobClient(signedAppendUri, new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+            {
+                BaseAddress = signedAppendUri
+            }),
+            Retry = { MaxRetries = 0 }
+        });
+        await signedAppend.AppendBlockAsync(new MemoryStream("signed-append"u8.ToArray(), writable: false));
+        Assert.Equal("signed-append", (await container.GetBlobClient("parent/log.txt").DownloadContentAsync())
+            .Value.Content.ToString());
 
         var foreignAgent = WithSuoid("parent/child.txt", foreignObjectId);
         var deniedTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
@@ -2633,11 +2646,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await writer.GetBlobClient("folder/existing.txt")
             .UploadAsync(BinaryData.FromString("replaced"), overwrite: true);
         await writer.GetBlobClient("folder/delete.txt").DeleteAsync();
+        var staged = writer.GetBlockBlobClient("folder/staged.txt");
+        var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes("block-1"));
+        await staged.StageBlockAsync(blockId, new MemoryStream("staged"u8.ToArray(), writable: false));
+        await staged.CommitBlockListAsync([blockId]);
         Assert.Equal("new", (await container.GetBlobClient("folder/new.txt").DownloadContentAsync())
             .Value.Content.ToString());
         Assert.Equal("replaced", (await container.GetBlobClient("folder/existing.txt").DownloadContentAsync())
             .Value.Content.ToString());
         Assert.False((await container.GetBlobClient("folder/delete.txt").ExistsAsync()).Value);
+        Assert.Equal("staged", (await container.GetBlobClient("folder/staged.txt").DownloadContentAsync())
+            .Value.Content.ToString());
 
         var rootDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
             writer.GetBlobClient("root-existing.txt").UploadAsync(
@@ -2659,6 +2678,85 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await writer.GetBlobClient("root-existing.txt")
             .UploadAsync(BinaryData.FromString("root-replaced"), overwrite: true);
         Assert.Equal("root-replaced", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+    }
+
+    [Fact]
+    public async Task HierarchicalAclRequiresFileReadAndWriteForAppendBlock()
+    {
+        const string appenderObjectId = "321c78dd-64e5-439f-bf30-748d84eea652";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-append-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetAppendBlobClient("folder/log.txt").CreateAsync();
+        var traverseAcl = $"user::rwx,user:{appenderObjectId}:--x,group::r-x,mask::r-x,other::---";
+        var appendAcl = $"user::rw-,user:{appenderObjectId}:rw-,group::r--,mask::rw-,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = traverseAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder",
+                AccessAcl = traverseAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder/log.txt",
+                AccessAcl = appendAcl
+            });
+
+        var appender = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, appenderObjectId))
+            .GetBlobContainerClient(container.Name)
+            .GetAppendBlobClient("folder/log.txt");
+        await appender.AppendBlockAsync(new MemoryStream("line"u8.ToArray(), writable: false));
+        Assert.Equal("line", (await container.GetBlobClient("folder/log.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "folder/log.txt",
+            AccessAcl = $"user::rw-,user:{appenderObjectId}:-w-,group::r--,mask::rw-,other::---"
+        });
+        var deniedFileRead = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            appender.AppendBlockAsync(new MemoryStream("denied"u8.ToArray(), writable: false)));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedFileRead.Status);
+
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder/log.txt",
+                AccessAcl = appendAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder",
+                AccessAcl = $"user::rwx,user:{appenderObjectId}:---,group::r-x,mask::r-x,other::---"
+            });
+        var deniedTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            appender.AppendBlockAsync(new MemoryStream("denied"u8.ToArray(), writable: false)));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedTraversal.Status);
+        Assert.Equal("line", (await container.GetBlobClient("folder/log.txt").DownloadContentAsync())
             .Value.Content.ToString());
     }
 

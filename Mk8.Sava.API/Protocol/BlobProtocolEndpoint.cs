@@ -1055,6 +1055,7 @@ public static class BlobProtocolEndpoint
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken);
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
@@ -1115,6 +1116,7 @@ public static class BlobProtocolEndpoint
             var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
             ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
             if (current is not null)
                 EnsureLease(http.Request, current.Lease, "blob");
@@ -1156,6 +1158,8 @@ public static class BlobProtocolEndpoint
             RequireAppendBlobVersion(request);
             RequireAny(request, 'a', 'w');
             var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
+            HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, current.GenerationId);
+            await RecheckAppendAclAsync(http, request, cancellationToken);
             EvaluateWriteConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
             var expectedPosition = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-appendpos");
@@ -3136,6 +3140,25 @@ public static class BlobProtocolEndpoint
                 throw AzureStorageException.InvalidQuery(queryName);
             http.Response.Headers[headerName] = value;
         }
+    }
+
+    private static async Task RecheckAppendAclAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        CancellationToken cancellationToken)
+    {
+        if (!request.Authorization.AclAppendChecked)
+            return;
+
+        var generation = await HierarchicalAclAuthorization.EnsureAppendAsync(
+            http.RequestServices.GetRequiredService<MetadataStore>(),
+            http.Request,
+            request,
+            request.Authorization.AclAppendObjectId!,
+            request.Authorization.AclAppendGroups!,
+            request.Authorization.Permissions,
+            cancellationToken);
+        HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, generation);
     }
 
     private static Task RecheckParentMutationAclAsync(
