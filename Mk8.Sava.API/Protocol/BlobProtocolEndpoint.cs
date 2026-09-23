@@ -1420,6 +1420,7 @@ public static class BlobProtocolEndpoint
             snapshot,
             includeDeleted: permanentDelete,
             cancellationToken);
+        HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, blob.GenerationId);
         ValidateBlobTypeVersion(request, blob.Kind);
 
         if (blob.IsIncrementalCopy && blob.Snapshot is null &&

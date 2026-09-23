@@ -481,6 +481,17 @@ its owning group from its parent directory (or the container root), while an
 overwrite keeps the existing path's owner and group. The current Blob-only
 surface retains the default POSIX permissions and ACL for files and
 directories; it does not implement the separate `dfs` ACL mutation protocol.
+For Get Blob and Get Blob Properties, a trusted bearer principal without a
+configured RBAC read grant can fall back to the same owner-only root/parent
+execute and file-read ACL check used for `suoid`, but only when its signed
+token contains a valid Entra `oid` claim. A `sub` or application ID is not an
+ACL identity. A configured RBAC read grant still authorizes without an ACL
+check. Bearer ACL fallback for other operations and group/named-user entries
+remains incomplete.
+For both bearer fallback and signed `suoid` reads, the ACL decision is bound to
+the blob generation served by the endpoint. A replacement or a blob created
+after authorization cannot turn an allowed read of an older or missing target
+into access to new content.
 HNS identity projection follows the Blob REST request shape. List Blobs accepts
 `x-ms-upn` only when `include=permissions` is present. Get Blob and Get Blob
 Properties accept it only from service version 2023-11-03. The value must be a
