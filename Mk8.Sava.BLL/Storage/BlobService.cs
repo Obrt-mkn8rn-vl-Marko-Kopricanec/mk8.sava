@@ -70,6 +70,13 @@ public sealed class BlobService(
 
     public async Task ApplyConfiguredAccountCapabilitiesAsync(CancellationToken cancellationToken = default)
     {
+        await metadata.EnsureAccountNamespaceModesAsync(
+            _options.Accounts.Keys.ToDictionary(
+                account => account,
+                IsHierarchicalNamespaceEnabled,
+                StringComparer.Ordinal),
+            cancellationToken);
+
         foreach (var (account, capabilities) in _options.AccountCapabilities)
         {
             if (!capabilities.VersioningEnabled)
