@@ -141,7 +141,9 @@ lease-enforced metadata writes, tags, append blobs, and page ranges/clears. The
 container scenario compares metadata, public-access policy, and lease-enforced
 deletion; it enables public access only in its disposable mk8.sava fixture to
 match Azurite's test account, leaving the service's secure default unchanged. The
-script configures Azurite with the test account key used by mk8.sava and
+service-list scenario compares prefix filtering, container metadata, one-item
+pages, and continuation through the official SDK, including an out-of-prefix
+container. The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
 is run with Yarn's `--ignore-engines` because newer transitive Azure packages
