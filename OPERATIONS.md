@@ -144,8 +144,12 @@ match Azurite's test account, leaving the service's secure default unchanged. Th
 service-list scenario compares prefix filtering, container metadata, one-item
 pages, and continuation through the official SDK, including an out-of-prefix
 container. The service-properties scenario compares a CORS rule round trip
-through the SDK and an allowed preflight response. The script configures Azurite
-with the test account key used by mk8.sava and
+through the SDK, an allowed preflight, a denied origin, and a malformed
+preflight. A same-account copy scenario compares source conditions, completion,
+and exact downloaded bytes. Azurite returns the generic `ConditionNotMet` for
+a stale copy-source ETag; mk8.sava retains the published Blob-specific
+`SourceConditionNotMet` code, and the test records this emulator divergence.
+The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
 is run with Yarn's `--ignore-engines` because newer transitive Azure packages
