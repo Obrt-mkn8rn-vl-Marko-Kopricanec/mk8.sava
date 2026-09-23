@@ -14,6 +14,8 @@ public sealed record ContainerRecord
     public string Group { get; init; } = "$superuser";
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AccessAcl { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool StickyBit { get; init; }
     [JsonIgnore]
     public string Acl => AccessAcl ?? "user::rwx,group::r-x,other::---";
     public IReadOnlyDictionary<string, string> Metadata { get; init; } =

@@ -2414,19 +2414,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(before.ETag, after.ETag);
         Assert.Null(after.AccessAcl);
 
-        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
-            entry with { AccessAcl = "user::rwx,group::r-x,other::---,default:user::rwx" }));
-        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
-            entry,
-            entry with
-            {
-                Path = "present.txt",
-                AccessAcl = "user::rw-,group::r--,other::---," +
-                            "default:user::rwx,default:group::r-x,default:other::---"
-            }));
-        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
-            entry,
-            entry));
+        await AssertInvalidAclManifestEntriesAsync(application, entry);
         Assert.Equal("present", (await container.GetBlobClient("present.txt").DownloadContentAsync())
             .Value.Content.ToString());
 
@@ -2442,6 +2430,32 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             File.Delete(oversizedPath);
         }
+    }
+
+    private static async Task AssertInvalidAclManifestEntriesAsync(
+        SavaWebApplicationFactory application, HierarchicalAclManifestEntry entry)
+    {
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry with { AccessAcl = "user::rwx,group::r-x,other::---,default:user::rwx" })).ConfigureAwait(false);
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry with
+            {
+                Path = "present.txt",
+                AccessAcl = "user::rw-,group::r--,other::---," +
+                            "default:user::rwx,default:group::r-x,default:other::---"
+            })).ConfigureAwait(false);
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry with
+            {
+                Path = "present.txt",
+                AccessAcl = "user::rw-,group::r--,other::---",
+                StickyBit = true
+            })).ConfigureAwait(false);
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry)).ConfigureAwait(false);
     }
 
     [Fact]
@@ -2797,6 +2811,100 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             });
 
         await AssertParentAclMutationsAsync(application, container, writerObjectId);
+    }
+
+    [Fact]
+    public async Task HierarchicalStickyDirectoryRejectsDeletionOfAnotherOwnersChild()
+    {
+        const string writerObjectId = "e054929f-c734-4e3b-b19b-b810eb24be22";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-sticky-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var foreign = container.GetBlobClient("sticky/foreign.txt");
+        await foreign.UploadAsync(BinaryData.FromString("retained"));
+        var rootAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::r-x,other::---";
+        var stickyAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = rootAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "sticky",
+                AccessAcl = stickyAcl,
+                StickyBit = true
+            });
+
+        var directory = container.GetBlobClient("sticky");
+        Assert.True((await directory.GetPropertiesAsync()).GetRawResponse().Headers
+            .TryGetValue("x-ms-permissions", out var mode));
+        Assert.Equal("rwxr-x--T", mode);
+        var writer = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId))
+            .GetBlobContainerClient(container.Name);
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient(foreign.Name).DeleteAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
+        Assert.Equal("retained", (await foreign.DownloadContentAsync()).Value.Content.ToString());
+
+        var owned = writer.GetBlobClient("sticky/owned.txt");
+        await owned.UploadAsync(BinaryData.FromString("owned"));
+        await owned.DeleteAsync();
+        Assert.False((await container.GetBlobClient(owned.Name).ExistsAsync()).Value);
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "sticky",
+            AccessAcl = stickyAcl,
+            StickyBit = false
+        });
+        await writer.GetBlobClient(foreign.Name).DeleteAsync();
+        Assert.False((await foreign.ExistsAsync()).Value);
+        await AssertStickyRootDeletionAsync(application, container, writer, writerObjectId);
+    }
+
+    private static async Task AssertStickyRootDeletionAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container,
+        BlobContainerClient writer, string writerObjectId)
+    {
+        var foreign = container.GetBlobClient("root-foreign.txt");
+        await foreign.UploadAsync(BinaryData.FromString("root-retained")).ConfigureAwait(false);
+        var rootAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---";
+        var entry = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = rootAcl,
+            StickyBit = true
+        };
+        await ApplyAclManifestAsync(application, entry).ConfigureAwait(false);
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient(foreign.Name).DeleteAsync()).ConfigureAwait(false);
+        Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
+        Assert.Equal("root-retained",
+            (await foreign.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+
+        var owned = writer.GetBlobClient("root-owned.txt");
+        await owned.UploadAsync(BinaryData.FromString("owned")).ConfigureAwait(false);
+        await owned.DeleteAsync().ConfigureAwait(false);
+        await ApplyAclManifestAsync(application, entry with { StickyBit = false }).ConfigureAwait(false);
+        await writer.GetBlobClient(foreign.Name).DeleteAsync().ConfigureAwait(false);
+        Assert.False((await foreign.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     private static async Task AssertParentAclMutationsAsync(

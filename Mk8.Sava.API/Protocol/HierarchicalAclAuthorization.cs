@@ -106,6 +106,9 @@ internal static class HierarchicalAclAuthorization
         {
             if (!PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'w'))
                 throw AzureStorageException.AuthorizationFailure();
+            if (permission == 'd')
+                await EnsureStickyDeleteAsync(metadata, request, objectId, root.Owner, root.StickyBit,
+                    cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -120,8 +123,28 @@ internal static class HierarchicalAclAuthorization
                 separator == lastSeparator &&
                 !PosixAccessControl.Allows(parent.Acl, parent.Owner, parent.Group, objectId, groups, 'w'))
                 throw AzureStorageException.AuthorizationFailure();
+            if (separator == lastSeparator && permission == 'd')
+                await EnsureStickyDeleteAsync(metadata, request, objectId, parent.Owner, parent.StickyBit,
+                    cancellationToken).ConfigureAwait(false);
             separator = name.IndexOf('/', separator + 1);
         }
+    }
+
+    private static async Task EnsureStickyDeleteAsync(
+        MetadataStore metadata,
+        StorageRequestContext request,
+        string objectId,
+        string parentOwner,
+        bool stickyBit,
+        CancellationToken cancellationToken)
+    {
+        if (!stickyBit || string.Equals(objectId, parentOwner, StringComparison.OrdinalIgnoreCase))
+            return;
+        var child = await metadata.GetBlobAsync(
+            request.Account, request.Container!, request.Blob!,
+            versionId: null, snapshot: null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        if (child is not null && !string.Equals(objectId, child.Owner, StringComparison.OrdinalIgnoreCase))
+            throw AzureStorageException.AuthorizationFailure();
     }
 
     internal static bool IsDirectoryListOperation(HttpRequest http, StorageRequestContext request)

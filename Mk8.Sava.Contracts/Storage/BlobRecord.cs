@@ -18,10 +18,10 @@ public sealed record BlobRecord
     public string Group { get; init; } = "$superuser";
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AccessAcl { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool StickyBit { get; init; }
     [JsonIgnore]
-    public string Permissions => AccessAcl is null
-        ? IsDirectory ? "rwxr-x---" : "rw-r-----"
-        : PosixAccessControl.FormatMode(AccessAcl);
+    public string Permissions => PosixAccessControl.FormatMode(Acl, StickyBit);
     [JsonIgnore]
     public string Acl => AccessAcl ?? (IsDirectory
         ? "user::rwx,group::r-x,other::---"

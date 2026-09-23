@@ -537,7 +537,9 @@ public sealed partial class MetadataStore(
             if (container is null)
                 throw new InvalidDataException($"The HNS ACL target container '{entry.Account}/{entry.Container}' does not exist.");
             PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
-            if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+            var stickyBit = entry.StickyBit ?? container.StickyBit;
+            if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal) &&
+                container.StickyBit == stickyBit)
                 return;
 
             var update = connection.CreateCommand();
@@ -550,6 +552,7 @@ public sealed partial class MetadataStore(
             AddContainerParameters(update, container with
             {
                 AccessAcl = entry.AccessAcl,
+                StickyBit = stickyBit,
                 Revision = NewRevision(),
                 ETag = NewETag(),
                 LastModified = _timeProvider.GetUtcNow()
@@ -564,11 +567,16 @@ public sealed partial class MetadataStore(
         if (blob is null || blob.IsDeleted)
             throw new InvalidDataException($"The HNS ACL target path '{entry.Account}/{entry.Container}/{entry.Path}' does not exist.");
         PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, blob.IsDirectory);
-        if (string.Equals(blob.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+        if (entry.StickyBit.HasValue && !blob.IsDirectory)
+            throw new InvalidDataException("The HNS ACL manifest cannot set a sticky bit on a file.");
+        var blobStickyBit = entry.StickyBit ?? blob.StickyBit;
+        if (string.Equals(blob.AccessAcl, entry.AccessAcl, StringComparison.Ordinal) &&
+            blob.StickyBit == blobStickyBit)
             return;
         await UpdateBlobRowAsync(connection, transaction, blob with
         {
             AccessAcl = entry.AccessAcl,
+            StickyBit = blobStickyBit,
             Revision = NewRevision(),
             ETag = NewETag(),
             LastModified = _timeProvider.GetUtcNow()

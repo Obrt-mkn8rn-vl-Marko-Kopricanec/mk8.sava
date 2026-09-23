@@ -35,10 +35,11 @@ internal static class PosixAccessControl
         return Has(parsed.Other, required);
     }
 
-    internal static string FormatMode(string acl)
+    internal static string FormatMode(string acl, bool stickyBit = false)
     {
         var parsed = Parse(acl);
-        return Format(parsed.Owner) + Format(parsed.Group & parsed.Mask) + Format(parsed.Other);
+        var mode = Format(parsed.Owner) + Format(parsed.Group & parsed.Mask) + Format(parsed.Other);
+        return stickyBit ? mode[..^1] + (mode[^1] == 'x' ? 't' : 'T') : mode;
     }
 
     internal static void ValidateStoredAcl(string acl, bool isDirectory)
