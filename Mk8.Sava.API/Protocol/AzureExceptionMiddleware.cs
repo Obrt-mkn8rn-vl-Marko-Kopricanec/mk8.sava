@@ -14,69 +14,55 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         {
             await next(context).ConfigureAwait(false);
         }
-        catch (AzureStorageException exception)
-        {
-            await WriteErrorAsync(context, exception).ConfigureAwait(false);
-        }
-        catch (RequestBodyTooLargeException exception)
-        {
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status413PayloadTooLarge,
-                "RequestBodyTooLarge",
-                exception.Message)).ConfigureAwait(false);
-        }
-        catch (StorageConcurrencyException)
-        {
-            await WriteErrorAsync(context, AzureStorageException.ConditionNotMet()).ConfigureAwait(false);
-        }
-        catch (StorageImmutabilityException exception)
-        {
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status409Conflict,
-                exception.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
-                exception.Message)).ConfigureAwait(false);
-        }
-        catch (StoragePendingCopyException exception)
-        {
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status409Conflict,
-                "PendingCopyOperation",
-                exception.Message)).ConfigureAwait(false);
-        }
-        catch (StorageBlobTypeMismatchException exception)
-        {
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status409Conflict,
-                "InvalidBlobType",
-                exception.Message)).ConfigureAwait(false);
-        }
-        catch (StoragePathConflictException)
-        {
-            await WriteErrorAsync(context, AzureStorageException.PathAlreadyExists()).ConfigureAwait(false);
-        }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             context.Abort();
         }
-        catch (XmlException)
-        {
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "InvalidXmlDocument",
-                "The specified XML is not syntactically valid.")).ConfigureAwait(false);
-        }
 #pragma warning disable CA1031 // The outer HTTP boundary must translate unexpected failures to Azure's InternalError response.
         catch (Exception exception)
         {
-            if (logger.IsEnabled(LogLevel.Error))
+            if (!IsKnownStorageException(exception) && logger.IsEnabled(LogLevel.Error))
                 StorageLogMessages.StorageOperationFailed(logger, exception, GetRequestId(context));
-            await WriteErrorAsync(context, new AzureStorageException(
-                StatusCodes.Status500InternalServerError,
-                "InternalError",
-                "The server encountered an internal error. Please retry the request.")).ConfigureAwait(false);
+            await WriteErrorAsync(context, MapException(exception)).ConfigureAwait(false);
         }
 #pragma warning restore CA1031
     }
+
+    private static bool IsKnownStorageException(Exception exception) =>
+        exception is AzureStorageException or RequestBodyTooLargeException or StorageConcurrencyException or
+            StorageImmutabilityException or StoragePendingCopyException or StorageBlobTypeMismatchException or
+            StoragePathConflictException or XmlException;
+
+    private static AzureStorageException MapException(Exception exception) => exception switch
+    {
+        AzureStorageException storage => storage,
+        RequestBodyTooLargeException oversized => new AzureStorageException(
+            StatusCodes.Status413PayloadTooLarge,
+            "RequestBodyTooLarge",
+            oversized.Message),
+        StorageConcurrencyException => AzureStorageException.ConditionNotMet(),
+        StorageImmutabilityException immutable => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            immutable.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
+            immutable.Message),
+        StoragePendingCopyException pending => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "PendingCopyOperation",
+            pending.Message),
+        StorageBlobTypeMismatchException mismatch => new AzureStorageException(
+            StatusCodes.Status409Conflict,
+            "InvalidBlobType",
+            mismatch.Message),
+        StoragePathConflictException => AzureStorageException.PathAlreadyExists(),
+        XmlException => new AzureStorageException(
+            StatusCodes.Status400BadRequest,
+            "InvalidXmlDocument",
+            "The specified XML is not syntactically valid."),
+        _ => new AzureStorageException(
+            StatusCodes.Status500InternalServerError,
+            "InternalError",
+            "The server encountered an internal error. Please retry the request.")
+    };
 
     private static async Task WriteErrorAsync(HttpContext context, AzureStorageException exception)
     {
