@@ -146,6 +146,18 @@ public sealed class SavaOptions : IValidatableObject
                     $"AccountCapabilities for '{accountName}' enables hierarchical blob snapshots without hierarchical namespace.",
                     [nameof(AccountCapabilities)]);
             }
+            if (capabilities.HierarchicalNamespaceEnabled && capabilities.VersioningEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' combines blob versioning with hierarchical namespace, which Azure does not support.",
+                    [nameof(AccountCapabilities)]);
+            }
+            if (capabilities.HierarchicalNamespaceEnabled && capabilities.ChangeFeedEnabled)
+            {
+                yield return new ValidationResult(
+                    $"AccountCapabilities for '{accountName}' combines change feed with hierarchical namespace, which Azure does not support.",
+                    [nameof(AccountCapabilities)]);
+            }
             var versionLevelImmutability = capabilities.ImmutableStorageWithVersioningEnabled ||
                                            capabilities.ImmutableStorageWithVersioningContainers.Count > 0;
             if (versionLevelImmutability && !capabilities.VersioningEnabled)
