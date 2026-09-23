@@ -115,7 +115,7 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
         };
         request.Headers.TryAddWithoutValidation("x-ms-version", version);
         if (sendMd5)
-            request.Content.Headers.ContentMD5 = MD5.HashData(content);
+            request.Content.Headers.ContentMD5 = AzureProtocolChecksum.Md5(content);
         return await transport.SendAsync(request).ConfigureAwait(false);
     }
 
@@ -125,7 +125,7 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
         bool expectMd5,
         bool expectCrc64)
     {
-        var expectedMd5 = Convert.ToBase64String(MD5.HashData(content));
+        var expectedMd5 = Convert.ToBase64String(AzureProtocolChecksum.Md5(content));
         var actualMd5 = response.Content.Headers.ContentMD5 is { } md5
             ? Convert.ToBase64String(md5)
             : null;

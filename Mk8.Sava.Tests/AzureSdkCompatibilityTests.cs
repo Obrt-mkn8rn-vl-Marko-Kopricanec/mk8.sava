@@ -4552,7 +4552,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Null(rangedHead.Content.Headers.ContentRange);
         }
 
-        var wholeMd5 = Convert.ToBase64String(MD5.HashData(content));
+        var wholeMd5 = Convert.ToBase64String(AzureProtocolChecksum.Md5(content));
         using (var oldRangeMd5Shape = await SendBlobAsync(
                    HttpMethod.Get,
                    "2015-12-11",
@@ -4582,7 +4582,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             Assert.Equal(HttpStatusCode.PartialContent, transactionalMd5.StatusCode);
             Assert.Equal(
-                Convert.ToBase64String(MD5.HashData(content.AsSpan(2, 3))),
+                Convert.ToBase64String(AzureProtocolChecksum.Md5(content.AsSpan(2, 3))),
                 Header(transactionalMd5, "Content-MD5"));
             Assert.Equal(wholeMd5, Header(transactionalMd5, "x-ms-blob-content-md5"));
         }
@@ -8819,7 +8819,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.False(wholeUploadHeaders.TryGetValue("x-ms-lease-status", out _));
         Assert.False(wholeUploadHeaders.TryGetValue("x-ms-meta-marker", out _));
         Assert.Equal(
-            Convert.ToBase64String(MD5.HashData(sourceBytes)),
+            Convert.ToBase64String(AzureProtocolChecksum.Md5(sourceBytes)),
             ResponseHeader(wholeUpload.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(sourceBytes),
@@ -8834,10 +8834,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var stagedFromUri = await block.StageBlockFromUriAsync(source.Uri, blockId, new StageBlockFromUriOptions
         {
             SourceRange = new HttpRange(blockOffset, blockLength),
-            SourceContentHash = MD5.HashData(blockSlice)
+            SourceContentHash = AzureProtocolChecksum.Md5(blockSlice)
         });
         Assert.Equal(
-            Convert.ToBase64String(MD5.HashData(blockSlice)),
+            Convert.ToBase64String(AzureProtocolChecksum.Md5(blockSlice)),
             ResponseHeader(stagedFromUri.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(blockSlice),
@@ -8853,10 +8853,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var appendedFromUri = await append.AppendBlockFromUriAsync(source.Uri, new AppendBlobAppendBlockFromUriOptions
         {
             SourceRange = new HttpRange(appendOffset, appendLength),
-            SourceContentHash = MD5.HashData(appendSlice)
+            SourceContentHash = AzureProtocolChecksum.Md5(appendSlice)
         });
         Assert.Equal(
-            Convert.ToBase64String(MD5.HashData(appendSlice)),
+            Convert.ToBase64String(AzureProtocolChecksum.Md5(appendSlice)),
             ResponseHeader(appendedFromUri.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(appendSlice),
@@ -8870,9 +8870,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             source.Uri,
             new HttpRange(0, 512),
             new HttpRange(512, 512),
-            new PageBlobUploadPagesFromUriOptions { SourceContentHash = MD5.HashData(pageSlice) });
+            new PageBlobUploadPagesFromUriOptions { SourceContentHash = AzureProtocolChecksum.Md5(pageSlice) });
         Assert.Equal(
-            Convert.ToBase64String(MD5.HashData(pageSlice)),
+            Convert.ToBase64String(AzureProtocolChecksum.Md5(pageSlice)),
             ResponseHeader(pagesFromUri.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(pageSlice),

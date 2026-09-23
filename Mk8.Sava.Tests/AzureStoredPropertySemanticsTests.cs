@@ -40,7 +40,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             request.Headers.CacheControl = CacheControlHeaderValue.Parse("private, max-age=120");
             using var response = await transport.SendAsync(request);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            Assert.Equal(MD5.HashData(firstPayload), response.Content.Headers.ContentMD5);
+            Assert.Equal(AzureProtocolChecksum.Md5(firstPayload), response.Content.Headers.ContentMD5);
         }
 
         var standard = (await blob.GetPropertiesAsync()).Value;
@@ -49,7 +49,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.Equal("hr-HR", standard.ContentLanguage);
         Assert.Equal("max-age=120, private", standard.CacheControl);
         Assert.Null(standard.ContentDisposition);
-        Assert.Equal(MD5.HashData(firstPayload), standard.ContentHash);
+        Assert.Equal(AzureProtocolChecksum.Md5(firstPayload), standard.ContentHash);
         Assert.Empty(standard.Metadata);
         Assert.Empty((await blob.GetTagsAsync()).Value.Tags);
 
@@ -57,10 +57,10 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         using (var request = PutBlobRequest(blob, secondPayload))
         {
             request.Content!.Headers.ContentType = MediaTypeHeaderValue.Parse("application/x-custom-md5");
-            request.Content.Headers.ContentMD5 = MD5.HashData("different transport hash"u8.ToArray());
+            request.Content.Headers.ContentMD5 = AzureProtocolChecksum.Md5("different transport hash"u8);
             request.Headers.TryAddWithoutValidation(
                 "x-ms-blob-content-md5",
-                Convert.ToBase64String(MD5.HashData(secondPayload)));
+                Convert.ToBase64String(AzureProtocolChecksum.Md5(secondPayload)));
             using var response = await transport.SendAsync(request);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
@@ -71,7 +71,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.Null(custom.ContentLanguage);
         Assert.Null(custom.CacheControl);
         Assert.Null(custom.ContentDisposition);
-        Assert.Equal(MD5.HashData(secondPayload), custom.ContentHash);
+        Assert.Equal(AzureProtocolChecksum.Md5(secondPayload), custom.ContentHash);
     }
 
     [Fact]
@@ -115,7 +115,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         Assert.Empty(committed.Metadata);
 
         await blob.SetHttpHeadersAsync(
-            FullHeaders("application/x-before-set", MD5.HashData("new block payload"u8.ToArray())));
+            FullHeaders("application/x-before-set", AzureProtocolChecksum.Md5("new block payload"u8)));
         using (var request = new HttpRequestMessage(
                    HttpMethod.Put,
                    AppendQuery(WriteUri(blob), "comp=properties"))
@@ -145,7 +145,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         var container = service.GetBlobContainerClient($"page-properties-{Guid.NewGuid():N}");
         await container.CreateAsync();
         var page = container.GetPageBlobClient("page.bin");
-        var expectedHash = MD5.HashData(Array.Empty<byte>());
+        var expectedHash = AzureProtocolChecksum.Md5(Array.Empty<byte>());
         await page.CreateAsync(
             512,
             new PageBlobCreateOptions
@@ -199,7 +199,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.Equal("en-GB", copiedProperties.ContentLanguage);
             Assert.Equal("public, max-age=45", copiedProperties.CacheControl);
             Assert.Equal("inline; filename=source.bin", copiedProperties.ContentDisposition);
-            Assert.Equal(MD5.HashData(payload), copiedProperties.ContentHash);
+            Assert.Equal(AzureProtocolChecksum.Md5(payload), copiedProperties.ContentHash);
             Assert.Equal("metadata", copiedProperties.Metadata["source"]);
 
             var replaced = container.GetBlockBlobClient("replaced.bin");
@@ -215,7 +215,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.Null(replacedProperties.ContentLanguage);
             Assert.Null(replacedProperties.CacheControl);
             Assert.Null(replacedProperties.ContentDisposition);
-            Assert.Equal(MD5.HashData(payload), replacedProperties.ContentHash);
+            Assert.Equal(AzureProtocolChecksum.Md5(payload), replacedProperties.ContentHash);
             Assert.Equal("metadata", replacedProperties.Metadata["source"]);
 
             var overridden = container.GetBlockBlobClient("overridden.bin");
@@ -860,7 +860,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             response.Content.Headers.ContentEncoding.Add("gzip");
             response.Content.Headers.ContentLanguage.Add("en-GB");
             response.Content.Headers.ContentDisposition = ContentDispositionHeaderValue.Parse("inline; filename=source.bin");
-            response.Content.Headers.ContentMD5 = MD5.HashData(payload);
+            response.Content.Headers.ContentMD5 = AzureProtocolChecksum.Md5(payload);
             response.Headers.CacheControl = CacheControlHeaderValue.Parse("public, max-age=45");
             response.Headers.ETag = new EntityTagHeaderValue("\"source-etag\"");
             response.Headers.TryAddWithoutValidation("x-ms-meta-source", "metadata");
