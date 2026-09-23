@@ -16,7 +16,7 @@ unshare -Urm --propagation private -- bash -c '
     mount_root=$1
     dotnet_host=$2
     test_project=$3
-    mount -t tmpfs -o size=16m,nosuid,nodev tmpfs "$mount_root"
+    mount -t tmpfs -o size=32m,nosuid,nodev tmpfs "$mount_root"
     trap '\''umount -- "$mount_root"'\'' EXIT
     env MK8_SAVA_ENOSPC_DATA_PATH="$mount_root/data" \
         "$dotnet_host" test "$test_project" \
