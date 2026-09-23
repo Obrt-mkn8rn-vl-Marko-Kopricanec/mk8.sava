@@ -6,9 +6,12 @@ public sealed class BearerAuthenticationOptions
     public string? Authority { get; init; }
     public string? MetadataAddress { get; init; }
     public bool RequireHttpsMetadata { get; init; } = true;
-    public List<string> ValidAudiences { get; init; } = ["https://storage.azure.com/"];
-    public List<string> ValidIssuers { get; init; } = [];
-    public Dictionary<string, string> SymmetricSigningKeys { get; init; } = new(StringComparer.Ordinal);
-    public Dictionary<string, BearerPrincipalAccess> Principals { get; init; } = new(StringComparer.Ordinal);
-    public Dictionary<string, string> RolePermissions { get; init; } = new(StringComparer.Ordinal);
+    public IList<string> ValidAudiences { get; init; } = ["https://storage.azure.com/"];
+    public IList<string> ValidIssuers { get; init; } = [];
+    public IDictionary<string, string> SymmetricSigningKeys { get; init; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+    public IDictionary<string, BearerPrincipalAccess> Principals { get; init; } =
+        new Dictionary<string, BearerPrincipalAccess>(StringComparer.Ordinal);
+    public IDictionary<string, string> RolePermissions { get; init; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
 }

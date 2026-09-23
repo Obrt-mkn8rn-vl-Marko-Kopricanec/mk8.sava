@@ -15,12 +15,13 @@ public sealed class SavaOptions : IValidatableObject
     public string DefaultAccount { get; init; } = "devstoreaccount1";
 
     [Required]
-    public Dictionary<string, string> Accounts { get; init; } = new(StringComparer.Ordinal);
+    public IDictionary<string, string> Accounts { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 
-    public Dictionary<string, string> DataEncryptionKeys { get; init; } = new(StringComparer.Ordinal);
+    public IDictionary<string, string> DataEncryptionKeys { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);
 
-    public Dictionary<string, StorageAccountCapabilities> AccountCapabilities { get; init; } = new(StringComparer.Ordinal);
-    public List<ObjectReplicationPolicyOptions> ObjectReplicationPolicies { get; init; } = [];
+    public IDictionary<string, StorageAccountCapabilities> AccountCapabilities { get; init; } =
+        new Dictionary<string, StorageAccountCapabilities>(StringComparer.Ordinal);
+    public IList<ObjectReplicationPolicyOptions> ObjectReplicationPolicies { get; init; } = [];
 
     public bool AllowAnonymousPublicAccess { get; init; }
     public int MinimumChunkBytes { get; init; } = 64 * 1024;
@@ -43,7 +44,7 @@ public sealed class SavaOptions : IValidatableObject
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 5_000L * 1024 * 1024;
-    public List<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
+    public IList<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
@@ -205,8 +206,8 @@ public sealed class SavaOptions : IValidatableObject
                     [nameof(ObjectReplicationPolicies)]);
             }
 
-            var sourceCapabilities = AccountCapabilities.GetValueOrDefault(policy.SourceAccount);
-            var destinationCapabilities = AccountCapabilities.GetValueOrDefault(policy.DestinationAccount);
+            AccountCapabilities.TryGetValue(policy.SourceAccount, out var sourceCapabilities);
+            AccountCapabilities.TryGetValue(policy.DestinationAccount, out var destinationCapabilities);
             if (sourceCapabilities is null ||
                 !sourceCapabilities.VersioningEnabled ||
                 !sourceCapabilities.ChangeFeedEnabled ||

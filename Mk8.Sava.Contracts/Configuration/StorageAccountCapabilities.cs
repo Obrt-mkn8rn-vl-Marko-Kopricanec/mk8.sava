@@ -19,5 +19,6 @@ public sealed class StorageAccountCapabilities
     public bool VersioningEnabled { get; init; }
     public bool ChangeFeedEnabled { get; init; }
     public bool ImmutableStorageWithVersioningEnabled { get; init; }
-    public HashSet<string> ImmutableStorageWithVersioningContainers { get; init; } = new(StringComparer.Ordinal);
+    public ISet<string> ImmutableStorageWithVersioningContainers { get; init; } =
+        new HashSet<string>(StringComparer.Ordinal);
 }

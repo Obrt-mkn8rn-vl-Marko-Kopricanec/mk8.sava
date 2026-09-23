@@ -78,7 +78,8 @@ internal static class PosixAccessControl
         foreach (var rawEntry in acl.Split(','))
         {
             var entry = rawEntry.Split(':');
-            var offset = entry.Length == 4 && entry[0] == "default" ? 1 : 0;
+            var offset = entry.Length == 4 &&
+                         string.Equals(entry[0], "default", StringComparison.Ordinal) ? 1 : 0;
             if (entry.Length - offset != 3)
                 throw new InvalidDataException("The hierarchical access ACL has an invalid entry.");
             var type = entry[offset];

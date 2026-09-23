@@ -16,8 +16,10 @@ public sealed record ContainerRecord
     public string? AccessAcl { get; init; }
     [JsonIgnore]
     public string Acl => AccessAcl ?? "user::rwx,group::r-x,other::---";
-    public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    public Dictionary<string, StoredAccessPolicy> AccessPolicies { get; init; } = new(StringComparer.Ordinal);
+    public IReadOnlyDictionary<string, string> Metadata { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, StoredAccessPolicy> AccessPolicies { get; init; } =
+        new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal);
     public string? PublicAccess { get; init; }
     public string? DefaultEncryptionScope { get; init; }
     public bool PreventEncryptionScopeOverride { get; init; }

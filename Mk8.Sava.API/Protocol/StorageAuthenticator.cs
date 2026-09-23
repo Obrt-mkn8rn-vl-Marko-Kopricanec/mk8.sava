@@ -1273,7 +1273,7 @@ public sealed class StorageAuthenticator(
 
     private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;
 
-    private static bool Covers(IReadOnlyCollection<string> configuredValues, string value) =>
+    private static bool Covers(ICollection<string> configuredValues, string value) =>
         configuredValues.Count == 0 || configuredValues.Contains("*", StringComparer.Ordinal) || configuredValues.Contains(value, StringComparer.Ordinal);
 
     private bool IsHierarchicalNamespaceEnabled(string account) =>

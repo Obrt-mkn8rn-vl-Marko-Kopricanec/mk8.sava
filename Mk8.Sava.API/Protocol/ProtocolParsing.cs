@@ -715,7 +715,7 @@ internal static class ProtocolParsing
         return new StorageAnalyticsRetentionPolicy { Enabled = enabled, Days = days };
     }
 
-    private static void ValidateCorsRules(IReadOnlyList<CorsRule> rules)
+    private static void ValidateCorsRules(IEnumerable<CorsRule> rules)
     {
         const int maximumSettingsBytes = 2 * 1024;
         var settingsBytes = 0;

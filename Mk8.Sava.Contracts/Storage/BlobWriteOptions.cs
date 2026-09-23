@@ -1,9 +1,10 @@
 namespace Mk8.Sava.Storage;
 
+#pragma warning disable CA1819 // The key must remain a byte array so the caller can zero it after use.
 public sealed record BlobWriteOptions(
     BlobHttpProperties Http,
-    Dictionary<string, string> Metadata,
-    Dictionary<string, string>? Tags = null,
+    IReadOnlyDictionary<string, string> Metadata,
+    IReadOnlyDictionary<string, string>? Tags = null,
     string? AccessTier = null,
     DateTimeOffset? ImmutabilityUntil = null,
     bool ImmutabilityLocked = false,
@@ -18,3 +19,4 @@ public sealed record BlobWriteOptions(
     DateTimeOffset? ExpiresAt = null,
     string? RehydratePriority = null,
     string? CreatorObjectId = null);
+#pragma warning restore CA1819
