@@ -41,6 +41,31 @@ internal static class PosixAccessControl
         return Format(parsed.Owner) + Format(parsed.Group & parsed.Mask) + Format(parsed.Other);
     }
 
+    internal static void ValidateStoredAcl(string acl, bool isDirectory)
+    {
+        var entries = acl.Split(',');
+        var access = entries.Where(entry => !entry.StartsWith("default:", StringComparison.Ordinal)).ToArray();
+        var defaults = entries.Where(entry => entry.StartsWith("default:", StringComparison.Ordinal))
+            .Select(entry => entry["default:".Length..]).ToArray();
+        if (access.Length is < 3 or > 32 || defaults.Length > 32 || defaults.Length > 0 && !isDirectory)
+            throw new InvalidDataException("The hierarchical ACL has invalid access or default entries.");
+        _ = Parse(string.Join(',', access));
+        if (defaults.Length > 0)
+            _ = Parse(string.Join(',', defaults));
+    }
+
+    internal static string? InheritDefaultAcl(string parentAcl, bool childIsDirectory)
+    {
+        if (!parentAcl.Contains("default:", StringComparison.Ordinal))
+            return null;
+        ValidateStoredAcl(parentAcl, isDirectory: true);
+        var defaults = parentAcl.Split(',')
+            .Where(entry => entry.StartsWith("default:", StringComparison.Ordinal))
+            .ToArray();
+        var access = string.Join(',', defaults.Select(entry => entry["default:".Length..]));
+        return childIsDirectory ? access + "," + string.Join(',', defaults) : access;
+    }
+
     private static ParsedAcl Parse(string acl)
     {
         var users = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);

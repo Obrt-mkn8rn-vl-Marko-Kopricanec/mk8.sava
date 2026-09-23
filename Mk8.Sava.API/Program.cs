@@ -133,6 +133,15 @@ if (operatorCommand is { Name: "create" })
     return;
 }
 
+if (operatorCommand is { Name: "acl-apply" })
+{
+    var applied = await app.Services.GetRequiredService<BlobService>().ApplyHierarchicalAclManifestAsync(
+        operatorCommand.Value.Path,
+        CancellationToken.None);
+    Console.WriteLine($"Applied HNS access ACLs to {applied} existing targets.");
+    return;
+}
+
 app.UseMiddleware<StorageTelemetryMiddleware>();
 app.UseMiddleware<AzureExceptionMiddleware>();
 app.UseMiddleware<RequestContextMiddleware>();
@@ -176,14 +185,15 @@ static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
     {
         ["--backup-create"] = "create",
         ["--backup-validate"] = "validate",
-        ["--restore-from"] = "restore"
+        ["--restore-from"] = "restore",
+        ["--hns-acl-apply"] = "acl-apply"
     };
     for (var index = 0; index < arguments.Length; index++)
     {
         if (!names.TryGetValue(arguments[index], out var name))
             continue;
         if (command is not null)
-            throw new ArgumentException("Specify only one backup or restore command.");
+            throw new ArgumentException("Specify only one operator command.");
         if (++index >= arguments.Length || string.IsNullOrWhiteSpace(arguments[index]))
             throw new ArgumentException($"The {arguments[index - 1]} command requires a path.");
         command = (name, arguments[index]);

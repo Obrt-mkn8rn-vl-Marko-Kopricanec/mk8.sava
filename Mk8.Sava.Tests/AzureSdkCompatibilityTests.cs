@@ -7,6 +7,7 @@ using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.IdentityModel.Tokens.Jwt;
 using System.Globalization;
 using System.Net;
@@ -2178,37 +2179,37 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.NotNull(root);
         var traverseAcl = $"user::rwx,user:{namedObjectId}:--x,group::r-x," +
                           $"group:{groupId}:--x,mask::r-x,other::---";
-        await metadata.PutContainerAsync(root with { AccessAcl = traverseAcl }, root.Revision, CancellationToken.None);
-
-        var parent = await metadata.GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            container.Name,
-            "parent",
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        Assert.NotNull(parent);
-        await metadata.PutBlobRecordAsync(
-            parent with { AccessAcl = traverseAcl },
-            parent.Revision,
-            CancellationToken.None);
-
-        var record = await metadata.GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            container.Name,
-            blob.Name,
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        Assert.NotNull(record);
         var readAcl = $"user::rw-,user:{namedObjectId}:r--,group::r--," +
                       $"group:{groupId}:r--,mask::r--,other::---";
-        await metadata.PutBlobRecordAsync(
-            record with { AccessAcl = readAcl },
-            record.Revision,
+        Assert.Equal(3, await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = traverseAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "parent",
+                AccessAcl = traverseAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = blob.Name,
+                AccessAcl = readAcl
+            }));
+        var updatedRoot = await metadata.GetContainerAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            includeDeleted: false,
             CancellationToken.None);
+        Assert.NotNull(updatedRoot);
+        Assert.NotEqual(root.ETag, updatedRoot.ETag);
 
         var named = CreateBearerClient(
             application,
@@ -2227,25 +2228,219 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await blob.UploadAsync(BinaryData.FromString("replaced-content"), overwrite: true);
         Assert.Equal("replaced-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
         Assert.Equal("replaced-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
-        record = await metadata.GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            container.Name,
-            blob.Name,
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        Assert.NotNull(record);
-
-        await metadata.PutBlobRecordAsync(
-            record with { AccessAcl = readAcl.Replace("mask::r--", "mask::---", StringComparison.Ordinal) },
-            record.Revision,
-            CancellationToken.None);
+        Assert.Equal(1, await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = blob.Name,
+                AccessAcl = readAcl.Replace("mask::r--", "mask::---", StringComparison.Ordinal)
+            }));
         var deniedNamed = await Assert.ThrowsAsync<RequestFailedException>(() => namedBlob.DownloadContentAsync());
         var deniedGroup = await Assert.ThrowsAsync<RequestFailedException>(() => groupBlob.DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedNamed.Status);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedGroup.Status);
         Assert.Equal("replaced-content", (await blob.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
+    public async Task HierarchicalAclManifestRollsBackEveryTargetWhenOneDoesNotExist()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-acl-atomic-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("present.txt").UploadAsync(BinaryData.FromString("present"));
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var before = await metadata.GetContainerAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(before);
+        var entry = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = "user::rwx,group::r-x,other::r-x"
+        };
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry with { Path = "missing.txt" }));
+        var after = await metadata.GetContainerAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(after);
+        Assert.Equal(before.ETag, after.ETag);
+        Assert.Null(after.AccessAcl);
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry with { AccessAcl = "user::rwx,group::r-x,other::---,default:user::rwx" }));
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry with
+            {
+                Path = "present.txt",
+                AccessAcl = "user::rw-,group::r--,other::---," +
+                            "default:user::rwx,default:group::r-x,default:other::---"
+            }));
+        await Assert.ThrowsAsync<InvalidDataException>(() => ApplyAclManifestAsync(application,
+            entry,
+            entry));
+        Assert.Equal("present", (await container.GetBlobClient("present.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+
+        var oversizedPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-acl-oversized-{Guid.NewGuid():N}.json");
+        try
+        {
+            await File.WriteAllTextAsync(oversizedPath, new string('x', 4 * 1024 * 1024 + 1));
+            await Assert.ThrowsAsync<InvalidDataException>(() => application.Services
+                .GetRequiredService<BlobService>()
+                .ApplyHierarchicalAclManifestAsync(oversizedPath, CancellationToken.None));
+        }
+        finally
+        {
+            File.Delete(oversizedPath);
+        }
+    }
+
+    [Fact]
+    public async Task HierarchicalDefaultAclPropagatesOnlyToNewDescendants()
+    {
+        const string readerObjectId = "e4508a61-2d86-42c7-8b51-3da9d71126b6";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-default-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("preexisting.txt").UploadAsync(BinaryData.FromString("old"));
+
+        var rootAcl = $"user::rwx,user:{readerObjectId}:--x,group::r-x,mask::r-x,other::---";
+        var defaultAcl = $"default:user::rwx,default:user:{readerObjectId}:r-x," +
+                         "default:group::r-x,default:mask::r-x,default:other::---";
+        var entry = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = rootAcl + "," + defaultAcl
+        };
+        await ApplyAclManifestAsync(application, entry);
+        var reader = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId))
+            .GetBlobContainerClient(container.Name);
+        var deniedOld = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            reader.GetBlobClient("preexisting.txt").DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedOld.Status);
+        await container.GetBlobClient("preexisting.txt").UploadAsync(BinaryData.FromString("replaced"), overwrite: true);
+        var deniedReplaced = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            reader.GetBlobClient("preexisting.txt").DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedReplaced.Status);
+
+        var nested = container.GetBlobClient("one/two/new.txt");
+        await nested.UploadAsync(BinaryData.FromString("new"));
+        Assert.Equal("new", (await reader.GetBlobClient(nested.Name).DownloadContentAsync())
+            .Value.Content.ToString());
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var one = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, "one", null, null, includeDeleted: false, CancellationToken.None);
+        var two = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, "one/two", null, null, includeDeleted: false, CancellationToken.None);
+        var file = await metadata.GetBlobAsync(SavaWebApplicationFactory.AccountName,
+            container.Name, nested.Name, null, null, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(one);
+        Assert.NotNull(two);
+        Assert.NotNull(file);
+        Assert.Equal(defaultAcl, string.Join(',', one.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
+        Assert.Equal(defaultAcl, string.Join(',', two.Acl.Split(',').Where(value => value.StartsWith("default:", StringComparison.Ordinal))));
+        Assert.DoesNotContain("default:", file.Acl, StringComparison.Ordinal);
+
+        await ApplyAclManifestAsync(application, entry with
+        {
+            AccessAcl = rootAcl + ",default:user::rwx,default:group::r-x,default:other::---"
+        });
+        await container.GetBlobClient("later.txt").UploadAsync(BinaryData.FromString("later"));
+        Assert.Equal("new", (await reader.GetBlobClient(nested.Name).DownloadContentAsync())
+            .Value.Content.ToString());
+        var deniedLater = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            reader.GetBlobClient("later.txt").DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedLater.Status);
+    }
+
+    [Fact]
+    public async Task HierarchicalAclOperatorCommandAppliesManifestAcrossProcessRestart()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-acl-command-{Guid.NewGuid():N}");
+        var manifestPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-acl-command-{Guid.NewGuid():N}.json");
+        var settings = new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        };
+        var containerName = $"hns-command-{Guid.NewGuid():N}";
+        const string accessAcl = "user::rwx,group::r-x,other::r-x";
+        try
+        {
+            await using (var initial = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false))
+            {
+                await initial.InitializeAsync();
+                await CreateClient(initial).GetBlobContainerClient(containerName).CreateAsync();
+            }
+
+            var manifest = new HierarchicalAclManifest
+            {
+                SchemaVersion = 1,
+                Entries =
+                [
+                    new HierarchicalAclManifestEntry
+                    {
+                        Account = SavaWebApplicationFactory.AccountName,
+                        Container = containerName,
+                        Path = string.Empty,
+                        AccessAcl = accessAcl
+                    }
+                ]
+            };
+            await File.WriteAllTextAsync(manifestPath,
+                JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            var start = new ProcessStartInfo(
+                Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+            {
+                WorkingDirectory = AppContext.BaseDirectory,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            };
+            start.ArgumentList.Add(typeof(Program).Assembly.Location);
+            start.ArgumentList.Add("--hns-acl-apply");
+            start.ArgumentList.Add(manifestPath);
+            start.Environment["Sava__DataPath"] = dataPath;
+            start.Environment[$"Sava__AccountCapabilities__{SavaWebApplicationFactory.AccountName}__HierarchicalNamespaceEnabled"] = "true";
+            using var process = Process.Start(start);
+            Assert.NotNull(process);
+            var output = process.StandardOutput.ReadToEndAsync();
+            var error = process.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            await process.WaitForExitAsync(timeout.Token);
+            Assert.True(process.ExitCode == 0, await error);
+            Assert.Contains("Applied HNS access ACLs to 1 existing targets.", await output, StringComparison.Ordinal);
+
+            await using var reopened = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false);
+            await reopened.InitializeAsync();
+            var root = await reopened.Services.GetRequiredService<MetadataStore>().GetContainerAsync(
+                SavaWebApplicationFactory.AccountName, containerName, includeDeleted: false, CancellationToken.None);
+            Assert.NotNull(root);
+            Assert.Equal(accessAcl, root.AccessAcl);
+        }
+        finally
+        {
+            File.Delete(manifestPath);
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+        }
     }
 
     [Fact]
@@ -13052,6 +13247,25 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app) =>
         CreateClient(app, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+
+    private static async Task<int> ApplyAclManifestAsync(
+        SavaWebApplicationFactory application,
+        params HierarchicalAclManifestEntry[] entries)
+    {
+        var manifestPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-acl-{Guid.NewGuid():N}.json");
+        try
+        {
+            var manifest = new HierarchicalAclManifest { SchemaVersion = 1, Entries = [.. entries] };
+            await File.WriteAllTextAsync(manifestPath,
+                JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            return await application.Services.GetRequiredService<BlobService>()
+                .ApplyHierarchicalAclManifestAsync(manifestPath, CancellationToken.None);
+        }
+        finally
+        {
+            File.Delete(manifestPath);
+        }
+    }
 
     private static byte[] EncodeStructuredBody(ReadOnlySpan<byte> content)
     {

@@ -529,9 +529,54 @@ overwrite keeps the existing path's owner and group. The current Blob-only
 surface retains the default POSIX permissions and ACL for files and
 directories. Stored custom access ACLs are evaluated for owner, named user,
 owning/named group, mask, and other entries, and survive blob overwrite. There
-is not yet a supported deployment provisioning path for those custom ACLs or
-default-ACL inheritance, and the separate `dfs` ACL mutation protocol is not
-implemented.
+is an offline operator provisioning path for existing HNS container roots and
+paths. Stop the service, prepare a JSON manifest outside its data root, then
+run the following command with the same account, data-root, and encryption-key
+configuration used by the service:
+
+```bash
+dotnet Mk8.Sava.API.dll --hns-acl-apply /path/to/hns-acls.json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "entries": [
+    {
+      "account": "datalakeaccount",
+      "container": "documents",
+      "path": "",
+      "accessAcl": "user::rwx,user:reader-object-id:--x,group::r-x,mask::r-x,other::---"
+    },
+    {
+      "account": "datalakeaccount",
+      "container": "documents",
+      "path": "reports",
+      "accessAcl": "user::rwx,user:reader-object-id:--x,group::r-x,mask::r-x,other::---"
+    },
+    {
+      "account": "datalakeaccount",
+      "container": "documents",
+      "path": "reports/annual.txt",
+      "accessAcl": "user::rw-,user:reader-object-id:r--,group::r--,mask::r--,other::---"
+    }
+  ]
+}
+```
+
+Every target must already exist, including any parent directory named in the
+manifest; an empty `path` addresses the container root. A directory or root
+may include a complete set of `default:` ACL entries. Those entries template
+the access ACL of subsequently created children, and new directories also
+inherit the default ACL. They do not retroactively change existing children;
+files cannot carry default entries. The command rejects non-HNS accounts,
+malformed ACLs, duplicate targets, and manifests larger than 4 MiB or 4,096
+entries. It commits all changes or none,
+and a changed ACL advances that target's ETag and Last-Modified timestamp.
+An unchanged ACL is idempotent. The command holds the data-root process lease,
+so it cannot run alongside a live service on that root. This is not an
+application-facing API or the separate `dfs` ACL mutation protocol. Blob-surface
+list/mutation authorization and live Azure validation remain incomplete.
 For Get Blob and Get Blob Properties, a trusted bearer principal without a
 configured RBAC read grant can fall back to the same root/parent
 execute and file-read ACL check used for `suoid`, but only when its signed

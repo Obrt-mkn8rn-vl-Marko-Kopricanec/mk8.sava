@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Protocol;
@@ -95,6 +97,63 @@ public sealed class BlobService(
                     cancellationToken);
             }
         }
+    }
+
+    public async Task<int> ApplyHierarchicalAclManifestAsync(
+        string manifestPath,
+        CancellationToken cancellationToken)
+    {
+        const int maximumBytes = 4 * 1024 * 1024;
+        var fullPath = Path.GetFullPath(manifestPath);
+        await using var file = new FileStream(
+            fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous);
+        if (file.Length > maximumBytes)
+            throw new InvalidDataException("The HNS ACL manifest exceeds the 4 MiB limit.");
+        var json = new byte[maximumBytes + 1];
+        var length = 0;
+        while (length < json.Length)
+        {
+            var read = await file.ReadAsync(json.AsMemory(length), cancellationToken);
+            if (read == 0)
+                break;
+            length += read;
+        }
+        if (length > maximumBytes)
+            throw new InvalidDataException("The HNS ACL manifest exceeds the 4 MiB limit.");
+        var manifest = JsonSerializer.Deserialize<HierarchicalAclManifest>(json.AsSpan(0, length),
+            new JsonSerializerOptions(JsonSerializerDefaults.Web)
+            {
+                UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+            }) ?? throw new InvalidDataException("The HNS ACL manifest is empty.");
+        if (manifest.SchemaVersion != 1 || manifest.Entries is not { Count: >= 1 and <= 4096 })
+            throw new InvalidDataException("The HNS ACL manifest has an unsupported schema or entry count.");
+
+        var targets = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in manifest.Entries)
+        {
+            if (entry is null ||
+                string.IsNullOrEmpty(entry.Account) ||
+                string.IsNullOrEmpty(entry.Container) ||
+                entry.Path is null ||
+                string.IsNullOrEmpty(entry.AccessAcl) ||
+                entry.AccessAcl.Length > 4096 ||
+                entry.Path.Length > 1024 ||
+                entry.Path.Any(char.IsControl) ||
+                !entry.Path.Equals(string.Empty, StringComparison.Ordinal) &&
+                (entry.Path.StartsWith("/", StringComparison.Ordinal) ||
+                 entry.Path.EndsWith("/", StringComparison.Ordinal)) ||
+                !_options.Accounts.ContainsKey(entry.Account) ||
+                !IsHierarchicalNamespaceEnabled(entry.Account))
+            {
+                throw new InvalidDataException("The HNS ACL manifest contains an invalid target or ACL.");
+            }
+            PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
+            if (!targets.Add($"{entry.Account}\u001f{entry.Container}\u001f{entry.Path}"))
+                throw new InvalidDataException("The HNS ACL manifest contains a duplicate target.");
+        }
+
+        await metadata.ApplyHierarchicalAclEntriesAsync(manifest.Entries, cancellationToken);
+        return manifest.Entries.Count;
     }
 
     public async Task<IReadOnlyList<ContainerRecord>> ListContainersAsync(
