@@ -152,7 +152,11 @@ public sealed class StorageSpaceEfficiencyTests
             await File.WriteAllBytesAsync(Path.Combine(nested, "sparse.bin"), new byte[8192]);
             await File.WriteAllBytesAsync(Path.Combine(external, "large.bin"), new byte[4 * 1024 * 1024]);
             Directory.CreateSymbolicLink(link, external);
-            var hardLink = new ProcessStartInfo("ln") { RedirectStandardError = true };
+            var hardLink = new ProcessStartInfo("ln")
+            {
+                RedirectStandardError = true,
+                UseShellExecute = false
+            };
             hardLink.ArgumentList.Add(smallFile);
             hardLink.ArgumentList.Add(Path.Combine(root, "small-hard-link.bin"));
             using (var linkProcess = Process.Start(hardLink)!)
@@ -169,7 +173,8 @@ public sealed class StorageSpaceEfficiencyTests
                 StartInfo = new ProcessStartInfo("du")
                 {
                     RedirectStandardOutput = true,
-                    RedirectStandardError = true
+                    RedirectStandardError = true,
+                    UseShellExecute = false
                 }
             };
             process.StartInfo.ArgumentList.Add("-s");
@@ -181,7 +186,7 @@ public sealed class StorageSpaceEfficiencyTests
             var error = await process.StandardError.ReadToEndAsync();
             await process.WaitForExitAsync();
             Assert.True(process.ExitCode == 0, error);
-            var separator = output.IndexOf('\t');
+            var separator = output.IndexOf('\t', StringComparison.Ordinal);
             Assert.True(separator > 0, output);
             Assert.Equal(
                 long.Parse(output.AsSpan(0, separator), CultureInfo.InvariantCulture),

@@ -9,7 +9,10 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
+// Public xUnit test classes use this fixture as a public primary-constructor parameter.
+#pragma warning disable CA1515
 public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, IAsyncLifetime
+#pragma warning restore CA1515
 {
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
     private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
@@ -128,6 +131,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
+        ArgumentNullException.ThrowIfNull(builder);
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
             configuration.AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.Ordinal)

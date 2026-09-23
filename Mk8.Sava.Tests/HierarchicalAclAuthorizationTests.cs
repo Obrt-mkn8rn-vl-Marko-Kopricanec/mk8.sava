@@ -15,6 +15,7 @@ public sealed class HierarchicalAclAuthorizationTests
     public void AppendFallbackOnlyTargetsTheCurrentBlobAppendOperation(
         string method, string component, string additionalQuery, bool expected)
     {
+        ArgumentNullException.ThrowIfNull(additionalQuery);
         var request = new DefaultHttpContext().Request;
         request.Method = method;
         request.QueryString = new QueryString(
@@ -45,6 +46,7 @@ public sealed class HierarchicalAclAuthorizationTests
     public void ParentMutationFallbackTargetsCurrentBlobPutBlockWriteAndDelete(
         string method, string component, string additionalQuery, char? expected)
     {
+        ArgumentNullException.ThrowIfNull(additionalQuery);
         var request = new DefaultHttpContext().Request;
         request.Method = method;
         request.QueryString = new QueryString(
@@ -106,6 +108,7 @@ public sealed class HierarchicalAclAuthorizationTests
     [InlineData("POST", "queryOther", false)]
     public void AclFallbackOnlyTargetsBlobContentReadOperations(string method, string component, bool expected)
     {
+        ArgumentNullException.ThrowIfNull(component);
         var request = new DefaultHttpContext().Request;
         request.Method = method;
         if (component.Length > 0)

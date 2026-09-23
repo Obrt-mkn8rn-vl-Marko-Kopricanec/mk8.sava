@@ -268,7 +268,7 @@ string.Equals(scenario, "pack-metadata-precommit"
 
     private sealed class ProcessStorageFaultInjector : IStorageFaultInjector
     {
-        private readonly object _gate = new();
+        private readonly Lock _gate = new();
         private StorageFaultPoint _point;
         private bool _armed;
         private bool _terminate;

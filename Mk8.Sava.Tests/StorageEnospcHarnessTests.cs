@@ -8,9 +8,6 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
-[CollectionDefinition("Isolated ENOSPC harness", DisableParallelization = true)]
-public sealed class StorageEnospcHarnessCollection;
-
 [Collection("Isolated ENOSPC harness")]
 public sealed class StorageEnospcHarnessTests
 {

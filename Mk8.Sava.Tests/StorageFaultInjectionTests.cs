@@ -459,7 +459,7 @@ public sealed class StorageFaultInjectionTests
 
     private sealed class ArmableStorageFaultInjector : IStorageFaultInjector
     {
-        private readonly object _gate = new();
+        private readonly Lock _gate = new();
         private StorageFaultPoint _point;
         private bool _armed;
 
