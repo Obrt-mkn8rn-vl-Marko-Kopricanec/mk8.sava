@@ -33,6 +33,27 @@ namespace Mk8.Sava.Tests;
 public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory)
     : IClassFixture<SavaWebApplicationFactory>
 {
+    private static readonly string[] RestoredTexts = ["second", "third"];
+    private static readonly string[] DirectoryNames = ["alpha", "alpha/beta"];
+    private static readonly string[] FileNames = ["alpha/beta/file.txt", "alpha/root.txt", "zeta.txt"];
+    private static readonly string[] RootFileNames = ["zeta.txt"];
+    private static readonly string[] AnalyticsLogTypes = ["read", "write", "delete"];
+    private static readonly int[] FirstParquetIds = [1, 2];
+    private static readonly string?[] FirstParquetNames = ["one", "two"];
+    private static readonly bool[] FirstParquetEnabled = [true, false];
+    private static readonly double[] FirstParquetScores = [1.25D, 2.5D];
+    private static readonly DateTime[] FirstParquetObserved =
+    [
+        new DateTime(2026, 9, 20, 10, 15, 0, DateTimeKind.Utc),
+        new DateTime(2026, 9, 21, 11, 30, 0, DateTimeKind.Utc)
+    ];
+    private static readonly int[] SecondParquetIds = [3];
+    private static readonly string?[] SecondParquetNames = ["three"];
+    private static readonly bool[] SecondParquetEnabled = [true];
+    private static readonly double[] SecondParquetScores = [3.75D];
+    private static readonly DateTime[] SecondParquetObserved =
+        [new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc)];
+
     [Fact]
     public async Task PathStyleServiceEndpointAcceptsTerminalAccountSeparator()
     {
@@ -1607,7 +1628,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
         var restoredText = (await restored.DownloadContentAsync()).Value.Content.ToString();
-        Assert.Contains(restoredText, new[] { "second", "third" }, StringComparer.Ordinal);
+        Assert.Contains(restoredText, RestoredTexts, StringComparer.Ordinal);
         Assert.Equal("active", (await blob.DownloadContentAsync()).Value.Content.ToString());
 
         family = await metadata.ListBlobFamilyAsync(
@@ -1666,13 +1687,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         var onlyDirectories = await ListAsync("showonly=directories&include=permissions");
         Assert.Equal(
-            new[] { "alpha", "alpha/beta" },
+            DirectoryNames,
             onlyDirectories.Descendants("Blob")
                 .Select(element => element.Element("Name")?.Value)
                 .ToArray());
         var onlyFiles = await ListAsync("showonly=files");
         Assert.Equal(
-            new[] { "alpha/beta/file.txt", "alpha/root.txt", "zeta.txt" },
+            FileNames,
             onlyFiles.Descendants("Blob")
                 .Select(element => element.Element("Name")?.Value)
                 .ToArray());
@@ -1698,7 +1719,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("rwxr-x---", prefixProperties.Element("Permissions")?.Value);
         Assert.Equal("alpha/", rootPrefix.Element("Name")?.Value);
         Assert.Equal(
-            new[] { "zeta.txt" },
+            RootFileNames,
             root.Descendants("Blob").Select(element => element.Element("Name")?.Value).ToArray());
 
         var alpha = await ListAsync($"delimiter=/&prefix={Uri.EscapeDataString("alpha/")}&include=permissions");
@@ -4070,7 +4091,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             Assert.Matches("^blob/[0-9]{4}/[0-9]{2}/[0-9]{2}/[0-9]{4}/[0-9]{6}\\.log$", item.Name);
             Assert.Equal("2.0", item.Metadata["LogVersion"]);
-            Assert.Contains(item.Metadata["LogType"], new[] { "read", "write", "delete" }, StringComparer.Ordinal);
+            Assert.Contains(item.Metadata["LogType"], AnalyticsLogTypes, StringComparer.Ordinal);
             Assert.EndsWith("Z", item.Metadata["StartTime"], StringComparison.Ordinal);
             Assert.EndsWith("Z", item.Metadata["EndTime"], StringComparison.Ordinal);
         });
@@ -13446,30 +13467,26 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
             {
                 using (var group = writer.CreateRowGroup())
                 {
-                    await group.WriteAsync<int>(id, new[] { 1, 2 }.AsMemory());
-                    await group.WriteAsync(name, new string?[] { "one", "two" });
-                    await group.WriteAsync<bool>(enabled, new[] { true, false }.AsMemory());
-                    await group.WriteAsync<double>(score, new[] { 1.25D, 2.5D }.AsMemory());
+                    await group.WriteAsync<int>(id, FirstParquetIds.AsMemory());
+                    await group.WriteAsync(name, FirstParquetNames);
+                    await group.WriteAsync<bool>(enabled, FirstParquetEnabled.AsMemory());
+                    await group.WriteAsync<double>(score, FirstParquetScores.AsMemory());
                     await group.WriteAsync<DateTime>(
                         observed,
-                        new[]
-                        {
-                            new DateTime(2026, 9, 20, 10, 15, 0, DateTimeKind.Utc),
-                            new DateTime(2026, 9, 21, 11, 30, 0, DateTimeKind.Utc)
-                        }.AsMemory());
+                        FirstParquetObserved.AsMemory());
                     await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory());
                     group.CompleteValidate();
                 }
 
                 using (var group = writer.CreateRowGroup())
                 {
-                    await group.WriteAsync<int>(id, new[] { 3 }.AsMemory());
-                    await group.WriteAsync(name, new string?[] { "three" });
-                    await group.WriteAsync<bool>(enabled, new[] { true }.AsMemory());
-                    await group.WriteAsync<double>(score, new[] { 3.75D }.AsMemory());
+                    await group.WriteAsync<int>(id, SecondParquetIds.AsMemory());
+                    await group.WriteAsync(name, SecondParquetNames);
+                    await group.WriteAsync<bool>(enabled, SecondParquetEnabled.AsMemory());
+                    await group.WriteAsync<double>(score, SecondParquetScores.AsMemory());
                     await group.WriteAsync<DateTime>(
                         observed,
-                        new[] { new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc) }.AsMemory());
+                        SecondParquetObserved.AsMemory());
                     await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory());
                     group.CompleteValidate();
                 }
