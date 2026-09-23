@@ -40,28 +40,85 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
     {
         var fullPath = Path.GetFullPath(directory);
         lock (_directoryGate)
-        {
-            var pending = new Stack<string>();
-            var current = fullPath;
-            while (!_durableDirectories.Contains(current))
-            {
-                pending.Push(current);
-                var parent = Directory.GetParent(current)?.FullName;
-                if (parent is null)
-                    break;
-                current = parent;
-            }
+            EnsureDurableDirectoryCore(fullPath);
+    }
 
-            while (pending.TryPop(out var path))
+    internal void PublishStandaloneChunk(string source, string destination)
+    {
+        var fullPath = Path.GetFullPath(destination);
+        EnsureChunkPath(fullPath);
+        lock (_directoryGate)
+        {
+            EnsureDurableDirectoryCore(Path.GetDirectoryName(fullPath)!);
+            StorageDurability.PublishFile(source, fullPath, overwrite: false);
+        }
+    }
+
+    internal void PruneEmptyChunkDirectories(string chunkPath)
+    {
+        var fullPath = Path.GetFullPath(chunkPath);
+        EnsureChunkPath(fullPath);
+        var chunksRoot = Path.GetFullPath(Chunks);
+        lock (_directoryGate)
+        {
+            var current = Path.GetDirectoryName(fullPath)!;
+            while (!string.Equals(current, chunksRoot, PathComparison))
             {
-                Directory.CreateDirectory(path);
-                var parent = Directory.GetParent(path)?.FullName;
-                if (parent is not null)
-                    StorageDurability.FlushDirectory(parent);
-                _durableDirectories.Add(path);
+                try
+                {
+                    Directory.Delete(current, recursive: false);
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    _durableDirectories.Remove(current);
+                    break;
+                }
+                catch (IOException)
+                {
+                    break;
+                }
+
+                _durableDirectories.Remove(current);
+                var parent = Directory.GetParent(current)!.FullName;
+                StorageDurability.FlushDirectory(parent);
+                current = parent;
             }
         }
     }
+
+    private void EnsureDurableDirectoryCore(string fullPath)
+    {
+        var pending = new Stack<string>();
+        var current = fullPath;
+        while (!_durableDirectories.Contains(current))
+        {
+            pending.Push(current);
+            var parent = Directory.GetParent(current)?.FullName;
+            if (parent is null)
+                break;
+            current = parent;
+        }
+
+        while (pending.TryPop(out var path))
+        {
+            Directory.CreateDirectory(path);
+            var parent = Directory.GetParent(path)?.FullName;
+            if (parent is not null)
+                StorageDurability.FlushDirectory(parent);
+            _durableDirectories.Add(path);
+        }
+    }
+
+    private void EnsureChunkPath(string fullPath)
+    {
+        var prefix = Path.GetFullPath(Chunks) + Path.DirectorySeparatorChar;
+        if (!fullPath.StartsWith(prefix, PathComparison))
+            throw new InvalidOperationException("The chunk path escaped the chunk storage root.");
+    }
+
+    private static StringComparison PathComparison => OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
 
     public void Dispose() => _rootLease.Dispose();
 
