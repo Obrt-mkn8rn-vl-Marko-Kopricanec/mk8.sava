@@ -146,7 +146,9 @@ pages, and continuation through the official SDK, including an out-of-prefix
 container. The service-properties scenario compares a CORS rule round trip
 through the SDK, an allowed preflight, a denied origin, and a malformed
 preflight. A same-account copy scenario compares source conditions, completion,
-and exact downloaded bytes. Azurite returns the generic `ConditionNotMet` for
+and exact downloaded bytes. A blob-list scenario compares filtered metadata,
+one-item pages and continuations, and delimiter-based hierarchy prefixes with
+an out-of-prefix blob. Azurite returns the generic `ConditionNotMet` for
 a stale copy-source ETag; mk8.sava retains the published Blob-specific
 `SourceConditionNotMet` code, and the test records this emulator divergence.
 The script configures Azurite with the test account key used by mk8.sava and

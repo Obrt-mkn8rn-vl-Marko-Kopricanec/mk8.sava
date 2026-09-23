@@ -199,6 +199,33 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task BlobPrefixMetadataAndHierarchyPagingMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseBlobListingAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseBlobListingAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -485,6 +512,53 @@ public sealed class AzuriteDifferentialTests
             properties.ContentLength, Convert.ToHexString(SHA256.HashData(actual)));
     }
 
+    private static async Task<BlobListingObservation> ExerciseBlobListingAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        foreach (var name in new[] { "folder/a.bin", "folder/b.bin", "folder/deeper/c.bin", "root.bin" })
+        {
+            await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name), new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["name"] = name }
+            }).ConfigureAwait(false);
+        }
+
+        var flatPages = new List<string>();
+        var flatContinuations = 0;
+        await foreach (var page in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            Traits = BlobTraits.Metadata,
+            Prefix = "folder/"
+        }).AsPages(pageSizeHint: 1).ConfigureAwait(false))
+        {
+            flatPages.Add(string.Join(',', page.Values.Select(item => $"{item.Name}:{item.Metadata["name"]}")));
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                flatContinuations++;
+        }
+
+        var hierarchyPages = new List<string>();
+        var hierarchyContinuations = 0;
+        await foreach (var page in container.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+        {
+            Delimiter = "/",
+            Prefix = "folder/"
+        }).AsPages(pageSizeHint: 1).ConfigureAwait(false))
+        {
+            hierarchyPages.Add(string.Join(',', page.Values.Select(item =>
+                item.IsPrefix ? $"P:{item.Prefix}" : $"B:{item.Blob.Name}")));
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                hierarchyContinuations++;
+        }
+
+        Assert.Equal(3, flatPages.Count);
+        Assert.Equal(2, flatContinuations);
+        Assert.Equal(3, hierarchyPages.Count);
+        Assert.Equal(2, hierarchyContinuations);
+        return new BlobListingObservation(
+            string.Join('|', flatPages), flatContinuations,
+            string.Join('|', hierarchyPages), hierarchyContinuations);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -555,4 +629,8 @@ public sealed class AzuriteDifferentialTests
     private sealed record CopyObservation(
         int StaleSourceStatus, string? StaleSourceCode, int StartStatus,
         string CopyStatus, long Length, string ContentSha256);
+
+    private sealed record BlobListingObservation(
+        string FlatPages, int FlatContinuations,
+        string HierarchyPages, int HierarchyContinuations);
 }
