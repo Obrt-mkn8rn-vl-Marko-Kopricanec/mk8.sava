@@ -329,6 +329,38 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     private static async Task<FlatObservation> ExerciseAsync(BlobContainerClient container)
     {
         var created = await container.CreateAsync().ConfigureAwait(false);
+        var baseline = await ExerciseFlatBaselineAsync(container).ConfigureAwait(false);
+        var blocks = await ExerciseFlatBlocksAsync(container).ConfigureAwait(false);
+        var appendBytes = await ExerciseFlatAppendAsync(container).ConfigureAwait(false);
+        var pageBytes = await ExerciseFlatPageAsync(container).ConfigureAwait(false);
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("missing.bin").GetPropertiesAsync()).ConfigureAwait(false);
+        Assert.NotNull(missing.ErrorCode);
+        var names = new List<string>();
+        await foreach (var item in container.GetBlobsAsync().ConfigureAwait(false))
+            names.Add(item.Name);
+
+        return new FlatObservation(
+            created.GetRawResponse().Status,
+            baseline.UploadStatus,
+            baseline.Length,
+            baseline.ContentType,
+            baseline.Metadata,
+            baseline.Tag,
+            baseline.FullBytes,
+            baseline.RangeBytes,
+            baseline.SnapshotBytes,
+            blocks.Bytes,
+            blocks.CommittedBlockIds,
+            appendBytes,
+            pageBytes,
+            missing.Status,
+            missing.ErrorCode,
+            string.Join(',', names));
+    }
+
+    private static async Task<FlatBaselineObservation> ExerciseFlatBaselineAsync(BlobContainerClient container)
+    {
         var bytes = new byte[128 * 1024];
         DeterministicTestBytes.Fill(0x4D4B38, bytes);
         var blob = container.GetBlobClient("nested/original.bin");
@@ -355,6 +387,23 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         await blob.UploadAsync(BinaryData.FromString("replacement"), overwrite: true).ConfigureAwait(false);
         var snapshotContent = await blob.WithSnapshot(snapshot.Value.Snapshot).DownloadContentAsync().ConfigureAwait(false);
 
+        Assert.Equal(bytes, downloaded.Value.Content.ToArray());
+        Assert.Equal(bytes.AsSpan(4093, 8195).ToArray(), rangeBuffer.ToArray());
+        Assert.Equal(bytes, snapshotContent.Value.Content.ToArray());
+        return new FlatBaselineObservation(
+            uploaded.GetRawResponse().Status,
+            properties.Value.ContentLength,
+            properties.Value.ContentType,
+            properties.Value.Metadata["case"],
+            tags.Value.Tags["phase"],
+            Convert.ToBase64String(downloaded.Value.Content.ToArray()),
+            Convert.ToBase64String(rangeBuffer.ToArray()),
+            Convert.ToBase64String(snapshotContent.Value.Content.ToArray()));
+    }
+
+    private static async Task<(string Bytes, string CommittedBlockIds)> ExerciseFlatBlocksAsync(
+        BlobContainerClient container)
+    {
         var block = container.GetBlockBlobClient("blocks.bin");
         var firstBlockId = Convert.ToBase64String("000001"u8);
         var secondBlockId = Convert.ToBase64String("000002"u8);
@@ -364,52 +413,33 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         var blockContent = await block.DownloadContentAsync().ConfigureAwait(false);
         var blockList = await block.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false);
 
+        Assert.Equal("betaalpha", blockContent.Value.Content.ToString());
+        Assert.Equal(new[] { firstBlockId, secondBlockId },
+            blockList.Value.CommittedBlocks.Select(item => item.Name).Order(StringComparer.Ordinal), StringComparer.Ordinal);
+        return (blockContent.Value.Content.ToString(), string.Join(',', blockList.Value.CommittedBlocks.Select(item => item.Name)));
+    }
+
+    private static async Task<string> ExerciseFlatAppendAsync(BlobContainerClient container)
+    {
         var append = container.GetAppendBlobClient("append.log");
         await append.CreateAsync().ConfigureAwait(false);
         await append.AppendBlockAsync(BinaryData.FromString("first|").ToStream()).ConfigureAwait(false);
         await append.AppendBlockAsync(BinaryData.FromString("second").ToStream()).ConfigureAwait(false);
         var appendContent = await append.DownloadContentAsync().ConfigureAwait(false);
+        Assert.Equal("first|second", appendContent.Value.Content.ToString());
+        return appendContent.Value.Content.ToString();
+    }
 
+    private static async Task<string> ExerciseFlatPageAsync(BlobContainerClient container)
+    {
         var page = container.GetPageBlobClient("page.bin");
         await page.CreateAsync(1024).ConfigureAwait(false);
         var pageBytes = new byte[512];
         DeterministicTestBytes.Fill(0x50414745, pageBytes);
         await page.UploadPagesAsync(new MemoryStream(pageBytes, writable: false), 512).ConfigureAwait(false);
         var pageContent = await page.DownloadContentAsync().ConfigureAwait(false);
-
-        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient("missing.bin").GetPropertiesAsync()).ConfigureAwait(false);
-        Assert.NotNull(missing.ErrorCode);
-        var names = new List<string>();
-        await foreach (var item in container.GetBlobsAsync().ConfigureAwait(false))
-            names.Add(item.Name);
-
-        Assert.Equal(bytes, downloaded.Value.Content.ToArray());
-        Assert.Equal(bytes.AsSpan(4093, 8195).ToArray(), rangeBuffer.ToArray());
-        Assert.Equal(bytes, snapshotContent.Value.Content.ToArray());
-        Assert.Equal("betaalpha", blockContent.Value.Content.ToString());
-        Assert.Equal("first|second", appendContent.Value.Content.ToString());
         Assert.Equal(pageBytes, pageContent.Value.Content.ToArray().AsSpan(512, 512).ToArray());
-        Assert.Equal(new[] { firstBlockId, secondBlockId },
-            blockList.Value.CommittedBlocks.Select(item => item.Name).Order(StringComparer.Ordinal), StringComparer.Ordinal);
-
-        return new FlatObservation(
-            created.GetRawResponse().Status,
-            uploaded.GetRawResponse().Status,
-            properties.Value.ContentLength,
-            properties.Value.ContentType,
-            properties.Value.Metadata["case"],
-            tags.Value.Tags["phase"],
-            Convert.ToBase64String(downloaded.Value.Content.ToArray()),
-            Convert.ToBase64String(rangeBuffer.ToArray()),
-            Convert.ToBase64String(snapshotContent.Value.Content.ToArray()),
-            blockContent.Value.Content.ToString(),
-            string.Join(',', blockList.Value.CommittedBlocks.Select(item => item.Name)),
-            appendContent.Value.Content.ToString(),
-            Convert.ToBase64String(pageContent.Value.Content.ToArray()),
-            missing.Status,
-            missing.ErrorCode,
-            string.Join(',', names));
+        return Convert.ToBase64String(pageContent.Value.Content.ToArray());
     }
 
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
@@ -422,6 +452,16 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         {
         }
     }
+
+    private sealed record FlatBaselineObservation(
+        int UploadStatus,
+        long Length,
+        string ContentType,
+        string Metadata,
+        string Tag,
+        string FullBytes,
+        string RangeBytes,
+        string SnapshotBytes);
 
     private sealed record FlatObservation(
         int CreateStatus,
