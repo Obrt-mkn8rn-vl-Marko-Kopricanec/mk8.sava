@@ -48,97 +48,134 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 });
             var container = client.GetBlobContainerClient($"allocation-{Guid.NewGuid():N}");
             await container.CreateAsync();
+            var benchmark = new AllocationBenchmarkScenario(application, container, rawRoot, output);
+            await benchmark.RunAsync().ConfigureAwait(true);
+        }
+        finally
+        {
+            Directory.Delete(rawRoot, recursive: true);
+        }
+    }
 
-            long logicalBytes = 0;
+    private sealed class AllocationBenchmarkScenario(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        string rawRoot,
+        ITestOutputHelper output)
+    {
+        private long _logicalBytes;
+
+        public async Task RunAsync()
+        {
             output.WriteLine("workload,logical_bytes,sava_allocated_bytes,raw_allocated_bytes,metadata_allocated_bytes,chunks_allocated_bytes,packs_allocated_bytes,staging_allocated_bytes,upload_ms,read_ms,process_cpu_ms,working_set_bytes,sampled_peak_staging_temp_allocated_bytes,sampled_peak_working_set_bytes");
+            await RunDuplicatesAsync().ConfigureAwait(false);
+            await RunShiftedPartialsAsync().ConfigureAwait(false);
+            await RunVersionsAsync().ConfigureAwait(false);
+            await RunSmallBlobsAsync().ConfigureAwait(false);
+            await RunIncompressibleAsync().ConfigureAwait(false);
+        }
 
-            async Task RecordAsync(string workload, Func<Task<(double UploadMs, double ReadMs)>> operation)
+        private async Task RecordAsync(string workload, Func<Task<(double UploadMs, double ReadMs)>> operation)
+        {
+            using var process = Process.GetCurrentProcess();
+            var cpuBefore = process.TotalProcessorTime;
+            var stagingPath = Path.Combine(application.DataPath, "staging");
+            var samples = new AllocationSamples(StorageAllocationMeter.MeasureRoot(stagingPath));
+            using var samplingCancellation = new CancellationTokenSource();
+            var sampler = Task.Run(() => SampleUsageAsync(stagingPath, samples, samplingCancellation.Token));
+            (double UploadMs, double ReadMs) timing;
+            try
             {
-                var cpuBefore = Process.GetCurrentProcess().TotalProcessorTime;
-                var stagingPath = Path.Combine(application.DataPath, "staging");
-                var stagingBaseline = StorageAllocationMeter.MeasureRoot(stagingPath);
-                long? peakTemporaryAllocation = stagingBaseline.HasValue ? 0 : null;
-                long peakWorkingSet = 0;
-                using var samplingCancellation = new CancellationTokenSource();
-                var sampler = Task.Run(async () =>
+                timing = await operation().ConfigureAwait(false);
+            }
+            finally
+            {
+                await samplingCancellation.CancelAsync().ConfigureAwait(false);
+                await sampler.ConfigureAwait(false);
+            }
+            process.Refresh();
+            samples.PeakWorkingSet = Math.Max(samples.PeakWorkingSet, process.WorkingSet64);
+            Assert.True(samples.PeakWorkingSet > 0);
+            await WriteRowAsync(workload, timing, process, cpuBefore, samples).ConfigureAwait(false);
+        }
+
+        private static async Task SampleUsageAsync(string stagingPath, AllocationSamples samples, CancellationToken cancellationToken)
+        {
+            using var process = Process.GetCurrentProcess();
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                var allocated = StorageAllocationMeter.MeasureRoot(stagingPath);
+                if (allocated is { } measured && samples.StagingBaseline is { } baseline)
                 {
-                    using var sampledProcess = Process.GetCurrentProcess();
-                    while (!samplingCancellation.IsCancellationRequested)
-                    {
-                        var allocated = StorageAllocationMeter.MeasureRoot(stagingPath);
-                        if (allocated is { } measured && stagingBaseline is { } baseline)
-                        {
-                            peakTemporaryAllocation = Math.Max(
-                                peakTemporaryAllocation!.Value,
-                                Math.Max(0, measured - baseline));
-                        }
-                        sampledProcess.Refresh();
-                        peakWorkingSet = Math.Max(peakWorkingSet, sampledProcess.WorkingSet64);
-                        try
-                        {
-                            await Task.Delay(TimeSpan.FromMilliseconds(10), samplingCancellation.Token).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException) when (samplingCancellation.IsCancellationRequested)
-                        {
-                            break;
-                        }
-                    }
-                });
-                (double UploadMs, double ReadMs) timing;
+                    samples.PeakTemporaryAllocation = Math.Max(
+                        samples.PeakTemporaryAllocation!.Value, Math.Max(0, measured - baseline));
+                }
+                process.Refresh();
+                samples.PeakWorkingSet = Math.Max(samples.PeakWorkingSet, process.WorkingSet64);
                 try
                 {
-                    timing = await operation().ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken).ConfigureAwait(false);
                 }
-                finally
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    await samplingCancellation.CancelAsync().ConfigureAwait(false);
-                    await sampler.ConfigureAwait(false);
+                    break;
                 }
-                var process = Process.GetCurrentProcess();
-                peakWorkingSet = Math.Max(peakWorkingSet, process.WorkingSet64);
-                Assert.True(peakWorkingSet > 0);
-                output.WriteLine(string.Join(',',
-                    workload,
-                    logicalBytes.ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(application.DataPath).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(rawRoot).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db")).ConfigureAwait(false) +
-                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")).ConfigureAwait(false) +
-                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")).ConfigureAwait(false))
-                    .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")).ConfigureAwait(false))
-                    .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "packs")).ConfigureAwait(false))
-                    .ToString(CultureInfo.InvariantCulture),
-                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "staging")).ConfigureAwait(false))
-                    .ToString(CultureInfo.InvariantCulture),
-                    timing.UploadMs.ToString("F3", CultureInfo.InvariantCulture),
-                    timing.ReadMs.ToString("F3", CultureInfo.InvariantCulture),
-                    (process.TotalProcessorTime - cpuBefore).TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture),
-                    process.WorkingSet64.ToString(CultureInfo.InvariantCulture),
-                    peakTemporaryAllocation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable",
-                    peakWorkingSet.ToString(CultureInfo.InvariantCulture)));
             }
+        }
 
-            async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
-            {
-                var watch = Stopwatch.StartNew();
-                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromBytes(content), overwrite: true).ConfigureAwait(false);
-                watch.Stop();
-                await File.WriteAllBytesAsync(Path.Combine(rawRoot, rawName), content).ConfigureAwait(false);
-                logicalBytes = checked(logicalBytes + content.Length);
-                return watch.Elapsed.TotalMilliseconds;
-            }
+        private async Task WriteRowAsync(
+            string workload,
+            (double UploadMs, double ReadMs) timing,
+            Process process,
+            TimeSpan cpuBefore,
+            AllocationSamples samples)
+        {
+            var metadataBytes = await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db"))
+                .ConfigureAwait(false) +
+                await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")).ConfigureAwait(false) +
+                await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")).ConfigureAwait(false);
+            output.WriteLine(string.Join(',',
+                workload,
+                _logicalBytes.ToString(CultureInfo.InvariantCulture),
+                (await MeasureAllocatedBytesAsync(application.DataPath).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
+                (await MeasureAllocatedBytesAsync(rawRoot).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
+                metadataBytes.ToString(CultureInfo.InvariantCulture),
+                (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")).ConfigureAwait(false))
+                    .ToString(CultureInfo.InvariantCulture),
+                (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "packs")).ConfigureAwait(false))
+                    .ToString(CultureInfo.InvariantCulture),
+                (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "staging")).ConfigureAwait(false))
+                    .ToString(CultureInfo.InvariantCulture),
+                timing.UploadMs.ToString("F3", CultureInfo.InvariantCulture),
+                timing.ReadMs.ToString("F3", CultureInfo.InvariantCulture),
+                (process.TotalProcessorTime - cpuBefore).TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture),
+                process.WorkingSet64.ToString(CultureInfo.InvariantCulture),
+                samples.PeakTemporaryAllocation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable",
+                samples.PeakWorkingSet.ToString(CultureInfo.InvariantCulture)));
+        }
 
-            async Task<double> VerifyAsync(string blobName, byte[] expected)
-            {
-                var watch = Stopwatch.StartNew();
-                var actual = await container.GetBlobClient(blobName).DownloadContentAsync().ConfigureAwait(false);
-                watch.Stop();
-                Assert.Equal(expected, actual.Value.Content.ToArray());
-                return watch.Elapsed.TotalMilliseconds;
-            }
+        private async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
+        {
+            var watch = Stopwatch.StartNew();
+            await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromBytes(content), overwrite: true)
+                .ConfigureAwait(false);
+            watch.Stop();
+            await File.WriteAllBytesAsync(Path.Combine(rawRoot, rawName), content).ConfigureAwait(false);
+            _logicalBytes = checked(_logicalBytes + content.Length);
+            return watch.Elapsed.TotalMilliseconds;
+        }
 
+        private async Task<double> VerifyAsync(string blobName, byte[] expected)
+        {
+            var watch = Stopwatch.StartNew();
+            var actual = await container.GetBlobClient(blobName).DownloadContentAsync().ConfigureAwait(false);
+            watch.Stop();
+            Assert.Equal(expected, actual.Value.Content.ToArray());
+            return watch.Elapsed.TotalMilliseconds;
+        }
+
+        private async Task RunDuplicatesAsync()
+        {
             var duplicate = new byte[256 * 1024];
             DeterministicTestBytes.Fill(0x5100, duplicate);
             await RecordAsync("eight_exact_duplicates", async () =>
@@ -147,8 +184,11 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 for (var index = 0; index < 8; index++)
                     write += await UploadAsync($"duplicate-{index}.bin", $"duplicate-{index}.bin", duplicate).ConfigureAwait(false);
                 return (write, await VerifyAsync("duplicate-7.bin", duplicate).ConfigureAwait(false));
-            });
+            }).ConfigureAwait(false);
+        }
 
+        private async Task RunShiftedPartialsAsync()
+        {
             var sharedBase = new byte[2 * 1024 * 1024];
             DeterministicTestBytes.Fill(0x5101, sharedBase);
             await RecordAsync("five_shifted_partials", async () =>
@@ -164,8 +204,11 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("partial-4.bin", latest).ConfigureAwait(false));
-            });
+            }).ConfigureAwait(false);
+        }
 
+        private async Task RunVersionsAsync()
+        {
             await RecordAsync("eight_versions", async () =>
             {
                 double write = 0;
@@ -177,8 +220,11 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     write += await UploadAsync("versioned.bin", $"version-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("versioned.bin", latest).ConfigureAwait(false));
-            });
+            }).ConfigureAwait(false);
+        }
 
+        private async Task RunSmallBlobsAsync()
+        {
             await RecordAsync("one_hundred_twenty_eight_small", async () =>
             {
                 double write = 0;
@@ -190,8 +236,11 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("small-127.bin", latest).ConfigureAwait(false));
-            });
+            }).ConfigureAwait(false);
+        }
 
+        private async Task RunIncompressibleAsync()
+        {
             await RecordAsync("four_incompressible", async () =>
             {
                 double write = 0;
@@ -203,11 +252,16 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("random-3.bin", latest).ConfigureAwait(false));
-            });
+            }).ConfigureAwait(false);
         }
-        finally
+
+        private sealed class AllocationSamples(long? stagingBaseline)
         {
-            Directory.Delete(rawRoot, recursive: true);
+            public long? StagingBaseline { get; } = stagingBaseline;
+
+            public long? PeakTemporaryAllocation { get; set; } = stagingBaseline.HasValue ? 0 : null;
+
+            public long PeakWorkingSet { get; set; }
         }
     }
 
