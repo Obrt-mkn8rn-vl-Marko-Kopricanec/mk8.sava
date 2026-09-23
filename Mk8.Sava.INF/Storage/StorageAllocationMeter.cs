@@ -77,7 +77,7 @@ internal static class StorageAllocationMeter
         }
     }
 
-    private static bool TryStat(string path, out AllocationStat stat)
+    internal static bool TryStat(string path, out AllocationStat stat)
     {
         var buffer = new byte[256];
         if (Statx(AtFdcwd, path, AtSymlinkNoFollow, StatxBasicStats, buffer) != 0)
@@ -104,7 +104,7 @@ internal static class StorageAllocationMeter
         return true;
     }
 
-    private readonly record struct AllocationStat(
+    internal readonly record struct AllocationStat(
         long AllocatedBytes,
         uint LinkCount,
         ulong Inode,

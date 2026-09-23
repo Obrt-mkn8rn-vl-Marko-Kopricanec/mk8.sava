@@ -106,6 +106,16 @@ public sealed class StorageSpaceEfficiencyTests
             var after = chunks.MeasurePhysicalUsage();
             Assert.Equal(before.ChunkBytes, after.ChunkBytes);
             Assert.Equal(before.ChunkCount, after.ChunkCount);
+
+            StoragePhysicalUsage? budgeted = null;
+            for (var pass = 0; pass < 100 && budgeted is null; pass++)
+            {
+                budgeted = chunks.ScanPhysicalUsageBatch(2);
+                Assert.InRange(chunks.PhysicalUsageScanStepsLastPass, 1, 2);
+            }
+            Assert.NotNull(budgeted);
+            Assert.Equal(after.ChunkBytes, budgeted.ChunkBytes);
+            Assert.Equal(after.ChunkCount, budgeted.ChunkCount);
         }
         finally
         {
