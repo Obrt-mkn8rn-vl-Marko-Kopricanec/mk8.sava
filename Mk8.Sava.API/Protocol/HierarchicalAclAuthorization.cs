@@ -4,6 +4,14 @@ namespace Mk8.Sava.Protocol;
 
 internal static class HierarchicalAclAuthorization
 {
+    internal static bool IsBlobReadOperation(HttpRequest http)
+    {
+        var component = http.Query["comp"].ToString();
+        return ((HttpMethods.IsGet(http.Method) || HttpMethods.IsHead(http.Method)) &&
+                (component.Length == 0 || component.Equals("metadata", StringComparison.OrdinalIgnoreCase))) ||
+               (HttpMethods.IsPost(http.Method) && component.Equals("query", StringComparison.OrdinalIgnoreCase));
+    }
+
     internal static void EnsureAuthorizedGeneration(StorageAuthorization authorization, string generationId)
     {
         if (authorization.AclReadChecked &&
@@ -25,8 +33,7 @@ internal static class HierarchicalAclAuthorization
         if (request.ResourceKind != StorageResourceKind.Blob ||
             request.Container is null ||
             request.Blob is null ||
-            !HttpMethods.IsGet(http.Method) && !HttpMethods.IsHead(http.Method) ||
-            !string.IsNullOrEmpty(http.Query["comp"].ToString()) ||
+            !IsBlobReadOperation(http) ||
             !signedPermissions.Contains('r', StringComparison.Ordinal))
         {
             throw AzureStorageException.AuthorizationFailure();

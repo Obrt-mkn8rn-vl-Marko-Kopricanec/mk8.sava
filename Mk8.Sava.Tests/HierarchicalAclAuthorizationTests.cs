@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
@@ -5,6 +6,24 @@ namespace Mk8.Sava.Tests;
 
 public sealed class HierarchicalAclAuthorizationTests
 {
+    [Theory]
+    [InlineData("GET", "", true)]
+    [InlineData("HEAD", "metadata", true)]
+    [InlineData("GET", "metadata", true)]
+    [InlineData("POST", "query", true)]
+    [InlineData("GET", "tags", false)]
+    [InlineData("GET", "blocklist", false)]
+    [InlineData("PUT", "metadata", false)]
+    [InlineData("POST", "queryOther", false)]
+    public void AclFallbackOnlyTargetsBlobContentReadOperations(string method, string component, bool expected)
+    {
+        var request = new DefaultHttpContext().Request;
+        request.Method = method;
+        if (component.Length > 0)
+            request.QueryString = new QueryString($"?comp={component}");
+        Assert.Equal(expected, HierarchicalAclAuthorization.IsBlobReadOperation(request));
+    }
+
     [Fact]
     public void PosixAclHonorsOwnerNamedUserGroupsMaskAndOtherPrecedence()
     {

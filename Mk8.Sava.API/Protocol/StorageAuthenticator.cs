@@ -247,8 +247,7 @@ public sealed class StorageAuthenticator(
             Guid.TryParse(objectId, out _) &&
             IsHierarchicalNamespaceEnabled(request.Account) &&
             request.ResourceKind == StorageResourceKind.Blob &&
-            (HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method)) &&
-            string.IsNullOrEmpty(context.Request.Query["comp"].ToString()))
+            HierarchicalAclAuthorization.IsBlobReadOperation(context.Request))
         {
             try
             {
