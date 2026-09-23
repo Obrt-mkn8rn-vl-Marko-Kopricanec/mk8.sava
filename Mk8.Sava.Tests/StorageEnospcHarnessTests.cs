@@ -3,6 +3,7 @@ using Azure;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.DependencyInjection;
 using Mk8.Sava.Storage;
 
@@ -298,6 +299,113 @@ public sealed class StorageEnospcHarnessTests
             await blob.SetMetadataAsync(
                 new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "recovered" }).ConfigureAwait(false);
             Assert.Equal("recovered", (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["state"]);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await restarted.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    [Fact]
+    public async Task ExhaustedFilesystemRollsBackFailedBlobPropertyUpdate()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "blob-properties-data");
+        var fillerPath = Path.Combine(mountRoot, "blob-properties-filler.bin");
+        var stableBytes = RandomNumberGenerator.GetBytes(8192);
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+
+        var acknowledged = await AssertBlobPropertyUpdateRejectedAsync(
+            dataPath, fillerPath, stableBytes, configuration).ConfigureAwait(true);
+        await AssertBlobPropertyUpdateRecoversAsync(
+            dataPath, stableBytes, acknowledged, configuration).ConfigureAwait(true);
+    }
+
+    private static async Task<BlobPropertyFailureObservation> AssertBlobPropertyUpdateRejectedAsync(
+        string dataPath,
+        string fillerPath,
+        byte[] stableBytes,
+        Dictionary<string, string?> configuration)
+    {
+        var first = CreateHarness(dataPath, configuration);
+        try
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(first).GetBlobContainerClient("enospc-blob-properties");
+            await container.CreateAsync().ConfigureAwait(false);
+            var blob = container.GetBlobClient("stable.bin");
+            await blob.UploadAsync(BinaryData.FromBytes(stableBytes), new BlobUploadOptions
+            {
+                HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-seed" }
+            }).ConfigureAwait(false);
+            var acknowledgedContentType = "application/x-seed";
+            var acknowledgedETag = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag;
+            var acknowledgedUpdates = 0;
+            FillUntilNoSpace(fillerPath, 256 * 1024);
+
+            var failed = false;
+            for (var index = 0; index < 256; index++)
+            {
+                var contentType = $"application/x-{index:D4}-{new string('p', 1024)}";
+                try
+                {
+                    var updated = await blob.SetHttpHeadersAsync(
+                        new BlobHttpHeaders { ContentType = contentType }).ConfigureAwait(false);
+                    acknowledgedContentType = contentType;
+                    acknowledgedETag = updated.Value.ETag;
+                    acknowledgedUpdates++;
+                }
+                catch (RequestFailedException failure)
+                {
+                    Assert.Equal(500, failure.Status);
+                    failed = true;
+                    break;
+                }
+            }
+            Assert.True(failed);
+            Assert.True(acknowledgedUpdates > 0);
+            File.Delete(fillerPath);
+
+            var properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+            Assert.Equal(acknowledgedContentType, properties.ContentType);
+            Assert.Equal(acknowledgedETag, properties.ETag);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            return new BlobPropertyFailureObservation(acknowledgedContentType, acknowledgedETag);
+        }
+        finally
+        {
+            await first.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertBlobPropertyUpdateRecoversAsync(
+        string dataPath,
+        byte[] stableBytes,
+        BlobPropertyFailureObservation acknowledged,
+        Dictionary<string, string?> configuration)
+    {
+        var restarted = CreateHarness(dataPath, configuration);
+        try
+        {
+            await restarted.InitializeAsync().ConfigureAwait(false);
+            var blob = CreateClient(restarted)
+                .GetBlobContainerClient("enospc-blob-properties")
+                .GetBlobClient("stable.bin");
+            var properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+            Assert.Equal(acknowledged.ContentType, properties.ContentType);
+            Assert.Equal(acknowledged.ETag, properties.ETag);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            await blob.SetHttpHeadersAsync(
+                new BlobHttpHeaders { ContentType = "application/x-recovered" }).ConfigureAwait(false);
+            Assert.Equal("application/x-recovered", (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.ContentType);
             Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
         }
         finally
@@ -738,6 +846,8 @@ public sealed class StorageEnospcHarnessTests
     private sealed record MetadataFailureObservation(IReadOnlyList<string> Acknowledged, string FailedName);
 
     private sealed record BlobMetadataFailureObservation(string State, ETag ETag);
+
+    private sealed record BlobPropertyFailureObservation(string ContentType, ETag ETag);
 
     private sealed record CompactionIdentity(string PackId, string ChunkId);
 
