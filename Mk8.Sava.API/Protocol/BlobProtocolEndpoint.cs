@@ -2706,18 +2706,15 @@ public static class BlobProtocolEndpoint
                 throw AzureStorageException.InvalidHeader("x-ms-copy-source-authorization", sourceAuthorization);
             sourceHttp.Request.Headers.Authorization = sourceAuthorization;
         }
+        else if (destinationRequest.Authorization.Kind == StorageAuthorizationKind.Bearer &&
+                 !QueryHelpers.ParseQuery(source.Uri.Query).ContainsKey("sig"))
+        {
+            sourceHttp.Request.Headers.Authorization = destination.Request.Headers.Authorization;
+        }
 
         if (sourceAuthorization is null &&
             string.Equals(source.Account, destinationRequest.Account, StringComparison.Ordinal) &&
             destinationRequest.Authorization.Kind == StorageAuthorizationKind.SharedKey)
-        {
-            sourceContext.Authorization = destinationRequest.Authorization;
-        }
-        else if (sourceAuthorization is null &&
-                 string.Equals(source.Account, destinationRequest.Account, StringComparison.Ordinal) &&
-                 destinationRequest.Authorization.Kind == StorageAuthorizationKind.Bearer &&
-                 destinationRequest.Authorization.Allows('r') &&
-                 !QueryHelpers.ParseQuery(source.Uri.Query).ContainsKey("sig"))
         {
             sourceContext.Authorization = destinationRequest.Authorization;
         }
@@ -2760,6 +2757,9 @@ public static class BlobProtocolEndpoint
             source.Snapshot,
             false,
             cancellationToken);
+        HierarchicalAclAuthorization.EnsureAuthorizedGeneration(
+            sourceContext.Authorization,
+            sourceBlob.GenerationId);
         ValidateBlobTypeVersion(destinationRequest, sourceBlob.Kind);
         return sourceBlob;
     }

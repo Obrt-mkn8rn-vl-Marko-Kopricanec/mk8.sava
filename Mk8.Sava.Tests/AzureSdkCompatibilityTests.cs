@@ -7743,6 +7743,50 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task InternalCopyReauthorizesBearerAgainstSourceContainer()
+    {
+        var allowedContainerName = $"copy-bearer-allowed-{Guid.NewGuid():N}";
+        var privateContainerName = $"copy-bearer-private-{Guid.NewGuid():N}";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:BearerAuthentication:Principals:copy-agent:Permissions"] = "rcw",
+            ["Sava:BearerAuthentication:Principals:copy-agent:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            ["Sava:BearerAuthentication:Principals:copy-agent:Containers:0"] = allowedContainerName
+        });
+        await application.InitializeAsync();
+        var owner = CreateClient(application);
+        var allowed = owner.GetBlobContainerClient(allowedContainerName);
+        var privateContainer = owner.GetBlobContainerClient(privateContainerName);
+        await allowed.CreateAsync();
+        await privateContainer.CreateAsync();
+        var publicSource = allowed.GetBlobClient("source.txt");
+        var privateSource = privateContainer.GetBlobClient("secret.txt");
+        await publicSource.UploadAsync(BinaryData.FromString("allowed bytes"));
+        await privateSource.UploadAsync(BinaryData.FromString("private bytes"));
+
+        var token = CreateJwt(SavaWebApplicationFactory.AccountKey, "copy-agent");
+        var bearerDestination = CreateBearerClient(application, token)
+            .GetBlobContainerClient(allowedContainerName);
+        var rejected = bearerDestination.GetBlobClient("rejected.txt");
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            rejected.SyncCopyFromUriAsync(privateSource.Uri));
+        Assert.Equal(403, denied.Status);
+        Assert.Equal("AuthorizationFailure", denied.ErrorCode);
+        Assert.False((await rejected.ExistsAsync()).Value);
+
+        var copied = bearerDestination.GetBlobClient("copied.txt");
+        await copied.SyncCopyFromUriAsync(publicSource.Uri);
+        Assert.Equal("allowed bytes", (await copied.DownloadContentAsync()).Value.Content.ToString());
+
+        var delegated = bearerDestination.GetBlobClient("delegated.txt");
+        await delegated.SyncCopyFromUriAsync(privateSource.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(5)));
+        Assert.Equal("private bytes", (await delegated.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task BearerDelegationKeysProduceScopedUserDelegationSasTokens()
     {
         var owner = CreateClient(factory);
