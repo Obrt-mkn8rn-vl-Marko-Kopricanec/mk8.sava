@@ -58,7 +58,7 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
                    transport,
                    container.GetBlockBlobClient("latest-md5.bin"),
                    blockContent,
-                   "2026-10-06",
+                   "2026-12-06",
                    sendMd5: true))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
