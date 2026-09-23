@@ -104,6 +104,19 @@ binary-cache, install, and build roots. Each harness starts a real loopback
 mk8.sava process with a disposable storage root rather than routing the client
 through ASP.NET's in-memory test server.
 
+An opt-in live differential test uses the .NET Azure Blob SDK pinned to service
+version `2023-11-03`. Set `MK8_SAVA_LIVE_AZURE_BLOB_CONNECTION_STRING` in the
+test process environment to a **disposable flat-namespace Azure account** and
+run `dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj --filter Category=LiveAzure`.
+Without that variable, xUnit reports the lane as skipped, not passed. It
+creates a unique `mk8diff-` container in Azure and mk8.sava, compares the same
+upload, properties, tags, full/ranged reads, snapshot/overwrite, block/append/
+page blob, listing, and missing-blob error observations, then deletes only those
+two containers. The connection string is never printed. A separate local-only
+test always exercises the scenario so the harness cannot silently rot. This
+is an initial differential lane, not evidence for the full Azure conformance
+matrix or HNS behavior.
+
 ## SAS authorization boundaries
 
 Service, account, and user-delegation SAS tokens use Azure's versioned
