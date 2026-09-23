@@ -854,6 +854,17 @@ public sealed class MetadataStore(
         return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
     }
 
+    internal async Task<long> GetPackIndexedLengthAsync(
+        string packId,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COALESCE(MAX(record_offset + record_length), 0) FROM packed_chunks WHERE pack_id = $pack;";
+        command.Parameters.AddWithValue("$pack", packId);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+    }
+
     internal async Task<bool> TryRegisterPackedChunkAsync(
         ChunkPackRecord pack,
         PackedChunkLocation location,

@@ -47,6 +47,123 @@ public sealed class StorageFaultInjectionTests
     }
 
     [Fact]
+    public async Task PartialStagingWriteFailureLeavesNoPublishedChunkAndCanRetry()
+    {
+        var faultInjector = new ArmableStorageFaultInjector();
+        var application = CreateApplication(faultInjector);
+        try
+        {
+            await application.InitializeAsync();
+            var container = CreateClient(application).GetBlobContainerClient($"staging-write-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+            var blob = container.GetBlobClient("payload.bin");
+            var content = RandomNumberGenerator.GetBytes(64 * 1024);
+
+            faultInjector.Arm(StorageFaultPoint.DuringChunkStagingWrite);
+            var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true));
+
+            Assert.Equal(500, failure.Status);
+            Assert.False((await blob.ExistsAsync()).Value);
+            Assert.Empty(EnumerateContentFiles(application.DataPath));
+            Assert.Empty(EnumerateStagingFiles(application.DataPath));
+
+            await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
+            Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
+        }
+        finally
+        {
+            await application.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task PartialPackAppendIsDiscardedBeforeTheNextAppendAfterRestart()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-write-{Guid.NewGuid():N}");
+        var faultInjector = new ArmableStorageFaultInjector();
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
+        };
+        var containerName = $"pack-write-{Guid.NewGuid():N}";
+        var stableBytes = RandomNumberGenerator.GetBytes(1536);
+        var retryBytes = RandomNumberGenerator.GetBytes(1536);
+        string packId;
+        long indexedLength;
+
+        var first = new SavaWebApplicationFactory(
+            dataPath,
+            faultInjector,
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await first.InitializeAsync();
+            var container = CreateClient(first).GetBlobContainerClient(containerName);
+            await container.CreateAsync();
+            await container.GetBlobClient("stable.bin").UploadAsync(BinaryData.FromBytes(stableBytes));
+            var metadata = first.Services.GetRequiredService<MetadataStore>();
+            var pack = await metadata.GetActiveChunkPackAsync(
+                SavaWebApplicationFactory.AccountName, CancellationToken.None);
+            Assert.NotNull(pack);
+            packId = pack.PackId;
+            indexedLength = await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None);
+            Assert.True(indexedLength > 0);
+
+            faultInjector.Arm(StorageFaultPoint.DuringPackRecordAppend);
+            var failedBlob = container.GetBlobClient("retry.bin");
+            var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                failedBlob.UploadAsync(BinaryData.FromBytes(retryBytes)));
+            Assert.Equal(500, failure.Status);
+            Assert.False((await failedBlob.ExistsAsync()).Value);
+            Assert.Equal(stableBytes,
+                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
+
+            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            Assert.True(new FileInfo(packPath).Length > indexedLength);
+            Assert.Equal(indexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None));
+        }
+        finally
+        {
+            await first.DisposeAsync();
+        }
+
+        var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: true,
+            disableMaintenance: true);
+        try
+        {
+            await restarted.InitializeAsync();
+            var container = CreateClient(restarted).GetBlobContainerClient(containerName);
+            Assert.Equal(stableBytes,
+                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
+            var retried = container.GetBlobClient("retry.bin");
+            await retried.UploadAsync(BinaryData.FromBytes(retryBytes));
+            Assert.Equal(retryBytes, (await retried.DownloadContentAsync()).Value.Content.ToArray());
+
+            var metadata = restarted.Services.GetRequiredService<MetadataStore>();
+            Assert.Equal(2, metadata.CountPackedChunks());
+            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            Assert.Equal(
+                await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None),
+                new FileInfo(packPath).Length);
+            Assert.Empty(EnumerateStagingFiles(dataPath));
+        }
+        finally
+        {
+            await restarted.DisposeAsync();
+        }
+    }
+
+    [Fact]
     public async Task MetadataCommitAndReclamationFaultsPreservePublicationBoundary()
     {
         var faultInjector = new ArmableStorageFaultInjector();

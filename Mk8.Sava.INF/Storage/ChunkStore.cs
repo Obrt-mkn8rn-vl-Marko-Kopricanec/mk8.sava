@@ -1367,22 +1367,25 @@ public sealed class ChunkStore
             var idLength = Encoding.UTF8.GetByteCount(id);
             var recordLength = checked(PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
             var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken);
+            long committedLength = 0;
             if (pack is not null)
             {
                 var path = GetPackPath(pack.PackId);
+                committedLength = await _metadata.GetPackIndexedLengthAsync(pack.PackId, cancellationToken);
                 if (!File.Exists(path))
                 {
-                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken);
-                    if (records != 0)
+                    if (committedLength != 0)
                         throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is missing.");
                     await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
                     pack = null;
                 }
                 else
                 {
+                    if (new FileInfo(path).Length < committedLength)
+                        throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is shorter than its indexed records.");
                     var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken);
                     if (records >= _options.ChunkPackMaximumRecords ||
-                        new FileInfo(path).Length + recordLength > _options.ChunkPackTargetBytes)
+                        committedLength + recordLength > _options.ChunkPackTargetBytes)
                     {
                         await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
                         pack = null;
@@ -1390,12 +1393,14 @@ public sealed class ChunkStore
                 }
             }
 
+            if (pack is null)
+                committedLength = 0;
             pack ??= new ChunkPackRecord(
                 CreatePackId(domain),
                 domain,
                 _metadata.GetUtcNow(),
                 Sealed: false);
-            var location = await AppendPackRecordAsync(pack, id, chunkFilePath, cancellationToken);
+            var location = await AppendPackRecordAsync(pack, id, chunkFilePath, committedLength, cancellationToken);
             var inserted = await _metadata.TryRegisterPackedChunkAsync(pack, location, cancellationToken);
             if (inserted &&
                 (new FileInfo(GetPackPath(pack.PackId)).Length >= _options.ChunkPackTargetBytes ||
@@ -1416,6 +1421,7 @@ public sealed class ChunkStore
         ChunkPackRecord pack,
         string id,
         string chunkFilePath,
+        long committedLength,
         CancellationToken cancellationToken)
     {
         var idBytes = Encoding.UTF8.GetBytes(id);
@@ -1441,11 +1447,24 @@ public sealed class ChunkStore
             FileShare.Read,
             128 * 1024,
             FileOptions.Asynchronous);
-        var recordOffset = output.Seek(0, SeekOrigin.End);
+        if (output.Length < committedLength)
+            throw new InvalidDataException($"Chunk pack '{pack.PackId}' is shorter than its indexed records.");
+        if (output.Length > committedLength)
+        {
+            // A previous append may have failed or crashed before its location was
+            // committed. Never append behind bytes that have no authoritative index.
+            output.SetLength(committedLength);
+            output.Flush(flushToDisk: true);
+        }
+        output.Position = committedLength;
+        var recordOffset = committedLength;
         await output.WriteAsync(header, cancellationToken);
         await output.WriteAsync(idBytes, cancellationToken);
         var payloadOffset = output.Position;
-        await output.WriteAsync(payload, cancellationToken);
+        var firstHalf = Math.Max(1, payload.Length / 2);
+        await output.WriteAsync(payload.AsMemory(0, firstHalf), cancellationToken);
+        _faultInjector.Inject(StorageFaultPoint.DuringPackRecordAppend);
+        await output.WriteAsync(payload.AsMemory(firstHalf), cancellationToken);
         await output.WriteAsync(footer, cancellationToken);
         await output.FlushAsync(cancellationToken);
         output.Flush(flushToDisk: true);
@@ -1514,6 +1533,7 @@ public sealed class ChunkStore
 
         await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
         await output.WriteAsync(header, cancellationToken);
+        _faultInjector.Inject(StorageFaultPoint.DuringChunkStagingWrite);
         await output.WriteAsync(ciphertext, cancellationToken);
         await output.FlushAsync(cancellationToken);
         output.Flush(flushToDisk: true);

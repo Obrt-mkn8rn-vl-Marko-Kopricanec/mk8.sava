@@ -30,8 +30,11 @@ Small-chunk publication serializes pack appends by sharing domain within one
 service process and repeats the existing-chunk lookup inside that gate. Concurrent
 identical uploads therefore reuse the first verified record without appending a
 dead duplicate to the pack.
-Pack compaction still removes records left by interrupted publication or other
-historical failures.
+Before appending to an active pack, the service compares its length with the end
+of the last SQLite-indexed record. It rejects a pack shorter than that committed
+boundary and truncates any unindexed tail left by an interrupted append before
+writing another record. Pack compaction still removes dead records inside packs
+left by interrupted publication or other historical failures.
 
 Only one mk8.sava process may open a data root at a time. The service holds an
 exclusive `.mk8-sava.lock` file handle for its lifetime and fails startup if
@@ -62,8 +65,9 @@ changing publication, SQLite, staging, or reclamation code:
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run.sh
 ```
 
-The harness creates a distinct temporary storage root for each of the six
-publication, metadata, pack-compaction, and reclamation checkpoints,
+The harness creates a distinct temporary storage root for each of the eight
+staging-write, pack-append, publication, metadata, pack-compaction, and
+reclamation checkpoints,
 terminates the worker without unwinding it, and validates recovery in a new test
 host before deleting that exact temporary root. Core dumps are disabled for the
 intentional terminations.
