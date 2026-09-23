@@ -1978,6 +1978,22 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var owned = WithSuoid("parent/child.txt", ownerObjectId);
         Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
         Assert.Equal(13, (await owned.GetPropertiesAsync()).Value.ContentLength);
+        using (var transport = new HttpClient(application.Server.CreateHandler()))
+        using (var metadataRequest = new HttpRequestMessage(
+                   HttpMethod.Get, new Uri(owned.Uri + "&comp=metadata", UriKind.Absolute)))
+        using (var metadataResponse = await transport.SendAsync(metadataRequest))
+            Assert.Equal(HttpStatusCode.OK, metadataResponse.StatusCode);
+        var signedBlockBlob = new BlockBlobClient(owned.Uri, new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+            {
+                BaseAddress = owned.Uri
+            }),
+            Retry = { MaxRetries = 0 }
+        });
+        var ownedQuery = await signedBlockBlob.QueryAsync("SELECT _1 FROM BlobStorage;");
+        using (var reader = new StreamReader(ownedQuery.Value.Content))
+            Assert.Contains("owned-content", await reader.ReadToEndAsync(), StringComparison.Ordinal);
         var deniedMutation = await Assert.ThrowsAsync<RequestFailedException>(() =>
             owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true));
         Assert.Equal("AuthorizationFailure", deniedMutation.ErrorCode);
@@ -2211,9 +2227,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.NotNull(updatedRoot);
         Assert.NotEqual(root.ETag, updatedRoot.ETag);
 
-        var named = CreateBearerClient(
-            application,
-            CreateJwt(SavaWebApplicationFactory.AccountKey, namedObjectId));
+        var namedToken = CreateJwt(SavaWebApplicationFactory.AccountKey, namedObjectId);
+        var named = CreateBearerClient(application, namedToken);
         var groupMember = CreateBearerClient(
             application,
             CreateJwt(SavaWebApplicationFactory.AccountKey, groupMemberObjectId, groups: [groupId]));
@@ -2221,6 +2236,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var groupBlob = groupMember.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
         Assert.Equal("acl-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
         Assert.Equal("acl-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
+        using var metadataTransport = new HttpClient(application.Server.CreateHandler());
+        async Task<HttpStatusCode> MetadataStatusAsync()
+        {
+            using var metadataRequest = new HttpRequestMessage(
+                HttpMethod.Get, new Uri(namedBlob.Uri + "?comp=metadata", UriKind.Absolute));
+            metadataRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", namedToken);
+            metadataRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var metadataResponse = await metadataTransport.SendAsync(metadataRequest);
+            return metadataResponse.StatusCode;
+        }
+        Assert.Equal(HttpStatusCode.OK, await MetadataStatusAsync());
+        var namedQuery = await named.GetBlobContainerClient(container.Name)
+            .GetBlockBlobClient(blob.Name).QueryAsync("SELECT _1 FROM BlobStorage;");
+        using (var queryReader = new StreamReader(namedQuery.Value.Content))
+            Assert.Contains("acl-content", await queryReader.ReadToEndAsync(), StringComparison.Ordinal);
         Assert.True((await namedBlob.GetPropertiesAsync()).GetRawResponse().Headers
             .TryGetValue("x-ms-permissions", out var mode));
         Assert.Equal("rw-r-----", mode);
@@ -2240,6 +2270,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var deniedGroup = await Assert.ThrowsAsync<RequestFailedException>(() => groupBlob.DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedNamed.Status);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedGroup.Status);
+        Assert.Equal(HttpStatusCode.Forbidden, await MetadataStatusAsync());
+        var deniedQuery = await Assert.ThrowsAsync<RequestFailedException>(() => named
+            .GetBlobContainerClient(container.Name)
+            .GetBlockBlobClient(blob.Name).QueryAsync("SELECT _1 FROM BlobStorage;"));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedQuery.Status);
         Assert.Equal("replaced-content", (await blob.DownloadContentAsync()).Value.Content.ToString());
     }
 

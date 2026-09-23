@@ -205,10 +205,11 @@ User-delegation `scid` is signature-validated from version `2020-02-10`.
 when the delegation-key owner has the explicit
 `Sava:BearerAuthentication:Principals:<object-id>:CanManageOwnership` grant;
 it attributes new file ownership to the signed authorized object ID without
-an additional POSIX ACL check. A signed `suoid` currently supports only Get
-Blob and Get Blob Properties for an existing file (or a missing target beneath
-traversable parents): the impersonated object ID needs execute permission on
-the container root and every parent directory, and read permission on the
+an additional POSIX ACL check. A signed `suoid` currently supports Get Blob,
+Get Blob Properties, Get Blob Metadata, and Query Blob Contents for an existing
+file (or a missing target beneath traversable parents): the impersonated object
+ID needs execute permission on the container root and every parent directory,
+and read permission on the
 file. Owner and stored named-user ACL entries are evaluated, including the
 mask; `suoid` alone does not carry group membership evidence. The
 delegation-key owner still needs the explicit ownership grant and the token
@@ -577,8 +578,9 @@ An unchanged ACL is idempotent. The command holds the data-root process lease,
 so it cannot run alongside a live service on that root. This is not an
 application-facing API or the separate `dfs` ACL mutation protocol. Blob-surface
 list/mutation authorization and live Azure validation remain incomplete.
-For Get Blob and Get Blob Properties, a trusted bearer principal without a
-configured RBAC read grant can fall back to the same root/parent
+For Get Blob, Get Blob Properties, Get Blob Metadata, and Query Blob Contents,
+a trusted bearer principal without a configured RBAC read grant can fall back
+to the same root/parent
 execute and file-read ACL check used for `suoid`, but only when its signed
 token contains a valid Entra `oid` claim. A `sub` or application ID is not an
 ACL identity. A configured RBAC read grant still authorizes without an ACL
