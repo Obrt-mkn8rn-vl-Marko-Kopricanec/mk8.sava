@@ -385,7 +385,8 @@ public sealed record StorageUsageSnapshot(
     int StagedBlockCount,
     int UniqueChunkCount,
     int ReachableChunkCount,
-    long? AllocatedRootBytes = null)
+    long? AllocatedRootBytes = null,
+    long PhysicalScanUnixSeconds = 0)
 {
     public static StorageUsageSnapshot Empty { get; } = new(0, 0, 0, 0, 0, 0, 0, 0, 0);
 }

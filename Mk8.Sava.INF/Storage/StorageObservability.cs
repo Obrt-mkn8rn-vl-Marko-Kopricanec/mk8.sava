@@ -86,6 +86,7 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_storage_physical_chunk_bytes", "Serialized file lengths of standalone chunks and chunk packs, not allocated filesystem bytes.", usage.PhysicalChunkBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_staging_bytes", "Serialized file lengths of staging files, not allocated filesystem bytes.", usage.StagingBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_metadata_bytes", "Serialized file lengths of SQLite metadata and journals, not allocated filesystem bytes.", usage.MetadataBytes, gauge: true);
+        AppendMetric(builder, "mk8_sava_storage_physical_last_scan_timestamp_seconds", "Unix timestamp of the last complete physical storage inventory; zero before the first scan.", usage.PhysicalScanUnixSeconds, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_allocation_available", "Whether a valid allocated-filesystem-byte measurement has been published.", usage.AllocatedRootBytes.HasValue ? 1 : 0, gauge: true);
         if (usage.AllocatedRootBytes is { } allocatedBytes)
             AppendMetric(builder, "mk8_sava_storage_allocated_root_bytes", "Filesystem-allocated bytes under the data root, including metadata, journals, staging, files, directories, and the root lease.", allocatedBytes, gauge: true);

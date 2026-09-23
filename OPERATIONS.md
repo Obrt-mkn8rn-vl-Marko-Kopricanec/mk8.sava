@@ -568,10 +568,17 @@ lengths. On Linux, `mk8_sava_storage_allocated_root_bytes` additionally measures
 actual 512-byte filesystem blocks under the complete data root, including
 SQLite journals, staging files, directories, and the root lease. It does not
 follow symlinks or count a hard-linked inode twice. The value is refreshed by a
-maintenance pass and is absent on platforms without the Linux `statx` block
+full inventory no more often than `Sava:PhysicalUsageScanInterval` (one minute
+by default), not on every maintenance pass. The metric
+`mk8_sava_storage_physical_last_scan_timestamp_seconds` reports when the last
+complete inventory finished. Physical chunk, staging, metadata, allocation,
+and unique-chunk gauges share that sampling cadence; logical blob/block bytes,
+record counts, and reachable-chunk counts still update each maintenance pass.
+The allocation gauge is absent on platforms without the Linux `statx` block
 accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
 valid measurement and distinguishes an unmeasured or unsupported host from
-an empty root. This full tree walk adds I/O on large roots.
+an empty root. A full inventory still adds I/O on large roots, and an individual
+scan is not yet bounded by a per-pass file limit.
 The serialized chunk and pack inventory also skips linked files and directories,
 so an external or cyclic link cannot inflate or trap its maintenance scan.
 

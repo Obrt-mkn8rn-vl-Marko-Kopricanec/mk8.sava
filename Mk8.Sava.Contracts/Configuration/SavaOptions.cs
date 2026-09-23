@@ -49,6 +49,7 @@ public sealed class SavaOptions : IValidatableObject
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
     public TimeSpan AsyncCopyCompletionDelay { get; init; } = TimeSpan.FromSeconds(1);
     public TimeSpan MaintenanceScanInterval { get; init; } = TimeSpan.FromSeconds(1);
+    public TimeSpan PhysicalUsageScanInterval { get; init; } = TimeSpan.FromMinutes(1);
     public TimeSpan UncommittedBlockRetention { get; init; } = TimeSpan.FromDays(7);
     public TimeSpan AbandonedStagingRetention { get; init; } = TimeSpan.FromDays(1);
     public int MaximumStagingFilesPerMaintenancePass { get; init; } = 256;
@@ -420,6 +421,9 @@ public sealed class SavaOptions : IValidatableObject
 
         if (MaintenanceScanInterval <= TimeSpan.Zero)
             yield return new ValidationResult("MaintenanceScanInterval must be positive.", [nameof(MaintenanceScanInterval)]);
+
+        if (PhysicalUsageScanInterval <= TimeSpan.Zero)
+            yield return new ValidationResult("PhysicalUsageScanInterval must be positive.", [nameof(PhysicalUsageScanInterval)]);
 
         if (UncommittedBlockRetention <= TimeSpan.Zero)
             yield return new ValidationResult("UncommittedBlockRetention must be positive.", [nameof(UncommittedBlockRetention)]);
