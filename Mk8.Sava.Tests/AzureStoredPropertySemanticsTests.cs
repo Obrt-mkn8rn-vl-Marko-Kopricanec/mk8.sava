@@ -26,8 +26,8 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new BlobUploadOptions
             {
                 HttpHeaders = FullHeaders("application/x-old"),
-                Metadata = new Dictionary<string, string> { ["old"] = "metadata" },
-                Tags = new Dictionary<string, string> { ["old"] = "tag" }
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["old"] = "metadata" },
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["old"] = "tag" }
             });
 
         var firstPayload = "replacement with standard properties"u8.ToArray();
@@ -86,7 +86,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new BlobUploadOptions
             {
                 HttpHeaders = FullHeaders("application/x-old-block"),
-                Metadata = new Dictionary<string, string> { ["old"] = "metadata" }
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["old"] = "metadata" }
             });
 
         var blockId = Convert.ToBase64String("replacement-block-0001"u8);
@@ -224,7 +224,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
                 new BlobSyncUploadFromUriOptions
                 {
                     HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-destination" },
-                    Metadata = new Dictionary<string, string> { ["destination"] = "metadata" }
+                    Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["destination"] = "metadata" }
                 });
             var overriddenProperties = (await overridden.GetPropertiesAsync()).Value;
             Assert.Equal("application/x-destination", overriddenProperties.ContentType);
@@ -261,8 +261,8 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new CommitBlockListOptions
             {
                 HttpHeaders = FullHeaders("application/x-sync-source"),
-                Metadata = new Dictionary<string, string> { ["source"] = "metadata" },
-                Tags = new Dictionary<string, string> { ["source"] = "tag" }
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["source"] = "metadata" },
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["source"] = "tag" }
             });
 
         var destination = container.GetBlockBlobClient("destination.bin");
@@ -292,7 +292,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new BlobCopyFromUriOptions
             {
                 CopySourceTagsMode = BlobCopySourceTagsMode.Replace,
-                Tags = new Dictionary<string, string> { ["destination"] = "tag" }
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["destination"] = "tag" }
             });
         var replacedTags = (await replaced.GetTagsAsync()).Value.Tags;
         Assert.Equal("tag", replacedTags["destination"]);
@@ -447,7 +447,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.Equal("block", blockProperties.Metadata["shape"]);
             Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await block.DownloadContentAsync()).Value.Content.ToArray());
             var committed = (await block.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks;
-            Assert.Equal(CopyShapeSourceHandler.BlockIds, committed.Select(item => item.Name));
+            Assert.Equal(CopyShapeSourceHandler.BlockIds, committed.Select(item => item.Name), StringComparer.Ordinal);
             Assert.Equal(CopyShapeSourceHandler.BlockLengths, committed.Select(item => item.SizeLong));
 
             var synchronousBlock = container.GetBlockBlobClient("synchronous-block-copy.bin");
@@ -455,7 +455,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             var synchronousBlocks = (await synchronousBlock.GetBlockListAsync(BlockListTypes.Committed))
                 .Value
                 .CommittedBlocks;
-            Assert.Equal(CopyShapeSourceHandler.BlockIds, synchronousBlocks.Select(item => item.Name));
+            Assert.Equal(CopyShapeSourceHandler.BlockIds, synchronousBlocks.Select(item => item.Name), StringComparer.Ordinal);
             Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await synchronousBlock.DownloadContentAsync()).Value.Content.ToArray());
 
             var append = container.GetAppendBlobClient("append-copy.bin");
@@ -551,7 +551,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 12, 0, 0, TimeSpan.Zero));
         var application = new SavaWebApplicationFactory(
             clock,
-            new Dictionary<string, string?>
+            new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:AsyncCopyCompletionDelay"] = "15.00:00:00"
             });
@@ -745,7 +745,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new MemoryStream(Enumerable.Repeat((byte)0x42, 512).ToArray()),
             offset: 0);
         Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
-        await pageDestination.SetMetadataAsync(new Dictionary<string, string> { ["mutation"] = "metadata" });
+        await pageDestination.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["mutation"] = "metadata" });
         Assert.Equal(default, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
 
         var blockSource = container.GetBlockBlobClient("block-source.bin");

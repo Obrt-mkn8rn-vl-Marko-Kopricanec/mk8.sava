@@ -99,7 +99,7 @@ public sealed class StorageAccountModeContinuityTests
     }
 
     private static SavaWebApplicationFactory CreateFactory(string dataPath, bool hierarchicalMode, bool deleteDataPath) =>
-        new(dataPath, new Dictionary<string, string?>
+        new(dataPath, new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] =
                 hierarchicalMode.ToString()

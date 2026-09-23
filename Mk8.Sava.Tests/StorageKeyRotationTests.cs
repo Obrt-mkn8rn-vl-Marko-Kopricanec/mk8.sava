@@ -25,7 +25,7 @@ public sealed class StorageKeyRotationTests
         string orphanChunkPath = string.Empty;
         try
         {
-            var baseConfiguration = new Dictionary<string, string?>
+            var baseConfiguration = new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:EnableSmallChunkPacking"] = "false",
                 ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -43,7 +43,7 @@ public sealed class StorageKeyRotationTests
                              foreignPath,
                              new NullStorageFaultInjector(),
                              analyticsSink: null,
-                             configurationOverrides: new Dictionary<string, string?>(baseConfiguration)
+                             configurationOverrides: new Dictionary<string, string?>(baseConfiguration, StringComparer.Ordinal)
                              {
                                  [$"Sava:DataEncryptionKeys:{account}"] = foreignKey
                              },
@@ -111,7 +111,7 @@ public sealed class StorageKeyRotationTests
                              dataPath,
                              injector,
                              analyticsSink: null,
-                             configurationOverrides: new Dictionary<string, string?>
+                             configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  ["Sava:EnableSmallChunkPacking"] = "false",
                                  ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -138,7 +138,7 @@ public sealed class StorageKeyRotationTests
 
             await using (var wrong = new SavaWebApplicationFactory(
                              dataPath,
-                             new Dictionary<string, string?>
+                             new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] =
                                      rotatedDataKey
@@ -168,7 +168,7 @@ public sealed class StorageKeyRotationTests
 
             await using var rotated = new SavaWebApplicationFactory(
                 dataPath,
-                new Dictionary<string, string?>
+                new Dictionary<string, string?>(StringComparer.Ordinal)
                 {
                     [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] = rotatedDataKey
                 },
@@ -219,7 +219,7 @@ public sealed class StorageKeyRotationTests
 
             await using (var wrong = new SavaWebApplicationFactory(
                              dataPath,
-                             new Dictionary<string, string?>
+                             new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  [$"Sava:DataEncryptionKeys:{account}"] =
                                      Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
@@ -258,7 +258,7 @@ public sealed class StorageKeyRotationTests
         var dataKey = independentDataKeyFromFirstWrite
             ? Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
             : oldCredential;
-        var firstConfiguration = new Dictionary<string, string?>
+        var firstConfiguration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         };
@@ -282,7 +282,7 @@ public sealed class StorageKeyRotationTests
 
             await using (var restarted = new SavaWebApplicationFactory(
                              dataPath,
-                             new Dictionary<string, string?>
+                             new Dictionary<string, string?>(StringComparer.Ordinal)
                              {
                                  [$"Sava:Accounts:{account}"] = newCredential,
                                  [$"Sava:DataEncryptionKeys:{account}"] = dataKey,

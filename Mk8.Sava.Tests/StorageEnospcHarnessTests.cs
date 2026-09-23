@@ -29,7 +29,7 @@ public sealed class StorageEnospcHarnessTests
         var stableBytes = RandomNumberGenerator.GetBytes(32 * 1024);
         var attemptedBytes = RandomNumberGenerator.GetBytes(512 * 1024);
         const string containerName = "enospc-harness";
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:EnableSmallChunkPacking"] = "false"
@@ -110,7 +110,7 @@ public sealed class StorageEnospcHarnessTests
         };
         var acknowledged = new List<string>();
         string? failedName = null;
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         };
@@ -196,7 +196,7 @@ public sealed class StorageEnospcHarnessTests
         var stableBytes = RandomNumberGenerator.GetBytes(1024);
         var attemptedBytes = RandomNumberGenerator.GetBytes(4096);
         var recorder = new RecordingStorageFaultInjector();
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
@@ -282,7 +282,7 @@ public sealed class StorageEnospcHarnessTests
         var dataPath = Path.Combine(mountRoot, "compaction-data");
         var fillerPath = Path.Combine(mountRoot, "compaction-filler.bin");
         var liveBytes = RandomNumberGenerator.GetBytes(4096);
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
@@ -379,7 +379,7 @@ public sealed class StorageEnospcHarnessTests
             Assert.Equal(1, compacted.CompactedPacks);
             Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
             Assert.NotEqual(packId,
-                (await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None))?.PackId);
+                (await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None))?.PackId, StringComparer.Ordinal);
         }
         finally
         {

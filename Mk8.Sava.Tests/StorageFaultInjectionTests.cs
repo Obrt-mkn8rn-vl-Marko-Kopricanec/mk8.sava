@@ -11,7 +11,7 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageFaultInjectionTests
 {
     private static readonly IReadOnlyDictionary<string, string?> FaultTestConfiguration =
-        new Dictionary<string, string?>
+        new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:EnableSmallChunkPacking"] = "false",
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
@@ -82,7 +82,7 @@ public sealed class StorageFaultInjectionTests
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-write-{Guid.NewGuid():N}");
         var faultInjector = new ArmableStorageFaultInjector();
-        var configuration = new Dictionary<string, string?>
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:MaintenanceScanInterval"] = "01:00:00",
             ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
@@ -287,7 +287,7 @@ public sealed class StorageFaultInjectionTests
             Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-race-{Guid.NewGuid():N}"),
             injector,
             analyticsSink: null,
-            configurationOverrides: new Dictionary<string, string?>
+            configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
                 ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
@@ -355,7 +355,7 @@ public sealed class StorageFaultInjectionTests
             Path.Combine(Path.GetTempPath(), $"mk8-sava-pack-commit-{Guid.NewGuid():N}"),
             faultInjector,
             analyticsSink: null,
-            configurationOverrides: new Dictionary<string, string?>
+            configurationOverrides: new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
                 ["Sava:SmallChunkPackingThresholdBytes"] = "4096",

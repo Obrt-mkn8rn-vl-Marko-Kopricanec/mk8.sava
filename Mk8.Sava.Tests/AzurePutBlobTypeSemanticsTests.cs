@@ -126,7 +126,7 @@ public sealed class AzurePutBlobTypeSemanticsTests(SavaWebApplicationFactory fac
         using var request = CreatePutRequest(blob, requestedType, content);
         if (requestedType == "PageBlob")
             request.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
-        using var response = await transport.SendAsync(request);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Equal("InvalidBlobType", ResponseHeader(response, "x-ms-error-code"));
     }
