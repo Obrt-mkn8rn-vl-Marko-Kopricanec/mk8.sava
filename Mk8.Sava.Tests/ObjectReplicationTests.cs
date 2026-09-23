@@ -193,66 +193,67 @@ public sealed class ObjectReplicationTests
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-object-replication-{Guid.NewGuid():N}");
         try
         {
-            {
-                var first = new SavaWebApplicationFactory(
-                             dataPath,
-                             CreateConfiguration(sourceContainerName, destinationContainerName, replicateTags: false),
-                             deleteDataPath: false);
-                await using (first.ConfigureAwait(false))
-                {
-                    await first.InitializeAsync();
-                    var source = CreateClient(
-                        first,
-                        SavaWebApplicationFactory.AccountName,
-                        SavaWebApplicationFactory.AccountKey);
-                    var destination = CreateClient(
-                        first,
-                        SavaWebApplicationFactory.SecondAccountName,
-                        SavaWebApplicationFactory.SecondAccountKey);
-                    await source.GetBlobContainerClient(sourceContainerName).CreateAsync();
-                    await destination.GetBlobContainerClient(destinationContainerName).CreateAsync();
-                    await source.GetBlobContainerClient(sourceContainerName)
-                        .GetBlobClient("persistent.bin")
-                        .UploadAsync(BinaryData.FromString("persistent"));
-                    var initial = await first.Services.GetRequiredService<BlobService>()
-                        .RunMaintenanceAsync(CancellationToken.None);
-                    Assert.Equal(1, initial.CompletedObjectReplications);
-                }
-            }
-
-            {
-                var restarted = new SavaWebApplicationFactory(
-                             dataPath,
-                             CreateConfiguration(sourceContainerName, destinationContainerName, replicateTags: false),
-                             deleteDataPath: false);
-                await using (restarted.ConfigureAwait(false))
-                {
-                    await restarted.InitializeAsync();
-                    var maintenance = await restarted.Services.GetRequiredService<BlobService>()
-                        .RunMaintenanceAsync(CancellationToken.None);
-                    Assert.Equal(0, maintenance.CompletedObjectReplications);
-                    var destination = CreateClient(
-                        restarted,
-                        SavaWebApplicationFactory.SecondAccountName,
-                        SavaWebApplicationFactory.SecondAccountKey);
-                    var versions = new List<BlobItem>();
-                    await foreach (var item in destination.GetBlobContainerClient(destinationContainerName).GetBlobsAsync(
-                                       traits: BlobTraits.None,
-                                       states: BlobStates.Version,
-                                       prefix: "persistent.bin",
-                                       cancellationToken: CancellationToken.None))
-                    {
-                        versions.Add(item);
-                    }
-                    Assert.Single(versions);
-                }
-            }
+            await CreateInitialReplicaAsync(
+                dataPath, sourceContainerName, destinationContainerName).ConfigureAwait(true);
+            await AssertNoDuplicateReplicaAfterRestartAsync(
+                dataPath, sourceContainerName, destinationContainerName).ConfigureAwait(true);
         }
         finally
         {
             if (Directory.Exists(dataPath))
                 Directory.Delete(dataPath, recursive: true);
         }
+    }
+
+    private static async Task CreateInitialReplicaAsync(
+        string dataPath,
+        string sourceContainerName,
+        string destinationContainerName)
+    {
+        var first = new SavaWebApplicationFactory(
+            dataPath,
+            CreateConfiguration(sourceContainerName, destinationContainerName, replicateTags: false),
+            deleteDataPath: false);
+        await using var disposal = first.ConfigureAwait(false);
+        await first.InitializeAsync().ConfigureAwait(false);
+        var source = CreateClient(first, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        var destination = CreateClient(first, SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        await source.GetBlobContainerClient(sourceContainerName).CreateAsync().ConfigureAwait(false);
+        await destination.GetBlobContainerClient(destinationContainerName).CreateAsync().ConfigureAwait(false);
+        await source.GetBlobContainerClient(sourceContainerName)
+            .GetBlobClient("persistent.bin").UploadAsync(BinaryData.FromString("persistent")).ConfigureAwait(false);
+        var initial = await first.Services.GetRequiredService<BlobService>()
+            .RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, initial.CompletedObjectReplications);
+    }
+
+    private static async Task AssertNoDuplicateReplicaAfterRestartAsync(
+        string dataPath,
+        string sourceContainerName,
+        string destinationContainerName)
+    {
+        var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            CreateConfiguration(sourceContainerName, destinationContainerName, replicateTags: false),
+            deleteDataPath: false);
+        await using var disposal = restarted.ConfigureAwait(false);
+        await restarted.InitializeAsync().ConfigureAwait(false);
+        var maintenance = await restarted.Services.GetRequiredService<BlobService>()
+            .RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(0, maintenance.CompletedObjectReplications);
+        var destination = CreateClient(restarted, SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var versions = new List<BlobItem>();
+        await foreach (var item in destination.GetBlobContainerClient(destinationContainerName).GetBlobsAsync(
+                           traits: BlobTraits.None,
+                           states: BlobStates.Version,
+                           prefix: "persistent.bin",
+                           cancellationToken: CancellationToken.None).ConfigureAwait(false))
+        {
+            versions.Add(item);
+        }
+        Assert.Single(versions);
     }
 
     [Fact]
