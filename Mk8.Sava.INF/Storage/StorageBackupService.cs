@@ -333,13 +333,14 @@ public sealed class StorageBackupService(
         var length = new FileInfo(path).Length;
         if (length <= 0)
             throw new InvalidDataException("The backup manifest has an invalid size.");
-        await using var input = new FileStream(
+        var input = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
             64 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var inputDisposal = input.ConfigureAwait(false);
         try
         {
             return await JsonSerializer.DeserializeAsync<BackupManifest>(input, JsonOptions, cancellationToken).ConfigureAwait(false)
@@ -357,13 +358,14 @@ public sealed class StorageBackupService(
         CancellationToken cancellationToken)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(manifest, JsonOptions);
-        await using var output = new FileStream(
+        var output = new FileStream(
             path,
             FileMode.CreateNew,
             FileAccess.Write,
             FileShare.None,
             64 * 1024,
             FileOptions.Asynchronous | FileOptions.WriteThrough);
+        await using var outputDisposal = output.ConfigureAwait(false);
         await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
@@ -375,20 +377,22 @@ public sealed class StorageBackupService(
         CancellationToken cancellationToken)
     {
         EnsureRegularFile(source, "backup source file");
-        await using var input = new FileStream(
+        var input = new FileStream(
             source,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
             1024 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        await using var output = new FileStream(
+        await using var inputDisposal = input.ConfigureAwait(false);
+        var output = new FileStream(
             destination,
             FileMode.CreateNew,
             FileAccess.Write,
             FileShare.None,
             1024 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.WriteThrough);
+        await using var outputDisposal = output.ConfigureAwait(false);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[1024 * 1024];
         long length = 0;
@@ -410,13 +414,14 @@ public sealed class StorageBackupService(
     private static async Task<BackupFileEntry> HashFileAsync(string path, CancellationToken cancellationToken)
     {
         EnsureRegularFile(path, "backup file");
-        await using var input = new FileStream(
+        var input = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
             1024 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var inputDisposal = input.ConfigureAwait(false);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[1024 * 1024];
         long length = 0;

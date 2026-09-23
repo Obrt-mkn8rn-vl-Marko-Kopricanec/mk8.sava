@@ -109,7 +109,8 @@ public sealed class ChunkStore
         StoredContent? copied = null;
         try
         {
-            await using var input = pipe.Reader.AsStream(leaveOpen: true);
+            var input = pipe.Reader.AsStream(leaveOpen: true);
+            await using var inputDisposal = input.ConfigureAwait(false);
             copied = await StorePinnedCoreAsync(
                 destinationAccount,
                 destinationEncryption,
@@ -143,7 +144,8 @@ public sealed class ChunkStore
             Exception? failure = null;
             try
             {
-                await using var output = pipe.Writer.AsStream(leaveOpen: true);
+                var output = pipe.Writer.AsStream(leaveOpen: true);
+                await using var outputDisposal = output.ConfigureAwait(false);
                 await WriteRangeAsync(
                     source,
                     sourceEncryption,
@@ -249,13 +251,14 @@ public sealed class ChunkStore
         CancellationToken cancellationToken)
     {
         var bytes = await ReadStoredChunkFileBytesAsync(id, cancellationToken).ConfigureAwait(false);
-        await using var output = new FileStream(
+        var output = new FileStream(
             destination,
             FileMode.CreateNew,
             FileAccess.Write,
             FileShare.None,
             128 * 1024,
             FileOptions.Asynchronous);
+        await using var outputDisposal = output.ConfigureAwait(false);
         await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
@@ -502,7 +505,8 @@ public sealed class ChunkStore
         CancellationToken cancellationToken)
     {
         var path = Path.Combine(_paths.Staging, $"materialized-{Guid.NewGuid():N}.tmp");
-        await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
+        var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
+        await using var outputDisposal = output.ConfigureAwait(false);
         await WriteRangeAsync(manifest, encryption, 0, manifest.Length, output, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
@@ -629,36 +633,40 @@ public sealed class ChunkStore
                 var replacements = new List<PackedChunkLocation>(locations.Count);
                 try
                 {
-                    await using (var source = new FileStream(
-                                     oldPath,
-                                     FileMode.Open,
-                                     FileAccess.Read,
-                                     FileShare.Read,
-                                     128 * 1024,
-                                     FileOptions.Asynchronous | FileOptions.RandomAccess))
-                    await using (var destination = new FileStream(
-                                     temporaryPath,
-                                     FileMode.CreateNew,
-                                     FileAccess.Write,
-                                     FileShare.None,
-                                     128 * 1024,
-                                     FileOptions.Asynchronous))
+                    var source = new FileStream(
+                        oldPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.Read,
+                        128 * 1024,
+                        FileOptions.Asynchronous | FileOptions.RandomAccess);
+                    await using (source.ConfigureAwait(false))
                     {
-                        foreach (var location in locations)
+                        var destination = new FileStream(
+                            temporaryPath,
+                            FileMode.CreateNew,
+                            FileAccess.Write,
+                            FileShare.None,
+                            128 * 1024,
+                            FileOptions.Asynchronous);
+                        await using (destination.ConfigureAwait(false))
                         {
-                            _ = await ReadPackedChunkPayloadAsync(location, cancellationToken).ConfigureAwait(false);
-                            var newOffset = destination.Position;
-                            source.Position = location.RecordOffset;
-                            await CopyExactlyAsync(source, destination, location.RecordLength, cancellationToken).ConfigureAwait(false);
-                            replacements.Add(location with
+                            foreach (var location in locations)
                             {
-                                PackId = replacement.PackId,
-                                RecordOffset = newOffset,
-                                PayloadOffset = checked(newOffset + location.PayloadOffset - location.RecordOffset)
-                            });
+                                _ = await ReadPackedChunkPayloadAsync(location, cancellationToken).ConfigureAwait(false);
+                                var newOffset = destination.Position;
+                                source.Position = location.RecordOffset;
+                                await CopyExactlyAsync(source, destination, location.RecordLength, cancellationToken).ConfigureAwait(false);
+                                replacements.Add(location with
+                                {
+                                    PackId = replacement.PackId,
+                                    RecordOffset = newOffset,
+                                    PayloadOffset = checked(newOffset + location.PayloadOffset - location.RecordOffset)
+                                });
+                            }
+                            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+                            destination.Flush(flushToDisk: true);
                         }
-                        await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
-                        destination.Flush(flushToDisk: true);
                     }
 
                     _paths.EnsureDurableDirectory(Path.GetDirectoryName(replacementPath)!);
@@ -1470,13 +1478,14 @@ public sealed class ChunkStore
 
         var path = GetPackPath(pack.PackId);
         _paths.EnsureDurableDirectory(Path.GetDirectoryName(path)!);
-        await using var output = new FileStream(
+        var output = new FileStream(
             path,
             FileMode.OpenOrCreate,
             FileAccess.ReadWrite,
             FileShare.Read,
             128 * 1024,
             FileOptions.Asynchronous);
+        await using var outputDisposal = output.ConfigureAwait(false);
         if (output.Length < committedLength)
             throw new InvalidDataException($"Chunk pack '{pack.PackId}' is shorter than its indexed records.");
         if (output.Length > committedLength)
@@ -1522,10 +1531,11 @@ public sealed class ChunkStore
         byte[] encoded = bytes;
         using (var compressed = new MemoryStream())
         {
-            await using (var brotli = new BrotliStream(compressed, new BrotliCompressionOptions
+            var brotli = new BrotliStream(compressed, new BrotliCompressionOptions
             {
                 Quality = compressionQuality
-            }, leaveOpen: true))
+            }, leaveOpen: true);
+            await using (brotli.ConfigureAwait(false))
             {
                 await brotli.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             }
@@ -1561,7 +1571,8 @@ public sealed class ChunkStore
             CryptographicOperations.ZeroMemory(encryptionKey);
         }
 
-        await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
+        var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
+        await using var outputDisposal = output.ConfigureAwait(false);
         await output.WriteAsync(header, cancellationToken).ConfigureAwait(false);
         _faultInjector.Inject(StorageFaultPoint.DuringChunkStagingWrite);
         await output.WriteAsync(ciphertext, cancellationToken).ConfigureAwait(false);
@@ -1587,13 +1598,14 @@ public sealed class ChunkStore
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
-        await using var input = new FileStream(
+        var input = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
             128 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var inputDisposal = input.ConfigureAwait(false);
         return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken).ConfigureAwait(false);
     }
 
@@ -1834,13 +1846,14 @@ public sealed class ChunkStore
         }
 
         var path = GetPackPath(location.PackId);
-        await using var input = new FileStream(
+        var input = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.ReadWrite,
             128 * 1024,
             FileOptions.Asynchronous | FileOptions.RandomAccess);
+        await using var inputDisposal = input.ConfigureAwait(false);
         if (location.RecordOffset > input.Length || location.RecordLength > input.Length - location.RecordOffset)
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' extends beyond its pack file.");
         input.Position = location.RecordOffset;
