@@ -26,35 +26,35 @@ public static class BlobProtocolEndpoint
         if (request.ResourceKind != StorageResourceKind.StaticWebsite &&
             HttpMethods.IsOptions(http.Request.Method))
         {
-            await HandleCorsPreflightAsync(http, service, request, cancellationToken);
+            await HandleCorsPreflightAsync(http, service, request, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (request.ResourceKind != StorageResourceKind.StaticWebsite)
-            await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken);
+            await ApplyCorsResponseHeadersAsync(http, service, request, cancellationToken).ConfigureAwait(false);
 
         if (string.Equals(
                 http.Request.Query["restype"].ToString(),
                 "account",
                 StringComparison.OrdinalIgnoreCase))
         {
-            await HandleAccountInformationAsync(http, request, service);
+            await HandleAccountInformationAsync(http, request, service).ConfigureAwait(false);
             return;
         }
 
         switch (request.ResourceKind)
         {
             case StorageResourceKind.Service:
-                await HandleServiceAsync(http, request, service, writer, cancellationToken);
+                await HandleServiceAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.Container:
-                await HandleContainerAsync(http, request, service, writer, cancellationToken);
+                await HandleContainerAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.Blob:
-                await HandleBlobAsync(http, request, service, writer, cancellationToken);
+                await HandleBlobAsync(http, request, service, writer, cancellationToken).ConfigureAwait(false);
                 break;
             case StorageResourceKind.StaticWebsite:
-                await HandleStaticWebsiteAsync(http, request, service, cancellationToken);
+                await HandleStaticWebsiteAsync(http, request, service, cancellationToken).ConfigureAwait(false);
                 break;
             default:
                 throw new ArgumentOutOfRangeException();
@@ -98,7 +98,7 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
-        if (comp == "userdelegationkey" && HttpMethods.IsPost(http.Request.Method))
+        if (string.Equals(comp, "userdelegationkey", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Get User Delegation Key");
             if (!http.Request.IsHttps)
@@ -113,16 +113,16 @@ public static class BlobProtocolEndpoint
             var keyRequest = await ProtocolParsing.ReadUserDelegationKeyRequestAsync(
                 http.Request.Body,
                 request.ServiceVersion,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
             var key = authenticator.IssueUserDelegationKey(request, keyRequest);
-            await writer.WriteUserDelegationKeyAsync(http, key, cancellationToken);
+            await writer.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (request.Authorization.Kind == StorageAuthorizationKind.Sas && !request.Authorization.IsAccountSas)
             throw AzureStorageException.AuthorizationFailure();
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "list")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "list", StringComparison.Ordinal))
         {
             Require(request, 'l');
             var prefix = http.Request.Query["prefix"].ToString();
@@ -137,7 +137,7 @@ public static class BlobProtocolEndpoint
                 prefix,
                 marker,
                 maxResults,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             await writer.WriteContainersAsync(
                 http,
                 containers,
@@ -146,33 +146,33 @@ public static class BlobProtocolEndpoint
                 maxResults,
                 includes.Contains("metadata"),
                 includes.Contains("deleted"),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (comp == "properties" && HttpMethods.IsGet(http.Request.Method))
+        if (string.Equals(comp, "properties", StringComparison.Ordinal) && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'r');
-            var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
-            await writer.WriteServicePropertiesAsync(http, properties, cancellationToken);
+            var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
+            await writer.WriteServicePropertiesAsync(http, properties, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (comp == "properties" && HttpMethods.IsPut(http.Request.Method))
+        if (string.Equals(comp, "properties", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
             Require(request, 'w');
-            var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+            var current = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
             var updated = await ProtocolParsing.ReadServicePropertiesAsync(
                 http.Request.Body,
                 current,
                 request.ServiceVersion,
-                cancellationToken);
-            await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken);
+                cancellationToken).ConfigureAwait(false);
+            await service.PutServicePropertiesAsync(request.Account, updated, cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
 
-        if (comp == "stats" && HttpMethods.IsGet(http.Request.Method))
+        if (string.Equals(comp, "stats", StringComparison.Ordinal) && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'r');
             throw new AzureStorageException(
@@ -181,7 +181,7 @@ public static class BlobProtocolEndpoint
                 "Service statistics are unavailable because this account has no geo-replicated secondary endpoint.");
         }
 
-        if (comp == "blobs" && HttpMethods.IsGet(http.Request.Method))
+        if (string.Equals(comp, "blobs", StringComparison.Ordinal) && HttpMethods.IsGet(http.Request.Method))
         {
             Require(request, 'f');
             RequireBlobIndexTags(request, service, "Find Blobs by Tags");
@@ -191,14 +191,14 @@ public static class BlobProtocolEndpoint
                 service,
                 writer,
                 scopedContainer: null,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (comp == "batch" && HttpMethods.IsPost(http.Request.Method))
+        if (string.Equals(comp, "batch", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
             Require(request, 'w');
-            await HandleBatchAsync(http, request, service, scopedContainer: null, cancellationToken);
+            await HandleBatchAsync(http, request, service, scopedContainer: null, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -218,18 +218,18 @@ public static class BlobProtocolEndpoint
                 http,
                 StatusCodes.Status405MethodNotAllowed,
                 "The resource doesn't support the specified HTTP verb.",
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
         if (!properties.StaticWebsite.Enabled)
         {
             await WriteStaticWebsiteErrorAsync(
                 http,
                 StatusCodes.Status404NotFound,
                 "The requested content does not exist.",
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -240,15 +240,15 @@ public static class BlobProtocolEndpoint
         var primaryPath = isDirectoryRequest && !string.IsNullOrEmpty(indexDocument)
             ? CombineWebsitePath(requestedPath, indexDocument)
             : requestedPath;
-        var blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, primaryPath, cancellationToken);
+        var blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, primaryPath, cancellationToken).ConfigureAwait(false);
         var statusCode = StatusCodes.Status200OK;
 
         if (blob is null && properties.StaticWebsite.DefaultIndexDocumentPath is { Length: > 0 } defaultDocument)
-            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, defaultDocument.TrimStart('/'), cancellationToken);
+            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, defaultDocument.TrimStart('/'), cancellationToken).ConfigureAwait(false);
 
         if (blob is null && properties.StaticWebsite.ErrorDocument404Path is { Length: > 0 } errorDocument)
         {
-            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, errorDocument.TrimStart('/'), cancellationToken);
+            blob = await TryGetStaticWebsiteBlobAsync(service, request.Account, errorDocument.TrimStart('/'), cancellationToken).ConfigureAwait(false);
             statusCode = StatusCodes.Status404NotFound;
         }
 
@@ -258,13 +258,13 @@ public static class BlobProtocolEndpoint
                 http,
                 StatusCodes.Status404NotFound,
                 "The requested content does not exist.",
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (statusCode == StatusCodes.Status200OK)
             EvaluateReadConditions(http.Request, blob);
-        await WriteStaticWebsiteBlobAsync(http, service, blob, statusCode, cancellationToken);
+        await WriteStaticWebsiteBlobAsync(http, service, blob, statusCode, cancellationToken).ConfigureAwait(false);
     }
 
     private static string CombineWebsitePath(string directory, string document) =>
@@ -289,7 +289,7 @@ public static class BlobProtocolEndpoint
                 versionId: null,
                 snapshot: null,
                 includeDeleted: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
         catch (AzureStorageException exception) when (exception.ErrorCode is "BlobNotFound" or "ContainerNotFound")
         {
@@ -331,7 +331,7 @@ public static class BlobProtocolEndpoint
         if (HttpMethods.IsHead(http.Request.Method))
             return;
 
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         if (length == 0)
             return;
         await service.WriteContentAsync(
@@ -340,7 +340,7 @@ public static class BlobProtocolEndpoint
             start,
             length,
             http.Response.Body,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static void SetStaticWebsiteHeader(IHeaderDictionary headers, string name, string? value)
@@ -362,7 +362,7 @@ public static class BlobProtocolEndpoint
         http.Response.ContentType = "text/html; charset=utf-8";
         http.Response.ContentLength = body.Length;
         if (!HttpMethods.IsHead(http.Request.Method))
-            await http.Response.Body.WriteAsync(body, cancellationToken);
+            await http.Response.Body.WriteAsync(body, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task HandleContainerAsync(
@@ -374,10 +374,10 @@ public static class BlobProtocolEndpoint
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
-        if (containerName == StorageAnalyticsService.LogsContainerName &&
+        if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
-            !(HttpMethods.IsPost(http.Request.Method) && comp == "batch"))
+            !(HttpMethods.IsPost(http.Request.Method) && string.Equals(comp, "batch", StringComparison.Ordinal)))
         {
             if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
             {
@@ -388,14 +388,14 @@ public static class BlobProtocolEndpoint
             }
             throw AzureStorageException.AuthorizationPermissionMismatch();
         }
-        if (comp == "batch" && HttpMethods.IsPost(http.Request.Method))
+        if (string.Equals(comp, "batch", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
             Require(request, 'w');
-            _ = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken);
-            await HandleBatchAsync(http, request, service, containerName, cancellationToken);
+            _ = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+            await HandleBatchAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
             return;
         }
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "blobs")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "blobs", StringComparison.Ordinal))
         {
             Require(request, 'f');
             RequireBlobIndexTags(request, service, "Find Blobs by Tags");
@@ -403,14 +403,14 @@ public static class BlobProtocolEndpoint
                 request.Account,
                 containerName,
                 includeDeleted: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             await WriteFindByTagsAsync(
                 http,
                 request,
                 service,
                 writer,
                 containerName,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -431,13 +431,13 @@ public static class BlobProtocolEndpoint
                 encryptionPolicy.DefaultScope,
                 encryptionPolicy.PreventOverride,
                 cancellationToken,
-                request.Authorization.CreatorObjectId);
+                request.Authorization.CreatorObjectId).ConfigureAwait(false);
             AzureResponseWriter.AddContainerHeaders(http.Response, created);
             http.Response.StatusCode = StatusCodes.Status201Created;
             return;
         }
 
-        if (comp == "undelete" && HttpMethods.IsPut(http.Request.Method))
+        if (string.Equals(comp, "undelete", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
             RequireAccountSasForContainerOperation(request);
@@ -452,13 +452,13 @@ public static class BlobProtocolEndpoint
                 deletedName,
                 containerName,
                 version,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status201Created;
             http.Response.ContentLength = 0;
             return;
         }
 
-        if (comp == "rename" && HttpMethods.IsPut(http.Request.Method))
+        if (string.Equals(comp, "rename", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Rename Container");
             RequireAccountSasForContainerOperation(request);
@@ -473,26 +473,26 @@ public static class BlobProtocolEndpoint
                 sourceName,
                 containerName,
                 ProtocolParsing.First(http.Request.Headers, "x-ms-source-lease-id"),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             http.Response.ContentLength = 0;
             return;
         }
 
-        var container = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken);
+        var container = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
             string.IsNullOrEmpty(comp))
         {
             RequireAccountSasForContainerOperation(request);
-            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
+            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerPropertiesHeaders(http.Response, container);
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "list")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "list", StringComparison.Ordinal))
         {
-            await AuthorizeContainerListAsync(request, service, container);
+            await AuthorizeContainerListAsync(request, service, container).ConfigureAwait(false);
             var includes = SplitCsv(http.Request.Query["include"].ToString());
             var prefix = http.Request.Query["prefix"].ToString();
             var startFrom = http.Request.Query["startfrom"].ToString();
@@ -559,7 +559,7 @@ public static class BlobProtocolEndpoint
                 delimiter,
                 decodedMarker,
                 maxResults,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (request.Authorization.AclListChecked)
             {
                 await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
@@ -569,7 +569,7 @@ public static class BlobProtocolEndpoint
                     request.Authorization.AclListObjectId!,
                     request.Authorization.AclListGroups!,
                     request.Authorization.Permissions,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
             ValidateListedBlobTypes(request, blobs);
             await writer.WriteBlobsAsync(
@@ -585,21 +585,21 @@ public static class BlobProtocolEndpoint
                 arrow,
                 hierarchicalNamespace,
                 service.IsLastAccessTimeTrackingEnabled(request.Account),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
-            comp == "metadata")
+string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             RequireAccountSasForContainerOperation(request);
-            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true);
+            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
             ValidateOptionalLease(http.Request, container.Lease, "container");
             AzureResponseWriter.AddContainerMetadataHeaders(http.Response, container);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "metadata")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             RequireAccountSasForContainerOperation(request);
             Require(request, 'w');
@@ -609,13 +609,13 @@ public static class BlobProtocolEndpoint
                 container.LastModified,
                 supportsIfUnmodifiedSince: false);
             ValidateOptionalLease(http.Request, container.Lease, "container");
-            var updated = await service.SetContainerMetadataAsync(container, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
+            var updated = await service.SetContainerMetadataAsync(container, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddContainerHeaders(http.Response, updated);
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
-            comp == "acl")
+string.Equals(comp, "acl", StringComparison.Ordinal))
         {
             RequireContainerAclPermission(request);
             ValidateOptionalLease(http.Request, container.Lease, "container");
@@ -628,11 +628,11 @@ public static class BlobProtocolEndpoint
             }
             AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
             if (HttpMethods.IsGet(http.Request.Method))
-                await writer.WriteAclAsync(http, container, cancellationToken);
+                await writer.WriteAclAsync(http, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "acl")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "acl", StringComparison.Ordinal))
         {
             RequireContainerAclPermission(request);
             BlobConditionEvaluator.EvaluateContainerWrite(
@@ -645,17 +645,17 @@ public static class BlobProtocolEndpoint
                 RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
             var policies = http.Request.ContentLength is null or 0
                 ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
-                : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken);
+                : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
             var updated = await service.SetContainerAclAsync(
                 container,
                 publicAccess,
                 policies,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddContainerHeaders(http.Response, updated);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "lease", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Lease Container");
             RequireContainerLeasePermission(request, http.Request);
@@ -664,7 +664,7 @@ public static class BlobProtocolEndpoint
                 container.LastModified,
                 supportsIfUnmodifiedSince: true);
             RequireZeroContentLength(http.Request);
-            await HandleContainerLeaseAsync(http, request, service, container, cancellationToken);
+            await HandleContainerLeaseAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -677,7 +677,7 @@ public static class BlobProtocolEndpoint
                 container.LastModified,
                 supportsIfUnmodifiedSince: true);
             EnsureLease(http.Request, container.Lease, "container");
-            await service.DeleteContainerAsync(container, cancellationToken);
+            await service.DeleteContainerAsync(container, cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -704,14 +704,14 @@ public static class BlobProtocolEndpoint
                 $"Blob Batch requires service version {minimumVersion:yyyy-MM-dd} or later.");
         }
 
-        var subrequests = await BlobBatchProtocol.ReadAsync(http.Request, cancellationToken);
+        var subrequests = await BlobBatchProtocol.ReadAsync(http.Request, cancellationToken).ConfigureAwait(false);
         var resolved = subrequests
             .Select(subrequest => ResolveBatchSubrequest(request.Account, scopedContainer, subrequest))
             .ToArray();
         var responses = new List<BlobBatchSubresponse>(resolved.Length);
         foreach (var subrequest in resolved)
-            responses.Add(await ExecuteBatchSubrequestAsync(http, request, service, subrequest, cancellationToken));
-        await BlobBatchProtocol.WriteAsync(http.Response, responses, cancellationToken);
+            responses.Add(await ExecuteBatchSubrequestAsync(http, request, service, subrequest, cancellationToken).ConfigureAwait(false));
+        await BlobBatchProtocol.WriteAsync(http.Response, responses, cancellationToken).ConfigureAwait(false);
     }
 
     private static ResolvedBatchSubrequest ResolveBatchSubrequest(
@@ -794,10 +794,10 @@ public static class BlobProtocolEndpoint
         {
             ValidateBlobVersionRequest(subrequestContext);
             var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
-            subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken);
+            subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken).ConfigureAwait(false);
             if (resolved.Snapshot is not null)
                 RequireBlobSnapshots(subrequestContext, service);
-            if (resolved.Container == StorageAnalyticsService.LogsContainerName &&
+            if (string.Equals(resolved.Container, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
                 resolved.Request.Kind != BlobBatchOperationKind.Delete)
             {
                 throw AzureStorageException.AuthorizationPermissionMismatch();
@@ -816,7 +816,7 @@ public static class BlobProtocolEndpoint
                 resolved.VersionId,
                 resolved.Snapshot,
                 includeDeleted: permanentDelete,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
 
             var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
             switch (resolved.Request.Kind)
@@ -834,17 +834,17 @@ public static class BlobProtocolEndpoint
                         await service.PermanentlyDeleteBlobAsync(
                             blob,
                             hasExplicitSnapshotOrVersion,
-                            cancellationToken);
+                            cancellationToken).ConfigureAwait(false);
                         headers["x-ms-delete-type-permanent"] = "true";
                     }
                     else
                     {
-                        var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken);
+                        var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken).ConfigureAwait(false);
                         await service.DeleteBlobAsync(
                             blob,
                             hasExplicitSnapshotOrVersion,
                             deleteSnapshots,
-                            cancellationToken);
+                            cancellationToken).ConfigureAwait(false);
                         if (IsServiceVersionAtLeast(subrequestContext, new DateOnly(2017, 7, 29)))
                             headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
                     }
@@ -875,7 +875,7 @@ public static class BlobProtocolEndpoint
                         rehydratePriority,
                         IsServiceVersionAtLeast(subrequestContext, new DateOnly(2020, 6, 12)),
                         IsServiceVersionAtLeast(subrequestContext, new DateOnly(2023, 8, 3)),
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                     return new BlobBatchSubresponse(
                         tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
                         headers,
@@ -893,7 +893,7 @@ public static class BlobProtocolEndpoint
         catch (Exception exception)
         {
             var storageException = MapBatchException(exception);
-            if (storageException.ErrorCode == "InternalError")
+            if (string.Equals(storageException.ErrorCode, "InternalError", StringComparison.Ordinal))
             {
                 outer.RequestServices
                     .GetRequiredService<ILoggerFactory>()
@@ -1017,7 +1017,7 @@ public static class BlobProtocolEndpoint
         if (request.Blob is null)
             containerName = "$root";
         var comp = http.Request.Query["comp"].ToString().ToLowerInvariant();
-        if (containerName == StorageAnalyticsService.LogsContainerName &&
+        if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
             !(HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp)))
@@ -1025,7 +1025,7 @@ public static class BlobProtocolEndpoint
             throw AzureStorageException.AuthorizationPermissionMismatch();
         }
         if (service.IsObjectReplicationDestinationContainer(request.Account, containerName) &&
-            (HttpMethods.IsPut(http.Request.Method) && comp != "tier" ||
+            (HttpMethods.IsPut(http.Request.Method) && !string.Equals(comp, "tier", StringComparison.Ordinal) ||
              HttpMethods.IsPatch(http.Request.Method) ||
              HttpMethods.IsDelete(http.Request.Method) && !string.IsNullOrEmpty(comp)))
         {
@@ -1043,19 +1043,19 @@ public static class BlobProtocolEndpoint
         if (permanentDelete)
             ValidatePermanentDeleteRequest(request, http.Request.Query["deletetype"].ToString());
         if (HttpMethods.IsPut(http.Request.Method) && comp is "snapshot" or "lease")
-            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), comp == "snapshot" ? "Snapshot Blob" : "Lease Blob");
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), string.Equals(comp, "snapshot", StringComparison.Ordinal) ? "Snapshot Blob" : "Lease Blob");
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
-            await HandlePutBlobAsync(http, request, service, containerName, blobName, cancellationToken);
+            await HandlePutBlobAsync(http, request, service, containerName, blobName, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "block")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "block", StringComparison.Ordinal))
         {
-            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
-            await RecheckParentMutationAclAsync(http, request, cancellationToken);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
             EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
             var blockId = http.Request.Query["blockid"].ToString();
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
@@ -1072,8 +1072,8 @@ public static class BlobProtocolEndpoint
                         blockId,
                         body,
                         encryption,
-                        cancellationToken),
-                    maximumBodyBytes: GetMaximumPutBlockBytes(request));
+                        cancellationToken).ConfigureAwait(false),
+                    maximumBodyBytes: GetMaximumPutBlockBytes(request)).ConfigureAwait(false);
             }
             else
             {
@@ -1097,10 +1097,10 @@ public static class BlobProtocolEndpoint
                             blockId,
                             source.Content,
                             encryption,
-                            cancellationToken);
+                            cancellationToken).ConfigureAwait(false);
                         return true;
                     },
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 checksums = transfer.Checksums;
             }
             http.Response.StatusCode = StatusCodes.Status201Created;
@@ -1110,22 +1110,22 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "blocklist")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "blocklist", StringComparison.Ordinal))
         {
             RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
-            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             ValidateBlobTypeVersion(request, current?.Kind);
             RequireBlockWrite(request, current is null);
-            await RecheckParentMutationAclAsync(http, request, cancellationToken);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
             EvaluateWriteConditions(http.Request, current);
             if (current is not null)
                 EnsureLease(http.Request, current.Lease, "blob");
             IReadOnlyList<BlockListEntry> blockIds = [];
             var checksums = await WithIntegrityValidationAsync(
                 http.Request,
-                async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken),
+                async body => blockIds = await ProtocolParsing.ReadBlockListAsync(body, cancellationToken).ConfigureAwait(false),
                 allowStructured: false,
-                maximumBodyBytes: ProtocolParsing.MaximumBlockListBodyBytes);
+                maximumBodyBytes: ProtocolParsing.MaximumBlockListBodyBytes).ConfigureAwait(false);
             var options = ReadWriteOptions(
                 http.Request,
                 current,
@@ -1144,7 +1144,7 @@ public static class BlobProtocolEndpoint
                 options,
                 current?.GenerationId,
                 current?.Revision,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddBlobWriteHeaders(http.Response, committed);
             AddRequestServerEncryptedHeader(http.Response);
             AddEncryptionResponseHeaders(http.Response, EncryptionOf(committed));
@@ -1153,13 +1153,13 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "appendblock")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "appendblock", StringComparison.Ordinal))
         {
             RequireAppendBlobVersion(request);
             RequireAny(request, 'a', 'w');
-            var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
+            var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken).ConfigureAwait(false);
             HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, current.GenerationId);
-            await RecheckAppendAclAsync(http, request, cancellationToken);
+            await RecheckAppendAclAsync(http, request, cancellationToken).ConfigureAwait(false);
             EvaluateWriteConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
             var expectedPosition = TryParseLongHeader(http.Request.Headers, "x-ms-blob-condition-appendpos");
@@ -1171,8 +1171,8 @@ public static class BlobProtocolEndpoint
             if (copySource is null)
             {
                 checksums = await WithIntegrityValidationAsync(http.Request, async body =>
-                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, encryption, cancellationToken),
-                    maximumBodyBytes: GetMaximumAppendBlockBytes(request));
+                    updated = await service.AppendBlockAsync(current, body, expectedPosition, expectedMaximumSize, encryption, cancellationToken).ConfigureAwait(false),
+                    maximumBodyBytes: GetMaximumAppendBlockBytes(request)).ConfigureAwait(false);
             }
             else
             {
@@ -1193,8 +1193,8 @@ public static class BlobProtocolEndpoint
                         expectedPosition,
                         expectedMaximumSize,
                         encryption,
-                        cancellationToken),
-                    cancellationToken);
+                        cancellationToken).ConfigureAwait(false),
+                    cancellationToken).ConfigureAwait(false);
                 checksums = transfer.Checksums;
             }
             AzureResponseWriter.AddBlobEntityHeaders(http.Response, updated);
@@ -1207,12 +1207,12 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "page")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "page", StringComparison.Ordinal))
         {
             RequirePageBlobVersion(request);
             RequireFlatNamespace(service, request.Account);
             Require(request, 'w');
-            var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken);
+            var current = await service.GetBlobAsync(request.Account, containerName, blobName, null, null, false, cancellationToken).ConfigureAwait(false);
             EvaluateWriteConditions(http.Request, current);
             EvaluatePageSequenceConditions(http.Request, current);
             EnsureLease(http.Request, current.Lease, "blob");
@@ -1221,7 +1221,7 @@ public static class BlobProtocolEndpoint
                 service,
                 current,
                 write: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var encryption = new BlobEncryption(
                 current.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -1234,12 +1234,12 @@ public static class BlobProtocolEndpoint
             var operation = ProtocolParsing.First(http.Request.Headers, "x-ms-page-write")?.ToLowerInvariant();
             BlobRecord updated;
             var checksums = TransactionalChecksums.Empty;
-            if (operation == "clear")
+            if (string.Equals(operation, "clear", StringComparison.Ordinal))
             {
                 RequireZeroContentLength(http.Request);
-                updated = await service.PutPageAsync(current, start, end, null, clear: true, encryption, cancellationToken);
+                updated = await service.PutPageAsync(current, start, end, null, clear: true, encryption, cancellationToken).ConfigureAwait(false);
             }
-            else if (operation == "update")
+            else if (string.Equals(operation, "update", StringComparison.Ordinal))
             {
                 const long maximumPageWriteBytes = 4L * 1024 * 1024;
                 if (rangeLength > maximumPageWriteBytes)
@@ -1256,8 +1256,8 @@ public static class BlobProtocolEndpoint
                             suppliedLength.ToString(CultureInfo.InvariantCulture));
                     }
                     checksums = await WithIntegrityValidationAsync(http.Request, async body =>
-                        updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken),
-                        maximumBodyBytes: maximumPageWriteBytes);
+                        updated = await service.PutPageAsync(current, start, end, body, clear: false, encryption, cancellationToken).ConfigureAwait(false),
+                        maximumBodyBytes: maximumPageWriteBytes).ConfigureAwait(false);
                 }
                 else
                 {
@@ -1279,8 +1279,8 @@ public static class BlobProtocolEndpoint
                             source.Content,
                             clear: false,
                             encryption,
-                            cancellationToken),
-                        cancellationToken);
+                            cancellationToken).ConfigureAwait(false),
+                        cancellationToken).ConfigureAwait(false);
                     checksums = transfer.Checksums;
                 }
             }
@@ -1299,7 +1299,7 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "incrementalcopy")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "incrementalcopy", StringComparison.Ordinal))
         {
             if (!DateOnly.TryParseExact(
                     request.ServiceVersion,
@@ -1318,7 +1318,7 @@ public static class BlobProtocolEndpoint
             ValidateIncrementalCopyHeaders(http.Request);
             RequireZeroContentLength(http.Request);
 
-            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             RequireAny(request, current is null ? 'c' : 'w', 'w');
             EvaluateWriteConditions(http.Request, current);
             if (current is not null)
@@ -1330,7 +1330,7 @@ public static class BlobProtocolEndpoint
                     service,
                     current,
                     write: true,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
             EnsureNoPendingCopyDestination(current);
             var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
@@ -1346,9 +1346,9 @@ public static class BlobProtocolEndpoint
                 request,
                 service,
                 resolvedSource,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EvaluateCopySourceConditions(http.Request, source);
-            source = await service.RecordDataAccessAsync(source, cancellationToken);
+            source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
             var copied = await service.BeginIncrementalCopyAsync(
                 request.Account,
                 containerName,
@@ -1357,16 +1357,16 @@ public static class BlobProtocolEndpoint
                 ReadCopyWriteOptions(http.Request, source, current),
                 SanitizeCopySource(copySource),
                 current,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: false);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "blocklist")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "blocklist", StringComparison.Ordinal))
         {
             Require(request, 'r');
-            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+            var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             ValidateBlobTypeVersion(request, current?.Kind);
             if (current is null)
                 EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
@@ -1376,17 +1376,17 @@ public static class BlobProtocolEndpoint
                 http.Request,
                 current?.Lease ?? LeaseRecord.Available,
                 "blob");
-            var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken);
+            var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             if (current is null && staged.Count == 0)
                 throw AzureStorageException.BlobNotFound();
             var listType = http.Request.Query["blocklisttype"].ToString().ToLowerInvariant();
             if (listType is not ("all" or "committed" or "uncommitted"))
                 throw AzureStorageException.InvalidQuery("blocklisttype");
-            await writer.WriteBlockListAsync(http, current, staged, listType, cancellationToken);
+            await writer.WriteBlockListAsync(http, current, staged, listType, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "undelete")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "undelete", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2017, 7, 29), "Undelete Blob");
             Require(request, 'w');
@@ -1403,11 +1403,11 @@ public static class BlobProtocolEndpoint
                     sourceName,
                     blobName,
                     deletionId,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
             else
             {
-                await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken);
+                await service.UndeleteBlobAsync(request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             }
             return;
         }
@@ -1418,12 +1418,12 @@ public static class BlobProtocolEndpoint
             snapshot is null &&
             !permanentDelete &&
             IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)) &&
-            await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken) is null)
+            await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false) is null)
         {
             Require(request, 'd');
             EvaluateWriteConditions(http.Request, null);
-            await RecheckParentMutationAclAsync(http, request, cancellationToken);
-            await service.DeleteUncommittedBlobAsync(request.Account, containerName, blobName, cancellationToken);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
+            await service.DeleteUncommittedBlobAsync(request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
         }
@@ -1435,14 +1435,14 @@ public static class BlobProtocolEndpoint
             versionId,
             snapshot,
             includeDeleted: permanentDelete,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, blob.GenerationId);
         ValidateBlobTypeVersion(request, blob.Kind);
 
         if (blob.IsIncrementalCopy && blob.Snapshot is null &&
             !(HttpMethods.IsHead(http.Request.Method) && string.IsNullOrEmpty(comp)) &&
             !(HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp)) &&
-            !(HttpMethods.IsPut(http.Request.Method) && comp == "copy"))
+            !(HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "copy", StringComparison.Ordinal)))
         {
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
@@ -1450,13 +1450,13 @@ public static class BlobProtocolEndpoint
                 "The operation is not permitted on an incremental copy destination blob.");
         }
 
-        if (HttpMethods.IsPost(http.Request.Method) && comp == "query")
+        if (HttpMethods.IsPost(http.Request.Method) && string.Equals(comp, "query", StringComparison.Ordinal))
         {
-            await HandleQueryAsync(http, request, service, blob, cancellationToken);
+            await HandleQueryAsync(http, request, service, blob, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "immutabilitypolicies")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "immutabilitypolicies", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Set Blob Immutability Policy");
             Require(request, 'i');
@@ -1480,22 +1480,22 @@ public static class BlobProtocolEndpoint
                 "unlocked" => false,
                 _ => throw AzureStorageException.InvalidHeader("x-ms-immutability-policy-mode", mode)
             };
-            var updated = await service.SetBlobImmutabilityPolicyAsync(blob, until, locked, cancellationToken);
+            var updated = await service.SetBlobImmutabilityPolicyAsync(blob, until, locked, cancellationToken).ConfigureAwait(false);
             AddImmutabilityHeaders(http.Response, updated);
             return;
         }
 
-        if (HttpMethods.IsDelete(http.Request.Method) && comp == "immutabilitypolicies")
+        if (HttpMethods.IsDelete(http.Request.Method) && string.Equals(comp, "immutabilitypolicies", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Delete Blob Immutability Policy");
             Require(request, 'i');
             RequireZeroContentLength(http.Request);
             BlobConditionEvaluator.EvaluateIfUnmodifiedSince(http.Request, blob.LastModified);
-            await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken);
+            await service.DeleteBlobImmutabilityPolicyAsync(blob, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "legalhold")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "legalhold", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 10, 2), "Set Blob Legal Hold");
             Require(request, 'i');
@@ -1503,12 +1503,12 @@ public static class BlobProtocolEndpoint
             var value = ProtocolParsing.First(http.Request.Headers, "x-ms-legal-hold");
             if (!bool.TryParse(value, out var hasLegalHold))
                 throw AzureStorageException.InvalidHeader("x-ms-legal-hold", value);
-            var updated = await service.SetBlobLegalHoldAsync(blob, hasLegalHold, cancellationToken);
+            var updated = await service.SetBlobLegalHoldAsync(blob, hasLegalHold, cancellationToken).ConfigureAwait(false);
             http.Response.Headers["x-ms-legal-hold"] = updated.HasLegalHold ? "true" : "false";
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "copy")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "copy", StringComparison.Ordinal))
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
@@ -1520,55 +1520,55 @@ public static class BlobProtocolEndpoint
             var copyId = http.Request.Query["copyid"].ToString();
             if (string.IsNullOrEmpty(copyId))
                 throw AzureStorageException.InvalidQuery("copyid");
-            await service.AbortCopyAsync(blob, copyId, cancellationToken);
+            await service.AbortCopyAsync(blob, copyId, cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) && string.IsNullOrEmpty(comp))
         {
-            await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+            await AuthorizeBlobReadAsync(request, service, blob, cancellationToken).ConfigureAwait(false);
             ValidateBlobUpnHeader(http.Request, service.IsHierarchicalNamespaceEnabled(request.Account));
             var encryption = await EnsureBlobEncryptionAsync(
                 http.Request,
                 service,
                 blob,
                 write: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
-            await WriteBlobAsync(http, service, blob, encryption, cancellationToken);
+            await WriteBlobAsync(http, service, blob, encryption, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
-            comp == "metadata")
+string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
-            await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+            await AuthorizeBlobReadAsync(request, service, blob, cancellationToken).ConfigureAwait(false);
             await EnsureBlobEncryptionAsync(
                 http.Request,
                 service,
                 blob,
                 write: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EvaluateReadConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             AzureResponseWriter.AddBlobMetadataHeaders(http.Response, blob);
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "tags")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "tags", StringComparison.Ordinal))
         {
             Require(request, 't');
             RequireBlobIndexTags(request, service, "Get Blob Tags");
             EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
             EvaluateBlobTagConditions(http.Request, request, blob, write: false);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
-            await writer.WriteTagsAsync(http, blob.Tags, cancellationToken);
+            await writer.WriteTagsAsync(http, blob.Tags, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "metadata")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
@@ -1578,17 +1578,17 @@ public static class BlobProtocolEndpoint
                 service,
                 blob,
                 write: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EvaluateWriteConditions(http.Request, blob);
             EnsureLease(http.Request, blob.Lease, "blob");
-            var updated = await service.SetBlobMetadataAsync(blob, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken);
+            var updated = await service.SetBlobMetadataAsync(blob, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddBlobEntityHeaders(http.Response, updated);
             AddRequestServerEncryptedHeader(http.Response);
             AddEncryptionResponseHeaders(http.Response, EncryptionOf(updated));
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "tags")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "tags", StringComparison.Ordinal))
         {
             Require(request, 't');
             RequireBlobIndexTags(request, service, "Set Blob Tags");
@@ -1599,14 +1599,14 @@ public static class BlobProtocolEndpoint
             Dictionary<string, string> tags = null!;
             _ = await WithIntegrityValidationAsync(
                 http.Request,
-                async body => tags = await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken),
-                allowStructured: false);
-            await service.SetBlobTagsAsync(blob, tags, cancellationToken);
+                async body => tags = await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken).ConfigureAwait(false),
+                allowStructured: false).ConfigureAwait(false);
+            await service.SetBlobTagsAsync(blob, tags, cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = StatusCodes.Status204NoContent;
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "properties")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "properties", StringComparison.Ordinal))
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
@@ -1616,7 +1616,7 @@ public static class BlobProtocolEndpoint
                 service,
                 blob,
                 write: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var contentEncryption = new BlobEncryption(
                 blob.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -1634,7 +1634,7 @@ public static class BlobProtocolEndpoint
                 sequence,
                 ProtocolParsing.First(http.Request.Headers, "x-ms-sequence-number-action"),
                 contentEncryption,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (updated.Kind == BlobKind.PageBlob)
                 AzureResponseWriter.AddPageBlobWriteHeaders(http.Response, updated);
             else
@@ -1642,7 +1642,7 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "snapshot")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "snapshot", StringComparison.Ordinal))
         {
             RequireAny(request, 'c', 'w');
             RequireBlobSnapshots(request, service);
@@ -1655,7 +1655,7 @@ public static class BlobProtocolEndpoint
                 service,
                 blob,
                 write: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EvaluateWriteConditions(http.Request, blob);
             ValidateOptionalLease(http.Request, blob.Lease, "blob");
             var hasSnapshotMetadata = http.Request.Headers.Keys.Any(name =>
@@ -1663,7 +1663,7 @@ public static class BlobProtocolEndpoint
             var created = await service.CreateSnapshotAsync(
                 blob,
                 hasSnapshotMetadata ? ProtocolParsing.ReadMetadata(http.Request.Headers) : null,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             http.Response.Headers["x-ms-snapshot"] = created.Snapshot;
             if (created.VersionId is not null)
                 http.Response.Headers["x-ms-version-id"] = created.VersionId;
@@ -1675,7 +1675,7 @@ public static class BlobProtocolEndpoint
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "seal")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "seal", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Append Blob Seal");
             RequireFlatNamespace(service, request.Account);
@@ -1687,12 +1687,12 @@ public static class BlobProtocolEndpoint
             var expectedPosition = TryParseLongHeader(
                 http.Request.Headers,
                 "x-ms-blob-condition-appendpos");
-            var updated = await service.SealAppendBlobAsync(blob, expectedPosition, cancellationToken);
+            var updated = await service.SealAppendBlobAsync(blob, expectedPosition, cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddAppendBlobSealHeaders(http.Response, updated);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "tier")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "tier", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2018, 11, 9), "Set Blob Tier");
             if (snapshot is not null)
@@ -1711,12 +1711,12 @@ public static class BlobProtocolEndpoint
                 rehydratePriority,
                 IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)),
                 IsServiceVersionAtLeast(request, new DateOnly(2023, 8, 3)),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             http.Response.StatusCode = updated.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK;
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "expiry")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "expiry", StringComparison.Ordinal))
         {
             RequireFeatureVersion(request, new DateOnly(2020, 2, 10), "Set Blob Expiry");
             Require(request, 'w');
@@ -1728,23 +1728,23 @@ public static class BlobProtocolEndpoint
             EnsureLease(http.Request, blob.Lease, "blob");
             var now = http.RequestServices.GetRequiredService<TimeProvider>().GetUtcNow();
             var expiry = ParseExpiry(http.Request.Headers, blob.CreatedAt, now);
-            var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken);
+            var updated = await service.SetExpiryAsync(blob, expiry, cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddEntityTag(http.Response, updated.ETag);
             http.Response.Headers.LastModified = updated.LastModified.ToString("R", CultureInfo.InvariantCulture);
             return;
         }
 
-        if (HttpMethods.IsPut(http.Request.Method) && comp == "lease")
+        if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "lease", StringComparison.Ordinal))
         {
             Require(request, 'w');
             EnsureMutableVersion(blob);
             EvaluateWriteConditions(http.Request, blob);
             RequireZeroContentLength(http.Request);
-            await HandleBlobLeaseAsync(http, request, service, blob, cancellationToken);
+            await HandleBlobLeaseAsync(http, request, service, blob, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        if (HttpMethods.IsGet(http.Request.Method) && comp == "pagelist")
+        if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "pagelist", StringComparison.Ordinal))
         {
             RequireFlatNamespace(service, request.Account);
             Require(request, 'r');
@@ -1757,7 +1757,7 @@ public static class BlobProtocolEndpoint
                 service,
                 blob,
                 write: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var encryption = new BlobEncryption(
                 blob.EncryptionScope,
                 suppliedEncryption.CustomerProvidedKeySha256,
@@ -1790,14 +1790,14 @@ public static class BlobProtocolEndpoint
                     versionId: null,
                     snapshot: previousSnapshot,
                     includeDeleted: false,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 var diff = await service.GetPageRangeDiffAsync(
                     blob,
                     previous,
                     encryption,
                     rangeStart,
                     rangeEnd,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 ranges = diff.PageRanges;
                 clearRanges = diff.ClearRanges;
             }
@@ -1831,7 +1831,7 @@ public static class BlobProtocolEndpoint
                 page.Where(item => !item.IsClear).Select(item => item.Range).ToArray(),
                 page.Where(item => item.IsClear).Select(item => item.Range).ToArray(),
                 nextMarker,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -1845,23 +1845,23 @@ public static class BlobProtocolEndpoint
                 http.Request,
                 blob.AccessTierChangedAt);
             EnsureLease(http.Request, blob.Lease, "blob");
-            await RecheckParentMutationAclAsync(http, request, cancellationToken);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
             if (permanentDelete)
             {
                 await service.PermanentlyDeleteBlobAsync(
                     blob,
                     hasExplicitSnapshotOrVersion,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 http.Response.Headers["x-ms-delete-type-permanent"] = "true";
             }
             else
             {
-                var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+                var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
                 await service.DeleteBlobAsync(
                     blob,
                     hasExplicitSnapshotOrVersion,
                     deleteSnapshots,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (IsServiceVersionAtLeast(request, new DateOnly(2017, 7, 29)))
                     http.Response.Headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
             }
@@ -1880,10 +1880,10 @@ public static class BlobProtocolEndpoint
         string blobName,
         CancellationToken cancellationToken)
     {
-        var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
+        var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
         ValidateBlobTypeVersion(request, current?.Kind);
         RequireAny(request, current is null ? 'c' : 'w', 'w');
-        await RecheckParentMutationAclAsync(http, request, cancellationToken);
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
         EvaluateWriteConditions(http.Request, current);
         if (current is not null ||
             http.Request.Headers.ContainsKey("x-ms-lease-id") &&
@@ -1919,7 +1919,7 @@ public static class BlobProtocolEndpoint
                     versionId: null,
                     legacySourceReference.Snapshot,
                     includeDeleted: false,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 ValidateBlobTypeVersion(request, legacySource.Kind);
                 ValidateOptionalLease(
                     http.Request,
@@ -1938,7 +1938,7 @@ public static class BlobProtocolEndpoint
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 AzureResponseWriter.AddBlobWriteHeaders(http.Response, legacyCopy);
                 http.Response.StatusCode = StatusCodes.Status201Created;
                 return;
@@ -1955,7 +1955,7 @@ public static class BlobProtocolEndpoint
             if (requestedType is not null)
             {
                 RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
-                if (requestedType != "BlockBlob")
+                if (!string.Equals(requestedType, "BlockBlob", StringComparison.Ordinal))
                     throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
                 if (requiresSync)
                     throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
@@ -1989,9 +1989,9 @@ public static class BlobProtocolEndpoint
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
-                        cancellationToken),
+                        cancellationToken).ConfigureAwait(false),
                     cancellationToken,
-                    copySourceTags);
+                    copySourceTags).ConfigureAwait(false);
                 var uploaded = transfer.Value;
                 AzureResponseWriter.AddBlobWriteHeaders(http.Response, uploaded);
                 AddRequestServerEncryptedHeader(http.Response);
@@ -2029,10 +2029,10 @@ public static class BlobProtocolEndpoint
                         service,
                         synchronousInternalSource,
                         cancellationToken,
-                        requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request));
+                        requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request)).ConfigureAwait(false);
                     EvaluateCopySourceConditions(http.Request, source);
                     ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
-                    source = await service.RecordDataAccessAsync(source, cancellationToken);
+                    source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
                     synchronousCopy = await service.CopyBlockBlobFromBlobAsync(
                         request.Account,
                         containerName,
@@ -2048,7 +2048,7 @@ public static class BlobProtocolEndpoint
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -2087,11 +2087,11 @@ public static class BlobProtocolEndpoint
                                 current?.Lease ?? LeaseRecord.Available,
                                 current?.GenerationId,
                                 current?.Revision,
-                                cancellationToken);
+                                cancellationToken).ConfigureAwait(false);
                         },
                         cancellationToken,
                         copySourceTags,
-                        preserveSourceShape: true);
+                        preserveSourceShape: true).ConfigureAwait(false);
                     synchronousCopy = transfer.Value;
                 }
                 AzureResponseWriter.AddBlobCopyHeaders(http.Response, synchronousCopy, includeVersion: false);
@@ -2128,11 +2128,11 @@ public static class BlobProtocolEndpoint
                     service,
                     internalSource,
                     cancellationToken,
-                    requireTagsPermission: HasSourceTagCondition(http.Request));
+                    requireTagsPermission: HasSourceTagCondition(http.Request)).ConfigureAwait(false);
                 EvaluateCopySourceConditions(http.Request, source);
                 ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
                 ValidateDestinationBlobType(current, source.Kind);
-                source = await service.RecordDataAccessAsync(source, cancellationToken);
+                source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
                 copied = await service.BeginCopyFromBlobAsync(
                     request.Account,
                     containerName,
@@ -2144,7 +2144,7 @@ public static class BlobProtocolEndpoint
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -2186,10 +2186,10 @@ public static class BlobProtocolEndpoint
                             current?.Lease ?? LeaseRecord.Available,
                             current?.GenerationId,
                             current?.Revision,
-                            cancellationToken);
+                            cancellationToken).ConfigureAwait(false);
                     },
                     cancellationToken,
-                    preserveSourceShape: true);
+                    preserveSourceShape: true).ConfigureAwait(false);
                 copied = transfer.Value;
             }
             AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: true);
@@ -2240,11 +2240,11 @@ public static class BlobProtocolEndpoint
                         current?.Lease ?? LeaseRecord.Available,
                         current?.GenerationId,
                         current?.Revision,
-                        cancellationToken),
+                        cancellationToken).ConfigureAwait(false),
                     maximumBodyBytes: GetMaximumPutBlobBytes(request),
                     expectedMd5HeaderName: persistedMd5 is null
                         ? "Content-MD5"
-                        : "x-ms-blob-content-md5");
+                        : "x-ms-blob-content-md5").ConfigureAwait(false);
                 break;
             case BlobKind.AppendBlob:
                 RequireAppendBlobVersion(request);
@@ -2261,7 +2261,7 @@ public static class BlobProtocolEndpoint
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 break;
             case BlobKind.PageBlob:
                 RequirePageBlobVersion(request);
@@ -2283,7 +2283,7 @@ public static class BlobProtocolEndpoint
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 break;
             default:
                 throw AzureStorageException.InvalidHeader("x-ms-blob-type", type);
@@ -2381,7 +2381,7 @@ public static class BlobProtocolEndpoint
                     "Structured response bodies require service version 2025-01-05 or later.");
             }
 
-            blob = await service.RecordDataAccessAsync(blob, cancellationToken);
+            blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
             AzureResponseWriter.AddBlobHeaders(
                 http.Response,
                 blob,
@@ -2400,9 +2400,9 @@ public static class BlobProtocolEndpoint
                         start + rangeStart,
                         rangeLength,
                         destination,
-                        token),
+                        token).ConfigureAwait(false),
                 http.Response.Body,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -2416,7 +2416,7 @@ public static class BlobProtocolEndpoint
             }
         }
 
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
             blob,
@@ -2429,7 +2429,7 @@ public static class BlobProtocolEndpoint
         if (wantMd5 || wantCrc64)
         {
             using var buffer = new MemoryStream((int)length);
-            await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken);
+            await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken).ConfigureAwait(false);
             var bytes = buffer.ToArray();
             if (wantMd5)
             {
@@ -2441,11 +2441,11 @@ public static class BlobProtocolEndpoint
                 crc64.Append(bytes);
                 http.Response.Headers["x-ms-content-crc64"] = Convert.ToBase64String(crc64.GetHash());
             }
-            await http.Response.Body.WriteAsync(bytes, cancellationToken);
+            await http.Response.Body.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        await service.WriteContentAsync(blob, encryption, start, length, http.Response.Body, cancellationToken);
+        await service.WriteContentAsync(blob, encryption, start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task HandleQueryAsync(
@@ -2466,7 +2466,7 @@ public static class BlobProtocolEndpoint
                 "Query Blob Contents requires service version 2019-12-12 or later.");
         }
 
-        await AuthorizeBlobReadAsync(request, service, blob, cancellationToken);
+        await AuthorizeBlobReadAsync(request, service, blob, cancellationToken).ConfigureAwait(false);
         if (blob.Kind != BlobKind.BlockBlob)
         {
             throw new AzureStorageException(
@@ -2486,8 +2486,8 @@ public static class BlobProtocolEndpoint
         EvaluateReadConditions(http.Request, blob);
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
-        var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken);
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken);
+        var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobQueryHeaders(http.Response, blob);
         http.Response.ContentType = "avro/binary";
         http.Response.StatusCode = StatusCodes.Status200OK;
@@ -2495,14 +2495,17 @@ public static class BlobProtocolEndpoint
         var encryption = new BlobEncryption(blob.EncryptionScope, null);
         if (query.Input.Kind == BlobQueryFormatKind.Parquet)
         {
-            await using var seekableContent = new BlobSeekableReadStream(service, blob, encryption);
-            await BlobQueryProtocol.ExecuteAsync(
+            var seekableContent = new BlobSeekableReadStream(service, blob, encryption);
+            await using (seekableContent.ConfigureAwait(false))
+            {
+                await BlobQueryProtocol.ExecuteAsync(
                 query,
                 seekableContent,
                 http.Response.Body,
                 blob.Content.Length,
-                cancellationToken);
-            return;
+                cancellationToken).ConfigureAwait(false);
+                return;
+            }
         }
 
         var pipe = new Pipe(new PipeOptions(
@@ -2517,26 +2520,29 @@ public static class BlobProtocolEndpoint
             pipe.Writer,
             producerCancellation.Token);
 
-        await using var content = pipe.Reader.AsStream(leaveOpen: true);
-        try
+        var content = pipe.Reader.AsStream(leaveOpen: true);
+        await using (content.ConfigureAwait(false))
         {
-            await BlobQueryProtocol.ExecuteAsync(
-                query,
-                content,
-                http.Response.Body,
-                blob.Content.Length,
-                cancellationToken);
-        }
-        finally
-        {
-            producerCancellation.Cancel();
-            await pipe.Reader.CompleteAsync();
             try
             {
-                await producer;
+                await BlobQueryProtocol.ExecuteAsync(
+                    query,
+                    content,
+                    http.Response.Body,
+                    blob.Content.Length,
+                    cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (producerCancellation.IsCancellationRequested)
+            finally
             {
+                producerCancellation.Cancel();
+                await pipe.Reader.CompleteAsync().ConfigureAwait(false);
+                try
+                {
+                    await producer.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (producerCancellation.IsCancellationRequested)
+                {
+                }
             }
         }
     }
@@ -2551,14 +2557,17 @@ public static class BlobProtocolEndpoint
         Exception? failure = null;
         try
         {
-            await using var destination = writer.AsStream(leaveOpen: true);
-            await service.WriteContentAsync(
+            var destination = writer.AsStream(leaveOpen: true);
+            await using (destination.ConfigureAwait(false))
+            {
+                await service.WriteContentAsync(
                 blob,
                 encryption,
                 0,
                 blob.Content.Length,
                 destination,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception)
         {
@@ -2567,7 +2576,7 @@ public static class BlobProtocolEndpoint
         }
         finally
         {
-            await writer.CompleteAsync(failure);
+            await writer.CompleteAsync(failure).ConfigureAwait(false);
         }
     }
 
@@ -2742,7 +2751,7 @@ public static class BlobProtocolEndpoint
             sourceContext.Authorization = await authenticator.AuthenticateAsync(
                 sourceHttp,
                 sourceContext,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
 
         if (sourceContext.Authorization.Kind == StorageAuthorizationKind.Anonymous)
@@ -2753,7 +2762,7 @@ public static class BlobProtocolEndpoint
                 source.Account,
                 source.Container,
                 includeDeleted: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (!service.AllowsAnonymousPublicAccess(source.Account) ||
                 sourceContainer.PublicAccess is not ("blob" or "container"))
                 throw AzureStorageException.AuthorizationFailure();
@@ -2774,7 +2783,7 @@ public static class BlobProtocolEndpoint
             source.VersionId,
             source.Snapshot,
             false,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         HierarchicalAclAuthorization.EnsureAuthorizedGeneration(
             sourceContext.Authorization,
             sourceBlob.GenerationId);
@@ -2795,7 +2804,7 @@ public static class BlobProtocolEndpoint
             container,
             transition.Lease,
             updateProperties: !returnsProperties,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         http.Response.StatusCode = LeaseStatusCode(action);
         if (returnsProperties)
         {
@@ -2814,7 +2823,7 @@ public static class BlobProtocolEndpoint
     {
         var modernLease = IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12));
         var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease, useLegacySemantics: !modernLease);
-        var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken);
+        var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken).ConfigureAwait(false);
         http.Response.StatusCode = LeaseStatusCode(action);
         if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
         {
@@ -2933,7 +2942,7 @@ public static class BlobProtocolEndpoint
                 allowOpenEnded: false,
                 allowEndPastLength: false);
         }
-        catch (AzureStorageException exception) when (exception.ErrorCode == "InvalidRange")
+        catch (AzureStorageException exception) when (string.Equals(exception.ErrorCode, "InvalidRange", StringComparison.Ordinal))
         {
             throw AzureStorageException.InvalidPageRange();
         }
@@ -3011,7 +3020,7 @@ public static class BlobProtocolEndpoint
             filter,
             marker,
             maxResults,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var nextMarker = page.HasMore && page.Items.Count > 0
             ? BlobTagQuery.EncodeMarker(
                 request,
@@ -3056,7 +3065,7 @@ public static class BlobProtocolEndpoint
             xml.WriteEndElement();
             xml.WriteElementString("NextMarker", nextMarker);
             xml.WriteEndElement();
-        }, cancellationToken);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task HandleCorsPreflightAsync(
@@ -3068,7 +3077,7 @@ public static class BlobProtocolEndpoint
         var origin = RequiredCorsHeader(http.Request.Headers, "Origin");
         var requestedMethod = RequiredCorsHeader(http.Request.Headers, "Access-Control-Request-Method");
         var requestedHeaders = ProtocolParsing.First(http.Request.Headers, "Access-Control-Request-Headers") ?? string.Empty;
-        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
         var rule = properties.Cors.FirstOrDefault(candidate =>
             MatchesCorsOrigin(candidate.AllowedOrigins, origin) &&
             MatchesCsv(candidate.AllowedMethods, requestedMethod) &&
@@ -3091,7 +3100,7 @@ public static class BlobProtocolEndpoint
         CancellationToken cancellationToken)
     {
         var origin = ProtocolParsing.First(http.Request.Headers, "Origin");
-        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken);
+        var properties = await service.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
         var rule = origin is null
             ? properties.Cors.FirstOrDefault(candidate =>
                 AllowsAllCorsOrigins(candidate.AllowedOrigins) &&
@@ -3157,7 +3166,7 @@ public static class BlobProtocolEndpoint
             request.Authorization.AclAppendObjectId!,
             request.Authorization.AclAppendGroups!,
             request.Authorization.Permissions,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, generation);
     }
 
@@ -3190,7 +3199,7 @@ public static class BlobProtocolEndpoint
             Require(request, 'r');
             return;
         }
-        var container = await service.GetContainerAsync(blob.Account, blob.Container, false, cancellationToken);
+        var container = await service.GetContainerAsync(blob.Account, blob.Container, false, cancellationToken).ConfigureAwait(false);
         if (!service.AllowsAnonymousPublicAccess(blob.Account))
             throw AzureStorageException.PublicAccessNotPermitted();
         if (container.PublicAccess is not ("blob" or "container"))
@@ -3209,7 +3218,7 @@ public static class BlobProtocolEndpoint
         {
             if (!service.AllowsAnonymousPublicAccess(container.Account))
                 throw AzureStorageException.PublicAccessNotPermitted();
-            if (!allowContainerPublic || container.PublicAccess != "container")
+            if (!allowContainerPublic || !string.Equals(container.PublicAccess, "container", StringComparison.Ordinal))
                 throw AzureStorageException.AuthorizationFailure();
         }
         return Task.CompletedTask;
@@ -3226,7 +3235,7 @@ public static class BlobProtocolEndpoint
         {
             if (!service.AllowsAnonymousPublicAccess(container.Account))
                 throw AzureStorageException.PublicAccessNotPermitted();
-            if (container.PublicAccess != "container")
+            if (!string.Equals(container.PublicAccess, "container", StringComparison.Ordinal))
                 throw AzureStorageException.AuthorizationFailure();
         }
         return Task.CompletedTask;
@@ -3389,7 +3398,7 @@ public static class BlobProtocolEndpoint
 
     private static void EnsureNoPendingCopyDestination(BlobRecord? destination)
     {
-        if (destination?.Copy?.Status == "pending")
+        if (string.Equals(destination?.Copy?.Status, "pending", StringComparison.Ordinal))
         {
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
@@ -3421,9 +3430,9 @@ public static class BlobProtocolEndpoint
     {
         try
         {
-            return await service.GetBlobAsync(account, container, name, null, null, false, cancellationToken);
+            return await service.GetBlobAsync(account, container, name, null, null, false, cancellationToken).ConfigureAwait(false);
         }
-        catch (AzureStorageException exception) when (exception.ErrorCode == "BlobNotFound")
+        catch (AzureStorageException exception) when (string.Equals(exception.ErrorCode, "BlobNotFound", StringComparison.Ordinal))
         {
             return null;
         }
@@ -3731,7 +3740,7 @@ public static class BlobProtocolEndpoint
             if (!hierarchicalNamespace)
                 throw AzureStorageException.InvalidQuery("include");
         }
-        if (hierarchicalNamespace && !string.IsNullOrEmpty(delimiter) && delimiter != "/")
+        if (hierarchicalNamespace && !string.IsNullOrEmpty(delimiter) && !string.Equals(delimiter, "/", StringComparison.Ordinal))
             throw AzureStorageException.InvalidQuery("delimiter");
         if (!string.IsNullOrEmpty(delimiter) &&
             includes.Contains("snapshots") &&
@@ -4206,9 +4215,9 @@ public static class BlobProtocolEndpoint
             StorageRequestContext.Get(request.HttpContext),
             new DateOnly(2021, 4, 10),
             "Copy source tags");
-        if (value == "REPLACE")
+        if (string.Equals(value, "REPLACE", StringComparison.Ordinal))
             return false;
-        if (value != "COPY")
+        if (!string.Equals(value, "COPY", StringComparison.Ordinal))
             throw AzureStorageException.InvalidHeader(headerName, value);
         if (request.Headers.ContainsKey("x-ms-tags"))
         {
@@ -4386,7 +4395,7 @@ public static class BlobProtocolEndpoint
                 blob.Account,
                 blob.Container,
                 includeDeleted: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (container.PreventEncryptionScopeOverride &&
                 supplied.Scope is not null &&
                 !string.Equals(supplied.Scope, container.DefaultEncryptionScope, StringComparison.Ordinal))
@@ -4655,25 +4664,28 @@ public static class BlobProtocolEndpoint
             var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
             try
             {
-                await using var temporary = new FileStream(
+                var temporary = new FileStream(
                     structuredTemporaryPath,
                     FileMode.CreateNew,
                     FileAccess.ReadWrite,
                     FileShare.None,
                     128 * 1024,
                     FileOptions.Asynchronous | FileOptions.SequentialScan);
-                await StructuredBodyDecoder.DecodeAsync(
+                await using (temporary.ConfigureAwait(false))
+                {
+                    await StructuredBodyDecoder.DecodeAsync(
                     request.Body,
                     temporary,
                     encodedLength,
                     decodedLength,
                     effectiveMaximumBodyBytes,
-                    request.HttpContext.RequestAborted);
-                temporary.Position = 0;
-                using var hashingBody = new TransactionalChecksumReadStream(temporary);
-                await action(hashingBody);
-                request.HttpContext.Response.Headers["x-ms-structured-body"] = structuredBody;
-                return hashingBody.Complete();
+                    request.HttpContext.RequestAborted).ConfigureAwait(false);
+                    temporary.Position = 0;
+                    using var hashingBody = new TransactionalChecksumReadStream(temporary);
+                    await action(hashingBody).ConfigureAwait(false);
+                    request.HttpContext.Response.Headers["x-ms-structured-body"] = structuredBody;
+                    return hashingBody.Complete();
+                }
             }
             finally
             {
@@ -4697,7 +4709,7 @@ public static class BlobProtocolEndpoint
         if (expectedMd5 is null && expectedCrc64 is null)
         {
             using var hashingBody = new TransactionalChecksumReadStream(request.Body);
-            await action(hashingBody);
+            await action(hashingBody).ConfigureAwait(false);
             return hashingBody.Complete();
         }
 
@@ -4709,43 +4721,46 @@ public static class BlobProtocolEndpoint
         var temporaryPath = Path.Combine(paths.Staging, $"validated-{Guid.NewGuid():N}.tmp");
         try
         {
-            await using var temporary = new FileStream(
+            var temporary = new FileStream(
                 temporaryPath,
                 FileMode.CreateNew,
                 FileAccess.ReadWrite,
                 FileShare.None,
                 128 * 1024,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-            var crc64 = new StorageCrc64();
-            var buffer = new byte[128 * 1024];
-            long length = 0;
-            while (true)
+            await using (temporary.ConfigureAwait(false))
             {
-                var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted);
-                if (read == 0)
-                    break;
-                length = checked(length + read);
-                if (length > effectiveMaximumBodyBytes)
-                    throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
-                md5.AppendData(buffer, 0, read);
-                crc64.Append(buffer.AsSpan(0, read));
-                await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted);
-            }
+                using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+                var crc64 = new StorageCrc64();
+                var buffer = new byte[128 * 1024];
+                long length = 0;
+                while (true)
+                {
+                    var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted).ConfigureAwait(false);
+                    if (read == 0)
+                        break;
+                    length = checked(length + read);
+                    if (length > effectiveMaximumBodyBytes)
+                        throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
+                    md5.AppendData(buffer, 0, read);
+                    crc64.Append(buffer.AsSpan(0, read));
+                    await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted).ConfigureAwait(false);
+                }
 
-            var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
-            var actual = expectedMd5 is null ? checksums.Crc64 : checksums.Md5;
-            if (!CryptographicOperations.FixedTimeEquals(expected, actual))
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    expectedMd5 is null ? "Crc64Mismatch" : "Md5Mismatch",
-                    "The checksum specified in the request did not match the value calculated by the server.");
-            }
+                var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
+                var actual = expectedMd5 is null ? checksums.Crc64 : checksums.Md5;
+                if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status400BadRequest,
+                        expectedMd5 is null ? "Crc64Mismatch" : "Md5Mismatch",
+                        "The checksum specified in the request did not match the value calculated by the server.");
+                }
 
-            temporary.Position = 0;
-            await action(temporary);
-            return checksums;
+                temporary.Position = 0;
+                await action(temporary).ConfigureAwait(false);
+                return checksums;
+            }
         }
         finally
         {
@@ -4912,8 +4927,7 @@ public static class BlobProtocolEndpoint
             .Any(item => string.Equals(item, value, StringComparison.Ordinal));
 
     private static bool MatchesCorsOrigin(string csv, string origin) =>
-        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate =>
-            candidate == "*" ||
+        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate => string.Equals(candidate, "*", StringComparison.Ordinal) ||
             string.Equals(candidate, origin, StringComparison.Ordinal) ||
             MatchesCorsSubdomain(candidate, origin));
 
@@ -4934,9 +4948,9 @@ public static class BlobProtocolEndpoint
     }
 
     private static bool AllowsAllCorsOrigins(string csv) =>
-        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate => candidate == "*");
+        csv.Split(',', StringSplitOptions.TrimEntries).Any(candidate => string.Equals(candidate, "*", StringComparison.Ordinal));
 
-    private static bool MatchesHeader(string csv, string header) => csv.Split(',', StringSplitOptions.TrimEntries).Any(item => item == "*" || (item.EndsWith('*') ? header.StartsWith(item[..^1], StringComparison.OrdinalIgnoreCase) : string.Equals(item, header, StringComparison.OrdinalIgnoreCase)));
+    private static bool MatchesHeader(string csv, string header) => csv.Split(',', StringSplitOptions.TrimEntries).Any(item => string.Equals(item, "*", StringComparison.Ordinal) || (item.EndsWith('*') ? header.StartsWith(item[..^1], StringComparison.OrdinalIgnoreCase) : string.Equals(item, header, StringComparison.OrdinalIgnoreCase)));
 
     private static void EnsureMutableVersion(BlobRecord blob)
     {

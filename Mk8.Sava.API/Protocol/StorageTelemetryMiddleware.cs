@@ -18,7 +18,7 @@ public sealed class StorageTelemetryMiddleware(
         if (context.Request.Path.StartsWithSegments("/health") ||
             context.Request.Path.StartsWithSegments("/metrics"))
         {
-            await next(context);
+            await next(context).ConfigureAwait(false);
             return;
         }
 
@@ -26,7 +26,7 @@ public sealed class StorageTelemetryMiddleware(
         var started = Stopwatch.GetTimestamp();
         try
         {
-            await next(context);
+            await next(context).ConfigureAwait(false);
         }
         finally
         {
@@ -48,7 +48,7 @@ public sealed class StorageTelemetryMiddleware(
                     var completedAt = timeProvider.GetUtcNow();
                     await analytics.RecordAsync(
                         CaptureAnalyticsRequest(context, request, startedAt, completedAt, elapsed),
-                        CancellationToken.None);
+                        CancellationToken.None).ConfigureAwait(false);
                 }
                 catch (Exception exception)
                 {

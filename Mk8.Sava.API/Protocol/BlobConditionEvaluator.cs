@@ -358,7 +358,7 @@ internal static class BlobConditionEvaluator
 
     private static bool Matches(string candidate, string etag, bool supportsQuotedEtags)
     {
-        if (candidate == "*")
+        if (string.Equals(candidate, "*", StringComparison.Ordinal))
             return true;
         var unquotedEtag = Unquote(etag);
         if (!supportsQuotedEtags)

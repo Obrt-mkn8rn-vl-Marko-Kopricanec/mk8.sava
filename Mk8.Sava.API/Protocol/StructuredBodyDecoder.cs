@@ -26,7 +26,7 @@ internal static class StructuredBodyDecoder
             throw new RequestBodyTooLargeException(maximumContentLength);
 
         var header = new byte[HeaderLength];
-        await ReadExactlyAsync(source, header, cancellationToken);
+        await ReadExactlyAsync(source, header, cancellationToken).ConfigureAwait(false);
         if (header[0] != 1)
             throw InvalidBody();
 
@@ -60,7 +60,7 @@ internal static class StructuredBodyDecoder
 
         for (var index = 1; index <= segmentCount; index++)
         {
-            await ReadExactlyAsync(source, segmentHeader, cancellationToken);
+            await ReadExactlyAsync(source, segmentHeader, cancellationToken).ConfigureAwait(false);
             if (BinaryPrimitives.ReadUInt16LittleEndian(segmentHeader) != index)
                 throw InvalidBody();
 
@@ -76,22 +76,22 @@ internal static class StructuredBodyDecoder
             while (remaining > 0)
             {
                 var requested = (int)Math.Min(buffer.Length, remaining);
-                var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken);
+                var read = await source.ReadAsync(buffer.AsMemory(0, requested), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                     throw InvalidBody();
                 segmentCrc64.Append(buffer.AsSpan(0, read));
                 messageCrc64.Append(buffer.AsSpan(0, read));
-                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
                 decodedLength = checked(decodedLength + read);
                 remaining -= read;
             }
 
-            await ReadExactlyAsync(source, expectedChecksum, cancellationToken);
+            await ReadExactlyAsync(source, expectedChecksum, cancellationToken).ConfigureAwait(false);
             if (!CryptographicOperations.FixedTimeEquals(expectedChecksum, segmentCrc64.GetHash()))
                 throw Crc64Mismatch();
         }
 
-        await ReadExactlyAsync(source, expectedChecksum, cancellationToken);
+        await ReadExactlyAsync(source, expectedChecksum, cancellationToken).ConfigureAwait(false);
         if (!CryptographicOperations.FixedTimeEquals(expectedChecksum, messageCrc64.GetHash()))
             throw Crc64Mismatch();
         if (decodedLength != expectedContentLength)
@@ -106,7 +106,7 @@ internal static class StructuredBodyDecoder
         var offset = 0;
         while (offset < destination.Length)
         {
-            var read = await source.ReadAsync(destination[offset..], cancellationToken);
+            var read = await source.ReadAsync(destination[offset..], cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 throw InvalidBody();
             offset += read;

@@ -101,13 +101,13 @@ public sealed class StorageAuthenticator(
             var bearer = await AuthenticateBearerAsync(
                 context,
                 request,
-                requireDataAuthorization: !hasSas);
+                requireDataAuthorization: !hasSas).ConfigureAwait(false);
             return hasSas
                 ? await AuthenticateSasAsync(context, request, cancellationToken, bearer)
-                : bearer;
+.ConfigureAwait(false) : bearer;
         }
         if (context.Request.Query.ContainsKey("sig"))
-            return await AuthenticateSasAsync(context, request, cancellationToken, null);
+            return await AuthenticateSasAsync(context, request, cancellationToken, null).ConfigureAwait(false);
         return StorageAuthorization.Anonymous;
     }
 
@@ -216,7 +216,7 @@ public sealed class StorageAuthenticator(
         if (!configuration.Enabled)
             throw AzureStorageException.BearerAuthenticationRequired();
 
-        var result = await context.AuthenticateAsync(BearerScheme);
+        var result = await context.AuthenticateAsync(BearerScheme).ConfigureAwait(false);
         if (!result.Succeeded || result.Principal?.Identity?.IsAuthenticated != true)
             throw AzureStorageException.BearerAuthenticationRequired();
 
@@ -271,11 +271,11 @@ public sealed class StorageAuthenticator(
                     objectId,
                     groups,
                     "r",
-                    context.RequestAborted);
+                    context.RequestAborted).ConfigureAwait(false);
                 aclReadChecked = true;
                 granted.Add('r');
             }
-            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
             {
                 // An ACL cannot grant this read; retain only the configured RBAC grants.
             }
@@ -297,12 +297,12 @@ public sealed class StorageAuthenticator(
                     .Where(value => Guid.TryParse(value, out _))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                    metadata, context.Request, request, objectId, groups, "l", context.RequestAborted);
+                    metadata, context.Request, request, objectId, groups, "l", context.RequestAborted).ConfigureAwait(false);
                 aclListGroups = groups;
                 aclListChecked = true;
                 granted.Add('l');
             }
-            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
             {
                 // An ACL cannot grant this list; retain only the configured RBAC grants.
             }
@@ -327,12 +327,12 @@ public sealed class StorageAuthenticator(
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 await HierarchicalAclAuthorization.EnsureParentMutationAsync(
                     metadata, context.Request, request, objectId, groups,
-                    mutationPermission.ToString(), context.RequestAborted);
+                    mutationPermission.ToString(), context.RequestAborted).ConfigureAwait(false);
                 aclMutationGroups = groups;
                 aclMutationChecked = true;
                 granted.Add(mutationPermission);
             }
-            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
             {
                 // An ACL cannot grant this mutation; retain only the configured RBAC grants.
             }
@@ -355,12 +355,12 @@ public sealed class StorageAuthenticator(
                     .Where(value => Guid.TryParse(value, out _))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
                 aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
-                    metadata, context.Request, request, objectId, groups, "a", context.RequestAborted);
+                    metadata, context.Request, request, objectId, groups, "a", context.RequestAborted).ConfigureAwait(false);
                 aclAppendGroups = groups;
                 aclAppendChecked = true;
                 granted.Add('a');
             }
-            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
             {
                 // An ACL cannot grant this append; retain only the configured RBAC grants.
             }
@@ -476,7 +476,7 @@ public sealed class StorageAuthenticator(
         }
         if (protocol is not ("" or "https" or "https,http"))
             throw AzureStorageException.AuthenticationFailed("The signed protocol field is invalid.");
-        if (protocol == "https" && !context.Request.IsHttps)
+        if (string.Equals(protocol, "https", StringComparison.Ordinal) && !context.Request.IsHttps)
             throw AzureStorageException.AuthorizationProtocolMismatch();
 
         if (!string.IsNullOrEmpty(signedIp))
@@ -543,7 +543,7 @@ public sealed class StorageAuthenticator(
                 throw AzureStorageException.AuthenticationFailed();
             ValidateServiceSasPermissions(permissions, signedVersion);
             signedResource = resourceType;
-            if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
+            if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
                 throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
@@ -562,7 +562,7 @@ public sealed class StorageAuthenticator(
             var keyVersion = query["skv"].ToString();
             if (!Guid.TryParse(objectId, out _) ||
                 !Guid.TryParse(tenantId, out _) ||
-                keyService != "b" ||
+!string.Equals(keyService, "b", StringComparison.Ordinal) ||
                 !DateOnly.TryParseExact(keyVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var parsedKeyVersion) ||
                 parsedKeyVersion < new DateOnly(2018, 11, 9))
             {
@@ -704,7 +704,7 @@ public sealed class StorageAuthenticator(
             var resourceType = query["sr"].ToString();
             ValidateServiceSasPermissions(permissions, signedVersion);
             signedResource = resourceType;
-            if (resourceType == "d" && !IsHierarchicalNamespaceEnabled(request.Account))
+            if (string.Equals(resourceType, "d", StringComparison.Ordinal) && !IsHierarchicalNamespaceEnabled(request.Account))
                 throw AzureStorageException.AuthorizationFailure();
             if (!ServiceSasCoversRequest(resourceType, request, signedVersion))
                 throw AzureStorageException.AuthorizationFailure();
@@ -760,7 +760,7 @@ public sealed class StorageAuthenticator(
             {
                 if (request.Container is null)
                     throw AzureStorageException.AuthorizationFailure();
-                var container = await metadata.GetContainerAsync(request.Account, request.Container, includeDeleted: false, cancellationToken);
+                var container = await metadata.GetContainerAsync(request.Account, request.Container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
                 if (container is null || !container.AccessPolicies.TryGetValue(identifier, out var policy))
                     throw AzureStorageException.AuthorizationFailure();
                 ValidateServiceSasPermissions(policy.Permission, signedVersion);
@@ -814,21 +814,21 @@ public sealed class StorageAuthenticator(
             {
                 aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
                     metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken);
+                    permissions, cancellationToken).ConfigureAwait(false);
                 aclAppendChecked = true;
             }
             else if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
             {
                 await HierarchicalAclAuthorization.EnsureParentMutationAsync(
                     metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken);
+                    permissions, cancellationToken).ConfigureAwait(false);
                 aclMutationChecked = true;
             }
             else if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
             {
                 await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
                     metadata, context.Request, request, aclObjectId, NoGroups,
-                    permissions, cancellationToken);
+                    permissions, cancellationToken).ConfigureAwait(false);
                 aclListChecked = true;
             }
             else
@@ -840,7 +840,7 @@ public sealed class StorageAuthenticator(
                     aclObjectId,
                     NoGroups,
                     permissions,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -1058,11 +1058,10 @@ public sealed class StorageAuthenticator(
             _ => false
         };
 
-    private static string GetSignedSnapshotOrVersion(IQueryCollection query, string resourceType) =>
-        resourceType == "bv"
-            ? query["versionid"].ToString()
-            : resourceType == "bs"
-                ? query["snapshot"].ToString()
+    private static string GetSignedSnapshotOrVersion(IQueryCollection query, string resourceType) => string.Equals(resourceType, "bv"
+, StringComparison.Ordinal) ? query["versionid"].ToString()
+            : string.Equals(resourceType, "bs"
+, StringComparison.Ordinal) ? query["snapshot"].ToString()
                 : string.Empty;
 
     private static string BuildSasCanonicalResource(
@@ -1076,7 +1075,7 @@ public sealed class StorageAuthenticator(
             : $"/{request.Account}";
         if (request.Container is not null)
             path += "/" + request.Container;
-        if (resourceType == "d")
+        if (string.Equals(resourceType, "d", StringComparison.Ordinal))
         {
             var directoryDepthText = query["sdd"].ToString();
             if (!int.TryParse(

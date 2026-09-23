@@ -108,7 +108,9 @@ public sealed partial class AzureResponseWriter
         AddStringColumn(fields, arrays, "CopyStatusDescription", items, entry =>
             includes.Contains("copy") ? entry.Blob?.Copy?.Description : null);
         AddStringColumn(fields, arrays, "CopyDestinationSnapshot", items, entry =>
-            entry.Blob?.Copy?.Status == "success" ? entry.Blob.CopyDestinationSnapshot : null);
+            string.Equals(entry.Blob?.Copy?.Status, "success", StringComparison.Ordinal)
+                ? entry.Blob?.CopyDestinationSnapshot
+                : null);
         AddTimestampColumn(fields, arrays, "ImmutabilityPolicyUntilDate", items, entry =>
             includes.Contains("immutabilitypolicy") ? entry.Blob?.ImmutabilityUntil : null);
         AddStringColumn(fields, arrays, "ImmutabilityPolicyMode", items, entry =>
@@ -172,9 +174,9 @@ public sealed partial class AzureResponseWriter
         using var batch = new RecordBatch(schema, arrays, items.Count);
         context.Response.ContentType = ArrowStreamContentType;
         using var writer = new ArrowStreamWriter(context.Response.Body, schema, leaveOpen: true);
-        await writer.WriteStartAsync(cancellationToken);
-        await writer.WriteRecordBatchAsync(batch, cancellationToken);
-        await writer.WriteEndAsync(cancellationToken);
+        await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+        await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static void AddStringColumn(

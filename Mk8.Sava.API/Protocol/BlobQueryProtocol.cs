@@ -65,9 +65,9 @@ internal static class BlobQueryProtocol
         try
         {
             using var reader = ProtocolParsing.CreateXmlReader(body);
-            var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+            var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
             var root = document.Root;
-            if (root?.Name.LocalName != "QueryRequest")
+            if (!string.Equals(root?.Name.LocalName, "QueryRequest", StringComparison.Ordinal))
                 throw InvalidXml("The QueryRequest root element is required.");
 
             var queryType = ChildValue(root, "QueryType");
@@ -116,43 +116,46 @@ internal static class BlobQueryProtocol
     {
         var plan = BlobQueryPlan.Parse(request.Expression);
         var avro = new BlobQueryAvroWriter(response);
-        await avro.InitializeAsync(cancellationToken);
+        await avro.InitializeAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
-            await using var selections = ExecutePlanAsync(input, request.Input, plan, cancellationToken)
+            var selections = ExecutePlanAsync(input, request.Input, plan, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
-            if (request.Output.Kind == BlobQueryFormatKind.Arrow)
+            await using (selections.ConfigureAwait(false))
             {
-                await WriteArrowResultsAsync(
-                    selections,
-                    request.Output.ArrowSchema,
-                    avro,
-                    cancellationToken);
-                await avro.CompleteAsync(totalBytes, cancellationToken);
-                return;
-            }
-
-            var wroteHeader = false;
-            while (await selections.MoveNextAsync())
-            {
-                var selected = selections.Current;
-
-                if (!wroteHeader && request.Output.Kind == BlobQueryFormatKind.Delimited && request.Output.HasHeaders)
+                if (request.Output.Kind == BlobQueryFormatKind.Arrow)
                 {
-                    await avro.AppendDataAsync(
-                        EncodeDelimited(selected.Names.Select(name => new QueryCell(name)).ToArray(), request.Output),
-                        cancellationToken);
-                    wroteHeader = true;
+                    await WriteArrowResultsAsync(
+                        selections,
+                        request.Output.ArrowSchema,
+                        avro,
+                        cancellationToken).ConfigureAwait(false);
+                    await avro.CompleteAsync(totalBytes, cancellationToken).ConfigureAwait(false);
+                    return;
                 }
 
-                var encoded = request.Output.Kind switch
+                var wroteHeader = false;
+                while (await selections.MoveNextAsync().ConfigureAwait(false))
                 {
-                    BlobQueryFormatKind.Delimited => EncodeDelimited(selected.Values, request.Output),
-                    BlobQueryFormatKind.Json => EncodeJson(selected, request.Output),
-                    _ => throw new InvalidOperationException("Unknown query output format.")
-                };
-                await avro.AppendDataAsync(encoded, cancellationToken);
+                    var selected = selections.Current;
+
+                    if (!wroteHeader && request.Output.Kind == BlobQueryFormatKind.Delimited && request.Output.HasHeaders)
+                    {
+                        await avro.AppendDataAsync(
+                            EncodeDelimited(selected.Names.Select(name => new QueryCell(name)).ToArray(), request.Output),
+                            cancellationToken).ConfigureAwait(false);
+                        wroteHeader = true;
+                    }
+
+                    var encoded = request.Output.Kind switch
+                    {
+                        BlobQueryFormatKind.Delimited => EncodeDelimited(selected.Values, request.Output),
+                        BlobQueryFormatKind.Json => EncodeJson(selected, request.Output),
+                        _ => throw new InvalidOperationException("Unknown query output format.")
+                    };
+                    await avro.AppendDataAsync(encoded, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -161,10 +164,10 @@ internal static class BlobQueryProtocol
         }
         catch (BlobQueryDataException exception)
         {
-            await avro.WriteErrorAsync(true, exception.Name, exception.Message, exception.Position, cancellationToken);
+            await avro.WriteErrorAsync(true, exception.Name, exception.Message, exception.Position, cancellationToken).ConfigureAwait(false);
         }
 
-        await avro.CompleteAsync(totalBytes, cancellationToken);
+        await avro.CompleteAsync(totalBytes, cancellationToken).ConfigureAwait(false);
     }
 
     private static async IAsyncEnumerable<QuerySelection> ExecutePlanAsync(
@@ -180,17 +183,20 @@ internal static class BlobQueryProtocol
                                format,
                                plan.SplitSize,
                                plan.SplitName,
-                               cancellationToken))
+                               cancellationToken).ConfigureAwait(false))
             {
                 yield return selection;
             }
             yield break;
         }
 
-        await using var rows = ReadRowsAsync(input, format, plan, cancellationToken)
+        var rows = ReadRowsAsync(input, format, plan, cancellationToken)
             .GetAsyncEnumerator(cancellationToken);
-        await foreach (var selection in SelectRowsAsync(rows, plan, cancellationToken))
-            yield return selection;
+        await using (rows.ConfigureAwait(false))
+        {
+            await foreach (var selection in SelectRowsAsync(rows, plan, cancellationToken).ConfigureAwait(false))
+                yield return selection;
+        }
     }
 
     private static async IAsyncEnumerable<QuerySelection> SelectRowsAsync(
@@ -202,7 +208,7 @@ internal static class BlobQueryProtocol
         {
             if (plan.LimitReached)
                 yield break;
-            while (await rows.MoveNextAsync())
+            while (await rows.MoveNextAsync().ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 plan.Accumulate(rows.Current);
@@ -212,7 +218,7 @@ internal static class BlobQueryProtocol
             yield break;
         }
 
-        while (!plan.LimitReached && await rows.MoveNextAsync())
+        while (!plan.LimitReached && await rows.MoveNextAsync().ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (plan.Select(rows.Current) is { } selected)
@@ -249,7 +255,7 @@ internal static class BlobQueryProtocol
                 []);
         }
 
-        if (type == "json")
+        if (string.Equals(type, "json", StringComparison.Ordinal))
         {
             var configuration = format is null ? null : Child(format, "JsonTextConfiguration");
             var record = ChildValue(configuration, "RecordSeparator") ?? "\n";
@@ -257,14 +263,14 @@ internal static class BlobQueryProtocol
             return new BlobQueryTextFormat(BlobQueryFormatKind.Json, ",", '"', record, '\\', false, []);
         }
 
-        if (!input && type == "arrow")
+        if (!input && string.Equals(type, "arrow", StringComparison.Ordinal))
         {
             var configuration = Child(format, "ArrowConfiguration")
                                 ?? throw InvalidXml("ArrowConfiguration is required for Arrow output.");
             var schema = Child(configuration, "Schema")
                          ?? throw InvalidXml("An Arrow output schema is required.");
             var fields = schema.Elements()
-                .Where(element => element.Name.LocalName == "Field")
+                .Where(element => string.Equals(element.Name.LocalName, "Field", StringComparison.Ordinal))
                 .Select((field, index) => ReadArrowField(field, index))
                 .ToArray();
             if (fields.Length is < 1 or > 256)
@@ -272,7 +278,7 @@ internal static class BlobQueryProtocol
             return new BlobQueryTextFormat(BlobQueryFormatKind.Arrow, ",", '"', "\n", '\\', false, fields);
         }
 
-        if (input && type == "parquet")
+        if (input && string.Equals(type, "parquet", StringComparison.Ordinal))
             return new BlobQueryTextFormat(BlobQueryFormatKind.Parquet, ",", '"', "\n", '\\', false, []);
 
         var direction = input ? "input" : "output";
@@ -337,10 +343,10 @@ internal static class BlobQueryProtocol
             new Dictionary<string, string>(StringComparer.Ordinal));
         using var dataStream = new BlobQueryAvroDataStream(avro, cancellationToken);
         using var writer = new ArrowStreamWriter(dataStream, schema, leaveOpen: true);
-        await writer.WriteStartAsync(cancellationToken);
+        await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
 
         var batch = new List<QuerySelection>(ArrowRecordBatchSize);
-        while (await rows.MoveNextAsync())
+        while (await rows.MoveNextAsync().ConfigureAwait(false))
         {
             var selected = rows.Current;
             if (selected.Values.Count != fields.Count)
@@ -354,13 +360,13 @@ internal static class BlobQueryProtocol
             batch.Add(selected);
             if (batch.Count < ArrowRecordBatchSize)
                 continue;
-            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken);
+            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
             batch.Clear();
         }
 
         if (batch.Count > 0)
-            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken);
-        await writer.WriteEndAsync(cancellationToken);
+            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
+        await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static Field CreateArrowField(QueryArrowColumn field)
@@ -389,7 +395,7 @@ internal static class BlobQueryProtocol
             .Select((field, index) => BuildArrowArray(field, rows, index))
             .ToArray();
         using var batch = new RecordBatch(schema, arrays, rows.Count);
-        await writer.WriteRecordBatchAsync(batch, cancellationToken);
+        await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
     }
 
     private static IArrowArray BuildArrowArray(
@@ -555,7 +561,7 @@ internal static class BlobQueryProtocol
             reader = await ParquetReader.CreateAsync(
                 input,
                 leaveStreamOpen: true,
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -566,7 +572,7 @@ internal static class BlobQueryProtocol
             throw InvalidParquetFile();
         }
 
-        await using (reader)
+        await using (reader.ConfigureAwait(false))
         {
             var fields = reader.Schema.GetDataFields();
             if (fields.Length == 0)
@@ -593,7 +599,7 @@ internal static class BlobQueryProtocol
                         group,
                         fields[column],
                         rowCount,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
 
                 for (var row = 0; row < rowCount; row++)
@@ -619,49 +625,49 @@ internal static class BlobQueryProtocol
             if (type == typeof(ReadOnlyMemory<char>))
             {
                 var values = new string?[rowCount];
-                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken);
+                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
                 return values;
             }
             if (type == typeof(ReadOnlyMemory<byte>))
             {
                 var values = new byte[]?[rowCount];
-                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken);
+                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
                 return values.Select(value => value is null ? null : Convert.ToBase64String(value)).ToArray();
             }
             if (type == typeof(bool))
-                return await ReadParquetValueColumnAsync<bool>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<bool>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(byte))
-                return await ReadParquetValueColumnAsync<byte>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<byte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(sbyte))
-                return await ReadParquetValueColumnAsync<sbyte>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<sbyte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(short))
-                return await ReadParquetValueColumnAsync<short>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<short>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(ushort))
-                return await ReadParquetValueColumnAsync<ushort>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<ushort>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(int))
-                return await ReadParquetValueColumnAsync<int>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<int>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(uint))
-                return await ReadParquetValueColumnAsync<uint>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<uint>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(long))
-                return await ReadParquetValueColumnAsync<long>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<long>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(ulong))
-                return await ReadParquetValueColumnAsync<ulong>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<ulong>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(float))
-                return await ReadParquetValueColumnAsync<float>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<float>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(double))
-                return await ReadParquetValueColumnAsync<double>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<double>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(decimal))
-                return await ReadParquetValueColumnAsync<decimal>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<decimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(BigDecimal))
-                return await ReadParquetValueColumnAsync<BigDecimal>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<BigDecimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(System.Numerics.BigInteger))
-                return await ReadParquetValueColumnAsync<System.Numerics.BigInteger>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<BigInteger>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(DateTime))
-                return await ReadParquetValueColumnAsync<DateTime>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<DateTime>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(DateOnly))
-                return await ReadParquetValueColumnAsync<DateOnly>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<DateOnly>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
             if (type == typeof(Guid))
-                return await ReadParquetValueColumnAsync<Guid>(group, field, rowCount, cancellationToken);
+                return await ReadParquetValueColumnAsync<Guid>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
 
             throw new BlobQueryDataException(
                 "UnsupportedParquetType",
@@ -693,20 +699,20 @@ internal static class BlobQueryProtocol
         if (field.IsNullable)
         {
             var values = new T?[rowCount];
-            await group.ReadAsync<T>(
+            await group.ReadAsync(
                 field,
                 values.AsMemory(),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
             for (var index = 0; index < values.Length; index++)
                 result[index] = values[index] is { } value ? NormalizeParquetValue(value) : null;
         }
         else
         {
             var values = new T[rowCount];
-            await group.ReadAsync<T>(
+            await group.ReadAsync(
                 field,
                 values.AsMemory(),
-                cancellationToken: cancellationToken);
+                cancellationToken: cancellationToken).ConfigureAwait(false);
             for (var index = 0; index < values.Length; index++)
                 result[index] = NormalizeParquetValue(values[index]);
         }
@@ -758,17 +764,17 @@ internal static class BlobQueryProtocol
         var inQuotes = false;
         var atFieldStart = true;
 
-        if (await reader.TryConsumeAsync(Utf8Preamble, cancellationToken))
+        if (await reader.TryConsumeAsync(Utf8Preamble, cancellationToken).ConfigureAwait(false))
             recordBytes += Utf8Preamble.Length;
 
-        while (await reader.HasDataAsync(cancellationToken))
+        while (await reader.HasDataAsync(cancellationToken).ConfigureAwait(false))
         {
             if (inQuotes)
             {
-                if (doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken))
+                if (doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
                 {
                     recordBytes = checked(recordBytes + quote.Length);
-                    if (await reader.TryConsumeAsync(quote, cancellationToken))
+                    if (await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
                     {
                         recordBytes = checked(recordBytes + quote.Length);
                         continue;
@@ -776,31 +782,31 @@ internal static class BlobQueryProtocol
                     inQuotes = false;
                     continue;
                 }
-                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(escape, cancellationToken))
+                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(escape, cancellationToken).ConfigureAwait(false))
                 {
                     recordBytes = checked(recordBytes + escape.Length);
-                    recordBytes = checked(recordBytes + await reader.ConsumeUtf8ScalarAsync(cancellationToken));
+                    recordBytes = checked(recordBytes + await reader.ConsumeUtf8ScalarAsync(cancellationToken).ConfigureAwait(false));
                     continue;
                 }
-                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken))
+                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
                 {
                     recordBytes = checked(recordBytes + quote.Length);
                     inQuotes = false;
                     continue;
                 }
-                _ = await reader.ReadByteAsync(cancellationToken);
+                _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
                 recordBytes = checked(recordBytes + 1);
                 continue;
             }
 
-            if (atFieldStart && await reader.TryConsumeAsync(quote, cancellationToken))
+            if (atFieldStart && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
             {
                 recordBytes = checked(recordBytes + quote.Length);
                 atFieldStart = false;
                 inQuotes = true;
                 continue;
             }
-            if (await reader.TryConsumeAsync(recordSeparator, cancellationToken))
+            if (await reader.TryConsumeAsync(recordSeparator, cancellationToken).ConfigureAwait(false))
             {
                 recordBytes = checked(recordBytes + recordSeparator.Length);
                 batchBytes = checked(batchBytes + recordBytes);
@@ -813,14 +819,14 @@ internal static class BlobQueryProtocol
                 }
                 continue;
             }
-            if (await reader.TryConsumeAsync(columnSeparator, cancellationToken))
+            if (await reader.TryConsumeAsync(columnSeparator, cancellationToken).ConfigureAwait(false))
             {
                 recordBytes = checked(recordBytes + columnSeparator.Length);
                 atFieldStart = true;
                 continue;
             }
 
-            _ = await reader.ReadByteAsync(cancellationToken);
+            _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
             recordBytes = checked(recordBytes + 1);
             atFieldStart = false;
         }
@@ -840,7 +846,7 @@ internal static class BlobQueryProtocol
     {
         if (format.Kind == BlobQueryFormatKind.Parquet)
         {
-            await foreach (var row in ReadParquetRowsAsync(input, cancellationToken))
+            await foreach (var row in ReadParquetRowsAsync(input, cancellationToken).ConfigureAwait(false))
                 yield return row;
             yield break;
         }
@@ -856,7 +862,7 @@ internal static class BlobQueryProtocol
         {
             string[]? headers = null;
             var rowNumber = 0L;
-            await foreach (var fields in ReadDelimitedRowsAsync(reader, format, cancellationToken))
+            await foreach (var fields in ReadDelimitedRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
             {
                 rowNumber++;
                 if (headers is null && format.HasHeaders)
@@ -876,7 +882,7 @@ internal static class BlobQueryProtocol
         }
 
         var position = 0L;
-        await foreach (var record in ReadRawRecordsAsync(reader, format.RecordSeparator, cancellationToken))
+        await foreach (var record in ReadRawRecordsAsync(reader, format.RecordSeparator, cancellationToken).ConfigureAwait(false))
         {
             if (string.IsNullOrWhiteSpace(record))
             {
@@ -933,7 +939,7 @@ internal static class BlobQueryProtocol
         {
             while (true)
             {
-                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
+                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                     break;
 
@@ -989,7 +995,7 @@ internal static class BlobQueryProtocol
                     if (EndsWith(field, format.RecordSeparator))
                     {
                         field.Length -= format.RecordSeparator.Length;
-                        if (format.RecordSeparator == "\n" && field.Length > 0 && field[^1] == '\r')
+                        if (string.Equals(format.RecordSeparator, "\n", StringComparison.Ordinal) && field.Length > 0 && field[^1] == '\r')
                             field.Length--;
                         fields.Add(field.ToString());
                         field.Clear();
@@ -1033,7 +1039,7 @@ internal static class BlobQueryProtocol
         {
             while (true)
             {
-                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
+                var read = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                     break;
                 for (var index = 0; index < read; index++)
@@ -1044,7 +1050,7 @@ internal static class BlobQueryProtocol
                     if (!EndsWith(record, separator))
                         continue;
                     record.Length -= separator.Length;
-                    if (separator == "\n" && record.Length > 0 && record[^1] == '\r')
+                    if (string.Equals(separator, "\n", StringComparison.Ordinal) && record.Length > 0 && record[^1] == '\r')
                         record.Length--;
                     yield return record.ToString();
                     record.Clear();
@@ -1152,7 +1158,7 @@ internal static class BlobQueryProtocol
     }
 
     private static XElement? Child(XElement? parent, string name) =>
-        parent?.Elements().FirstOrDefault(element => element.Name.LocalName == name);
+        parent?.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, name, StringComparison.Ordinal));
 
     private static string? ChildValue(XElement? parent, string name) => Child(parent, name)?.Value;
 
@@ -1187,7 +1193,7 @@ internal static class BlobQueryProtocol
 
         public async ValueTask<int> ConsumeUtf8ScalarAsync(CancellationToken cancellationToken)
         {
-            var first = await ReadByteAsync(cancellationToken);
+            var first = await ReadByteAsync(cancellationToken).ConfigureAwait(false);
             if (first < 0)
                 return 0;
             var length = first switch
@@ -1199,7 +1205,7 @@ internal static class BlobQueryProtocol
                 _ => 1
             };
             var consumed = 1;
-            while (consumed < length && await ReadByteAsync(cancellationToken) >= 0)
+            while (consumed < length && await ReadByteAsync(cancellationToken).ConfigureAwait(false) >= 0)
                 consumed++;
             return consumed;
         }
@@ -1220,10 +1226,10 @@ internal static class BlobQueryProtocol
         private async ValueTask<bool> TryConsumeSlowAsync(
             byte[] value,
             CancellationToken cancellationToken) =>
-            await EnsureAsync(value.Length, cancellationToken) && TryConsumeBuffered(value);
+            await EnsureAsync(value.Length, cancellationToken).ConfigureAwait(false) && TryConsumeBuffered(value);
 
         private async ValueTask<int> ReadByteSlowAsync(CancellationToken cancellationToken) =>
-            await EnsureAsync(1, cancellationToken) ? _buffer[_start++] : -1;
+            await EnsureAsync(1, cancellationToken).ConfigureAwait(false) ? _buffer[_start++] : -1;
 
         private ValueTask<bool> EnsureAsync(int count, CancellationToken cancellationToken)
         {
@@ -1244,7 +1250,7 @@ internal static class BlobQueryProtocol
             }
             while (_end < count && !_endOfStream)
             {
-                var read = await input.ReadAsync(_buffer.AsMemory(_end), cancellationToken);
+                var read = await input.ReadAsync(_buffer.AsMemory(_end), cancellationToken).ConfigureAwait(false);
                 if (read == 0)
                 {
                     _endOfStream = true;
@@ -1294,7 +1300,7 @@ internal sealed class BlobQueryAvroDataStream(
         int count,
         CancellationToken cancellationToken)
     {
-        await WriteAsync(buffer.AsMemory(offset, count), cancellationToken);
+        await WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
     }
 
     public override async ValueTask WriteAsync(
@@ -1303,7 +1309,7 @@ internal sealed class BlobQueryAvroDataStream(
     {
         if (!cancellationToken.CanBeCanceled || cancellationToken == requestCancellationToken)
         {
-            await writer.AppendDataAsync(buffer, requestCancellationToken);
+            await writer.AppendDataAsync(buffer, requestCancellationToken).ConfigureAwait(false);
             _position += buffer.Length;
             return;
         }
@@ -1311,7 +1317,7 @@ internal sealed class BlobQueryAvroDataStream(
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             requestCancellationToken,
             cancellationToken);
-        await writer.AppendDataAsync(buffer, linked.Token);
+        await writer.AppendDataAsync(buffer, linked.Token).ConfigureAwait(false);
         _position += buffer.Length;
     }
 
@@ -1349,20 +1355,20 @@ internal sealed class BlobQueryAvroWriter(Stream destination)
         WriteBytes(header, "null"u8);
         WriteLong(header, 0);
         header.Write(_syncMarker);
-        await destination.WriteAsync(header.GetBuffer().AsMemory(0, checked((int)header.Length)), cancellationToken);
+        await destination.WriteAsync(header.GetBuffer().AsMemory(0, checked((int)header.Length)), cancellationToken).ConfigureAwait(false);
     }
 
     public async Task AppendDataAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
         EnsureWritable();
         if (_data.Length > 0 && _data.Length + data.Length > DataBlockSize)
-            await FlushDataAsync(cancellationToken);
+            await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         if (data.Length >= DataBlockSize)
         {
-            await WriteRecordAsync(0, payload => WriteBytes(payload, data.Span), cancellationToken);
+            await WriteRecordAsync(0, payload => WriteBytes(payload, data.Span), cancellationToken).ConfigureAwait(false);
             return;
         }
-        await _data.WriteAsync(data, cancellationToken);
+        await _data.WriteAsync(data, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task WriteErrorAsync(
@@ -1373,27 +1379,27 @@ internal sealed class BlobQueryAvroWriter(Stream destination)
         CancellationToken cancellationToken)
     {
         EnsureWritable();
-        await FlushDataAsync(cancellationToken);
+        await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         await WriteRecordAsync(1, payload =>
         {
             payload.WriteByte(fatal ? (byte)1 : (byte)0);
             WriteString(payload, name);
             WriteString(payload, description);
             WriteLong(payload, position);
-        }, cancellationToken);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task CompleteAsync(long totalBytes, CancellationToken cancellationToken)
     {
         EnsureWritable();
-        await FlushDataAsync(cancellationToken);
+        await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         await WriteRecordAsync(2, payload =>
         {
             WriteLong(payload, totalBytes);
             WriteLong(payload, totalBytes);
-        }, cancellationToken);
-        await WriteRecordAsync(3, payload => WriteLong(payload, totalBytes), cancellationToken);
-        await destination.FlushAsync(cancellationToken);
+        }, cancellationToken).ConfigureAwait(false);
+        await WriteRecordAsync(3, payload => WriteLong(payload, totalBytes), cancellationToken).ConfigureAwait(false);
+        await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
         _completed = true;
     }
 
@@ -1402,7 +1408,7 @@ internal sealed class BlobQueryAvroWriter(Stream destination)
         if (_data.Length == 0)
             return;
         var length = checked((int)_data.Length);
-        await WriteRecordAsync(0, payload => WriteBytes(payload, _data.GetBuffer().AsSpan(0, length)), cancellationToken);
+        await WriteRecordAsync(0, payload => WriteBytes(payload, _data.GetBuffer().AsSpan(0, length)), cancellationToken).ConfigureAwait(false);
         _data.SetLength(0);
     }
 
@@ -1421,7 +1427,7 @@ internal sealed class BlobQueryAvroWriter(Stream destination)
         payload.Position = 0;
         payload.CopyTo(block);
         block.Write(_syncMarker);
-        await destination.WriteAsync(block.GetBuffer().AsMemory(0, checked((int)block.Length)), cancellationToken);
+        await destination.WriteAsync(block.GetBuffer().AsMemory(0, checked((int)block.Length)), cancellationToken).ConfigureAwait(false);
     }
 
     private void EnsureWritable()
@@ -1985,14 +1991,14 @@ internal sealed class BlobQueryPlan
 
         try
         {
-            if (operation == "+" && IsTimestamp(left) && TryTimestamp(left, out var leftTimestamp) && TryDouble(right, out var rightDays))
+            if (string.Equals(operation, "+", StringComparison.Ordinal) && IsTimestamp(left) && TryTimestamp(left, out var leftTimestamp) && TryDouble(right, out var rightDays))
                 return new QueryCell(leftTimestamp.AddDays(rightDays));
-            if (operation == "+" && TryDouble(left, out var leftDays) && IsTimestamp(right) && TryTimestamp(right, out var rightTimestamp))
+            if (string.Equals(operation, "+", StringComparison.Ordinal) && TryDouble(left, out var leftDays) && IsTimestamp(right) && TryTimestamp(right, out var rightTimestamp))
                 return new QueryCell(rightTimestamp.AddDays(leftDays));
-            if (operation == "-" && IsTimestamp(left) && TryTimestamp(left, out leftTimestamp) && TryDouble(right, out rightDays))
+            if (string.Equals(operation, "-", StringComparison.Ordinal) && IsTimestamp(left) && TryTimestamp(left, out leftTimestamp) && TryDouble(right, out rightDays))
                 return new QueryCell(leftTimestamp.AddDays(-rightDays));
 
-            if (left.Value is long leftInteger && right.Value is long rightInteger && operation != "/")
+            if (left.Value is long leftInteger && right.Value is long rightInteger && !string.Equals(operation, "/", StringComparison.Ordinal))
             {
                 return operation switch
                 {
@@ -2060,7 +2066,7 @@ internal sealed class BlobQueryPlan
         IReadOnlyList<QueryExpression> arguments,
         QueryRow row)
     {
-        if (name == "COALESCE")
+        if (string.Equals(name, "COALESCE", StringComparison.Ordinal))
         {
             foreach (var argument in arguments)
             {
@@ -2071,11 +2077,11 @@ internal sealed class BlobQueryPlan
             return new QueryCell(null);
         }
 
-        if (name == "UTCNOW")
+        if (string.Equals(name, "UTCNOW", StringComparison.Ordinal))
             return new QueryCell(DateTimeOffset.UtcNow);
 
         var first = arguments[0].Evaluate(row);
-        if (name == "NULLIF")
+        if (string.Equals(name, "NULLIF", StringComparison.Ordinal))
         {
             var second = arguments[1].Evaluate(row);
             return !first.IsNullLike && !second.IsNullLike && CompareValues(first, second) == 0
@@ -2860,7 +2866,7 @@ internal sealed class BlobQueryPlan
                     if (double.TryParse(token.Text, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) && double.IsFinite(number))
                         return new QueryOperand(null, new QueryCell(number));
                     throw InvalidQuery(token.Position, $"The numeric literal '{token.Text}' is invalid.");
-                case QueryTokenKind.Symbol when token.Text == "(":
+                case QueryTokenKind.Symbol when string.Equals(token.Text, "(", StringComparison.Ordinal):
                     var nested = ParseExpression();
                     ExpectSymbol(")");
                     return nested;
@@ -2871,7 +2877,7 @@ internal sealed class BlobQueryPlan
 
         private QueryExpression ParseAggregateExpression(QueryToken token, string function)
         {
-            var countStar = function == "COUNT" && MatchSymbol("*");
+            var countStar = string.Equals(function, "COUNT", StringComparison.Ordinal) && MatchSymbol("*");
             QueryExpression? operand = null;
             if (!countStar)
                 operand = ParseExpression();
@@ -2976,10 +2982,10 @@ internal sealed class BlobQueryPlan
         private bool IsSysSplitStart() =>
             _position + 2 < _tokens.Count &&
             _tokens[_position].Kind == QueryTokenKind.Symbol &&
-            _tokens[_position].Text == "." &&
+string.Equals(_tokens[_position].Text, ".", StringComparison.Ordinal) &&
             IsKeyword(_tokens[_position + 1], "split") &&
             _tokens[_position + 2].Kind == QueryTokenKind.Symbol &&
-            _tokens[_position + 2].Text == "(";
+string.Equals(_tokens[_position + 2].Text, "(", StringComparison.Ordinal);
 
         private bool MatchKeyword(string value)
         {
@@ -2997,7 +3003,7 @@ internal sealed class BlobQueryPlan
 
         private bool MatchSymbol(string value)
         {
-            if (Current.Kind != QueryTokenKind.Symbol || Current.Text != value)
+            if (Current.Kind != QueryTokenKind.Symbol || !string.Equals(Current.Text, value, StringComparison.Ordinal))
                 return false;
             _position++;
             return true;
@@ -3065,9 +3071,9 @@ internal sealed class BlobQueryPlan
             {
                 if (tokens[index].Kind == QueryTokenKind.Symbol)
                 {
-                    if (tokens[index].Text == "(")
+                    if (string.Equals(tokens[index].Text, "(", StringComparison.Ordinal))
                         depth++;
-                    else if (tokens[index].Text == ")")
+                    else if (string.Equals(tokens[index].Text, ")", StringComparison.Ordinal))
                         depth--;
                     continue;
                 }
@@ -3082,16 +3088,16 @@ internal sealed class BlobQueryPlan
                     return null;
                 }
                 index++;
-                if (index < tokens.Count && tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == "[")
+                if (index < tokens.Count && tokens[index].Kind == QueryTokenKind.Symbol && string.Equals(tokens[index].Text, "[", StringComparison.Ordinal))
                 {
                     index += 3;
                 }
                 while (index + 1 < tokens.Count &&
-                       tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == ".")
+                       tokens[index].Kind == QueryTokenKind.Symbol && string.Equals(tokens[index].Text, ".", StringComparison.Ordinal))
                 {
                     index += 2;
                     while (index < tokens.Count &&
-                           tokens[index].Kind == QueryTokenKind.Symbol && tokens[index].Text == "[")
+                           tokens[index].Kind == QueryTokenKind.Symbol && string.Equals(tokens[index].Text, "[", StringComparison.Ordinal))
                     {
                         index += 3;
                     }

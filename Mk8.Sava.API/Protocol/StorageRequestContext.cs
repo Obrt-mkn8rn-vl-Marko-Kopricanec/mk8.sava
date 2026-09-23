@@ -60,11 +60,11 @@ public sealed class RequestContextMiddleware(
         if (context.Request.Path.StartsWithSegments("/health") ||
             context.Request.Path.StartsWithSegments("/metrics"))
         {
-            await next(context);
+            await next(context).ConfigureAwait(false);
             return;
         }
 
-        var parsed = await ParseAsync(context);
+        var parsed = await ParseAsync(context).ConfigureAwait(false);
         StorageRequestContext.Set(context, parsed.Context);
         if (!context.Request.IsHttps &&
             _options.AccountCapabilities.TryGetValue(parsed.Context.Account, out var capabilities) &&
@@ -77,10 +77,10 @@ public sealed class RequestContextMiddleware(
                               HttpMethods.IsOptions(context.Request.Method);
         parsed.Context.Authorization = parsed.Context.ResourceKind == StorageResourceKind.StaticWebsite || isCorsPreflight
             ? StorageAuthorization.Anonymous
-            : await authenticator.AuthenticateAsync(context, parsed.Context, context.RequestAborted);
+            : await authenticator.AuthenticateAsync(context, parsed.Context, context.RequestAborted).ConfigureAwait(false);
         ValidateAuthorizationVersion(parsed);
         AzureExceptionMiddleware.AddCommonHeaders(context);
-        await next(context);
+        await next(context).ConfigureAwait(false);
     }
 
     private async Task<ParsedRequest> ParseAsync(HttpContext context)
@@ -135,7 +135,7 @@ public sealed class RequestContextMiddleware(
         var (serviceVersion, versionSource) = await ResolveServiceVersionAsync(
             context.Request,
             account,
-            context.RequestAborted);
+            context.RequestAborted).ConfigureAwait(false);
         var request = new StorageRequestContext
         {
             RequestId = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(16)),
@@ -187,7 +187,7 @@ public sealed class RequestContextMiddleware(
             }
         }
 
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         if (!string.IsNullOrEmpty(properties.DefaultServiceVersion))
         {
             return (

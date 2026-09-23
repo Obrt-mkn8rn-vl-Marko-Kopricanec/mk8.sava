@@ -61,7 +61,7 @@ internal sealed class BlobSeekableReadStream(
             _position,
             count,
             destination,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         if (destination.Position != count)
             throw new EndOfStreamException("The blob content ended before the requested query range.");
         _position += count;

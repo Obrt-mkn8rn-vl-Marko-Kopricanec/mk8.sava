@@ -48,7 +48,7 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
         Memory<byte> buffer,
         CancellationToken cancellationToken = default)
     {
-        var read = await inner.ReadAsync(buffer, cancellationToken);
+        var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         Append(buffer.Span[..read]);
         return read;
     }

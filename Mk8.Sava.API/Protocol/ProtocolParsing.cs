@@ -186,9 +186,9 @@ internal static class ProtocolParsing
     public static async Task<Dictionary<string, string>> ReadTagsBodyAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
         var tags = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var tag in document.Descendants().Where(element => element.Name.LocalName == "Tag"))
+        foreach (var tag in document.Descendants().Where(element => string.Equals(element.Name.LocalName, "Tag", StringComparison.Ordinal)))
         {
             var key = ChildValue(tag, "Key");
             var value = ChildValue(tag, "Value");
@@ -206,33 +206,33 @@ internal static class ProtocolParsing
     public static async Task<IReadOnlyList<BlockListEntry>> ReadBlockListAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body, MaximumBlockListXmlCharacters);
-        if (await reader.MoveToContentAsync() != XmlNodeType.Element || reader.LocalName != "BlockList")
+        if (await reader.MoveToContentAsync().ConfigureAwait(false) != XmlNodeType.Element || !string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
         var blocks = new List<BlockListEntry>();
         var rootDepth = reader.Depth;
         if (reader.IsEmptyElement)
         {
-            await reader.ReadAsync();
-            await EnsureEndOfXmlDocumentAsync(reader, cancellationToken);
+            await reader.ReadAsync().ConfigureAwait(false);
+            await EnsureEndOfXmlDocumentAsync(reader, cancellationToken).ConfigureAwait(false);
             return blocks;
         }
 
-        await reader.ReadAsync();
+        await reader.ReadAsync().ConfigureAwait(false);
         while (!reader.EOF)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (reader.NodeType is XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace)
             {
-                await reader.ReadAsync();
+                await reader.ReadAsync().ConfigureAwait(false);
                 continue;
             }
             if (reader.NodeType == XmlNodeType.EndElement &&
                 reader.Depth == rootDepth &&
-                reader.LocalName == "BlockList")
+string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
             {
-                await reader.ReadAsync();
-                await EnsureEndOfXmlDocumentAsync(reader, cancellationToken);
+                await reader.ReadAsync().ConfigureAwait(false);
+                await EnsureEndOfXmlDocumentAsync(reader, cancellationToken).ConfigureAwait(false);
                 return blocks;
             }
             if (reader.NodeType != XmlNodeType.Element || reader.Depth != rootDepth + 1)
@@ -256,7 +256,7 @@ internal static class ProtocolParsing
             string blockId;
             try
             {
-                blockId = await reader.ReadElementContentAsStringAsync();
+                blockId = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
             }
             catch (InvalidOperationException)
             {
@@ -271,11 +271,12 @@ internal static class ProtocolParsing
     public static async Task<Dictionary<string, StoredAccessPolicy>> ReadAclAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
         var policies = new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal);
         var root = document.Root;
-        if (root?.Name.LocalName != "SignedIdentifiers" ||
-            root.Elements().Any(element => element.Name.LocalName != "SignedIdentifier"))
+        if (root is null ||
+            !string.Equals(root.Name.LocalName, "SignedIdentifiers", StringComparison.Ordinal) ||
+            root.Elements().Any(element => !string.Equals(element.Name.LocalName, "SignedIdentifier", StringComparison.Ordinal)))
         {
             throw InvalidAclXml();
         }
@@ -314,11 +315,11 @@ internal static class ProtocolParsing
         CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
-        if (document.Root?.Name.LocalName != "KeyInfo")
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
+        var root = document.Root;
+        if (root is null || !string.Equals(root.Name.LocalName, "KeyInfo", StringComparison.Ordinal))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
-        var root = document.Root;
         ValidateUniqueChildren(root);
         ValidateKnownChildren(root, "Start", "Expiry", "DelegatedUserTid");
         var startsAt = ParseRequiredDate(ChildValue(root, "Start"), "Start");
@@ -343,9 +344,9 @@ internal static class ProtocolParsing
         CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
         var root = document.Root;
-        if (root?.Name.LocalName != "StorageServiceProperties")
+        if (root is null || !string.Equals(root.Name.LocalName, "StorageServiceProperties", StringComparison.Ordinal))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
 
         if (!DateOnly.TryParseExact(
@@ -605,7 +606,7 @@ internal static class ProtocolParsing
             cancellationToken.ThrowIfCancellationRequested();
             if (reader.NodeType is not (XmlNodeType.Whitespace or XmlNodeType.SignificantWhitespace or XmlNodeType.None))
                 throw InvalidBlockListXml();
-            await reader.ReadAsync();
+            await reader.ReadAsync().ConfigureAwait(false);
         }
     }
 
@@ -685,7 +686,7 @@ internal static class ProtocolParsing
         ValidateUniqueChildren(element);
         ValidateKnownChildren(element, "Version", "Enabled", "IncludeAPIs", "RetentionPolicy");
         var version = RequiredText(element, "Version");
-        if (version != "1.0")
+        if (!string.Equals(version, "1.0", StringComparison.Ordinal))
             throw InvalidServicePropertiesXml("The Storage Analytics version is invalid.");
         var enabled = ParseBool(RequiredText(element, "Enabled"), false);
         var includeApisValue = OptionalText(element, "IncludeAPIs");
@@ -785,7 +786,7 @@ internal static class ProtocolParsing
 
     private static bool IsValidCorsOrigin(string origin)
     {
-        if (origin == "*")
+        if (string.Equals(origin, "*", StringComparison.Ordinal))
             return true;
         var wildcardCount = origin.Count(character => character == '*');
         if (wildcardCount > 1)
@@ -793,12 +794,12 @@ internal static class ProtocolParsing
         var normalized = wildcardCount == 0
             ? origin
             : origin.Replace("://*.", "://cors-wildcard.", StringComparison.Ordinal);
-        if (wildcardCount == 1 && normalized == origin)
+        if (wildcardCount == 1 && string.Equals(normalized, origin, StringComparison.Ordinal))
             return false;
         return Uri.TryCreate(normalized, UriKind.Absolute, out var uri) &&
                uri.Scheme is "http" or "https" &&
                string.IsNullOrEmpty(uri.UserInfo) &&
-               uri.AbsolutePath == "/" &&
+string.Equals(uri.AbsolutePath, "/", StringComparison.Ordinal) &&
                string.IsNullOrEmpty(uri.Query) &&
                string.IsNullOrEmpty(uri.Fragment);
     }
@@ -874,12 +875,12 @@ internal static class ProtocolParsing
     private static string? OptionalText(XElement parent, string name) => Child(parent, name)?.Value;
 
     private static XElement? Child(XElement parent, string name) =>
-        parent.Elements().FirstOrDefault(element => element.Name.LocalName == name);
+        parent.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, name, StringComparison.Ordinal));
 
     private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
     private static string? ChildValue(XElement parent, string name) =>
-        parent.Elements().FirstOrDefault(element => element.Name.LocalName == name)?.Value;
+        parent.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, name, StringComparison.Ordinal))?.Value;
 
     private static AzureStorageException InvalidRange() => new(
         StatusCodes.Status416RangeNotSatisfiable,
