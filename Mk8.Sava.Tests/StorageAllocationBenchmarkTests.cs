@@ -1,0 +1,206 @@
+using System.Diagnostics;
+using System.Globalization;
+using Azure.Core.Pipeline;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Xunit.Abstractions;
+
+namespace Mk8.Sava.Tests;
+
+[CollectionDefinition("Storage allocation benchmark", DisableParallelization = true)]
+public sealed class StorageAllocationBenchmarkCollection;
+
+[Collection("Storage allocation benchmark")]
+public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
+{
+    [Fact]
+    public async Task OrdinarySdkWorkloadsReportFilesystemAllocationAgainstRawFiles()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            output.WriteLine("Allocated-byte benchmark requires GNU du on Linux; the other platform lanes are not measured here.");
+            return;
+        }
+
+        var rawRoot = Path.Combine(Path.GetTempPath(), $"mk8-sava-raw-baseline-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(rawRoot);
+        try
+        {
+            await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
+                ["Sava:MaintenanceScanInterval"] = "01:00:00",
+                ["Sava:MinimumChunkBytes"] = "65536",
+                ["Sava:TargetChunkBytes"] = "262144",
+                ["Sava:MaximumChunkBytes"] = "1048576",
+                ["Sava:SmallChunkPackingThresholdBytes"] = "49152",
+                ["Logging:LogLevel:Default"] = "Warning"
+            });
+            await application.InitializeAsync();
+            var account = SavaWebApplicationFactory.AccountName;
+            var endpoint = new Uri($"http://{account}.localhost");
+            var client = new BlobServiceClient(
+                endpoint,
+                new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
+                new BlobClientOptions
+                {
+                    Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+                    {
+                        BaseAddress = endpoint
+                    }),
+                    Retry = { MaxRetries = 0 }
+                });
+            var container = client.GetBlobContainerClient($"allocation-{Guid.NewGuid():N}");
+            await container.CreateAsync();
+
+            long logicalBytes = 0;
+            output.WriteLine("workload,logical_bytes,sava_allocated_bytes,raw_allocated_bytes,metadata_allocated_bytes,chunks_allocated_bytes,packs_allocated_bytes,staging_allocated_bytes,upload_ms,read_ms,process_cpu_ms,working_set_bytes");
+
+            async Task RecordAsync(string workload, Func<Task<(double UploadMs, double ReadMs)>> operation)
+            {
+                var cpuBefore = Process.GetCurrentProcess().TotalProcessorTime;
+                var timing = await operation();
+                var process = Process.GetCurrentProcess();
+                output.WriteLine(string.Join(',',
+                    workload,
+                    logicalBytes.ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(application.DataPath)).ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(rawRoot)).ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db")) +
+                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")) +
+                     await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")))
+                    .ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")))
+                    .ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "packs")))
+                    .ToString(CultureInfo.InvariantCulture),
+                    (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "staging")))
+                    .ToString(CultureInfo.InvariantCulture),
+                    timing.UploadMs.ToString("F3", CultureInfo.InvariantCulture),
+                    timing.ReadMs.ToString("F3", CultureInfo.InvariantCulture),
+                    (process.TotalProcessorTime - cpuBefore).TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture),
+                    process.WorkingSet64.ToString(CultureInfo.InvariantCulture)));
+            }
+
+            async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
+            {
+                var watch = Stopwatch.StartNew();
+                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromBytes(content), overwrite: true);
+                watch.Stop();
+                await File.WriteAllBytesAsync(Path.Combine(rawRoot, rawName), content);
+                logicalBytes = checked(logicalBytes + content.Length);
+                return watch.Elapsed.TotalMilliseconds;
+            }
+
+            async Task<double> VerifyAsync(string blobName, byte[] expected)
+            {
+                var watch = Stopwatch.StartNew();
+                var actual = await container.GetBlobClient(blobName).DownloadContentAsync();
+                watch.Stop();
+                Assert.Equal(expected, actual.Value.Content.ToArray());
+                return watch.Elapsed.TotalMilliseconds;
+            }
+
+            var duplicate = new byte[256 * 1024];
+            new Random(0x5100).NextBytes(duplicate);
+            await RecordAsync("eight_exact_duplicates", async () =>
+            {
+                double write = 0;
+                for (var index = 0; index < 8; index++)
+                    write += await UploadAsync($"duplicate-{index}.bin", $"duplicate-{index}.bin", duplicate);
+                return (write, await VerifyAsync("duplicate-7.bin", duplicate));
+            });
+
+            var sharedBase = new byte[2 * 1024 * 1024];
+            new Random(0x5101).NextBytes(sharedBase);
+            await RecordAsync("five_shifted_partials", async () =>
+            {
+                double write = 0;
+                byte[] latest = sharedBase;
+                for (var index = 0; index < 5; index++)
+                {
+                    latest = new byte[sharedBase.Length + 4096];
+                    sharedBase.AsSpan(0, 2048).CopyTo(latest);
+                    new Random(0x5200 + index).NextBytes(latest.AsSpan(2048, 4096));
+                    sharedBase.AsSpan(2048).CopyTo(latest.AsSpan(6144));
+                    write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest);
+                }
+                return (write, await VerifyAsync("partial-4.bin", latest));
+            });
+
+            await RecordAsync("eight_versions", async () =>
+            {
+                double write = 0;
+                byte[] latest = [];
+                for (var index = 0; index < 8; index++)
+                {
+                    latest = new byte[128 * 1024];
+                    latest.AsSpan().Fill((byte)('A' + index));
+                    write += await UploadAsync("versioned.bin", $"version-{index}.bin", latest);
+                }
+                return (write, await VerifyAsync("versioned.bin", latest));
+            });
+
+            await RecordAsync("one_hundred_twenty_eight_small", async () =>
+            {
+                double write = 0;
+                byte[] latest = [];
+                for (var index = 0; index < 128; index++)
+                {
+                    latest = new byte[80];
+                    new Random(0x5300 + index).NextBytes(latest);
+                    write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest);
+                }
+                return (write, await VerifyAsync("small-127.bin", latest));
+            });
+
+            await RecordAsync("four_incompressible", async () =>
+            {
+                double write = 0;
+                byte[] latest = [];
+                for (var index = 0; index < 4; index++)
+                {
+                    latest = new byte[512 * 1024];
+                    new Random(0x5400 + index).NextBytes(latest);
+                    write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest);
+                }
+                return (write, await VerifyAsync("random-3.bin", latest));
+            });
+        }
+        finally
+        {
+            Directory.Delete(rawRoot, recursive: true);
+        }
+    }
+
+    private static async Task<long> MeasureAllocatedBytesAsync(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path))
+            return 0;
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo("du")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            }
+        };
+        process.StartInfo.ArgumentList.Add("-s");
+        process.StartInfo.ArgumentList.Add("--block-size=1");
+        process.StartInfo.ArgumentList.Add("--");
+        process.StartInfo.ArgumentList.Add(path);
+        using (process)
+        {
+            process.Start();
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException($"du failed while measuring filesystem allocation: {error}");
+            var separator = output.IndexOf('\t');
+            if (separator < 0 || !long.TryParse(output.AsSpan(0, separator), CultureInfo.InvariantCulture, out var bytes))
+                throw new InvalidDataException("du returned an invalid allocated-byte measurement.");
+            return bytes;
+        }
+    }
+}

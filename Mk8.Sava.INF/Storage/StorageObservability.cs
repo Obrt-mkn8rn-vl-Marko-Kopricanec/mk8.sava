@@ -83,9 +83,9 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_http_request_duration_seconds_count", "Storage protocol requests represented by the duration sum.", Interlocked.Read(ref _requestCount));
         AppendMetric(builder, "mk8_sava_storage_logical_blob_bytes", "Logical bytes referenced by blob records.", usage.LogicalBlobBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_logical_uncommitted_block_bytes", "Logical bytes referenced by uncommitted blocks.", usage.LogicalStagedBlockBytes, gauge: true);
-        AppendMetric(builder, "mk8_sava_storage_physical_chunk_bytes", "Physical bytes occupied by standalone chunks and chunk packs.", usage.PhysicalChunkBytes, gauge: true);
-        AppendMetric(builder, "mk8_sava_storage_staging_bytes", "Physical bytes occupied by staging files.", usage.StagingBytes, gauge: true);
-        AppendMetric(builder, "mk8_sava_storage_metadata_bytes", "Physical bytes occupied by SQLite metadata and its journals.", usage.MetadataBytes, gauge: true);
+        AppendMetric(builder, "mk8_sava_storage_physical_chunk_bytes", "Serialized file lengths of standalone chunks and chunk packs, not allocated filesystem bytes.", usage.PhysicalChunkBytes, gauge: true);
+        AppendMetric(builder, "mk8_sava_storage_staging_bytes", "Serialized file lengths of staging files, not allocated filesystem bytes.", usage.StagingBytes, gauge: true);
+        AppendMetric(builder, "mk8_sava_storage_metadata_bytes", "Serialized file lengths of SQLite metadata and journals, not allocated filesystem bytes.", usage.MetadataBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_blob_records", "Blob, version, and snapshot records.", usage.BlobRecordCount, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_uncommitted_blocks", "Uncommitted block records.", usage.StagedBlockCount, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_unique_chunks", "Unique immutable chunk identities across standalone and packed storage.", usage.UniqueChunkCount, gauge: true);
