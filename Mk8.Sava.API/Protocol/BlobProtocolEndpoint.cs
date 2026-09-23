@@ -5284,6 +5284,10 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var hasCustomerKeyHeader = encodedKey is not null || encodedHash is not null || algorithm is not null;
         if (!hasCustomerKeyHeader)
             return new BlobEncryption(scope, null);
+        var context = StorageRequestContext.Get(request.HttpContext);
+        var service = request.HttpContext.RequestServices.GetRequiredService<BlobService>();
+        if (service.IsHierarchicalNamespaceEnabled(context.Account))
+            throw AzureStorageException.BlobOperationNotSupported();
         return ReadCustomerProvidedKey(request, write, scope, encodedKey, encodedHash, algorithm);
     }
 

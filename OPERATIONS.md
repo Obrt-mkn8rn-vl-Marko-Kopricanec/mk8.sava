@@ -482,6 +482,13 @@ account already enrolled in that preview. Without it, mk8.sava rejects snapshot
 creation, selectors, listings, source copies, and delete-snapshot options on the
 HNS account instead of applying flat-namespace behavior.
 
+Customer-provided encryption keys are unsupported on HNS accounts, per
+Microsoft's [storage-account feature support table](https://learn.microsoft.com/en-us/azure/storage/blobs/storage-feature-support-in-storage-accounts#standard-general-purpose-v2-accounts).
+Requests carrying the blob's `x-ms-encryption-key` headers are rejected there
+on writes and reads, before a new blob can be published. Encryption scopes
+remain supported on HNS accounts;
+flat-namespace customer-provided-key behavior is unchanged.
+
 `LastAccessTimeTrackingEnabled` emulates Azure's account-level last-access-time
 policy. Data writes update the persisted access time immediately. The first data
 read in a 24-hour window updates it; later reads in the same window do not. Get
