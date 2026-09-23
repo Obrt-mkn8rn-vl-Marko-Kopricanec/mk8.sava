@@ -8,9 +8,6 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
-[CollectionDefinition("Storage allocation benchmark", DisableParallelization = true)]
-public sealed class StorageAllocationBenchmarkCollection;
-
 [Collection("Storage allocation benchmark")]
 public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
 {
@@ -223,7 +220,8 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             StartInfo = new ProcessStartInfo("du")
             {
                 RedirectStandardOutput = true,
-                RedirectStandardError = true
+                RedirectStandardError = true,
+                UseShellExecute = false
             }
         };
         process.StartInfo.ArgumentList.Add("-s");
@@ -238,7 +236,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             await process.WaitForExitAsync().ConfigureAwait(false);
             if (process.ExitCode != 0)
                 throw new InvalidOperationException($"du failed while measuring filesystem allocation: {error}");
-            var separator = output.IndexOf('\t');
+            var separator = output.IndexOf('\t', StringComparison.Ordinal);
             if (separator < 0 || !long.TryParse(output.AsSpan(0, separator), CultureInfo.InvariantCulture, out var bytes))
                 throw new InvalidDataException("du returned an invalid allocated-byte measurement.");
             return bytes;

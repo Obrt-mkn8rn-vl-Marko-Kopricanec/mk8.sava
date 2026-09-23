@@ -888,7 +888,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             HttpRequestMessage request,
             CancellationToken cancellationToken)
         {
-            var path = request.RequestUri?.AbsolutePath;
+            var path = request.RequestUri?.AbsolutePath ?? string.Empty;
             var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(
                 request.RequestUri?.Query ?? string.Empty);
             if (query.TryGetValue("comp", out var component) && component == "blocklist")
@@ -925,7 +925,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             }
             if (string.Equals(path, "/page", StringComparison.Ordinal))
                 response.Headers.TryAddWithoutValidation("x-ms-blob-sequence-number", "42");
-            response.Headers.TryAddWithoutValidation("x-ms-meta-shape", path?.TrimStart('/'));
+            response.Headers.TryAddWithoutValidation("x-ms-meta-shape", path.TrimStart('/'));
             return Task.FromResult(response);
         }
 

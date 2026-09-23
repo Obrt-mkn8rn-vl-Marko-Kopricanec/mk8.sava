@@ -33,6 +33,10 @@ namespace Mk8.Sava.Tests;
 public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory)
     : IClassFixture<SavaWebApplicationFactory>
 {
+    private static readonly JsonSerializerOptions IndentedWebJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true
+    };
     private static readonly string[] RestoredTexts = ["second", "third"];
     private static readonly string[] DirectoryNames = ["alpha", "alpha/beta"];
     private static readonly string[] FileNames = ["alpha/beta/file.txt", "alpha/root.txt", "zeta.txt"];
@@ -2834,7 +2838,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 ]
             };
             await File.WriteAllTextAsync(manifestPath,
-                JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+                JsonSerializer.Serialize(manifest, JsonSerializerOptions.Web));
             var start = new ProcessStartInfo(
                 Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
             {
@@ -2976,7 +2980,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             boundaryRequest.Headers.TryAddWithoutValidation("x-ms-version", "2024-11-04");
             using var boundaryResponse = await transport.SendAsync(boundaryRequest);
             Assert.Equal(HttpStatusCode.OK, boundaryResponse.StatusCode);
-            Assert.Contains("<Key>state</Key><Value>updated</Value>", await boundaryResponse.Content.ReadAsStringAsync());
+            Assert.Contains("<Key>state</Key><Value>updated</Value>",
+                await boundaryResponse.Content.ReadAsStringAsync(), StringComparison.Ordinal);
         }
 
         using var legacyRequest = new HttpRequestMessage(HttpMethod.Get, AppendQuery(tagSas, "comp=tags"));
@@ -5373,7 +5378,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                       <DeleteRetentionPolicy>
                         <Enabled>true</Enabled>
                         <Days>7</Days>
-                        <AllowPermanentDelete>{enabled.ToString().ToLowerInvariant()}</AllowPermanentDelete>
+                        <AllowPermanentDelete>{(enabled ? "true" : "false")}</AllowPermanentDelete>
                       </DeleteRetentionPolicy>
                     </StorageServiceProperties>
                     """,
@@ -6798,7 +6803,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var replaced = false;
             for (var index = 0; index < pairs.Length; index++)
             {
-                var separator = pairs[index].IndexOf('=');
+                var separator = pairs[index].IndexOf('=', StringComparison.Ordinal);
                 var encodedName = separator < 0 ? pairs[index] : pairs[index][..separator];
                 if (!string.Equals(Uri.UnescapeDataString(encodedName), name, StringComparison.Ordinal))
                     continue;
@@ -10947,7 +10952,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.NotEqual(-1, value);
                 file.Position--;
                 file.WriteByte((byte)(value ^ 0xff));
+                // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
                 file.Flush(flushToDisk: true);
+#pragma warning restore CA1849
             }
         }
 
@@ -11177,7 +11185,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     Assert.NotEqual(-1, value);
                     corrupt.Position = 0;
                     corrupt.WriteByte((byte)(value ^ 0xff));
+                    // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
                     corrupt.Flush(flushToDisk: true);
+#pragma warning restore CA1849
                 }
             }
             var record = await blobs.GetBlobAsync(
@@ -11196,7 +11207,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
         finally
         {
+            // A failure before assignment leaves this nullable factory uninitialized.
+#pragma warning disable CA1508
             if (restarted is not null)
+#pragma warning restore CA1508
                 await restarted.DisposeAsync().ConfigureAwait(true);
             if (!initialDisposed)
                 await initial.DisposeAsync().ConfigureAwait(true);
@@ -11479,7 +11493,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     Assert.NotEqual(-1, value);
                     corrupt.Position--;
                     corrupt.WriteByte((byte)(value ^ 0xff));
+                    // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
                     corrupt.Flush(flushToDisk: true);
+#pragma warning restore CA1849
                 }
             }
             await Assert.ThrowsAsync<InvalidDataException>(() =>
@@ -13227,7 +13244,8 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         using var corsResponse = await client.SendAsync(corsRequest);
         Assert.Equal(HttpStatusCode.OK, corsResponse.StatusCode);
         Assert.Equal("https://client.example", corsResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
-        Assert.Contains("ETag", corsResponse.Headers.GetValues("Access-Control-Expose-Headers").Single());
+        Assert.Contains("ETag", corsResponse.Headers.GetValues("Access-Control-Expose-Headers").Single(),
+            StringComparison.Ordinal);
         Assert.Contains("Origin", corsResponse.Headers.Vary, StringComparer.Ordinal);
 
         using var wildcardRequest = new HttpRequestMessage(HttpMethod.Get, uri);
@@ -13752,7 +13770,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         {
             var manifest = new HierarchicalAclManifest { SchemaVersion = 1, Entries = [.. entries] };
             await File.WriteAllTextAsync(manifestPath,
-                JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web))).ConfigureAwait(false);
+                JsonSerializer.Serialize(manifest, JsonSerializerOptions.Web)).ConfigureAwait(false);
             return await application.Services.GetRequiredService<BlobService>()
                 .ApplyHierarchicalAclManifestAsync(manifestPath, CancellationToken.None).ConfigureAwait(false);
         }
@@ -13950,10 +13968,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         };
         await File.WriteAllBytesAsync(
             Path.Combine(backupPath, "backup-manifest.json"),
-            JsonSerializer.SerializeToUtf8Bytes(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)
-            {
-                WriteIndented = true
-            })).ConfigureAwait(false);
+            JsonSerializer.SerializeToUtf8Bytes(manifest, IndentedWebJsonOptions)).ConfigureAwait(false);
     }
 
     private static string ListIdentity(BlobRecord item) =>
@@ -13998,7 +14013,10 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
                      .OrderBy(header => header.Key, StringComparer.OrdinalIgnoreCase))
         {
             canonicalHeaders
+                // Azure Shared Key Lite signs canonical lowercase header names.
+#pragma warning disable CA1308
                 .Append(header.Key.ToLowerInvariant())
+#pragma warning restore CA1308
                 .Append(':')
                 .AppendJoin(',', header.Value.Select(value => string.Join(
                     ' ',
@@ -14015,7 +14033,10 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         {
             canonicalResource
                 .Append('\n')
+                // Azure Shared Key Lite signs canonical lowercase query names.
+#pragma warning disable CA1308
                 .Append(parameter.Key.ToLowerInvariant())
+#pragma warning restore CA1308
                 .Append(':')
                 .AppendJoin(',', parameter.Value.OrderBy(value => value, StringComparer.Ordinal));
         }
@@ -14219,7 +14240,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
             Interlocked.Add(ref _utcTicks, value.Ticks);
     }
 
-    private static IReadOnlyList<string> ParseAnalyticsLogFields(string record)
+    private static List<string> ParseAnalyticsLogFields(string record)
     {
         var fields = new List<string>();
         var field = new StringBuilder();

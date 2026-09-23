@@ -9,18 +9,6 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class LiveAzureFactAttribute : FactAttribute
-{
-    public const string ConnectionStringVariable = "MK8_SAVA_LIVE_AZURE_BLOB_CONNECTION_STRING";
-    public const string HnsConnectionStringVariable = "MK8_SAVA_LIVE_AZURE_HNS_CONNECTION_STRING";
-
-    public LiveAzureFactAttribute(string connectionStringVariable = ConnectionStringVariable)
-    {
-        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(connectionStringVariable)))
-            Skip = $"Set {connectionStringVariable} to a disposable Azure test account.";
-    }
-}
-
 public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
 {
     [Fact]
@@ -108,7 +96,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Trait("Category", "LiveAzure")]
     public async Task FlatNamespaceSdkStateAndErrorsMatchLiveAzure()
     {
-        var connectionString = Environment.GetEnvironmentVariable(LiveAzureFactAttribute.ConnectionStringVariable)
+        var connectionString = Environment.GetEnvironmentVariable(LiveAzureFactAttribute.DefaultConnectionStringVariable)
                                ?? throw new InvalidOperationException("The live Azure test account was removed after discovery.");
 
         var remote = new BlobServiceClient(connectionString, new BlobClientOptions(
@@ -184,7 +172,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     [Trait("Category", "LiveAzure")]
     public async Task FlatAuthorizationAndConcurrencyMatchLiveAzure()
     {
-        var connectionString = Environment.GetEnvironmentVariable(LiveAzureFactAttribute.ConnectionStringVariable)
+        var connectionString = Environment.GetEnvironmentVariable(LiveAzureFactAttribute.DefaultConnectionStringVariable)
                                ?? throw new InvalidOperationException("The live Azure test account was removed after discovery.");
         var remote = new BlobServiceClient(connectionString, new BlobClientOptions(
             BlobClientOptions.ServiceVersion.V2023_11_03)
