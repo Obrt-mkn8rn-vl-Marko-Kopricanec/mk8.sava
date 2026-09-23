@@ -65,6 +65,7 @@ public sealed class StorageAuthenticator(
     ILogger<StorageAuthenticator> logger)
 {
     public const string BearerScheme = "StorageBearer";
+    private static readonly IReadOnlySet<string> NoGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
     private readonly SavaOptions _options = options.Value;
 
@@ -251,11 +252,16 @@ public sealed class StorageAuthenticator(
         {
             try
             {
-                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureOwnerReadAsync(
+                var groups = principal.FindAll("groups")
+                    .Select(claim => claim.Value)
+                    .Where(value => Guid.TryParse(value, out _))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
                     metadata,
                     context.Request,
                     request,
                     objectId,
+                    groups,
                     "r",
                     context.RequestAborted);
                 aclReadChecked = true;
@@ -699,11 +705,12 @@ public sealed class StorageAuthenticator(
         string? aclAuthorizedGenerationId = null;
         if (aclObjectId is not null)
         {
-            aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureOwnerReadAsync(
+            aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
                 metadata,
                 context.Request,
                 request,
                 aclObjectId,
+                NoGroups,
                 permissions,
                 cancellationToken);
         }

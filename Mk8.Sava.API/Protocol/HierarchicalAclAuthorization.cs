@@ -13,11 +13,12 @@ internal static class HierarchicalAclAuthorization
         }
     }
 
-    internal static async Task<string?> EnsureOwnerReadAsync(
+    internal static async Task<string?> EnsureReadAsync(
         MetadataStore metadata,
         HttpRequest http,
         StorageRequestContext request,
         string objectId,
+        IReadOnlySet<string> groups,
         string signedPermissions,
         CancellationToken cancellationToken)
     {
@@ -36,7 +37,8 @@ internal static class HierarchicalAclAuthorization
             request.Container,
             includeDeleted: false,
             cancellationToken);
-        if (root is null || !HasOwnerPermission(root.Owner, "rwxr-x---", objectId, 'x'))
+        if (root is null ||
+            !PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'x'))
             throw AzureStorageException.AuthorizationFailure();
 
         var blob = await metadata.GetBlobAsync(
@@ -79,7 +81,13 @@ internal static class HierarchicalAclAuthorization
             if (directory is null && blob is null)
                 return null;
             if (directory is null || !directory.IsDirectory ||
-                !HasOwnerPermission(directory.Owner, directory.Permissions, objectId, 'x'))
+                !PosixAccessControl.Allows(
+                    directory.Acl,
+                    directory.Owner,
+                    directory.Group,
+                    objectId,
+                    groups,
+                    'x'))
             {
                 throw AzureStorageException.AuthorizationFailure();
             }
@@ -87,23 +95,18 @@ internal static class HierarchicalAclAuthorization
         }
 
         if (blob is not null &&
-            (blob.IsDirectory || !HasOwnerPermission(blob.Owner, blob.Permissions, objectId, 'r')))
+            (blob.IsDirectory ||
+             !PosixAccessControl.Allows(
+                 blob.Acl,
+                 blob.Owner,
+                 blob.Group,
+                 objectId,
+                 groups,
+                 'r')))
         {
             throw AzureStorageException.AuthorizationFailure();
         }
         return blob?.GenerationId;
     }
 
-    private static bool HasOwnerPermission(
-        string owner,
-        string permissions,
-        string objectId,
-        char permission)
-    {
-        var index = "rwx".IndexOf(permission);
-        return index >= 0 &&
-               permissions.Length >= 3 &&
-               permissions[index] == permission &&
-               string.Equals(owner, objectId, StringComparison.OrdinalIgnoreCase);
-    }
 }

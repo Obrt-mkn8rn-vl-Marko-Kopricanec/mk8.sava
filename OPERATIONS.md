@@ -207,12 +207,14 @@ when the delegation-key owner has the explicit
 it attributes new file ownership to the signed authorized object ID without
 an additional POSIX ACL check. A signed `suoid` currently supports only Get
 Blob and Get Blob Properties for an existing file (or a missing target beneath
-traversable parents): the impersonated object ID must be the owning user of the
-container root and every parent directory with execute permission, and of the
-file with read permission. The delegation-key owner still needs the explicit
-ownership grant and the token still needs `r`; signing or changing the object
-ID cannot bypass the ACL check. Other `suoid` operations and group/named-user
-ACL grants remain fail-closed pending the full POSIX authorization model.
+traversable parents): the impersonated object ID needs execute permission on
+the container root and every parent directory, and read permission on the
+file. Owner and stored named-user ACL entries are evaluated, including the
+mask; `suoid` alone does not carry group membership evidence. The
+delegation-key owner still needs the explicit ownership grant and the token
+still needs `r`; signing or changing the object ID cannot bypass the ACL
+check. Other `suoid` operations remain fail-closed pending the full POSIX
+authorization model.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,
@@ -525,14 +527,19 @@ delegation SAS creations use the authenticated object ID. A new path inherits
 its owning group from its parent directory (or the container root), while an
 overwrite keeps the existing path's owner and group. The current Blob-only
 surface retains the default POSIX permissions and ACL for files and
-directories; it does not implement the separate `dfs` ACL mutation protocol.
+directories. Stored custom access ACLs are evaluated for owner, named user,
+owning/named group, mask, and other entries, and survive blob overwrite. There
+is not yet a supported deployment provisioning path for those custom ACLs or
+default-ACL inheritance, and the separate `dfs` ACL mutation protocol is not
+implemented.
 For Get Blob and Get Blob Properties, a trusted bearer principal without a
-configured RBAC read grant can fall back to the same owner-only root/parent
+configured RBAC read grant can fall back to the same root/parent
 execute and file-read ACL check used for `suoid`, but only when its signed
 token contains a valid Entra `oid` claim. A `sub` or application ID is not an
 ACL identity. A configured RBAC read grant still authorizes without an ACL
-check. Bearer ACL fallback for other operations and group/named-user entries
-remains incomplete.
+check. Signed bearer `groups` claims can satisfy stored owning/named-group
+entries; group memberships absent from the token are not resolved. Bearer ACL
+fallback for other operations remains incomplete.
 For both bearer fallback and signed `suoid` reads, the ACL decision is bound to
 the blob generation served by the endpoint. A replacement or a blob created
 after authorization cannot turn an allowed read of an older or missing target

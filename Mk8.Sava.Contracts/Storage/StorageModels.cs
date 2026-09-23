@@ -67,6 +67,10 @@ public sealed record ContainerRecord
     public required DateTimeOffset LastModified { get; init; }
     public string Owner { get; init; } = "$superuser";
     public string Group { get; init; } = "$superuser";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? AccessAcl { get; init; }
+    [JsonIgnore]
+    public string Acl => AccessAcl ?? "user::rwx,group::r-x,other::---";
     public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public Dictionary<string, StoredAccessPolicy> AccessPolicies { get; init; } = new(StringComparer.Ordinal);
     public string? PublicAccess { get; init; }
@@ -103,12 +107,16 @@ public sealed record BlobRecord
     public bool IsDirectory { get; init; }
     public string Owner { get; init; } = "$superuser";
     public string Group { get; init; } = "$superuser";
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? AccessAcl { get; init; }
     [JsonIgnore]
-    public string Permissions => IsDirectory ? "rwxr-x---" : "rw-r-----";
+    public string Permissions => AccessAcl is null
+        ? IsDirectory ? "rwxr-x---" : "rw-r-----"
+        : PosixAccessControl.FormatMode(AccessAcl);
     [JsonIgnore]
-    public string Acl => IsDirectory
+    public string Acl => AccessAcl ?? (IsDirectory
         ? "user::rwx,group::r-x,other::---"
-        : "user::rw-,group::r--,other::---";
+        : "user::rw-,group::r--,other::---");
     public ulong? DeletionId { get; init; }
     public DateTimeOffset? DeletedAt { get; init; }
     public DateTimeOffset? DeleteRetentionUntil { get; init; }
