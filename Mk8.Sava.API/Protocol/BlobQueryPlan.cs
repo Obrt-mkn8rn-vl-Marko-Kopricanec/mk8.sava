@@ -999,7 +999,20 @@ internal sealed class BlobQueryPlan
             if (Current.Kind != QueryTokenKind.End)
                 throw InvalidQuery(Current.Position, $"Unexpected token '{Current.Text}'.");
 
-            QueryAggregateState? aggregate = null;
+            var aggregate = ParseAggregate(ref projections);
+            var (splitSize, splitName) = ParseSplit(ref projections, predicate, limit, tablePath);
+            return new BlobQueryPlan(
+                projections,
+                predicate,
+                limit,
+                aggregate,
+                tablePath,
+                splitSize,
+                splitName);
+        }
+
+        private QueryAggregateState? ParseAggregate(ref List<QueryProjection> projections)
+        {
             if (projections.Any(projection => projection.Expression is QueryAggregateExpression))
             {
                 if (projections.Count != 1 ||
@@ -1009,16 +1022,23 @@ internal sealed class BlobQueryPlan
                         Current.Position,
                         "An aggregate query must select exactly one aggregate expression.");
                 }
-                aggregate = new QueryAggregateState(
+                var aggregate = new QueryAggregateState(
                     projection.Name,
                     expression.Kind,
                     expression.Operand,
                     expression.CountStar);
                 projections = [];
+                return aggregate;
             }
+            return null;
+        }
 
-            long? splitSize = null;
-            string? splitName = null;
+        private (long? Size, string? Name) ParseSplit(
+            ref List<QueryProjection> projections,
+            QueryPredicate? predicate,
+            long? limit,
+            IReadOnlyList<QueryTableSegment> tablePath)
+        {
             if (projections.Any(projection => projection.Expression is QuerySplitExpression))
             {
                 if (projections.Count != 1 ||
@@ -1029,18 +1049,10 @@ internal sealed class BlobQueryPlan
                         Current.Position,
                         "Sys.Split must be the only projection and cannot use WHERE, LIMIT, or a table path.");
                 }
-                splitSize = split.Size;
-                splitName = projection.Name;
                 projections = [];
+                return (split.Size, projection.Name);
             }
-            return new BlobQueryPlan(
-                projections,
-                predicate,
-                limit,
-                aggregate,
-                tablePath,
-                splitSize,
-                splitName);
+            return (null, null);
         }
 
         private List<QueryTableSegment> ParseTablePath(int sourcePosition)

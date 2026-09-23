@@ -3032,42 +3032,53 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                     page.Items[^1].Name,
                     page.Items[^1].GenerationId))
             : string.Empty;
-        var endpoint = StorageResourcePath.GetServiceEndpoint(http.Request, request.Account);
         await AzureResponseWriter.WriteXmlAsync(http, xml =>
+            WriteFindByTagsXml(xml, http, request, filter, page, expression, nextMarker),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void WriteFindByTagsXml(
+        XmlWriter xml,
+        HttpContext http,
+        StorageRequestContext request,
+        BlobTagFilter filter,
+        TaggedBlobPage page,
+        string expression,
+        string nextMarker)
+    {
+        var endpoint = StorageResourcePath.GetServiceEndpoint(http.Request, request.Account);
+        xml.WriteStartElement("EnumerationResults");
+        xml.WriteAttributeString("ServiceEndpoint", endpoint);
+        xml.WriteElementString("Where", expression);
+        xml.WriteStartElement("Blobs");
+        foreach (var blob in page.Items)
         {
-            xml.WriteStartElement("EnumerationResults");
-            xml.WriteAttributeString("ServiceEndpoint", endpoint);
-            xml.WriteElementString("Where", expression);
-            xml.WriteStartElement("Blobs");
-            foreach (var blob in page.Items)
+            xml.WriteStartElement("Blob");
+            xml.WriteElementString("Name", blob.Name);
+            xml.WriteElementString("ContainerName", blob.Container);
+            if (IsServiceVersionAtLeast(request, new DateOnly(2020, 4, 8)))
             {
-                xml.WriteStartElement("Blob");
-                xml.WriteElementString("Name", blob.Name);
-                xml.WriteElementString("ContainerName", blob.Container);
-                if (IsServiceVersionAtLeast(request, new DateOnly(2020, 4, 8)))
+                xml.WriteStartElement("Tags");
+                xml.WriteStartElement("TagSet");
+                foreach (var key in filter.Predicates
+                             .Select(predicate => predicate.Key)
+                             .Distinct(StringComparer.Ordinal))
                 {
-                    xml.WriteStartElement("Tags");
-                    xml.WriteStartElement("TagSet");
-                    foreach (var key in filter.Predicates
-                                 .Select(predicate => predicate.Key)
-                                 .Distinct(StringComparer.Ordinal))
-                    {
-                        if (!blob.Tags.TryGetValue(key, out var value))
-                            continue;
-                        xml.WriteStartElement("Tag");
-                        xml.WriteElementString("Key", key);
-                        xml.WriteElementString("Value", value);
-                        xml.WriteEndElement();
-                    }
-                    xml.WriteEndElement();
+                    if (!blob.Tags.TryGetValue(key, out var value))
+                        continue;
+                    xml.WriteStartElement("Tag");
+                    xml.WriteElementString("Key", key);
+                    xml.WriteElementString("Value", value);
                     xml.WriteEndElement();
                 }
                 xml.WriteEndElement();
+                xml.WriteEndElement();
             }
             xml.WriteEndElement();
-            xml.WriteElementString("NextMarker", nextMarker);
-            xml.WriteEndElement();
-        }, cancellationToken).ConfigureAwait(false);
+        }
+        xml.WriteEndElement();
+        xml.WriteElementString("NextMarker", nextMarker);
+        xml.WriteEndElement();
     }
 
     private static async Task HandleCorsPreflightAsync(

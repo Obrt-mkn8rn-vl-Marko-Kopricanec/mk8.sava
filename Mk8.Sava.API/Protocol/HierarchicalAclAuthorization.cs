@@ -247,49 +247,17 @@ internal static class HierarchicalAclAuthorization
             request.Snapshot,
             includeDeleted: false,
             cancellationToken).ConfigureAwait(false);
-        var separator = request.Blob.IndexOf('/', StringComparison.Ordinal);
-        var indexedParents = false;
-        while (separator > 0)
-        {
-            var name = request.Blob[..separator];
-            var directory = await metadata.GetBlobAsync(
+        if (!await EnsureReadableParentsAsync(
+                metadata,
                 request.Account,
                 request.Container,
-                name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: false,
-                cancellationToken).ConfigureAwait(false);
-            if (directory is null && blob is not null && !indexedParents)
-            {
-                await metadata.EnsureHierarchicalDirectoriesAsync(
-                    request.Account,
-                    request.Container,
-                    cancellationToken).ConfigureAwait(false);
-                indexedParents = true;
-                directory = await metadata.GetBlobAsync(
-                    request.Account,
-                    request.Container,
-                    name,
-                    versionId: null,
-                    snapshot: null,
-                    includeDeleted: false,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            if (directory is null && blob is null)
-                return null;
-            if (directory is null || !directory.IsDirectory ||
-                !PosixAccessControl.Allows(
-                    directory.Acl,
-                    directory.Owner,
-                    directory.Group,
-                    objectId,
-                    groups,
-                    'x'))
-            {
-                throw AzureStorageException.AuthorizationFailure();
-            }
-            separator = request.Blob.IndexOf('/', separator + 1);
+                request.Blob,
+                blob,
+                objectId,
+                groups,
+                cancellationToken).ConfigureAwait(false))
+        {
+            return null;
         }
 
         if (blob is not null &&
@@ -305,6 +273,63 @@ internal static class HierarchicalAclAuthorization
             throw AzureStorageException.AuthorizationFailure();
         }
         return blob?.GenerationId;
+    }
+
+    private static async Task<bool> EnsureReadableParentsAsync(
+        MetadataStore metadata,
+        string account,
+        string container,
+        string blobName,
+        BlobRecord? blob,
+        string objectId,
+        IReadOnlySet<string> groups,
+        CancellationToken cancellationToken)
+    {
+        var separator = blobName.IndexOf('/', StringComparison.Ordinal);
+        var indexedParents = false;
+        while (separator > 0)
+        {
+            var name = blobName[..separator];
+            var directory = await metadata.GetBlobAsync(
+                account,
+                container,
+                name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                cancellationToken).ConfigureAwait(false);
+            if (directory is null && blob is not null && !indexedParents)
+            {
+                await metadata.EnsureHierarchicalDirectoriesAsync(
+                    account,
+                    container,
+                    cancellationToken).ConfigureAwait(false);
+                indexedParents = true;
+                directory = await metadata.GetBlobAsync(
+                    account,
+                    container,
+                    name,
+                    versionId: null,
+                    snapshot: null,
+                    includeDeleted: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            if (directory is null && blob is null)
+                return false;
+            if (directory is null || !directory.IsDirectory ||
+                !PosixAccessControl.Allows(
+                    directory.Acl,
+                    directory.Owner,
+                    directory.Group,
+                    objectId,
+                    groups,
+                    'x'))
+            {
+                throw AzureStorageException.AuthorizationFailure();
+            }
+            separator = blobName.IndexOf('/', separator + 1);
+        }
+        return true;
     }
 
 }
