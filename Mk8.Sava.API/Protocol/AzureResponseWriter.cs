@@ -790,6 +790,18 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         bool lastAccessTimeTracking = false)
     {
         var request = StorageRequestContext.Get(response.HttpContext);
+        AddBlobIdentityAndEncryptionHeaders(response, blob, request, hierarchicalNamespace);
+        AddBlobTierAndReplicationHeaders(response, blob, request, hierarchicalNamespace, lastAccessTimeTracking);
+        AddBlobHttpAndLeaseHeaders(response, blob, request);
+        AddBlobStateAndCopyHeaders(response, blob, request);
+    }
+
+    private static void AddBlobIdentityAndEncryptionHeaders(
+        HttpResponse response,
+        BlobRecord blob,
+        StorageRequestContext request,
+        bool hierarchicalNamespace)
+    {
         AddBlobEntityHeaders(response, blob);
         if (IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
@@ -815,6 +827,15 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2021, 8, 6)))
             SetOptional(response.Headers, "x-ms-encryption-context", blob.EncryptionContext);
+    }
+
+    private static void AddBlobTierAndReplicationHeaders(
+        HttpResponse response,
+        BlobRecord blob,
+        StorageRequestContext request,
+        bool hierarchicalNamespace,
+        bool lastAccessTimeTracking)
+    {
         if (blob.Kind == Storage.BlobKind.BlockBlob &&
             IsServiceVersionAtLeast(request, new DateOnly(2017, 4, 17)))
         {
@@ -850,6 +871,13 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             SetOptional(response.Headers, "x-ms-last-access-time", blob.LastAccessedAt?.ToString("R", CultureInfo.InvariantCulture));
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 2, 10)))
             SetOptional(response.Headers, "x-ms-expiry-time", blob.ExpiresAt?.ToString("R", CultureInfo.InvariantCulture));
+    }
+
+    private static void AddBlobHttpAndLeaseHeaders(
+        HttpResponse response,
+        BlobRecord blob,
+        StorageRequestContext request)
+    {
         response.Headers["x-ms-lease-status"] = LeaseStatus(blob.Lease);
         if (IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
         {
@@ -877,6 +905,13 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         {
             SetOptional(response.Headers, "Content-MD5", blob.Http.ContentMd5);
         }
+    }
+
+    private static void AddBlobStateAndCopyHeaders(
+        HttpResponse response,
+        BlobRecord blob,
+        StorageRequestContext request)
+    {
         foreach (var (name, value) in blob.Metadata)
             response.Headers[$"x-ms-meta-{name}"] = value;
         if (blob.Tags.Count > 0 && IsServiceVersionAtLeast(request, new DateOnly(2019, 12, 12)))
