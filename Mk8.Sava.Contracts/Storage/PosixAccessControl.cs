@@ -77,15 +77,8 @@ internal static class PosixAccessControl
 
         foreach (var rawEntry in acl.Split(','))
         {
-            var entry = rawEntry.Split(':');
-            var offset = entry.Length == 4 &&
-                         string.Equals(entry[0], "default", StringComparison.Ordinal) ? 1 : 0;
-            if (entry.Length - offset != 3)
-                throw new InvalidDataException("The hierarchical access ACL has an invalid entry.");
-            var type = entry[offset];
-            var identity = entry[offset + 1];
-            var permissions = ParsePermissions(entry[offset + 2]);
-            if (offset == 1)
+            var (type, identity, permissions, isDefault) = ParseEntry(rawEntry);
+            if (isDefault)
                 continue;
 
             switch (type)
@@ -127,6 +120,17 @@ internal static class PosixAccessControl
             throw new InvalidDataException("The hierarchical access ACL is missing a required entry.");
 
         return new ParsedAcl(owner.Value, owningGroup.Value, other.Value, mask ?? 7, users, groups);
+    }
+
+    private static (string Type, string Identity, int Permissions, bool IsDefault) ParseEntry(string rawEntry)
+    {
+        var entry = rawEntry.Split(':');
+        var isDefault = entry.Length == 4 &&
+                        string.Equals(entry[0], "default", StringComparison.Ordinal);
+        var offset = isDefault ? 1 : 0;
+        if (entry.Length - offset != 3)
+            throw new InvalidDataException("The hierarchical access ACL has an invalid entry.");
+        return (entry[offset], entry[offset + 1], ParsePermissions(entry[offset + 2]), isDefault);
     }
 
     private static int ParsePermissions(string value)

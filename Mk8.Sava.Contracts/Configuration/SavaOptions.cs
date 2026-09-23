@@ -64,6 +64,26 @@ public sealed class SavaOptions : IValidatableObject
 
     public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
     {
+        foreach (var result in ValidateAccounts())
+            yield return result;
+        foreach (var result in ValidateCapabilities())
+            yield return result;
+        foreach (var result in ValidateReplication())
+            yield return result;
+        foreach (var result in ValidateSpace())
+            yield return result;
+        foreach (var result in ValidatePacking())
+            yield return result;
+        foreach (var result in ValidateTransfer())
+            yield return result;
+        foreach (var result in ValidateMaintenance())
+            yield return result;
+        foreach (var result in ValidateBearer())
+            yield return result;
+    }
+
+    private IEnumerable<ValidationResult> ValidateAccounts()
+    {
         if (Accounts.Count == 0)
             yield return new ValidationResult("At least one storage account is required.", [nameof(Accounts)]);
 
@@ -100,7 +120,10 @@ public sealed class SavaOptions : IValidatableObject
                     [nameof(DataEncryptionKeys)]);
             }
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidateCapabilities()
+    {
         foreach (var (accountName, capabilities) in AccountCapabilities)
         {
             if (!Accounts.ContainsKey(accountName))
@@ -157,135 +180,21 @@ public sealed class SavaOptions : IValidatableObject
                     [nameof(AccountCapabilities)]);
             }
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidateReplication()
+    {
         var replicationPolicyIds = new HashSet<Guid>();
         var replicationAccountPairs = new HashSet<string>(StringComparer.Ordinal);
         var replicationDestinationContainers = new HashSet<string>(StringComparer.Ordinal);
         foreach (var policy in ObjectReplicationPolicies)
         {
-            if (!Guid.TryParseExact(policy.PolicyId, "D", out var policyId) || !replicationPolicyIds.Add(policyId))
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy ID '{policy.PolicyId}' must be a unique GUID.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (!Accounts.ContainsKey(policy.SourceAccount) || !Accounts.ContainsKey(policy.DestinationAccount))
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' references an unknown account.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (string.Equals(policy.SourceAccount, policy.DestinationAccount, StringComparison.Ordinal))
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' must use different source and destination accounts.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (!replicationAccountPairs.Add($"{policy.SourceAccount}\n{policy.DestinationAccount}"))
-            {
-                yield return new ValidationResult(
-                    $"Only one object replication policy is allowed for the account pair '{policy.SourceAccount}' and '{policy.DestinationAccount}'.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (!policy.EnabledAt.HasValue)
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' requires its durable control-plane enablement time.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            else if (policy.EnabledAt.Value < EarliestObjectReplicationTime)
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' has an enablement time before 1601-01-01T00:00:00Z.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (policy.Rules.Count is 0 or > 1000)
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' must contain between one and 1,000 rules.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-
-            AccountCapabilities.TryGetValue(policy.SourceAccount, out var sourceCapabilities);
-            AccountCapabilities.TryGetValue(policy.DestinationAccount, out var destinationCapabilities);
-            if (sourceCapabilities is null ||
-                !sourceCapabilities.VersioningEnabled ||
-                !sourceCapabilities.ChangeFeedEnabled ||
-                destinationCapabilities is null ||
-                !destinationCapabilities.VersioningEnabled)
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' requires source change feed and blob versioning on both accounts.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-            if (sourceCapabilities?.HierarchicalNamespaceEnabled == true ||
-                destinationCapabilities?.HierarchicalNamespaceEnabled == true)
-            {
-                yield return new ValidationResult(
-                    $"Object replication policy '{policy.PolicyId}' cannot use a hierarchical-namespace account.",
-                    [nameof(ObjectReplicationPolicies)]);
-            }
-
-            var ruleIds = new HashSet<Guid>();
-            var sourceContainers = new HashSet<string>(StringComparer.Ordinal);
-            var destinationContainers = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var rule in policy.Rules)
-            {
-                if (!Guid.TryParseExact(rule.RuleId, "D", out var ruleId) || !ruleIds.Add(ruleId))
-                {
-                    yield return new ValidationResult(
-                        $"Object replication rule ID '{rule.RuleId}' in policy '{policy.PolicyId}' must be a unique GUID.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (string.IsNullOrWhiteSpace(rule.SourceContainer) ||
-                    string.IsNullOrWhiteSpace(rule.DestinationContainer))
-                {
-                    yield return new ValidationResult(
-                        $"Object replication policy '{policy.PolicyId}' contains a rule with a blank container name.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                var uniqueSourceContainer = sourceContainers.Add(rule.SourceContainer);
-                var uniqueDestinationContainer = destinationContainers.Add(rule.DestinationContainer);
-                if (!uniqueSourceContainer || !uniqueDestinationContainer)
-                {
-                    yield return new ValidationResult(
-                        $"Object replication policy '{policy.PolicyId}' uses a source or destination container in more than one rule.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (uniqueDestinationContainer &&
-                    !replicationDestinationContainers.Add(
-                        $"{policy.DestinationAccount}\n{rule.DestinationContainer}"))
-                {
-                    yield return new ValidationResult(
-                        $"Object replication destination container '{rule.DestinationContainer}' in account '{policy.DestinationAccount}' participates in more than one policy.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (rule.PrefixMatch.Count > 10)
-                {
-                    yield return new ValidationResult(
-                        $"Object replication rule '{rule.RuleId}' contains more than 10 prefix filters.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (rule.PrefixMatch.Any(string.IsNullOrEmpty))
-                {
-                    yield return new ValidationResult(
-                        $"Object replication rule '{rule.RuleId}' contains an empty prefix filter.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (rule.PrefixMatch.Distinct(StringComparer.Ordinal).Count() != rule.PrefixMatch.Count)
-                {
-                    yield return new ValidationResult(
-                        $"Object replication rule '{rule.RuleId}' contains duplicate prefix filters.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-                if (rule.MinimumCreationTime is { } minimumCreationTime &&
-                    minimumCreationTime < EarliestObjectReplicationTime)
-                {
-                    yield return new ValidationResult(
-                        $"Object replication rule '{rule.RuleId}' has a minimum creation time before 1601-01-01T00:00:00Z.",
-                        [nameof(ObjectReplicationPolicies)]);
-                }
-            }
+            foreach (var result in ValidateReplicationPolicyIdentity(policy, replicationPolicyIds, replicationAccountPairs))
+                yield return result;
+            foreach (var result in ValidateReplicationPolicyCapabilities(policy))
+                yield return result;
+            foreach (var result in ValidateReplicationRules(policy, replicationDestinationContainers))
+                yield return result;
         }
 
         foreach (var source in ObjectReplicationPolicies.GroupBy(policy => policy.SourceAccount, StringComparer.Ordinal))
@@ -306,7 +215,167 @@ public sealed class SavaOptions : IValidatableObject
                     [nameof(ObjectReplicationPolicies)]);
             }
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidateReplicationPolicyIdentity(
+        ObjectReplicationPolicyOptions policy,
+        HashSet<Guid> policyIds,
+        HashSet<string> accountPairs)
+    {
+        if (!Guid.TryParseExact(policy.PolicyId, "D", out var policyId) || !policyIds.Add(policyId))
+        {
+            yield return new ValidationResult(
+                $"Object replication policy ID '{policy.PolicyId}' must be a unique GUID.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (!Accounts.ContainsKey(policy.SourceAccount) || !Accounts.ContainsKey(policy.DestinationAccount))
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' references an unknown account.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (string.Equals(policy.SourceAccount, policy.DestinationAccount, StringComparison.Ordinal))
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' must use different source and destination accounts.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (!accountPairs.Add($"{policy.SourceAccount}\n{policy.DestinationAccount}"))
+        {
+            yield return new ValidationResult(
+                $"Only one object replication policy is allowed for the account pair '{policy.SourceAccount}' and '{policy.DestinationAccount}'.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (!policy.EnabledAt.HasValue)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' requires its durable control-plane enablement time.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        else if (policy.EnabledAt.Value < EarliestObjectReplicationTime)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' has an enablement time before 1601-01-01T00:00:00Z.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (policy.Rules.Count is 0 or > 1000)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' must contain between one and 1,000 rules.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+    }
+
+    private IEnumerable<ValidationResult> ValidateReplicationPolicyCapabilities(ObjectReplicationPolicyOptions policy)
+    {
+        AccountCapabilities.TryGetValue(policy.SourceAccount, out var sourceCapabilities);
+        AccountCapabilities.TryGetValue(policy.DestinationAccount, out var destinationCapabilities);
+        if (sourceCapabilities is null ||
+            !sourceCapabilities.VersioningEnabled ||
+            !sourceCapabilities.ChangeFeedEnabled ||
+            destinationCapabilities is null ||
+            !destinationCapabilities.VersioningEnabled)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' requires source change feed and blob versioning on both accounts.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (sourceCapabilities?.HierarchicalNamespaceEnabled == true ||
+            destinationCapabilities?.HierarchicalNamespaceEnabled == true)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' cannot use a hierarchical-namespace account.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+    }
+
+    private static IEnumerable<ValidationResult> ValidateReplicationRules(
+        ObjectReplicationPolicyOptions policy,
+        HashSet<string> destinationPolicyContainers)
+    {
+        var ruleIds = new HashSet<Guid>();
+        var sourceContainers = new HashSet<string>(StringComparer.Ordinal);
+        var destinationContainers = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var rule in policy.Rules)
+        {
+            foreach (var result in ValidateReplicationRuleIdentity(
+                policy, rule, ruleIds, sourceContainers, destinationContainers, destinationPolicyContainers))
+                yield return result;
+            foreach (var result in ValidateReplicationRuleFilters(rule))
+                yield return result;
+        }
+    }
+
+    private static IEnumerable<ValidationResult> ValidateReplicationRuleIdentity(
+        ObjectReplicationPolicyOptions policy,
+        ObjectReplicationRuleOptions rule,
+        HashSet<Guid> ruleIds,
+        HashSet<string> sourceContainers,
+        HashSet<string> destinationContainers,
+        HashSet<string> destinationPolicyContainers)
+    {
+        if (!Guid.TryParseExact(rule.RuleId, "D", out var ruleId) || !ruleIds.Add(ruleId))
+        {
+            yield return new ValidationResult(
+                $"Object replication rule ID '{rule.RuleId}' in policy '{policy.PolicyId}' must be a unique GUID.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (string.IsNullOrWhiteSpace(rule.SourceContainer) ||
+            string.IsNullOrWhiteSpace(rule.DestinationContainer))
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' contains a rule with a blank container name.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        var uniqueSourceContainer = sourceContainers.Add(rule.SourceContainer);
+        var uniqueDestinationContainer = destinationContainers.Add(rule.DestinationContainer);
+        if (!uniqueSourceContainer || !uniqueDestinationContainer)
+        {
+            yield return new ValidationResult(
+                $"Object replication policy '{policy.PolicyId}' uses a source or destination container in more than one rule.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (uniqueDestinationContainer &&
+            !destinationPolicyContainers.Add(
+                $"{policy.DestinationAccount}\n{rule.DestinationContainer}"))
+        {
+            yield return new ValidationResult(
+                $"Object replication destination container '{rule.DestinationContainer}' in account '{policy.DestinationAccount}' participates in more than one policy.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+    }
+
+    private static IEnumerable<ValidationResult> ValidateReplicationRuleFilters(ObjectReplicationRuleOptions rule)
+    {
+        if (rule.PrefixMatch.Count > 10)
+        {
+            yield return new ValidationResult(
+                $"Object replication rule '{rule.RuleId}' contains more than 10 prefix filters.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (rule.PrefixMatch.Any(string.IsNullOrEmpty))
+        {
+            yield return new ValidationResult(
+                $"Object replication rule '{rule.RuleId}' contains an empty prefix filter.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (rule.PrefixMatch.Distinct(StringComparer.Ordinal).Count() != rule.PrefixMatch.Count)
+        {
+            yield return new ValidationResult(
+                $"Object replication rule '{rule.RuleId}' contains duplicate prefix filters.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+        if (rule.MinimumCreationTime is { } minimumCreationTime &&
+            minimumCreationTime < EarliestObjectReplicationTime)
+        {
+            yield return new ValidationResult(
+                $"Object replication rule '{rule.RuleId}' has a minimum creation time before 1601-01-01T00:00:00Z.",
+                [nameof(ObjectReplicationPolicies)]);
+        }
+    }
+
+    private IEnumerable<ValidationResult> ValidateSpace()
+    {
         if (EnableCrossAccountDeduplication &&
             (!TryDecodeKey(CrossAccountEncryptionKey ?? string.Empty, out var crossAccountKey) || crossAccountKey.Length < 32))
         {
@@ -358,7 +427,10 @@ public sealed class SavaOptions : IValidatableObject
                 "BackgroundCompressionChunksPerMaintenancePass must be positive.",
                 [nameof(BackgroundCompressionChunksPerMaintenancePass)]);
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidatePacking()
+    {
         if (SmallChunkPackingThresholdBytes <= 0 ||
             SmallChunkPackingThresholdBytes > MaximumChunkBytes)
         {
@@ -396,7 +468,10 @@ public sealed class SavaOptions : IValidatableObject
                 "ChunkPackCompactionMinimumDeadRatio must be between zero and one.",
                 [nameof(ChunkPackCompactionMinimumDeadRatio)]);
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidateTransfer()
+    {
         if (MaximumRequestBodyBytes <= 0)
             yield return new ValidationResult("MaximumRequestBodyBytes must be positive.", [nameof(MaximumRequestBodyBytes)]);
 
@@ -420,7 +495,10 @@ public sealed class SavaOptions : IValidatableObject
                 "Rehydration and copy-completion delays cannot be negative.",
                 [nameof(StandardRehydrationDelay), nameof(HighPriorityRehydrationDelay), nameof(AsyncCopyCompletionDelay)]);
         }
+    }
 
+    private IEnumerable<ValidationResult> ValidateMaintenance()
+    {
         if (MaintenanceScanInterval <= TimeSpan.Zero)
             yield return new ValidationResult("MaintenanceScanInterval must be positive.", [nameof(MaintenanceScanInterval)]);
 
@@ -467,7 +545,10 @@ public sealed class SavaOptions : IValidatableObject
             yield return new ValidationResult(
                 "IntegrityScanChunksPerMaintenancePass must be positive.",
                 [nameof(IntegrityScanChunksPerMaintenancePass)]);
+    }
 
+    private IEnumerable<ValidationResult> ValidateBearer()
+    {
         if (BearerAuthentication.Enabled)
         {
             if (BearerAuthentication.ValidAudiences.Count == 0)
