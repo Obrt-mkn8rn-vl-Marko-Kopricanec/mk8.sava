@@ -518,6 +518,33 @@ public sealed class ChunkStore
         return new PhysicalChunkPage(items, hasMore);
     }
 
+    internal async IAsyncEnumerable<string> EnumeratePhysicalChunkIdsForStartupAsync(
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        foreach (var id in EnumerateStorageIdsOrdered(
+                     _paths.Chunks,
+                     relativeDirectory: string.Empty,
+                     after: null,
+                     ".chunk"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return id;
+        }
+
+        string? after = null;
+        while (true)
+        {
+            var page = await _metadata.ListPackedChunkIdsAsync(after, 512, cancellationToken);
+            foreach (var id in page.Items)
+                yield return id;
+            if (!page.HasMore)
+                break;
+            if (page.Items.Count == 0)
+                throw new InvalidDataException("The packed-chunk inventory failed to advance.");
+            after = page.Items[^1];
+        }
+    }
+
     internal async Task<PackCompactionResult> TryCompactPackAsync(
         ChunkPackRecord pack,
         CancellationToken cancellationToken)
