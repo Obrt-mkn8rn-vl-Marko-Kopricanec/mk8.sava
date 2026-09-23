@@ -7,6 +7,34 @@ namespace Mk8.Sava.Tests;
 public sealed class HierarchicalAclAuthorizationTests
 {
     [Theory]
+    [InlineData("PUT", "", "", 'w')]
+    [InlineData("DELETE", "", "", 'd')]
+    [InlineData("GET", "", "", null)]
+    [InlineData("PUT", "metadata", "", null)]
+    [InlineData("DELETE", "", "deletetype=permanent", null)]
+    [InlineData("DELETE", "", "snapshot=2026-01-01", null)]
+    public void ParentMutationFallbackOnlyTargetsCurrentBlobPutAndDelete(
+        string method, string component, string additionalQuery, char? expected)
+    {
+        var request = new DefaultHttpContext().Request;
+        request.Method = method;
+        request.QueryString = new QueryString(
+            $"?comp={component}" + (additionalQuery.Length == 0 ? string.Empty : $"&{additionalQuery}"));
+        var resource = new StorageRequestContext
+        {
+            RequestId = "test",
+            Account = "account",
+            Container = "container",
+            Blob = "blob",
+            ResourceKind = StorageResourceKind.Blob,
+            CanonicalResourcePath = "/account/container/blob",
+            ServiceVersion = "2023-11-03",
+            Authorization = StorageAuthorization.Anonymous
+        };
+        Assert.Equal(expected, HierarchicalAclAuthorization.GetParentMutationPermission(request, resource));
+    }
+
+    [Theory]
     [InlineData("GET", "/", "", "", "", true)]
     [InlineData("GET", "/", "one/two/", "files", "metadata", true)]
     [InlineData("GET", "", "", "", "", false)]

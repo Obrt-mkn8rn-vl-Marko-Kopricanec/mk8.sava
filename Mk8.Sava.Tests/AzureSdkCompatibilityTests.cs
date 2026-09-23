@@ -1994,15 +1994,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var ownedQuery = await signedBlockBlob.QueryAsync("SELECT _1 FROM BlobStorage;");
         using (var reader = new StreamReader(ownedQuery.Value.Content))
             Assert.Contains("owned-content", await reader.ReadToEndAsync(), StringComparison.Ordinal);
-        var deniedMutation = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true));
-        Assert.Equal("AuthorizationFailure", deniedMutation.ErrorCode);
-        Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
+        await owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true);
+        Assert.Equal("changed", (await owned.DownloadContentAsync()).Value.Content.ToString());
 
         var foreignAgent = WithSuoid("parent/child.txt", foreignObjectId);
         var deniedTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
             foreignAgent.DownloadContentAsync());
         Assert.Equal("AuthorizationFailure", deniedTraversal.ErrorCode);
+        var deniedMutation = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            foreignAgent.UploadAsync(BinaryData.FromString("forbidden"), overwrite: true));
+        Assert.Equal("AuthorizationFailure", deniedMutation.ErrorCode);
         var tampered = CreateBlobClient(
             application,
             new Uri(owned.Uri.AbsoluteUri.Replace(
@@ -2092,7 +2093,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             target with { AccessAcl = $"user::rw-,user:{foreignObjectId}:r--,group::r--,mask::r--,other::---" },
             target.Revision,
             CancellationToken.None);
-        Assert.Equal("owned-content", (await foreignAgent.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("changed", (await foreignAgent.DownloadContentAsync()).Value.Content.ToString());
     }
 
     [Fact]
@@ -2590,6 +2591,75 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.Forbidden, tampered.StatusCode);
             Assert.Equal("AuthenticationFailed", tampered.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
+
+    [Fact]
+    public async Task HierarchicalAclAuthorizesPutAndDeleteFromTheParentDirectory()
+    {
+        const string writerObjectId = "97f5af62-55de-46b3-86b5-151988d1ae11";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-write-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("folder/existing.txt").UploadAsync(BinaryData.FromString("old"));
+        await container.GetBlobClient("folder/delete.txt").UploadAsync(BinaryData.FromString("delete"));
+        await container.GetBlobClient("root-existing.txt").UploadAsync(BinaryData.FromString("root"));
+        var rootAcl = $"user::rwx,user:{writerObjectId}:--x,group::r-x,mask::-wx,other::---";
+        var folderAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = rootAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "folder",
+                AccessAcl = folderAcl
+            });
+
+        var writer = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId))
+            .GetBlobContainerClient(container.Name);
+        await writer.GetBlobClient("folder/new.txt").UploadAsync(BinaryData.FromString("new"));
+        await writer.GetBlobClient("folder/existing.txt")
+            .UploadAsync(BinaryData.FromString("replaced"), overwrite: true);
+        await writer.GetBlobClient("folder/delete.txt").DeleteAsync();
+        Assert.Equal("new", (await container.GetBlobClient("folder/new.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+        Assert.Equal("replaced", (await container.GetBlobClient("folder/existing.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+        Assert.False((await container.GetBlobClient("folder/delete.txt").ExistsAsync()).Value);
+
+        var rootDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient("root-existing.txt").UploadAsync(
+                BinaryData.FromString("forbidden"), overwrite: true));
+        Assert.Equal(StatusCodes.Status403Forbidden, rootDenied.Status);
+        var missingParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            writer.GetBlobClient("missing/child.txt").UploadAsync(BinaryData.FromString("forbidden")));
+        Assert.Equal(StatusCodes.Status403Forbidden, missingParent.Status);
+        Assert.Equal("root", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---"
+        });
+        await writer.GetBlobClient("root-existing.txt")
+            .UploadAsync(BinaryData.FromString("root-replaced"), overwrite: true);
+        Assert.Equal("root-replaced", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync())
+            .Value.Content.ToString());
     }
 
     [Fact]
