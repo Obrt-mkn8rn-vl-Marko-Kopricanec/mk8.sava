@@ -869,6 +869,13 @@ exact duplicates, shifted partial sharing, retained versions, small files, and
 incompressible files. Timings are an in-process diagnostic, not a network or
 MSAVA production-performance claim; rerun them on the target filesystem and
 with a separately characterized MSAVA baseline before setting release budgets.
+The Linux fixture now enforces controlled cumulative mk8.sava/raw allocation
+ceilings of 80%, 60%, 60%, 70%, and 75% for those five workloads respectively.
+The incompressible workload additionally limits its incremental allocated bytes
+to 150% of its raw-file increment; every workload limits sampled staging peak
+to 4 MiB and in-process working set to 512 MiB. These are regression budgets
+for this small, isolated fixture, not deployment-filesystem latency or memory
+service-level objectives.
 
 ## Create and validate a backup
 
