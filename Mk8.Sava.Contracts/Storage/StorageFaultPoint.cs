@@ -11,8 +11,3 @@ public enum StorageFaultPoint
     AfterPackMetadataCommit,
     BeforeGarbageCollectionDelete
 }
-
-public interface IStorageFaultInjector
-{
-    void Inject(StorageFaultPoint point);
-}
