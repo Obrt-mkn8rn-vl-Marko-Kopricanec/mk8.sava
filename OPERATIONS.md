@@ -690,6 +690,10 @@ Metadata, property, tier, and expiry mutations recheck that parent permission
 immediately before storage mutation. These
 rules follow Microsoft's documented
 [HNS ACL create/update/delete permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions).
+Container-scoped Blob Batch delete and tier subrequests independently recheck
+the same ACL grant before each mutation. A local signed `suoid` case covers
+sticky-directory batch delete denial/allowance and a batch tier change; it
+does not establish full batch account-mode or concurrency parity.
 Unsupported ACL-only mutation shapes still fail closed.
 For both bearer fallback and signed `suoid` reads, the ACL decision is bound to
 the blob generation served by the endpoint. A replacement or a blob created
