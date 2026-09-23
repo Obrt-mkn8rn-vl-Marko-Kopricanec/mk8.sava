@@ -97,7 +97,7 @@ public sealed class ChunkStore
             pauseWriterThreshold: checked(_options.MaximumChunkBytes * 2L),
             resumeWriterThreshold: _options.MaximumChunkBytes,
             useSynchronizationContext: false));
-        var producer = ProduceAsync();
+        var producer = ProduceDomainCopyAsync(pipe, source, sourceEncryption, transferCancellation.Token);
         StoredContent? copied = null;
         try
         {
@@ -132,31 +132,35 @@ public sealed class ChunkStore
         {
             await pipe.Reader.CompleteAsync().ConfigureAwait(false);
         }
+    }
 
-        async Task ProduceAsync()
+    private async Task ProduceDomainCopyAsync(
+        Pipe pipe,
+        ContentManifest source,
+        BlobEncryption sourceEncryption,
+        CancellationToken cancellationToken)
+    {
+        Exception? failure = null;
+        try
         {
-            Exception? failure = null;
-            try
-            {
-                var output = pipe.Writer.AsStream(leaveOpen: true);
-                await using var outputDisposal = output.ConfigureAwait(false);
-                await WriteRangeAsync(
-                    source,
-                    sourceEncryption,
-                    0,
-                    source.Length,
-                    output,
-                    transferCancellation.Token).ConfigureAwait(false);
-            }
-            catch (Exception exception)
-            {
-                failure = exception;
-                throw;
-            }
-            finally
-            {
-                await pipe.Writer.CompleteAsync(failure).ConfigureAwait(false);
-            }
+            var output = pipe.Writer.AsStream(leaveOpen: true);
+            await using var outputDisposal = output.ConfigureAwait(false);
+            await WriteRangeAsync(
+                source,
+                sourceEncryption,
+                0,
+                source.Length,
+                output,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+            throw;
+        }
+        finally
+        {
+            await pipe.Writer.CompleteAsync(failure).ConfigureAwait(false);
         }
     }
 
@@ -726,58 +730,70 @@ public sealed class ChunkStore
 #pragma warning restore HLQ012
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var separator = packId.LastIndexOf('/');
-            if (separator <= 0)
-                continue;
-            var domain = packId[..separator];
-            var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
-            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
+            if (await TryReclaimOrphanPackAsync(packId, olderThan, cancellationToken).ConfigureAwait(false) is { } length)
             {
-                var path = GetPackPath(packId);
-                FileInfo file;
-                try
-                {
-                    file = new FileInfo(path);
-                    if (!file.Exists || file.LastWriteTimeUtc > olderThan.UtcDateTime)
-                        continue;
-                }
-                catch (IOException)
-                {
-                    continue;
-                }
-
-                if (_metadata.ChunkPackExists(packId))
-                    continue;
-
-                var length = file.Length;
-                try
-                {
-                    File.Delete(path);
-                    reclaimed++;
-                    bytesSaved = checked(bytesSaved + length);
-                }
-                catch (FileNotFoundException)
-                {
-                    // Another recovery pass removed the unregistered pack first.
-                }
-                catch (IOException)
-                {
-                    // A writer still owns the file; reconsider it on the next cycle.
-                }
-                catch (UnauthorizedAccessException)
-                {
-                    // Surface the bytes through physical usage and retry later.
-                }
-            }
-            finally
-            {
-                gate.Release();
+                reclaimed++;
+                bytesSaved = checked(bytesSaved + length);
             }
         }
 
         _orphanPackCursor = hasMore && page.Count > 0 ? page[^1] : null;
         return (reclaimed, bytesSaved);
+    }
+
+    private async Task<long?> TryReclaimOrphanPackAsync(
+        string packId,
+        DateTimeOffset olderThan,
+        CancellationToken cancellationToken)
+    {
+        var separator = packId.LastIndexOf('/');
+        if (separator <= 0)
+            return null;
+        var domain = packId[..separator];
+        var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var path = GetPackPath(packId);
+            FileInfo file;
+            try
+            {
+                file = new FileInfo(path);
+                if (!file.Exists || file.LastWriteTimeUtc > olderThan.UtcDateTime)
+                    return null;
+            }
+            catch (IOException)
+            {
+                return null;
+            }
+
+            if (_metadata.ChunkPackExists(packId))
+                return null;
+
+            var length = file.Length;
+            try
+            {
+                File.Delete(path);
+                return length;
+            }
+            catch (FileNotFoundException)
+            {
+                // Another recovery pass removed the unregistered pack first.
+            }
+            catch (IOException)
+            {
+                // A writer still owns the file; reconsider it on the next cycle.
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Surface the bytes through physical usage and retry later.
+            }
+            return null;
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private static IEnumerable<string> EnumerateStorageIdsOrdered(
@@ -888,6 +904,18 @@ public sealed class ChunkStore
             }
         }
 
+        var metadataBytes = MeasureMetadataBytes();
+
+        return new StoragePhysicalUsage(
+            chunkBytes,
+            stagingBytes,
+            metadataBytes,
+            chunkCount,
+            StorageAllocationMeter.MeasureRoot(_paths.Root));
+    }
+
+    private long MeasureMetadataBytes()
+    {
         long metadataBytes = 0;
         foreach (var path in new[] { _paths.Database, _paths.Database + "-wal", _paths.Database + "-shm" })
         {
@@ -900,12 +928,7 @@ public sealed class ChunkStore
             }
         }
 
-        return new StoragePhysicalUsage(
-            chunkBytes,
-            stagingBytes,
-            metadataBytes,
-            chunkCount,
-            StorageAllocationMeter.MeasureRoot(_paths.Root));
+        return metadataBytes;
     }
 
     internal StoragePhysicalUsage? ScanPhysicalUsageBatch(int maximumEntries)
@@ -1408,35 +1431,7 @@ public sealed class ChunkStore
             var payloadLength = checked((int)new FileInfo(chunkFilePath).Length);
             var idLength = Encoding.UTF8.GetByteCount(id);
             var recordLength = checked(PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
-            var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken).ConfigureAwait(false);
-            long committedLength = 0;
-            if (pack is not null)
-            {
-                var path = GetPackPath(pack.PackId);
-                committedLength = await _metadata.GetPackIndexedLengthAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
-                if (!File.Exists(path))
-                {
-                    if (committedLength != 0)
-                        throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is missing.");
-                    await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
-                    pack = null;
-                }
-                else
-                {
-                    if (new FileInfo(path).Length < committedLength)
-                        throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is shorter than its indexed records.");
-                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
-                    if (records >= _options.ChunkPackMaximumRecords ||
-                        committedLength + recordLength > _options.ChunkPackTargetBytes)
-                    {
-                        await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
-                        pack = null;
-                    }
-                }
-            }
-
-            if (pack is null)
-                committedLength = 0;
+            var (pack, committedLength) = await GetWritablePackAsync(domain, recordLength, cancellationToken).ConfigureAwait(false);
             pack ??= new ChunkPackRecord(
                 CreatePackId(domain),
                 domain,
@@ -1457,6 +1452,37 @@ public sealed class ChunkStore
         {
             gate.Release();
         }
+    }
+
+    private async Task<(ChunkPackRecord? Pack, long CommittedLength)> GetWritablePackAsync(
+        string domain,
+        int recordLength,
+        CancellationToken cancellationToken)
+    {
+        var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken).ConfigureAwait(false);
+        if (pack is null)
+            return (null, 0);
+
+        var path = GetPackPath(pack.PackId);
+        var committedLength = await _metadata.GetPackIndexedLengthAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
+        if (!File.Exists(path))
+        {
+            if (committedLength != 0)
+                throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is missing.");
+            await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
+            return (null, 0);
+        }
+
+        if (new FileInfo(path).Length < committedLength)
+            throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is shorter than its indexed records.");
+        var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
+        if (records >= _options.ChunkPackMaximumRecords ||
+            committedLength + recordLength > _options.ChunkPackTargetBytes)
+        {
+            await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
+            return (null, 0);
+        }
+        return (pack, committedLength);
     }
 
     private async Task<PackedChunkLocation> AppendPackRecordAsync(

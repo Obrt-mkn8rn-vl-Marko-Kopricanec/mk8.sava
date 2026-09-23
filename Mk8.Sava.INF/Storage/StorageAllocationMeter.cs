@@ -28,19 +28,8 @@ internal static class StorageAllocationMeter
             {
                 if (!TryStat(path, out var stat))
                     continue;
-                FileAttributes attributes;
-                try
-                {
-                    attributes = File.GetAttributes(path);
-                }
-                catch (FileNotFoundException)
-                {
+                if (!TryGetAttributes(path, out var attributes))
                     continue;
-                }
-                catch (DirectoryNotFoundException)
-                {
-                    continue;
-                }
 
                 var isDirectory = (attributes & FileAttributes.Directory) != FileAttributes.None;
                 if (isDirectory && (attributes & FileAttributes.ReparsePoint) == FileAttributes.None)
@@ -74,6 +63,25 @@ internal static class StorageAllocationMeter
         catch (PlatformNotSupportedException)
         {
             return null;
+        }
+    }
+
+    private static bool TryGetAttributes(string path, out FileAttributes attributes)
+    {
+        try
+        {
+            attributes = File.GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            attributes = default;
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            attributes = default;
+            return false;
         }
     }
 
