@@ -373,6 +373,30 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
         if (!root.Elements().Any())
             throw InvalidServicePropertiesXml("At least one service property must be specified.");
 
+        var (logging, hourMetrics, minuteMetrics) = ReadServiceAnalytics(root, current, version);
+        var cors = ReadServiceCors(root, current, version);
+
+        var (defaultServiceVersion, deleteEnabled, deleteDays, allowPermanentDelete) =
+            ReadVersionAndDeletePolicy(root, current, version);
+        var staticWebsite = ReadStaticWebsite(root, current, version);
+
+        return current with
+        {
+            Logging = logging,
+            HourMetrics = hourMetrics,
+            MinuteMetrics = minuteMetrics,
+            Cors = cors,
+            DefaultServiceVersion = defaultServiceVersion ?? current.DefaultServiceVersion,
+            BlobSoftDeleteEnabled = deleteEnabled,
+            BlobSoftDeleteRetentionDays = deleteDays,
+            BlobPermanentDeleteEnabled = allowPermanentDelete,
+            StaticWebsite = staticWebsite
+        };
+    }
+
+    private static (StorageAnalyticsLogging Logging, StorageAnalyticsMetrics HourMetrics, StorageAnalyticsMetrics MinuteMetrics)
+        ReadServiceAnalytics(XElement root, ServiceProperties current, DateOnly version)
+    {
         var modernAnalytics = version >= new DateOnly(2013, 8, 15);
         var loggingElement = Child(root, "Logging");
         var legacyMetricsElement = Child(root, "Metrics");
@@ -393,7 +417,11 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
         var minuteMetrics = minuteMetricsElement is null
             ? current.MinuteMetrics
             : ReadAnalyticsMetrics(minuteMetricsElement);
+        return (logging, hourMetrics, minuteMetrics);
+    }
 
+    private static IList<CorsRule> ReadServiceCors(XElement root, ServiceProperties current, DateOnly version)
+    {
         var corsElement = Child(root, "Cors");
         var cors = corsElement is null ? current.Cors : [];
         if (corsElement is not null)
@@ -424,7 +452,45 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "A maximum of five CORS rules is supported.");
         if (corsElement is not null)
             ValidateCorsRules(cors);
+        return cors;
+    }
 
+    private static StaticWebsiteProperties ReadStaticWebsite(XElement root, ServiceProperties current, DateOnly version)
+    {
+        var website = Child(root, "StaticWebsite");
+        if (website is null)
+            return current.StaticWebsite;
+        RequireServicePropertiesVersion(version, new DateOnly(2018, 3, 28), "StaticWebsite");
+        ValidateUniqueChildren(website);
+        ValidateKnownChildren(
+            website,
+            "Enabled",
+            "IndexDocument",
+            "DefaultIndexDocumentPath",
+            "ErrorDocument404Path");
+        var indexDocument = NullIfEmpty(OptionalText(website, "IndexDocument"));
+        var defaultIndexDocumentPath = NullIfEmpty(OptionalText(website, "DefaultIndexDocumentPath"));
+        if (defaultIndexDocumentPath is not null)
+            RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "DefaultIndexDocumentPath");
+        if (indexDocument is not null && defaultIndexDocumentPath is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidXmlDocument",
+                "IndexDocument and DefaultIndexDocumentPath are mutually exclusive.");
+        }
+        return new StaticWebsiteProperties
+        {
+            Enabled = ParseBool(RequiredText(website, "Enabled"), false),
+            IndexDocument = indexDocument,
+            DefaultIndexDocumentPath = defaultIndexDocumentPath,
+            ErrorDocument404Path = NullIfEmpty(OptionalText(website, "ErrorDocument404Path"))
+        };
+    }
+
+    private static (string? DefaultVersion, bool DeleteEnabled, int DeleteDays, bool AllowPermanentDelete)
+        ReadVersionAndDeletePolicy(XElement root, ServiceProperties current, DateOnly version)
+    {
         var defaultServiceVersion = OptionalText(root, "DefaultServiceVersion");
         if (defaultServiceVersion is not null)
         {
@@ -448,50 +514,7 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
             current.BlobSoftDeleteRetentionDays,
             current.BlobPermanentDeleteEnabled,
             supportsPermanentDelete: true);
-        var website = Child(root, "StaticWebsite");
-        var staticWebsite = current.StaticWebsite;
-        if (website is not null)
-        {
-            RequireServicePropertiesVersion(version, new DateOnly(2018, 3, 28), "StaticWebsite");
-            ValidateUniqueChildren(website);
-            ValidateKnownChildren(
-                website,
-                "Enabled",
-                "IndexDocument",
-                "DefaultIndexDocumentPath",
-                "ErrorDocument404Path");
-            var indexDocument = NullIfEmpty(OptionalText(website, "IndexDocument"));
-            var defaultIndexDocumentPath = NullIfEmpty(OptionalText(website, "DefaultIndexDocumentPath"));
-            if (defaultIndexDocumentPath is not null)
-                RequireServicePropertiesVersion(version, new DateOnly(2019, 12, 12), "DefaultIndexDocumentPath");
-            if (indexDocument is not null && defaultIndexDocumentPath is not null)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "InvalidXmlDocument",
-                    "IndexDocument and DefaultIndexDocumentPath are mutually exclusive.");
-            }
-            staticWebsite = new StaticWebsiteProperties
-            {
-                Enabled = ParseBool(RequiredText(website, "Enabled"), false),
-                IndexDocument = indexDocument,
-                DefaultIndexDocumentPath = defaultIndexDocumentPath,
-                ErrorDocument404Path = NullIfEmpty(OptionalText(website, "ErrorDocument404Path"))
-            };
-        }
-
-        return current with
-        {
-            Logging = logging,
-            HourMetrics = hourMetrics,
-            MinuteMetrics = minuteMetrics,
-            Cors = cors,
-            DefaultServiceVersion = defaultServiceVersion ?? current.DefaultServiceVersion,
-            BlobSoftDeleteEnabled = deletePolicy.Enabled,
-            BlobSoftDeleteRetentionDays = deletePolicy.Days,
-            BlobPermanentDeleteEnabled = deletePolicy.AllowPermanentDelete,
-            StaticWebsite = staticWebsite
-        };
+        return (defaultServiceVersion, deletePolicy.Enabled, deletePolicy.Days, deletePolicy.AllowPermanentDelete);
     }
 
     public static (long Start, long End) ParseRange(string value, long length)

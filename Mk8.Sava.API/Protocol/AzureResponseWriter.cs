@@ -73,89 +73,96 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
                 writer.WriteElementString("MaxResults", maxResults.ToString(CultureInfo.InvariantCulture));
             writer.WriteStartElement("Containers");
             foreach (var container in page.Items)
-            {
-                writer.WriteStartElement("Container");
-                writer.WriteElementString("Name", container.Name);
-                if (!usesModernEndpointShape)
-                {
-                    writer.WriteElementString(
-                        "Url",
-                        StorageResourcePath.GetContainerEndpoint(
-                            context.Request,
-                            request.Account,
-                            container.Name));
-                }
-                var isDeleted = includeDeleted && container.DeletedAt.HasValue;
-                if (isDeleted)
-                {
-                    WriteOptional(writer, "Version", container.DeletedVersion);
-                    writer.WriteElementString("Deleted", "true");
-                }
-                writer.WriteStartElement("Properties");
-                writer.WriteElementString(
-                    IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19))
-                        ? "Last-Modified"
-                        : "LastModified",
-                    container.LastModified.ToString("R", CultureInfo.InvariantCulture));
-                writer.WriteElementString("Etag", FormatEntityTag(request, container.ETag));
-                if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
-                {
-                    writer.WriteElementString("LeaseStatus", LeaseStatus(container.Lease));
-                    writer.WriteElementString("LeaseState", LeaseStateValue(container.Lease));
-                    if (container.Lease.State == Storage.LeaseState.Leased)
-                    {
-                        writer.WriteElementString(
-                            "LeaseDuration",
-                            container.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
-                    }
-                }
-                if (!isDeleted &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
-                {
-                    WriteOptional(writer, "PublicAccess", container.PublicAccess);
-                }
-                if (!isDeleted &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
-                {
-                    writer.WriteElementString(
-                        "HasImmutabilityPolicy",
-                        container.ImmutabilityUntil.HasValue ? "true" : "false");
-                    writer.WriteElementString("HasLegalHold", container.HasLegalHold ? "true" : "false");
-                }
-                if (!isDeleted &&
-                    container.DefaultEncryptionScope is not null &&
-                    IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
-                {
-                    writer.WriteElementString("DefaultEncryptionScope", container.DefaultEncryptionScope);
-                    writer.WriteElementString(
-                        "DenyEncryptionScopeOverride",
-                        container.PreventEncryptionScopeOverride ? "true" : "false");
-                }
-                if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
-                {
-                    writer.WriteElementString(
-                        "ImmutableStorageWithVersioningEnabled",
-                        container.ImmutableStorageWithVersioningEnabled ? "true" : "false");
-                }
-                if (isDeleted)
-                {
-                    WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
-                    if (container.DeleteRetentionUntil.HasValue)
-                    {
-                        writer.WriteElementString(
-                            "RemainingRetentionDays",
-                            RemainingRetentionDays(container.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
-                    }
-                }
-                writer.WriteEndElement();
-                if (includeMetadata)
-                    WriteMetadata(writer, container.Metadata);
-                writer.WriteEndElement();
-            }
+                WriteContainerElement(writer, context, request, container, includeMetadata, includeDeleted, usesModernEndpointShape);
             writer.WriteEndElement();
             writer.WriteElementString("NextMarker", nextMarker);
             writer.WriteEndElement();
         }, cancellationToken);
+    }
+
+    private static void WriteContainerElement(
+        XmlWriter writer,
+        HttpContext context,
+        StorageRequestContext request,
+        ContainerRecord container,
+        bool includeMetadata,
+        bool includeDeleted,
+        bool usesModernEndpointShape)
+    {
+        writer.WriteStartElement("Container");
+        writer.WriteElementString("Name", container.Name);
+        if (!usesModernEndpointShape)
+        {
+            writer.WriteElementString(
+                "Url",
+                StorageResourcePath.GetContainerEndpoint(context.Request, request.Account, container.Name));
+        }
+        var isDeleted = includeDeleted && container.DeletedAt.HasValue;
+        if (isDeleted)
+        {
+            WriteOptional(writer, "Version", container.DeletedVersion);
+            writer.WriteElementString("Deleted", "true");
+        }
+        WriteContainerProperties(writer, request, container, isDeleted);
+        if (includeMetadata)
+            WriteMetadata(writer, container.Metadata);
+        writer.WriteEndElement();
+    }
+
+    private static void WriteContainerProperties(
+        XmlWriter writer,
+        StorageRequestContext request,
+        ContainerRecord container,
+        bool isDeleted)
+    {
+        writer.WriteStartElement("Properties");
+        writer.WriteElementString(
+            IsServiceVersionAtLeast(request, new DateOnly(2009, 9, 19)) ? "Last-Modified" : "LastModified",
+            container.LastModified.ToString("R", CultureInfo.InvariantCulture));
+        writer.WriteElementString("Etag", FormatEntityTag(request, container.ETag));
+        if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)))
+        {
+            writer.WriteElementString("LeaseStatus", LeaseStatus(container.Lease));
+            writer.WriteElementString("LeaseState", LeaseStateValue(container.Lease));
+            if (container.Lease.State == Storage.LeaseState.Leased)
+            {
+                writer.WriteElementString(
+                    "LeaseDuration",
+                    container.Lease.DurationSeconds == -1 ? "infinite" : "fixed");
+            }
+        }
+        if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+            WriteOptional(writer, "PublicAccess", container.PublicAccess);
+        if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2017, 11, 9)))
+        {
+            writer.WriteElementString("HasImmutabilityPolicy", container.ImmutabilityUntil.HasValue ? "true" : "false");
+            writer.WriteElementString("HasLegalHold", container.HasLegalHold ? "true" : "false");
+        }
+        if (!isDeleted && container.DefaultEncryptionScope is not null &&
+            IsServiceVersionAtLeast(request, new DateOnly(2019, 7, 7)))
+        {
+            writer.WriteElementString("DefaultEncryptionScope", container.DefaultEncryptionScope);
+            writer.WriteElementString(
+                "DenyEncryptionScopeOverride",
+                container.PreventEncryptionScopeOverride ? "true" : "false");
+        }
+        if (!isDeleted && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
+        {
+            writer.WriteElementString(
+                "ImmutableStorageWithVersioningEnabled",
+                container.ImmutableStorageWithVersioningEnabled ? "true" : "false");
+        }
+        if (isDeleted)
+        {
+            WriteOptional(writer, "DeletedTime", container.DeletedAt?.ToString("R", CultureInfo.InvariantCulture));
+            if (container.DeleteRetentionUntil.HasValue)
+            {
+                writer.WriteElementString(
+                    "RemainingRetentionDays",
+                    RemainingRetentionDays(container.DeleteRetentionUntil.Value).ToString(CultureInfo.InvariantCulture));
+            }
+        }
+        writer.WriteEndElement();
     }
 
     internal static Task WriteBlobsAsync(
