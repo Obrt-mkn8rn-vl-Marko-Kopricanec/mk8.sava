@@ -348,7 +348,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
     {
         var created = await container.CreateAsync().ConfigureAwait(false);
         var bytes = new byte[128 * 1024];
-        new Random(0x4D4B38).NextBytes(bytes);
+        DeterministicTestBytes.Fill(0x4D4B38, bytes);
         var blob = container.GetBlobClient("nested/original.bin");
         var uploaded = await blob.UploadAsync(BinaryData.FromBytes(bytes), new BlobUploadOptions
         {
@@ -391,7 +391,7 @@ public sealed class LiveAzureDifferentialTests(ITestOutputHelper output)
         var page = container.GetPageBlobClient("page.bin");
         await page.CreateAsync(1024).ConfigureAwait(false);
         var pageBytes = new byte[512];
-        new Random(0x50414745).NextBytes(pageBytes);
+        DeterministicTestBytes.Fill(0x50414745, pageBytes);
         await page.UploadPagesAsync(new MemoryStream(pageBytes, writable: false), 512).ConfigureAwait(false);
         var pageContent = await page.DownloadContentAsync().ConfigureAwait(false);
 

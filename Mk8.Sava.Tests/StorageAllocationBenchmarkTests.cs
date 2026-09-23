@@ -146,7 +146,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             }
 
             var duplicate = new byte[256 * 1024];
-            new Random(0x5100).NextBytes(duplicate);
+            DeterministicTestBytes.Fill(0x5100, duplicate);
             await RecordAsync("eight_exact_duplicates", async () =>
             {
                 double write = 0;
@@ -156,7 +156,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             });
 
             var sharedBase = new byte[2 * 1024 * 1024];
-            new Random(0x5101).NextBytes(sharedBase);
+            DeterministicTestBytes.Fill(0x5101, sharedBase);
             await RecordAsync("five_shifted_partials", async () =>
             {
                 double write = 0;
@@ -165,7 +165,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 {
                     latest = new byte[sharedBase.Length + 4096];
                     sharedBase.AsSpan(0, 2048).CopyTo(latest);
-                    new Random(0x5200 + index).NextBytes(latest.AsSpan(2048, 4096));
+                    DeterministicTestBytes.Fill(0x5200 + index, latest.AsSpan(2048, 4096));
                     sharedBase.AsSpan(2048).CopyTo(latest.AsSpan(6144));
                     write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest).ConfigureAwait(false);
                 }
@@ -192,7 +192,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 for (var index = 0; index < 128; index++)
                 {
                     latest = new byte[80];
-                    new Random(0x5300 + index).NextBytes(latest);
+                    DeterministicTestBytes.Fill(0x5300 + index, latest);
                     write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("small-127.bin", latest).ConfigureAwait(false));
@@ -205,7 +205,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 for (var index = 0; index < 4; index++)
                 {
                     latest = new byte[512 * 1024];
-                    new Random(0x5400 + index).NextBytes(latest);
+                    DeterministicTestBytes.Fill(0x5400 + index, latest);
                     write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest).ConfigureAwait(false);
                 }
                 return (write, await VerifyAsync("random-3.bin", latest).ConfigureAwait(false));

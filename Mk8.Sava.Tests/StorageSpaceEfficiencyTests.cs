@@ -87,7 +87,7 @@ public sealed class StorageSpaceEfficiencyTests
             await application.InitializeAsync();
             var chunks = application.Services.GetRequiredService<ChunkStore>();
             var content = new byte[80];
-            new Random(0x7600).NextBytes(content);
+            DeterministicTestBytes.Fill(0x7600, content);
             using var pinned = await chunks.StorePinnedAsync(
                 SavaWebApplicationFactory.AccountName,
                 new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null),
@@ -209,7 +209,7 @@ public sealed class StorageSpaceEfficiencyTests
             ["Sava:MaintenanceScanInterval"] = "01:00:00"
         };
         var bytes = new byte[80];
-        new Random(0x6400).NextBytes(bytes);
+        DeterministicTestBytes.Fill(0x6400, bytes);
 
         try
         {
@@ -290,12 +290,12 @@ public sealed class StorageSpaceEfficiencyTests
         var service = application.Services.GetRequiredService<BlobService>();
         var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
         var firstBytes = new byte[80];
-        new Random(0x6200).NextBytes(firstBytes);
+        DeterministicTestBytes.Fill(0x6200, firstBytes);
 
         for (var index = 0; index < 32; index++)
         {
             var bytes = new byte[80];
-            new Random(0x6200 + index).NextBytes(bytes);
+            DeterministicTestBytes.Fill(0x6200 + index, bytes);
             using var stored = await chunks.StorePinnedAsync(
                 SavaWebApplicationFactory.AccountName,
                 encryption,
@@ -382,7 +382,7 @@ public sealed class StorageSpaceEfficiencyTests
             await Task.WhenAll(Enumerable.Range(0, 48).Select(async index =>
             {
                 var bytes = new byte[80];
-                new Random(0x6300 + index).NextBytes(bytes);
+                DeterministicTestBytes.Fill(0x6300 + index, bytes);
                 using var stored = await chunks.StorePinnedAsync(
                     SavaWebApplicationFactory.AccountName,
                     encryption,
@@ -440,7 +440,7 @@ public sealed class StorageSpaceEfficiencyTests
         for (var index = 0; index < 32; index++)
         {
             var bytes = new byte[80];
-            new Random(0x6100 + index).NextBytes(bytes);
+            DeterministicTestBytes.Fill(0x6100 + index, bytes);
             await container.GetBlobClient($"small-{index}.bin").UploadAsync(BinaryData.FromBytes(bytes));
         }
 
@@ -483,9 +483,9 @@ public sealed class StorageSpaceEfficiencyTests
         await container.CreateAsync();
 
         var original = new byte[512 * 1024];
-        new Random(0x5A8A).NextBytes(original);
+        DeterministicTestBytes.Fill(0x5A8A, original);
         var inserted = new byte[3 * 1024];
-        new Random(0x5A8B).NextBytes(inserted);
+        DeterministicTestBytes.Fill(0x5A8B, inserted);
         var shifted = new byte[original.Length + inserted.Length];
         original.AsSpan(0, 2048).CopyTo(shifted);
         inserted.CopyTo(shifted, 2048);

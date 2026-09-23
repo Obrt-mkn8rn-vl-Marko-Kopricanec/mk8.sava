@@ -35,8 +35,8 @@ public sealed class ChunkCollisionTests
         var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
         var firstBytes = new byte[1024];
         var secondBytes = new byte[1024];
-        new Random(0x5100).NextBytes(firstBytes);
-        new Random(0x5200).NextBytes(secondBytes);
+        DeterministicTestBytes.Fill(0x5100, firstBytes);
+        DeterministicTestBytes.Fill(0x5200, secondBytes);
 
         using var first = await chunks.StorePinnedAsync(
             SavaWebApplicationFactory.AccountName,
