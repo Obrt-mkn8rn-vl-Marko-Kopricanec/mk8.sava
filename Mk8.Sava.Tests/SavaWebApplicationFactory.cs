@@ -134,44 +134,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         ArgumentNullException.ThrowIfNull(builder);
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
-            configuration.AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.Ordinal)
-            {
-                ["Sava:DataPath"] = DataPath,
-                ["Sava:DefaultAccount"] = AccountName,
-                [$"Sava:Accounts:{AccountName}"] = AccountKey,
-                [$"Sava:Accounts:{SecondAccountName}"] = SecondAccountKey,
-                ["Sava:BearerAuthentication:Enabled"] = "true",
-                ["Sava:BearerAuthentication:ValidAudiences:0"] = "https://storage.azure.com/",
-                ["Sava:BearerAuthentication:ValidIssuers:0"] = "https://issuer.mk8.test",
-                ["Sava:BearerAuthentication:SymmetricSigningKeys:test-key"] = AccountKey,
-                ["Sava:BearerAuthentication:Principals:reader-1:Permissions"] = "rl",
-                ["Sava:BearerAuthentication:Principals:reader-1:Accounts:0"] = AccountName,
-                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Permissions"] = "r",
-                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Accounts:0"] = AccountName,
-                [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
-                ["Sava:MinimumChunkBytes"] = "4096",
-                ["Sava:TargetChunkBytes"] = "8192",
-                ["Sava:MaximumChunkBytes"] = "16384",
-                ["Sava:CompressionQuality"] = "5",
-                ["Sava:CompressionMinimumSavingsBytes"] = "32",
-                ["Sava:BackgroundCompressionQuality"] = "11",
-                ["Sava:BackgroundCompressionMinimumSavingsBytes"] = "32",
-                ["Sava:BackgroundCompressionMinimumAge"] = "01:00:00",
-                ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "8",
-                ["Sava:SmallChunkPackingThresholdBytes"] = "2048",
-                ["Sava:StandardRehydrationDelay"] = "00:00:05",
-                ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
-                ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
-                ["Sava:MaintenanceScanInterval"] = "00:00:00.050",
-                ["Sava:AbandonedStagingRetention"] = "1.00:00:00",
-                ["Sava:MaximumStagingFilesPerMaintenancePass"] = "1000",
-                ["Sava:UrlTransferAllowedPrivateHosts:0"] = "127.0.0.1",
-                ["Sava:BlobRecordsPerMaintenancePass"] = "100000",
-                ["Sava:ContainerRecordsPerMaintenancePass"] = "100000",
-                ["Sava:UncommittedBlocksPerMaintenancePass"] = "100000",
-                ["Sava:GarbageCollectionChunksPerMaintenancePass"] = "100000",
-                ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
-            });
+            configuration.AddInMemoryCollection(CreateBaseConfiguration());
             if (_configurationOverrides is not null)
                 configuration.AddInMemoryCollection(_configurationOverrides);
         });
@@ -219,6 +182,45 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             });
         }
     }
+
+    private Dictionary<string, string?> CreateBaseConfiguration() => new(StringComparer.Ordinal)
+    {
+        ["Sava:DataPath"] = DataPath,
+        ["Sava:DefaultAccount"] = AccountName,
+        [$"Sava:Accounts:{AccountName}"] = AccountKey,
+        [$"Sava:Accounts:{SecondAccountName}"] = SecondAccountKey,
+        ["Sava:BearerAuthentication:Enabled"] = "true",
+        ["Sava:BearerAuthentication:ValidAudiences:0"] = "https://storage.azure.com/",
+        ["Sava:BearerAuthentication:ValidIssuers:0"] = "https://issuer.mk8.test",
+        ["Sava:BearerAuthentication:SymmetricSigningKeys:test-key"] = AccountKey,
+        ["Sava:BearerAuthentication:Principals:reader-1:Permissions"] = "rl",
+        ["Sava:BearerAuthentication:Principals:reader-1:Accounts:0"] = AccountName,
+        [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Permissions"] = "r",
+        [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:Accounts:0"] = AccountName,
+        [$"Sava:BearerAuthentication:Principals:{DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
+        ["Sava:MinimumChunkBytes"] = "4096",
+        ["Sava:TargetChunkBytes"] = "8192",
+        ["Sava:MaximumChunkBytes"] = "16384",
+        ["Sava:CompressionQuality"] = "5",
+        ["Sava:CompressionMinimumSavingsBytes"] = "32",
+        ["Sava:BackgroundCompressionQuality"] = "11",
+        ["Sava:BackgroundCompressionMinimumSavingsBytes"] = "32",
+        ["Sava:BackgroundCompressionMinimumAge"] = "01:00:00",
+        ["Sava:BackgroundCompressionChunksPerMaintenancePass"] = "8",
+        ["Sava:SmallChunkPackingThresholdBytes"] = "2048",
+        ["Sava:StandardRehydrationDelay"] = "00:00:05",
+        ["Sava:HighPriorityRehydrationDelay"] = "00:00:00.200",
+        ["Sava:AsyncCopyCompletionDelay"] = "00:00:02",
+        ["Sava:MaintenanceScanInterval"] = "00:00:00.050",
+        ["Sava:AbandonedStagingRetention"] = "1.00:00:00",
+        ["Sava:MaximumStagingFilesPerMaintenancePass"] = "1000",
+        ["Sava:UrlTransferAllowedPrivateHosts:0"] = "127.0.0.1",
+        ["Sava:BlobRecordsPerMaintenancePass"] = "100000",
+        ["Sava:ContainerRecordsPerMaintenancePass"] = "100000",
+        ["Sava:UncommittedBlocksPerMaintenancePass"] = "100000",
+        ["Sava:GarbageCollectionChunksPerMaintenancePass"] = "100000",
+        ["Sava:IntegrityScanChunksPerMaintenancePass"] = "100000"
+    };
 
     public Task InitializeAsync()
     {

@@ -32,49 +32,30 @@ public sealed class AzureTransactionalChecksumResponseTests(SavaWebApplicationFa
         }
 
         var blockContent = "put block response checksum"u8.ToArray();
-        using (var response = await PutBlockAsync(
-                   transport,
-                   container.GetBlockBlobClient("modern-no-md5.bin"),
-                   blockContent,
-                   "2023-11-03",
-                   sendMd5: false))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertChecksums(response, blockContent, expectMd5: false, expectCrc64: true);
-        }
+        await AssertBlockChecksumAsync(transport, container, "modern-no-md5.bin", blockContent,
+            "2023-11-03", sendMd5: false, expectMd5: false, expectCrc64: true);
+        await AssertBlockChecksumAsync(transport, container, "modern-md5.bin", blockContent,
+            "2023-11-03", sendMd5: true, expectMd5: true, expectCrc64: false);
+        await AssertBlockChecksumAsync(transport, container, "latest-md5.bin", blockContent,
+            "2026-12-06", sendMd5: true, expectMd5: true, expectCrc64: true);
+        await AssertBlockChecksumAsync(transport, container, "legacy.bin", blockContent,
+            "2018-11-09", sendMd5: false, expectMd5: true, expectCrc64: false);
+    }
 
-        using (var response = await PutBlockAsync(
-                   transport,
-                   container.GetBlockBlobClient("modern-md5.bin"),
-                   blockContent,
-                   "2023-11-03",
-                   sendMd5: true))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertChecksums(response, blockContent, expectMd5: true, expectCrc64: false);
-        }
-
-        using (var response = await PutBlockAsync(
-                   transport,
-                   container.GetBlockBlobClient("latest-md5.bin"),
-                   blockContent,
-                   "2026-12-06",
-                   sendMd5: true))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertChecksums(response, blockContent, expectMd5: true, expectCrc64: true);
-        }
-
-        using (var response = await PutBlockAsync(
-                   transport,
-                   container.GetBlockBlobClient("legacy.bin"),
-                   blockContent,
-                   "2018-11-09",
-                   sendMd5: false))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            AssertChecksums(response, blockContent, expectMd5: true, expectCrc64: false);
-        }
+    private static async Task AssertBlockChecksumAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        string name,
+        byte[] content,
+        string version,
+        bool sendMd5,
+        bool expectMd5,
+        bool expectCrc64)
+    {
+        using var response = await PutBlockAsync(
+            transport, container.GetBlockBlobClient(name), content, version, sendMd5).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        AssertChecksums(response, content, expectMd5, expectCrc64);
     }
 
     private static async Task<HttpResponseMessage> PutBlobAsync(

@@ -26,12 +26,7 @@ public sealed class ChunkCollisionTests
         await using var applicationDisposal1 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var services = application.Services;
-        var chunks = new ChunkStore(
-            services.GetRequiredService<StoragePaths>(),
-            services.GetRequiredService<MetadataStore>(),
-            services.GetRequiredService<IStorageFaultInjector>(),
-            services.GetRequiredService<IOptions<SavaOptions>>(),
-            _ => Enumerable.Repeat((byte)0xa5, 32).ToArray());
+        var chunks = CreateCollisionStore(services);
         var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
         var firstBytes = new byte[1024];
         var secondBytes = new byte[1024];
@@ -53,15 +48,7 @@ public sealed class ChunkCollisionTests
         Assert.NotEqual(firstId, secondId, StringComparer.Ordinal);
         Assert.EndsWith("-1024", firstId, StringComparison.Ordinal);
         Assert.EndsWith("-1024-1", secondId, StringComparison.Ordinal);
-        Assert.Equal(
-            packed ? 2 : 0,
-            await services.GetRequiredService<MetadataStore>().CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
-        Assert.Equal(
-            packed ? 0 : 2,
-            Directory.EnumerateFiles(
-                Path.Combine(application.DataPath, "chunks"),
-                "*.chunk",
-                SearchOption.AllDirectories).Count());
+        await AssertPhysicalLocationsAsync(application, packed);
 
         using var repeatedFirst = await chunks.StorePinnedAsync(
             SavaWebApplicationFactory.AccountName,
@@ -76,23 +63,45 @@ public sealed class ChunkCollisionTests
         Assert.Equal(firstId, Assert.Single(repeatedFirst.Manifest.Chunks).Id);
         Assert.Equal(secondId, Assert.Single(repeatedSecond.Manifest.Chunks).Id);
 
-        using var firstOutput = new MemoryStream();
-        using var secondOutput = new MemoryStream();
+        await AssertRoundTripAsync(chunks, encryption, first.Manifest, firstBytes).ConfigureAwait(true);
+        await AssertRoundTripAsync(chunks, encryption, second.Manifest, secondBytes).ConfigureAwait(true);
+    }
+
+    private static ChunkStore CreateCollisionStore(IServiceProvider services) => new(
+        services.GetRequiredService<StoragePaths>(),
+        services.GetRequiredService<MetadataStore>(),
+        services.GetRequiredService<IStorageFaultInjector>(),
+        services.GetRequiredService<IOptions<SavaOptions>>(),
+        _ => Enumerable.Repeat((byte)0xa5, 32).ToArray());
+
+    private static async Task AssertPhysicalLocationsAsync(SavaWebApplicationFactory application, bool packed)
+    {
+        Assert.Equal(
+            packed ? 2 : 0,
+            await application.Services.GetRequiredService<MetadataStore>()
+                .CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+        Assert.Equal(
+            packed ? 0 : 2,
+            Directory.EnumerateFiles(
+                Path.Combine(application.DataPath, "chunks"),
+                "*.chunk",
+                SearchOption.AllDirectories).Count());
+    }
+
+    private static async Task AssertRoundTripAsync(
+        ChunkStore chunks,
+        BlobEncryption encryption,
+        ContentManifest manifest,
+        byte[] expected)
+    {
+        using var output = new MemoryStream();
         await chunks.WriteRangeAsync(
-            first.Manifest,
+            manifest,
             encryption,
             0,
-            firstBytes.Length,
-            firstOutput,
-            CancellationToken.None).ConfigureAwait(true);
-        await chunks.WriteRangeAsync(
-            second.Manifest,
-            encryption,
-            0,
-            secondBytes.Length,
-            secondOutput,
-            CancellationToken.None).ConfigureAwait(true);
-        Assert.Equal(firstBytes, firstOutput.ToArray());
-        Assert.Equal(secondBytes, secondOutput.ToArray());
+            expected.Length,
+            output,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(expected, output.ToArray());
     }
 }
