@@ -48,7 +48,7 @@ internal static class StorageResourcePath
                 escapedPath = absolute.AbsolutePath;
                 return true;
             }
-            var queryOffset = rawTarget.IndexOf('?');
+            var queryOffset = rawTarget.IndexOf('?', StringComparison.Ordinal);
             escapedPath = queryOffset < 0 ? rawTarget : rawTarget[..queryOffset];
             return true;
         }

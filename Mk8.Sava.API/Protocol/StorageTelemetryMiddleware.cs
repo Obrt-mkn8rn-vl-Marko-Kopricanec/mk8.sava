@@ -6,7 +6,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-public sealed class StorageTelemetryMiddleware(
+internal sealed class StorageTelemetryMiddleware(
     RequestDelegate next,
     IStorageTelemetry telemetry,
     IStorageAnalyticsSink analytics,
@@ -15,8 +15,8 @@ public sealed class StorageTelemetryMiddleware(
 {
     public async Task InvokeAsync(HttpContext context)
     {
-        if (context.Request.Path.StartsWithSegments("/health") ||
-            context.Request.Path.StartsWithSegments("/metrics"))
+        if (context.Request.Path.StartsWithSegments("/health", StringComparison.OrdinalIgnoreCase) ||
+            context.Request.Path.StartsWithSegments("/metrics", StringComparison.OrdinalIgnoreCase))
         {
             await next(context).ConfigureAwait(false);
             return;
@@ -270,7 +270,7 @@ public sealed class StorageTelemetryMiddleware(
         var parts = rawQuery.TrimStart('?').Split('&');
         for (var index = 0; index < parts.Length; index++)
         {
-            var separator = parts[index].IndexOf('=');
+            var separator = parts[index].IndexOf('=', StringComparison.Ordinal);
             var encodedName = separator < 0 ? parts[index] : parts[index][..separator];
             if (string.Equals(WebUtility.UrlDecode(encodedName), "sig", StringComparison.OrdinalIgnoreCase))
                 parts[index] = encodedName + "=XXXXX";

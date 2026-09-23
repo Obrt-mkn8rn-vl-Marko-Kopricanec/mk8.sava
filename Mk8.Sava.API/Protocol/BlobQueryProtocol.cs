@@ -1076,7 +1076,8 @@ internal static class BlobQueryProtocol
             var quote = value.Contains(format.ColumnSeparator, StringComparison.Ordinal) ||
                         value.Contains(format.RecordSeparator, StringComparison.Ordinal) ||
                         value.Contains(format.Quote, StringComparison.Ordinal) ||
-                        value.Contains('\r') || value.Contains('\n');
+                        value.Contains('\r', StringComparison.Ordinal) ||
+                        value.Contains('\n', StringComparison.Ordinal);
             if (!quote)
             {
                 builder.Append(value);

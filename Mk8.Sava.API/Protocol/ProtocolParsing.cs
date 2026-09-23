@@ -169,7 +169,7 @@ internal static class ProtocolParsing
         var tags = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var pair in value.Split('&', StringSplitOptions.RemoveEmptyEntries))
         {
-            var separator = pair.IndexOf('=');
+            var separator = pair.IndexOf('=', StringComparison.Ordinal);
             if (separator <= 0)
                 throw AzureStorageException.InvalidHeader("x-ms-tags", value);
             var key = WebUtility.UrlDecode(pair[..separator]);
@@ -773,7 +773,7 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
         foreach (var header in value.Split(',', StringSplitOptions.TrimEntries))
         {
             if (header.Length == 0 || header.Length > 256 || header.Count(character => character == '*') > 1 ||
-                header.Contains('*') && !header.EndsWith('*'))
+                header.Contains('*', StringComparison.Ordinal) && !header.EndsWith('*'))
             {
                 throw InvalidServicePropertiesXml("A CORS header value is invalid.");
             }
