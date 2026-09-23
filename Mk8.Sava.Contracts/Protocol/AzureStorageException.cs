@@ -1,8 +1,11 @@
 using System.Net;
+using System.Collections.ObjectModel;
 
 namespace Mk8.Sava.Protocol;
 
+#pragma warning disable CA1032, RCS1194 // Azure errors must carry a protocol status and error code.
 public sealed class AzureStorageException : Exception
+#pragma warning restore CA1032, RCS1194
 {
     public AzureStorageException(
         int statusCode,
@@ -23,7 +26,7 @@ public sealed class AzureStorageException : Exception
     }
 
     private static readonly IReadOnlyDictionary<string, string> EmptyValues =
-        new Dictionary<string, string>(StringComparer.Ordinal);
+        new ReadOnlyDictionary<string, string>(new Dictionary<string, string>(StringComparer.Ordinal));
 
     public int StatusCode { get; }
     public string ErrorCode { get; }
@@ -185,12 +188,16 @@ public sealed class AzureStorageException : Exception
 
     public static AzureStorageException LeaseOperationMismatch(string resource) => new(
         (int)HttpStatusCode.PreconditionFailed,
-        resource == "container" ? "LeaseIdMismatchWithContainerOperation" : "LeaseIdMismatchWithBlobOperation",
+        string.Equals(resource, "container", StringComparison.Ordinal)
+            ? "LeaseIdMismatchWithContainerOperation"
+            : "LeaseIdMismatchWithBlobOperation",
         $"The lease ID specified did not match the lease ID for the {resource}.");
 
     public static AzureStorageException LeaseNotPresentForOperation(string resource) => new(
         (int)HttpStatusCode.PreconditionFailed,
-        resource == "container" ? "LeaseNotPresentWithContainerOperation" : "LeaseNotPresentWithBlobOperation",
+        string.Equals(resource, "container", StringComparison.Ordinal)
+            ? "LeaseNotPresentWithContainerOperation"
+            : "LeaseNotPresentWithBlobOperation",
         $"A lease ID was specified, but there is currently no active lease on the {resource}.");
 
     public static AzureStorageException RequestForbiddenByContainerEncryptionPolicy() => new(

@@ -34,8 +34,10 @@ public sealed record BlobRecord
     public required string ETag { get; init; }
     public required DateTimeOffset CreatedAt { get; init; }
     public required DateTimeOffset LastModified { get; init; }
-    public Dictionary<string, string> Metadata { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    public Dictionary<string, string> Tags { get; init; } = new(StringComparer.Ordinal);
+    public IReadOnlyDictionary<string, string> Metadata { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, string> Tags { get; init; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
     public BlobHttpProperties Http { get; init; } = new();
     public LeaseRecord Lease { get; init; } = LeaseRecord.Available;
     public long SequenceNumber { get; init; }
@@ -58,19 +60,19 @@ public sealed record BlobRecord
     public string? CustomerProvidedKeySha256 { get; init; }
     public CopyState? Copy { get; init; }
     public ContentManifest? PendingCopyContent { get; init; }
-    public List<CommittedBlockRecord>? PendingCopyCommittedBlocks { get; init; }
+    public IReadOnlyList<CommittedBlockRecord>? PendingCopyCommittedBlocks { get; init; }
     public int? PendingCopyAppendBlockCount { get; init; }
     public bool? PendingCopyIsSealed { get; init; }
-    public List<PageRange>? PendingCopyPageRanges { get; init; }
+    public IReadOnlyList<PageRange>? PendingCopyPageRanges { get; init; }
     public bool IsIncrementalCopy { get; init; }
     public string? IncrementalCopySource { get; init; }
     public string? IncrementalCopySourceSnapshot { get; init; }
     public DateTimeOffset? IncrementalCopySourceCreatedAt { get; init; }
     public string? CopyDestinationSnapshot { get; init; }
-    public List<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
+    public IReadOnlyList<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
-    public List<PageRange> PageRanges { get; init; } = [];
-    public Dictionary<string, ObjectReplicationStatusRecord> ObjectReplicationStatuses { get; init; } =
-        new(StringComparer.Ordinal);
+    public IReadOnlyList<PageRange> PageRanges { get; init; } = [];
+    public IReadOnlyDictionary<string, ObjectReplicationStatusRecord> ObjectReplicationStatuses { get; init; } =
+        new Dictionary<string, ObjectReplicationStatusRecord>(StringComparer.Ordinal);
     public string? ObjectReplicationDestinationPolicyId { get; init; }
 }

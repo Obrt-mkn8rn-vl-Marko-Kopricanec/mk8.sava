@@ -13,7 +13,9 @@ public sealed record StorageAnalyticsRequest
     public required long ServerLatencyMilliseconds { get; init; }
     public required string AuthenticationType { get; init; }
     public string? RequesterAccountName { get; init; }
+#pragma warning disable CA1056 // Preserve the redacted, escaped request target exactly as logged.
     public required string RequestUrl { get; init; }
+#pragma warning restore CA1056
     public required string RequestedObjectKey { get; init; }
     public required string RequestId { get; init; }
     public string? RequesterIpAddress { get; init; }

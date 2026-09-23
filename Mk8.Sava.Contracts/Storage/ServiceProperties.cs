@@ -12,6 +12,6 @@ public sealed record ServiceProperties
     public int BlobSoftDeleteRetentionDays { get; init; } = 7;
     public bool BlobPermanentDeleteEnabled { get; init; }
     public string? DefaultServiceVersion { get; init; }
-    public List<CorsRule> Cors { get; init; } = [];
+    public IList<CorsRule> Cors { get; init; } = [];
     public StaticWebsiteProperties StaticWebsite { get; init; } = new();
 }
