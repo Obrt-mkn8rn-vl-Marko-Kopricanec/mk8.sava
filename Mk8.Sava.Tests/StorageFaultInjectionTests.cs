@@ -91,7 +91,6 @@ public sealed class StorageFaultInjectionTests
         var stableBytes = RandomNumberGenerator.GetBytes(1536);
         var retryBytes = RandomNumberGenerator.GetBytes(1536);
         string packId;
-        long indexedLength;
 
         var first = new SavaWebApplicationFactory(
             dataPath,
@@ -102,34 +101,12 @@ public sealed class StorageFaultInjectionTests
             disableMaintenance: true);
         try
         {
-            await first.InitializeAsync();
-            var container = CreateClient(first).GetBlobContainerClient(containerName);
-            await container.CreateAsync();
-            await container.GetBlobClient("stable.bin").UploadAsync(BinaryData.FromBytes(stableBytes));
-            var metadata = first.Services.GetRequiredService<MetadataStore>();
-            var pack = await metadata.GetActiveChunkPackAsync(
-                SavaWebApplicationFactory.AccountName, CancellationToken.None);
-            Assert.NotNull(pack);
-            packId = pack.PackId;
-            indexedLength = await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None);
-            Assert.True(indexedLength > 0);
-
-            faultInjector.Arm(StorageFaultPoint.DuringPackRecordAppend);
-            var failedBlob = container.GetBlobClient("retry.bin");
-            var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                failedBlob.UploadAsync(BinaryData.FromBytes(retryBytes)));
-            Assert.Equal(500, failure.Status);
-            Assert.False((await failedBlob.ExistsAsync()).Value);
-            Assert.Equal(stableBytes,
-                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
-
-            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-            Assert.True(new FileInfo(packPath).Length > indexedLength);
-            Assert.Equal(indexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None));
+            packId = await SeedAndInterruptPackAsync(
+                first, containerName, stableBytes, retryBytes, faultInjector).ConfigureAwait(true);
         }
         finally
         {
-            await first.DisposeAsync();
+            await first.DisposeAsync().ConfigureAwait(true);
         }
 
         var restarted = new SavaWebApplicationFactory(
@@ -141,26 +118,78 @@ public sealed class StorageFaultInjectionTests
             disableMaintenance: true);
         try
         {
-            await restarted.InitializeAsync();
-            var container = CreateClient(restarted).GetBlobContainerClient(containerName);
-            Assert.Equal(stableBytes,
-                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
-            var retried = container.GetBlobClient("retry.bin");
-            await retried.UploadAsync(BinaryData.FromBytes(retryBytes));
-            Assert.Equal(retryBytes, (await retried.DownloadContentAsync()).Value.Content.ToArray());
-
-            var metadata = restarted.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
-            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-            Assert.Equal(
-                await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None).ConfigureAwait(true),
-                new FileInfo(packPath).Length);
-            Assert.Empty(EnumerateStagingFiles(dataPath));
+            await AssertRecoveredPackAsync(
+                restarted, containerName, stableBytes, retryBytes, packId).ConfigureAwait(true);
         }
         finally
         {
             await restarted.DisposeAsync().ConfigureAwait(true);
         }
+    }
+
+    private static async Task AssertRecoveredPackAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        byte[] stableBytes,
+        byte[] retryBytes,
+        string packId)
+    {
+        await application.InitializeAsync().ConfigureAwait(false);
+        var container = CreateClient(application).GetBlobContainerClient(containerName);
+        Assert.Equal(stableBytes,
+            (await container.GetBlobClient("stable.bin").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToArray());
+        var retried = container.GetBlobClient("retry.bin");
+        await retried.UploadAsync(BinaryData.FromBytes(retryBytes)).ConfigureAwait(false);
+        Assert.Equal(retryBytes,
+            (await retried.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+        var packPath = Path.Combine(application.DataPath, "packs",
+            packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+        Assert.Equal(await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None)
+            .ConfigureAwait(false), new FileInfo(packPath).Length);
+        Assert.Empty(EnumerateStagingFiles(application.DataPath));
+    }
+
+    private static async Task<string> SeedAndInterruptPackAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        byte[] stableBytes,
+        byte[] retryBytes,
+        ArmableStorageFaultInjector faultInjector)
+    {
+        await application.InitializeAsync().ConfigureAwait(false);
+        var container = CreateClient(application).GetBlobContainerClient(containerName);
+        await container.CreateAsync().ConfigureAwait(false);
+        await container.GetBlobClient("stable.bin")
+            .UploadAsync(BinaryData.FromBytes(stableBytes)).ConfigureAwait(false);
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var pack = await metadata.GetActiveChunkPackAsync(
+            SavaWebApplicationFactory.AccountName, CancellationToken.None).ConfigureAwait(false);
+        Assert.NotNull(pack);
+        var packId = pack.PackId;
+        var indexedLength = await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.True(indexedLength > 0);
+
+        faultInjector.Arm(StorageFaultPoint.DuringPackRecordAppend);
+        var failedBlob = container.GetBlobClient("retry.bin");
+        var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            failedBlob.UploadAsync(BinaryData.FromBytes(retryBytes))).ConfigureAwait(false);
+        Assert.Equal(500, failure.Status);
+        Assert.False((await failedBlob.ExistsAsync().ConfigureAwait(false)).Value);
+        Assert.Equal(stableBytes,
+            (await container.GetBlobClient("stable.bin").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToArray());
+
+        var packPath = Path.Combine(application.DataPath, "packs",
+            packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+        Assert.True(new FileInfo(packPath).Length > indexedLength);
+        Assert.Equal(indexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None)
+            .ConfigureAwait(false));
+        return packId;
     }
 
     [Fact]
@@ -312,26 +341,8 @@ public sealed class StorageFaultInjectionTests
             var stored = await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(30));
             try
             {
-                var chunkId = Assert.Single(stored[0].Manifest.Chunks).Id;
-                Assert.Equal(chunkId, Assert.Single(stored[1].Manifest.Chunks).Id);
-                var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
-                Assert.NotNull(location);
-                Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
-                var packPath = Path.Combine(
-                    application.DataPath,
-                    "packs",
-                    location.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-                Assert.Equal(location.RecordLength, new FileInfo(packPath).Length);
-
-                using var reconstructed = new MemoryStream();
-                await store.WriteRangeAsync(
-                    stored[1].Manifest,
-                    encryption,
-                    0,
-                    payload.Length,
-                    reconstructed,
-                    CancellationToken.None).ConfigureAwait(true);
-                Assert.Equal(payload, reconstructed.ToArray());
+                await AssertSinglePublishedPackedChunkAsync(
+                    application, store, metadata, stored, encryption, payload).ConfigureAwait(true);
             }
             finally
             {
@@ -343,6 +354,35 @@ public sealed class StorageFaultInjectionTests
         {
             await application.DisposeAsync().ConfigureAwait(true);
         }
+    }
+
+    private static async Task AssertSinglePublishedPackedChunkAsync(
+        SavaWebApplicationFactory application,
+        ChunkStore store,
+        MetadataStore metadata,
+        StoredContent[] stored,
+        BlobEncryption encryption,
+        byte[] payload)
+    {
+        var chunkId = Assert.Single(stored[0].Manifest.Chunks).Id;
+        Assert.Equal(chunkId, Assert.Single(stored[1].Manifest.Chunks).Id);
+        var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.NotNull(location);
+        Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+        var packPath = Path.Combine(
+            application.DataPath, "packs", location.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+        Assert.Equal(location.RecordLength, new FileInfo(packPath).Length);
+
+        using var reconstructed = new MemoryStream();
+        await store.WriteRangeAsync(
+            stored[1].Manifest,
+            encryption,
+            0,
+            payload.Length,
+            reconstructed,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(payload, reconstructed.ToArray());
     }
 
     [Theory]
@@ -393,30 +433,33 @@ public sealed class StorageFaultInjectionTests
             faultInjector.Arm(faultPoint);
             await Assert.ThrowsAsync<IOException>(() => service.RunMaintenanceAsync(CancellationToken.None));
 
-            var committedLocation = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
-            Assert.NotNull(committedLocation);
-            var committedPath = Path.Combine(
-                application.DataPath,
-                "packs",
-                committedLocation.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-            Assert.True(File.Exists(committedPath));
-            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+            await AssertPackLocationExistsAsync(application, metadata, chunkId).ConfigureAwait(true);
+            Assert.Equal(liveBytes,
+                (await live.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
 
-            await service.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+            await service.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(true);
+            Assert.Equal(liveBytes,
+                (await live.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
             Assert.Single(EnumerateContentFiles(application.DataPath));
-            var recoveredLocation = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
-            Assert.NotNull(recoveredLocation);
-            var recoveredPath = Path.Combine(
-                application.DataPath,
-                "packs",
-                recoveredLocation.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-            Assert.True(File.Exists(recoveredPath));
+            await AssertPackLocationExistsAsync(application, metadata, chunkId).ConfigureAwait(true);
         }
         finally
         {
-            await application.DisposeAsync();
+            await application.DisposeAsync().ConfigureAwait(true);
         }
+    }
+
+    private static async Task AssertPackLocationExistsAsync(
+        SavaWebApplicationFactory application,
+        MetadataStore metadata,
+        string chunkId)
+    {
+        var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.NotNull(location);
+        var path = Path.Combine(
+            application.DataPath, "packs", location.PackId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+        Assert.True(File.Exists(path));
     }
 
     private static SavaWebApplicationFactory CreateApplication(IStorageFaultInjector faultInjector) =>
