@@ -106,18 +106,11 @@ public sealed class StorageSpaceEfficiencyTests
             Directory.CreateSymbolicLink(cycleLink, Path.Combine(application.DataPath, "chunks"));
 
             var after = chunks.MeasurePhysicalUsage();
-            Assert.Equal(before.ChunkBytes, after.ChunkBytes);
-            Assert.Equal(before.ChunkCount, after.ChunkCount);
+            AssertSamePhysicalUsage(before, after);
 
-            StoragePhysicalUsage? budgeted = null;
-            for (var pass = 0; pass < 100 && budgeted is null; pass++)
-            {
-                budgeted = chunks.ScanPhysicalUsageBatch(2);
-                Assert.InRange(chunks.PhysicalUsageScanStepsLastPass, 1, 2);
-            }
+            var budgeted = CompleteBudgetedPhysicalUsageScan(chunks);
             Assert.NotNull(budgeted);
-            Assert.Equal(after.ChunkBytes, budgeted.ChunkBytes);
-            Assert.Equal(after.ChunkCount, budgeted.ChunkCount);
+            AssertSamePhysicalUsage(after, budgeted);
         }
         finally
         {
@@ -130,6 +123,23 @@ public sealed class StorageSpaceEfficiencyTests
             if (Directory.Exists(external))
                 Directory.Delete(external, recursive: true);
         }
+    }
+
+    private static void AssertSamePhysicalUsage(StoragePhysicalUsage expected, StoragePhysicalUsage actual)
+    {
+        Assert.Equal(expected.ChunkBytes, actual.ChunkBytes);
+        Assert.Equal(expected.ChunkCount, actual.ChunkCount);
+    }
+
+    private static StoragePhysicalUsage? CompleteBudgetedPhysicalUsageScan(ChunkStore chunks)
+    {
+        StoragePhysicalUsage? usage = null;
+        for (var pass = 0; pass < 100 && usage is null; pass++)
+        {
+            usage = chunks.ScanPhysicalUsageBatch(2);
+            Assert.InRange(chunks.PhysicalUsageScanStepsLastPass, 1, 2);
+        }
+        return usage;
     }
 
     [Fact]
@@ -168,29 +178,7 @@ public sealed class StorageSpaceEfficiencyTests
 
             var measured = StorageAllocationMeter.MeasureRoot(root);
             Assert.NotNull(measured);
-            using var process = new Process
-            {
-                StartInfo = new ProcessStartInfo("du")
-                {
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false
-                }
-            };
-            process.StartInfo.ArgumentList.Add("-s");
-            process.StartInfo.ArgumentList.Add("--block-size=1");
-            process.StartInfo.ArgumentList.Add("--");
-            process.StartInfo.ArgumentList.Add(root);
-            process.Start();
-            var output = await process.StandardOutput.ReadToEndAsync();
-            var error = await process.StandardError.ReadToEndAsync();
-            await process.WaitForExitAsync();
-            Assert.True(process.ExitCode == 0, error);
-            var separator = output.IndexOf('\t', StringComparison.Ordinal);
-            Assert.True(separator > 0, output);
-            Assert.Equal(
-                long.Parse(output.AsSpan(0, separator), CultureInfo.InvariantCulture),
-                measured.Value);
+            Assert.Equal(await MeasureWithDuAsync(root).ConfigureAwait(true), measured.Value);
         }
         finally
         {
@@ -201,6 +189,31 @@ public sealed class StorageSpaceEfficiencyTests
             if (Directory.Exists(external))
                 Directory.Delete(external, recursive: true);
         }
+    }
+
+    private static async Task<long> MeasureWithDuAsync(string root)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo("du")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            }
+        };
+        process.StartInfo.ArgumentList.Add("-s");
+        process.StartInfo.ArgumentList.Add("--block-size=1");
+        process.StartInfo.ArgumentList.Add("--");
+        process.StartInfo.ArgumentList.Add(root);
+        process.Start();
+        var output = await process.StandardOutput.ReadToEndAsync().ConfigureAwait(false);
+        var error = await process.StandardError.ReadToEndAsync().ConfigureAwait(false);
+        await process.WaitForExitAsync().ConfigureAwait(false);
+        Assert.True(process.ExitCode == 0, error);
+        var separator = output.IndexOf('\t', StringComparison.Ordinal);
+        Assert.True(separator > 0, output);
+        return long.Parse(output.AsSpan(0, separator), CultureInfo.InvariantCulture);
     }
 
     [Fact]
@@ -218,28 +231,15 @@ public sealed class StorageSpaceEfficiencyTests
 
         try
         {
-            {
-                var first = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
-                await using (first.ConfigureAwait(false))
-                {
-                    await first.InitializeAsync();
-                    await CreateClient(first).GetBlobContainerClient(containerName)
-                        .CreateIfNotExistsAsync();
-                    await CreateClient(first).GetBlobContainerClient(containerName)
-                        .GetBlobClient("packed.bin").UploadAsync(BinaryData.FromBytes(bytes));
-                    Assert.Empty(Directory.EnumerateDirectories(
-                        Path.Combine(dataPath, "chunks"),
-                        "*",
-                        SearchOption.AllDirectories));
-                }
-            }
+            await CreateInitialPackedBlobAsync(dataPath, configuration, containerName, bytes)
+                .ConfigureAwait(true);
 
             var chunksRoot = Path.Combine(dataPath, "chunks");
             var emptyLeaf = Path.Combine(chunksRoot, "legacy", "domain", "hash");
             var occupied = Path.Combine(chunksRoot, "occupied");
             Directory.CreateDirectory(emptyLeaf);
             Directory.CreateDirectory(occupied);
-            await File.WriteAllBytesAsync(Path.Combine(occupied, "keep.bin"), [7]);
+            await File.WriteAllBytesAsync(Path.Combine(occupied, "keep.bin"), [7]).ConfigureAwait(true);
 
             if (OperatingSystem.IsLinux())
             {
@@ -251,21 +251,9 @@ public sealed class StorageSpaceEfficiencyTests
                 var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
                 await using (restarted.ConfigureAwait(false))
                 {
-                    await restarted.InitializeAsync();
-                    Assert.False(Directory.Exists(emptyLeaf));
-                    Assert.False(Directory.Exists(Path.Combine(chunksRoot, "legacy")));
-                    Assert.True(File.Exists(Path.Combine(occupied, "keep.bin")));
-                    if (OperatingSystem.IsLinux())
-                    {
-                        Assert.True(Directory.Exists(Path.Combine(externalPath, "outside-empty")));
-                        Assert.True(Directory.Exists(Path.Combine(chunksRoot, "linked")));
-                    }
-
-                    var downloaded = await CreateClient(restarted)
-                        .GetBlobContainerClient(containerName)
-                        .GetBlobClient("packed.bin")
-                        .DownloadContentAsync();
-                    Assert.Equal(bytes, downloaded.Value.Content.ToArray());
+                    await AssertRestartStateAsync(
+                        restarted, emptyLeaf, occupied, externalPath, containerName, bytes)
+                        .ConfigureAwait(true);
                 }
             }
         }
@@ -278,6 +266,50 @@ public sealed class StorageSpaceEfficiencyTests
                 Directory.Delete(dataPath, recursive: true);
             if (Directory.Exists(externalPath))
                 Directory.Delete(externalPath, recursive: true);
+        }
+    }
+
+    private static async Task AssertRestartStateAsync(
+        SavaWebApplicationFactory restarted,
+        string emptyLeaf,
+        string occupied,
+        string externalPath,
+        string containerName,
+        byte[] bytes)
+    {
+        await restarted.InitializeAsync().ConfigureAwait(false);
+        Assert.False(Directory.Exists(emptyLeaf));
+        Assert.False(Directory.Exists(Path.Combine(restarted.DataPath, "chunks", "legacy")));
+        Assert.True(File.Exists(Path.Combine(occupied, "keep.bin")));
+        if (OperatingSystem.IsLinux())
+        {
+            Assert.True(Directory.Exists(Path.Combine(externalPath, "outside-empty")));
+            Assert.True(Directory.Exists(Path.Combine(restarted.DataPath, "chunks", "linked")));
+        }
+
+        var downloaded = await CreateClient(restarted)
+            .GetBlobContainerClient(containerName)
+            .GetBlobClient("packed.bin")
+            .DownloadContentAsync().ConfigureAwait(false);
+        Assert.Equal(bytes, downloaded.Value.Content.ToArray());
+    }
+
+    private static async Task CreateInitialPackedBlobAsync(
+        string dataPath,
+        IReadOnlyDictionary<string, string?> configuration,
+        string containerName,
+        byte[] bytes)
+    {
+        var first = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+        await using (first.ConfigureAwait(false))
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            await CreateClient(first).GetBlobContainerClient(containerName)
+                .CreateIfNotExistsAsync().ConfigureAwait(false);
+            await CreateClient(first).GetBlobContainerClient(containerName)
+                .GetBlobClient("packed.bin").UploadAsync(BinaryData.FromBytes(bytes)).ConfigureAwait(false);
+            Assert.Empty(Directory.EnumerateDirectories(
+                Path.Combine(dataPath, "chunks"), "*", SearchOption.AllDirectories));
         }
     }
 
