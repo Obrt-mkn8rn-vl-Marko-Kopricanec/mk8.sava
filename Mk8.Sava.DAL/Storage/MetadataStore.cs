@@ -5,7 +5,7 @@ using Microsoft.Data.Sqlite;
 
 namespace Mk8.Sava.Storage;
 
-public sealed class MetadataStore(
+public sealed partial class MetadataStore(
     IStoragePaths paths,
     IStorageFaultInjector faultInjector,
     TimeProvider? timeProvider = null) : IDisposable
@@ -18,43 +18,7 @@ public sealed class MetadataStore(
     private const int ObjectReplicationSchemaVersion = 5;
     private const int DataKeyContinuitySchemaVersion = 6;
 
-    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
-    {
-        Converters = { new JsonStringEnumConverter() }
-    };
-
-    private readonly string _connectionString = new SqliteConnectionStringBuilder
-    {
-        DataSource = paths.Database,
-        Mode = SqliteOpenMode.ReadWriteCreate,
-        Cache = SqliteCacheMode.Shared,
-        Pooling = true
-    }.ToString();
-    private readonly SemaphoreSlim _writeGate = new(1, 1);
-    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
-
-    public void Dispose()
-    {
-        _writeGate.Dispose();
-        GC.SuppressFinalize(this);
-    }
-
-    public async Task InitializeAsync(CancellationToken cancellationToken = default)
-    {
-        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
-            await using var connectionDisposal = connection.ConfigureAwait(false);
-            await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode=WAL;", cancellationToken).ConfigureAwait(false);
-            await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
-            var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
-            if (schemaVersion > CurrentSchemaVersion)
-            {
-                throw new InvalidDataException(
-                    $"The metadata schema version {schemaVersion} is newer than the supported version {CurrentSchemaVersion}.");
-            }
-            await ExecuteNonQueryAsync(connection, """
+    private const string InitialSchemaSql = """
                 CREATE TABLE IF NOT EXISTS containers (
                     account TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -194,7 +158,45 @@ public sealed class MetadataStore(
                 CREATE INDEX IF NOT EXISTS ix_object_replication_destination
                     ON object_replication_states(destination_generation_id)
                     WHERE destination_generation_id IS NOT NULL;
-                """, cancellationToken).ConfigureAwait(false);
+                """;
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        Converters = { new JsonStringEnumConverter() }
+    };
+
+    private readonly string _connectionString = new SqliteConnectionStringBuilder
+    {
+        DataSource = paths.Database,
+        Mode = SqliteOpenMode.ReadWriteCreate,
+        Cache = SqliteCacheMode.Shared,
+        Pooling = true
+    }.ToString();
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+
+    public void Dispose()
+    {
+        _writeGate.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
+    {
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode=WAL;", cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
+            var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
+            if (schemaVersion > CurrentSchemaVersion)
+            {
+                throw new InvalidDataException(
+                    $"The metadata schema version {schemaVersion} is newer than the supported version {CurrentSchemaVersion}.");
+            }
+            await ExecuteNonQueryAsync(connection, InitialSchemaSql, cancellationToken).ConfigureAwait(false);
             if (schemaVersion == 1)
             {
                 await MigrateVersion1ToVersion2Async(connection, cancellationToken).ConfigureAwait(false);
@@ -512,58 +514,65 @@ public sealed class MetadataStore(
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
             foreach (var entry in entries)
-            {
-                if (entry.Path.Length == 0)
-                {
-                    var container = await GetContainerAsync(
-                        connection, transaction, entry.Account, entry.Container,
-                        includeDeleted: false, cancellationToken).ConfigureAwait(false);
-                    if (container is null)
-                        throw new InvalidDataException($"The HNS ACL target container '{entry.Account}/{entry.Container}' does not exist.");
-                    PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
-                    if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
-                        continue;
-
-                    var update = connection.CreateCommand();
-                    await using var updateDisposal = update.ConfigureAwait(false);
-                    update.Transaction = transaction;
-                    update.CommandText = """
-                        UPDATE containers SET modified_ticks = $modified, data = $data
-                        WHERE account = $account AND name = $name AND deleted = 0;
-                        """;
-                    AddContainerParameters(update, container with
-                    {
-                        AccessAcl = entry.AccessAcl,
-                        Revision = NewRevision(),
-                        ETag = NewETag(),
-                        LastModified = _timeProvider.GetUtcNow()
-                    });
-                    if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                        throw new StorageConcurrencyException();
-                    continue;
-                }
-
-                var blob = await GetCurrentBlobAsync(
-                    connection, transaction, entry.Account, entry.Container, entry.Path, cancellationToken).ConfigureAwait(false);
-                if (blob is null || blob.IsDeleted)
-                    throw new InvalidDataException($"The HNS ACL target path '{entry.Account}/{entry.Container}/{entry.Path}' does not exist.");
-                PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, blob.IsDirectory);
-                if (string.Equals(blob.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
-                    continue;
-                await UpdateBlobRowAsync(connection, transaction, blob with
-                {
-                    AccessAcl = entry.AccessAcl,
-                    Revision = NewRevision(),
-                    ETag = NewETag(),
-                    LastModified = _timeProvider.GetUtcNow()
-                }, cancellationToken).ConfigureAwait(false);
-            }
+                await ApplyHierarchicalAclEntryAsync(connection, transaction, entry, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
             _writeGate.Release();
         }
+    }
+
+    private async Task ApplyHierarchicalAclEntryAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        HierarchicalAclManifestEntry entry,
+        CancellationToken cancellationToken)
+    {
+        if (entry.Path.Length == 0)
+        {
+            var container = await GetContainerAsync(
+                connection, transaction, entry.Account, entry.Container,
+                includeDeleted: false, cancellationToken).ConfigureAwait(false);
+            if (container is null)
+                throw new InvalidDataException($"The HNS ACL target container '{entry.Account}/{entry.Container}' does not exist.");
+            PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
+            if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+                return;
+
+            var update = connection.CreateCommand();
+            await using var updateDisposal = update.ConfigureAwait(false);
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE containers SET modified_ticks = $modified, data = $data
+                WHERE account = $account AND name = $name AND deleted = 0;
+                """;
+            AddContainerParameters(update, container with
+            {
+                AccessAcl = entry.AccessAcl,
+                Revision = NewRevision(),
+                ETag = NewETag(),
+                LastModified = _timeProvider.GetUtcNow()
+            });
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new StorageConcurrencyException();
+            return;
+        }
+
+        var blob = await GetCurrentBlobAsync(
+            connection, transaction, entry.Account, entry.Container, entry.Path, cancellationToken).ConfigureAwait(false);
+        if (blob is null || blob.IsDeleted)
+            throw new InvalidDataException($"The HNS ACL target path '{entry.Account}/{entry.Container}/{entry.Path}' does not exist.");
+        PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, blob.IsDirectory);
+        if (string.Equals(blob.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+            return;
+        await UpdateBlobRowAsync(connection, transaction, blob with
+        {
+            AccessAcl = entry.AccessAcl,
+            Revision = NewRevision(),
+            ETag = NewETag(),
+            LastModified = _timeProvider.GetUtcNow()
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public Task<bool> TryRestoreContainerAsync(
@@ -637,111 +646,9 @@ public sealed class MetadataStore(
             }
             else
             {
-                var existingDestination = await GetContainerAsync(
-                    connection,
-                    transaction,
-                    destination.Account,
-                    destination.Name,
-                    includeDeleted: true,
-                    cancellationToken).ConfigureAwait(false);
-                if (existingDestination is not null)
+                if (!await RelocateContainerNameAsync(
+                    connection, transaction, sourceName, destination, cancellationToken).ConfigureAwait(false))
                     return false;
-
-                var addContainer = connection.CreateCommand();
-                await using (addContainer.ConfigureAwait(false))
-                {
-                    addContainer.Transaction = transaction;
-                    addContainer.CommandText = """
-                        INSERT INTO containers(account, name, deleted, modified_ticks, data)
-                        VALUES ($account, $name, $deleted, $modified, $data);
-                        """;
-                    AddContainerParameters(addContainer, destination);
-                    if (await addContainer.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                        throw new StorageConcurrencyException();
-                }
-
-                var updateBlobs = connection.CreateCommand();
-                await using (updateBlobs.ConfigureAwait(false))
-                {
-                    updateBlobs.Transaction = transaction;
-                    updateBlobs.CommandText = """
-                        UPDATE blobs
-                        SET container = $destination,
-                            data = json_set(data, '$.container', $destination)
-                        WHERE account = $account AND container = $container;
-                        """;
-                    updateBlobs.Parameters.AddWithValue("$destination", destination.Name);
-                    updateBlobs.Parameters.AddWithValue("$account", destination.Account);
-                    updateBlobs.Parameters.AddWithValue("$container", sourceName);
-                    await updateBlobs.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                var addBlocks = connection.CreateCommand();
-                await using (addBlocks.ConfigureAwait(false))
-                {
-                    addBlocks.Transaction = transaction;
-                    addBlocks.CommandText = """
-                        INSERT INTO staged_blocks(
-                            account, container, blob_name, block_id, created_ticks, logical_length, data)
-                        SELECT account,
-                               $destination,
-                               blob_name,
-                               block_id,
-                               created_ticks,
-                               logical_length,
-                               json_set(data, '$.container', $destination)
-                        FROM staged_blocks
-                        WHERE account = $account AND container = $container;
-                        """;
-                    addBlocks.Parameters.AddWithValue("$destination", destination.Name);
-                    addBlocks.Parameters.AddWithValue("$account", destination.Account);
-                    addBlocks.Parameters.AddWithValue("$container", sourceName);
-                    await addBlocks.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                var addBlockReferences = connection.CreateCommand();
-                await using (addBlockReferences.ConfigureAwait(false))
-                {
-                    addBlockReferences.Transaction = transaction;
-                    addBlockReferences.CommandText = """
-                        INSERT INTO staged_block_chunk_references(
-                            account, container, blob_name, block_id, chunk_id)
-                        SELECT account, $destination, blob_name, block_id, chunk_id
-                        FROM staged_block_chunk_references
-                        WHERE account = $account AND container = $container;
-                        """;
-                    addBlockReferences.Parameters.AddWithValue("$destination", destination.Name);
-                    addBlockReferences.Parameters.AddWithValue("$account", destination.Account);
-                    addBlockReferences.Parameters.AddWithValue("$container", sourceName);
-                    await addBlockReferences.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                var deleteBlocks = connection.CreateCommand();
-                await using (deleteBlocks.ConfigureAwait(false))
-                {
-                    deleteBlocks.Transaction = transaction;
-                    deleteBlocks.CommandText = """
-                        DELETE FROM staged_blocks
-                        WHERE account = $account AND container = $container;
-                        """;
-                    deleteBlocks.Parameters.AddWithValue("$account", destination.Account);
-                    deleteBlocks.Parameters.AddWithValue("$container", sourceName);
-                    await deleteBlocks.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                var deleteSource = connection.CreateCommand();
-                await using (deleteSource.ConfigureAwait(false))
-                {
-                    deleteSource.Transaction = transaction;
-                    deleteSource.CommandText = """
-                        DELETE FROM containers
-                        WHERE account = $account AND name = $name;
-                        """;
-                    deleteSource.Parameters.AddWithValue("$account", destination.Account);
-                    deleteSource.Parameters.AddWithValue("$name", sourceName);
-                    if (await deleteSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                        throw new StorageConcurrencyException();
-                }
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
@@ -1243,39 +1150,9 @@ public sealed class MetadataStore(
                 throw new StorageConcurrencyException();
 
             if (replacementPack is not null)
-            {
-                var addPack = connection.CreateCommand();
-                await using var addPackDisposal = addPack.ConfigureAwait(false);
-                addPack.Transaction = transaction;
-                addPack.CommandText = """
-                    INSERT INTO chunk_packs(pack_id, domain, created_ticks, sealed)
-                    VALUES ($pack, $domain, $created, 1);
-                    """;
-                addPack.Parameters.AddWithValue("$pack", replacementPack.PackId);
-                addPack.Parameters.AddWithValue("$domain", replacementPack.Domain);
-                addPack.Parameters.AddWithValue("$created", replacementPack.CreatedAt.UtcTicks);
-                await addPack.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-
-                foreach (var location in replacementLocations)
-                {
-                    var update = connection.CreateCommand();
-                    await using var updateDisposal = update.ConfigureAwait(false);
-                    update.Transaction = transaction;
-                    update.CommandText = """
-                        UPDATE packed_chunks SET
-                            pack_id = $pack,
-                            record_offset = $record_offset,
-                            record_length = $record_length,
-                            payload_offset = $payload_offset,
-                            payload_length = $payload_length
-                        WHERE chunk_id = $chunk AND pack_id = $old_pack;
-                        """;
-                    AddPackedChunkLocationParameters(update, location);
-                    update.Parameters.AddWithValue("$old_pack", oldPack.PackId);
-                    if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                        throw new StorageConcurrencyException();
-                }
-            }
+                await ReplacePackedChunkLocationsAsync(
+                    connection, transaction, oldPack.PackId, replacementPack,
+                    replacementLocations, cancellationToken).ConfigureAwait(false);
 
             var removeOld = connection.CreateCommand();
             await using var removeOldDisposal = removeOld.ConfigureAwait(false);
@@ -1291,6 +1168,47 @@ public sealed class MetadataStore(
         finally
         {
             _writeGate.Release();
+        }
+    }
+
+    private static async Task ReplacePackedChunkLocationsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string oldPackId,
+        ChunkPackRecord replacementPack,
+        IReadOnlyList<PackedChunkLocation> replacementLocations,
+        CancellationToken cancellationToken)
+    {
+        var addPack = connection.CreateCommand();
+        await using var addPackDisposal = addPack.ConfigureAwait(false);
+        addPack.Transaction = transaction;
+        addPack.CommandText = """
+            INSERT INTO chunk_packs(pack_id, domain, created_ticks, sealed)
+            VALUES ($pack, $domain, $created, 1);
+            """;
+        addPack.Parameters.AddWithValue("$pack", replacementPack.PackId);
+        addPack.Parameters.AddWithValue("$domain", replacementPack.Domain);
+        addPack.Parameters.AddWithValue("$created", replacementPack.CreatedAt.UtcTicks);
+        await addPack.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+
+        foreach (var location in replacementLocations)
+        {
+            var update = connection.CreateCommand();
+            await using var updateDisposal = update.ConfigureAwait(false);
+            update.Transaction = transaction;
+            update.CommandText = """
+                UPDATE packed_chunks SET
+                    pack_id = $pack,
+                    record_offset = $record_offset,
+                    record_length = $record_length,
+                    payload_offset = $payload_offset,
+                    payload_length = $payload_length
+                WHERE chunk_id = $chunk AND pack_id = $old_pack;
+                """;
+            AddPackedChunkLocationParameters(update, location);
+            update.Parameters.AddWithValue("$old_pack", oldPackId);
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+                throw new StorageConcurrencyException();
         }
     }
 
@@ -1315,188 +1233,12 @@ public sealed class MetadataStore(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
         ArgumentOutOfRangeException.ThrowIfNegative(legacyOffset);
 
-        var predicates = new List<string>
-        {
-            "account = $account",
-            "container = $container",
-            "name >= $prefix",
-            "name >= $start_from",
-            "substr(name, 1, length($prefix)) = $prefix"
-        };
-        if (hierarchicalNamespace)
-        {
-            var activePredicate = includeSnapshots
-                ? "((is_current = 1 OR snapshot IS NOT NULL) AND is_deleted = 0)"
-                : "is_current = 1 AND is_deleted = 0";
-            var deletedPredicate = includeSnapshots
-                ? "is_deleted = 1"
-                : "is_deleted = 1 AND snapshot IS NULL";
-            predicates.Add(showOnly == BlobListShowOnly.Deleted
-                ? deletedPredicate
-                : includeDeleted
-                    ? $"({activePredicate} OR ({deletedPredicate}))"
-                    : activePredicate);
-            if (showOnly == BlobListShowOnly.Files)
-                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 0");
-            else if (showOnly == BlobListShowOnly.Directories)
-                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 1");
-        }
-        else
-        {
-            if (!includeVersions && !includeSnapshots)
-                predicates.Add("is_current = 1");
-            else if (!includeVersions)
-                predicates.Add("(is_current = 1 OR snapshot IS NOT NULL)");
-            else if (!includeSnapshots)
-                predicates.Add("snapshot IS NULL");
-            if (!includeDeleted)
-                predicates.Add("is_deleted = 0");
-        }
-        if (!string.IsNullOrEmpty(endBefore))
-            predicates.Add("name < $end_before");
+        var predicates = BuildBlobListingPredicates(
+            hierarchicalNamespace, showOnly, includeVersions, includeSnapshots,
+            includeDeleted, endBefore);
 
-        const string rankExpression = """
-            CASE
-                WHEN is_current = 1 THEN 0
-                WHEN version_id IS NOT NULL THEN 1
-                WHEN snapshot IS NULL THEN 2
-                ELSE 3
-            END
-            """;
-        var eligibleBlobs = $"""
-            SELECT data, name, version_id, snapshot, generation_id,
-                   {rankExpression} AS rank,
-                   0 AS is_uncommitted,
-                   COALESCE(json_extract(data, '$.isDirectory'), 0) AS is_directory
-            FROM blobs
-            WHERE {string.Join(" AND ", predicates)}
-            """;
-        var uncommittedPredicates = new List<string>
-        {
-            "staged.account = $account",
-            "staged.container = $container",
-            "staged.blob_name >= $prefix",
-            "staged.blob_name >= $start_from",
-            "substr(staged.blob_name, 1, length($prefix)) = $prefix"
-        };
-        if (!string.IsNullOrEmpty(endBefore))
-            uncommittedPredicates.Add("staged.blob_name < $end_before");
-        var eligibleUncommitted = $"""
-            SELECT NULL AS data, staged.blob_name AS name,
-                   NULL AS version_id, NULL AS snapshot, '' AS generation_id,
-                   -1 AS rank, 1 AS is_uncommitted, 0 AS is_directory
-            FROM staged_blocks AS staged
-            WHERE $include_uncommitted = 1
-              AND {string.Join(" AND ", uncommittedPredicates)}
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM blobs AS current
-                  WHERE current.account = staged.account
-                    AND current.container = staged.container
-                    AND current.name = staged.blob_name
-                    AND current.is_current = 1
-                    AND current.is_deleted = 0
-              )
-            GROUP BY staged.blob_name
-            """;
-        var eligible = $"""
-            SELECT * FROM ({eligibleBlobs})
-            UNION ALL
-            SELECT * FROM ({eligibleUncommitted})
-            """;
-        var entries = string.IsNullOrEmpty(delimiter)
-            ? $"""
-                WITH entries AS (
-                    SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id, is_uncommitted, is_directory
-                    FROM ({eligible})
-                )
-                """
-            : hierarchicalNamespace
-                ? $"""
-                    WITH eligible AS (
-                        SELECT source.*,
-                               instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
-                        FROM ({eligible}) AS source
-                    ),
-                    candidates AS (
-                        SELECT data,
-                               CASE
-                                   WHEN is_directory = 1 AND delimiter_offset = 0 THEN name || '/'
-                                   WHEN delimiter_offset > 0 THEN substr(
-                                       name,
-                                       1,
-                                       length($prefix) + delimiter_offset)
-                                   ELSE name
-                               END AS entry_name,
-                               CASE
-                                   WHEN is_directory = 1 OR delimiter_offset > 0 THEN 0
-                                   ELSE 1
-                               END AS entry_type,
-                               CASE
-                                   WHEN is_directory = 1 AND delimiter_offset = 0 THEN data
-                                   ELSE NULL
-                               END AS prefix_data,
-                               rank, version_id, snapshot, generation_id,
-                               is_uncommitted, is_directory
-                        FROM eligible
-                    ),
-                    entries AS (
-                        SELECT COALESCE(
-                                   MAX(prefix_data),
-                                   CASE WHEN $include_directory_properties = 1 THEN (
-                                       SELECT directory.data
-                                       FROM blobs AS directory
-                                       WHERE directory.account = $account
-                                         AND directory.container = $container
-                                         AND directory.name = substr(entry_name, 1, length(entry_name) - 1)
-                                         AND directory.is_current = 1
-                                         AND directory.is_deleted = 0
-                                         AND COALESCE(json_extract(directory.data, '$.isDirectory'), 0) = 1
-                                       LIMIT 1
-                                   ) END) AS data,
-                               entry_name, 0 AS entry_type,
-                               -1 AS rank, NULL AS version_id, NULL AS snapshot,
-                               '' AS generation_id, 0 AS is_uncommitted, 1 AS is_directory
-                        FROM candidates
-                        WHERE entry_type = 0
-                        GROUP BY entry_name
-                        UNION ALL
-                        SELECT data, entry_name, 1 AS entry_type, rank,
-                               version_id, snapshot, generation_id, is_uncommitted, is_directory
-                        FROM candidates
-                        WHERE entry_type = 1
-                    )
-                    """
-            : $"""
-                WITH eligible AS (
-                    SELECT source.*,
-                           instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
-                    FROM ({eligible}) AS source
-                ),
-                entries AS (
-                    SELECT DISTINCT
-                           NULL AS data,
-                           substr(
-                               name,
-                               1,
-                               length($prefix) + delimiter_offset + length($delimiter) - 1) AS entry_name,
-                           0 AS entry_type,
-                           -1 AS rank,
-                           NULL AS version_id,
-                           NULL AS snapshot,
-                           '' AS generation_id,
-                           0 AS is_uncommitted,
-                           0 AS is_directory
-                    FROM eligible
-                    WHERE delimiter_offset > 0
-                    UNION ALL
-                    SELECT data, name AS entry_name, 1 AS entry_type, rank,
-                           version_id, snapshot, generation_id, is_uncommitted, is_directory
-                    FROM eligible
-                    WHERE delimiter_offset = 0
-                )
-                """;
+        var eligible = BuildEligibleBlobListingSql(predicates, endBefore);
+        var entries = BuildBlobListingEntriesSql(eligible, delimiter, hierarchicalNamespace);
 
         var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
         await using var connectionDisposal = connection.ConfigureAwait(false);
@@ -1504,41 +1246,7 @@ public sealed class MetadataStore(
         await using var commandDisposal = command.ConfigureAwait(false);
         // The query is assembled only from fixed SQL fragments; all request values are bound below.
 #pragma warning disable CA2100
-        command.CommandText = $"""
-            {entries}
-            SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
-                   is_uncommitted, is_directory
-            FROM entries
-            WHERE $has_cursor = 0
-               OR ($name_complete = 1 AND entry_name > $cursor_name)
-               OR ($name_complete = 0 AND (
-                    entry_name > $cursor_name
-                    OR (entry_name = $cursor_name AND (
-                        entry_type > $cursor_type
-                        OR (entry_type = $cursor_type AND entry_type = 1 AND (
-                            rank > $cursor_rank
-                            OR (rank = $cursor_rank AND (
-                                ($cursor_rank = 1 AND (
-                                    version_id < $ordered_id
-                                    OR (version_id = $ordered_id AND generation_id > $generation_id)
-                                ))
-                                OR ($cursor_rank = 3 AND (
-                                    snapshot > $ordered_id
-                                    OR (snapshot = $ordered_id AND generation_id > $generation_id)
-                                ))
-                                OR ($cursor_rank NOT IN (1, 3) AND generation_id > $generation_id)
-                            ))
-                        ))
-                    ))
-               ))
-            ORDER BY entry_name COLLATE BINARY,
-                     entry_type,
-                     rank,
-                     CASE WHEN rank = 1 THEN version_id END DESC,
-                     CASE WHEN rank = 3 THEN snapshot END,
-                     generation_id
-            LIMIT $limit OFFSET $offset;
-            """;
+        command.CommandText = BuildBlobListingPageSql(entries);
 #pragma warning restore CA2100
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
@@ -1583,6 +1291,253 @@ public sealed class MetadataStore(
         return new BlobListPage(items, hasMore);
     }
 
+    private static List<string> BuildBlobListingPredicates(
+        bool hierarchicalNamespace,
+        BlobListShowOnly showOnly,
+        bool includeVersions,
+        bool includeSnapshots,
+        bool includeDeleted,
+        string endBefore)
+    {
+        var predicates = new List<string>
+        {
+            "account = $account",
+            "container = $container",
+            "name >= $prefix",
+            "name >= $start_from",
+            "substr(name, 1, length($prefix)) = $prefix"
+        };
+        if (hierarchicalNamespace)
+        {
+            var activePredicate = includeSnapshots
+                ? "((is_current = 1 OR snapshot IS NOT NULL) AND is_deleted = 0)"
+                : "is_current = 1 AND is_deleted = 0";
+            var deletedPredicate = includeSnapshots
+                ? "is_deleted = 1"
+                : "is_deleted = 1 AND snapshot IS NULL";
+            predicates.Add(showOnly == BlobListShowOnly.Deleted
+                ? deletedPredicate
+                : includeDeleted
+                    ? $"({activePredicate} OR ({deletedPredicate}))"
+                    : activePredicate);
+            if (showOnly == BlobListShowOnly.Files)
+                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 0");
+            else if (showOnly == BlobListShowOnly.Directories)
+                predicates.Add("COALESCE(json_extract(data, '$.isDirectory'), 0) = 1");
+        }
+        else
+        {
+            if (!includeVersions && !includeSnapshots)
+                predicates.Add("is_current = 1");
+            else if (!includeVersions)
+                predicates.Add("(is_current = 1 OR snapshot IS NOT NULL)");
+            else if (!includeSnapshots)
+                predicates.Add("snapshot IS NULL");
+            if (!includeDeleted)
+                predicates.Add("is_deleted = 0");
+        }
+        if (!string.IsNullOrEmpty(endBefore))
+            predicates.Add("name < $end_before");
+        return predicates;
+    }
+
+    private static string BuildEligibleBlobListingSql(
+        IReadOnlyList<string> predicates,
+        string endBefore)
+    {
+        const string rankExpression = """
+            CASE
+                WHEN is_current = 1 THEN 0
+                WHEN version_id IS NOT NULL THEN 1
+                WHEN snapshot IS NULL THEN 2
+                ELSE 3
+            END
+            """;
+        var eligibleBlobs = $"""
+            SELECT data, name, version_id, snapshot, generation_id,
+                   {rankExpression} AS rank,
+                   0 AS is_uncommitted,
+                   COALESCE(json_extract(data, '$.isDirectory'), 0) AS is_directory
+            FROM blobs
+            WHERE {string.Join(" AND ", predicates)}
+            """;
+        var uncommittedPredicates = new List<string>
+        {
+            "staged.account = $account",
+            "staged.container = $container",
+            "staged.blob_name >= $prefix",
+            "staged.blob_name >= $start_from",
+            "substr(staged.blob_name, 1, length($prefix)) = $prefix"
+        };
+        if (!string.IsNullOrEmpty(endBefore))
+            uncommittedPredicates.Add("staged.blob_name < $end_before");
+        var eligibleUncommitted = $"""
+            SELECT NULL AS data, staged.blob_name AS name,
+                   NULL AS version_id, NULL AS snapshot, '' AS generation_id,
+                   -1 AS rank, 1 AS is_uncommitted, 0 AS is_directory
+            FROM staged_blocks AS staged
+            WHERE $include_uncommitted = 1
+              AND {string.Join(" AND ", uncommittedPredicates)}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM blobs AS current
+                  WHERE current.account = staged.account
+                    AND current.container = staged.container
+                    AND current.name = staged.blob_name
+                    AND current.is_current = 1
+                    AND current.is_deleted = 0
+              )
+            GROUP BY staged.blob_name
+            """;
+        return $"""
+            SELECT * FROM ({eligibleBlobs})
+            UNION ALL
+            SELECT * FROM ({eligibleUncommitted})
+            """;
+    }
+
+    private static string BuildBlobListingEntriesSql(
+        string eligible,
+        string delimiter,
+        bool hierarchicalNamespace)
+    {
+        if (string.IsNullOrEmpty(delimiter))
+        {
+            return $"""
+                WITH entries AS (
+                    SELECT data, name AS entry_name, 1 AS entry_type, rank,
+                           version_id, snapshot, generation_id, is_uncommitted, is_directory
+                    FROM ({eligible})
+                )
+                """;
+        }
+        return hierarchicalNamespace
+            ? BuildHierarchicalBlobListingEntriesSql(eligible)
+            : BuildFlatBlobListingEntriesSql(eligible);
+    }
+
+    private static string BuildHierarchicalBlobListingEntriesSql(string eligible) => $"""
+        WITH eligible AS (
+            SELECT source.*,
+                   instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
+            FROM ({eligible}) AS source
+        ),
+        candidates AS (
+            SELECT data,
+                   CASE
+                       WHEN is_directory = 1 AND delimiter_offset = 0 THEN name || '/'
+                       WHEN delimiter_offset > 0 THEN substr(
+                           name,
+                           1,
+                           length($prefix) + delimiter_offset)
+                       ELSE name
+                   END AS entry_name,
+                   CASE
+                       WHEN is_directory = 1 OR delimiter_offset > 0 THEN 0
+                       ELSE 1
+                   END AS entry_type,
+                   CASE
+                       WHEN is_directory = 1 AND delimiter_offset = 0 THEN data
+                       ELSE NULL
+                   END AS prefix_data,
+                   rank, version_id, snapshot, generation_id,
+                   is_uncommitted, is_directory
+            FROM eligible
+        ),
+        entries AS (
+            SELECT COALESCE(
+                       MAX(prefix_data),
+                       CASE WHEN $include_directory_properties = 1 THEN (
+                           SELECT directory.data
+                           FROM blobs AS directory
+                           WHERE directory.account = $account
+                             AND directory.container = $container
+                             AND directory.name = substr(entry_name, 1, length(entry_name) - 1)
+                             AND directory.is_current = 1
+                             AND directory.is_deleted = 0
+                             AND COALESCE(json_extract(directory.data, '$.isDirectory'), 0) = 1
+                           LIMIT 1
+                       ) END) AS data,
+                   entry_name, 0 AS entry_type,
+                   -1 AS rank, NULL AS version_id, NULL AS snapshot,
+                   '' AS generation_id, 0 AS is_uncommitted, 1 AS is_directory
+            FROM candidates
+            WHERE entry_type = 0
+            GROUP BY entry_name
+            UNION ALL
+            SELECT data, entry_name, 1 AS entry_type, rank,
+                   version_id, snapshot, generation_id, is_uncommitted, is_directory
+            FROM candidates
+            WHERE entry_type = 1
+        )
+        """;
+
+    private static string BuildFlatBlobListingEntriesSql(string eligible) => $"""
+        WITH eligible AS (
+            SELECT source.*,
+                   instr(substr(name, length($prefix) + 1), $delimiter) AS delimiter_offset
+            FROM ({eligible}) AS source
+        ),
+        entries AS (
+            SELECT DISTINCT
+                   NULL AS data,
+                   substr(
+                       name,
+                       1,
+                       length($prefix) + delimiter_offset + length($delimiter) - 1) AS entry_name,
+                   0 AS entry_type,
+                   -1 AS rank,
+                   NULL AS version_id,
+                   NULL AS snapshot,
+                   '' AS generation_id,
+                   0 AS is_uncommitted,
+                   0 AS is_directory
+            FROM eligible
+            WHERE delimiter_offset > 0
+            UNION ALL
+            SELECT data, name AS entry_name, 1 AS entry_type, rank,
+                   version_id, snapshot, generation_id, is_uncommitted, is_directory
+            FROM eligible
+            WHERE delimiter_offset = 0
+        )
+        """;
+
+    private static string BuildBlobListingPageSql(string entries) => $"""
+        {entries}
+        SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
+               is_uncommitted, is_directory
+        FROM entries
+        WHERE $has_cursor = 0
+           OR ($name_complete = 1 AND entry_name > $cursor_name)
+           OR ($name_complete = 0 AND (
+                entry_name > $cursor_name
+                OR (entry_name = $cursor_name AND (
+                    entry_type > $cursor_type
+                    OR (entry_type = $cursor_type AND entry_type = 1 AND (
+                        rank > $cursor_rank
+                        OR (rank = $cursor_rank AND (
+                            ($cursor_rank = 1 AND (
+                                version_id < $ordered_id
+                                OR (version_id = $ordered_id AND generation_id > $generation_id)
+                            ))
+                            OR ($cursor_rank = 3 AND (
+                                snapshot > $ordered_id
+                                OR (snapshot = $ordered_id AND generation_id > $generation_id)
+                            ))
+                            OR ($cursor_rank NOT IN (1, 3) AND generation_id > $generation_id)
+                        ))
+                    ))
+                ))
+           ))
+        ORDER BY entry_name COLLATE BINARY,
+                 entry_type,
+                 rank,
+                 CASE WHEN rank = 1 THEN version_id END DESC,
+                 CASE WHEN rank = 3 THEN snapshot END,
+                 generation_id
+        LIMIT $limit OFFSET $offset;
+        """;
+
     internal async Task<TaggedBlobPage> FindBlobsByTagsPageAsync(
         string account,
         BlobTagFilter filter,
@@ -1591,38 +1546,7 @@ public sealed class MetadataStore(
         CancellationToken cancellationToken)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
-        if (filter.Predicates.Count == 0)
-            throw new ArgumentException("At least one tag predicate is required.", nameof(filter));
-
-        var predicates = new List<string>
-        {
-            "blob.account = $account",
-            "blob.is_current = 1",
-            "blob.is_deleted = 0",
-            "blob.snapshot IS NULL"
-        };
-        if (filter.Container is not null)
-            predicates.Add("blob.container = $container");
-        for (var index = 0; index < filter.Predicates.Count; index++)
-        {
-            var comparison = filter.Predicates[index].Comparison switch
-            {
-                BlobTagComparison.Equal => "=",
-                BlobTagComparison.GreaterThan => ">",
-                BlobTagComparison.GreaterThanOrEqual => ">=",
-                BlobTagComparison.LessThan => "<",
-                BlobTagComparison.LessThanOrEqual => "<=",
-                _ => throw new ArgumentOutOfRangeException(nameof(filter))
-            };
-            predicates.Add($"""
-                EXISTS (
-                    SELECT 1 FROM blob_tags AS tag{index}
-                    WHERE tag{index}.generation_id = blob.generation_id
-                      AND tag{index}.tag_key = $key{index}
-                      AND tag{index}.tag_value {comparison} $value{index}
-                )
-                """);
-        }
+        var predicates = BuildTagSearchPredicates(filter);
 
         var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
         await using var connectionDisposal = connection.ConfigureAwait(false);
@@ -1663,6 +1587,44 @@ public sealed class MetadataStore(
         if (hasMore)
             records.RemoveAt(records.Count - 1);
         return new TaggedBlobPage(records, hasMore);
+    }
+
+    private static List<string> BuildTagSearchPredicates(BlobTagFilter filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        if (filter.Predicates.Count == 0)
+            throw new ArgumentException("At least one tag predicate is required.", nameof(filter));
+
+        var predicates = new List<string>
+        {
+            "blob.account = $account",
+            "blob.is_current = 1",
+            "blob.is_deleted = 0",
+            "blob.snapshot IS NULL"
+        };
+        if (filter.Container is not null)
+            predicates.Add("blob.container = $container");
+        for (var index = 0; index < filter.Predicates.Count; index++)
+        {
+            var comparison = filter.Predicates[index].Comparison switch
+            {
+                BlobTagComparison.Equal => "=",
+                BlobTagComparison.GreaterThan => ">",
+                BlobTagComparison.GreaterThanOrEqual => ">=",
+                BlobTagComparison.LessThan => "<",
+                BlobTagComparison.LessThanOrEqual => "<=",
+                _ => throw new ArgumentOutOfRangeException(nameof(filter))
+            };
+            predicates.Add($"""
+                EXISTS (
+                    SELECT 1 FROM blob_tags AS tag{index}
+                    WHERE tag{index}.generation_id = blob.generation_id
+                      AND tag{index}.tag_key = $key{index}
+                      AND tag{index}.tag_value {comparison} $value{index}
+                )
+                """);
+        }
+        return predicates;
     }
 
     internal async Task<KeysetPage<BlobRecord>> ListBlobMaintenancePageAsync(
@@ -1770,130 +1732,17 @@ public sealed class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
-            var current = await GetCurrentBlobAsync(connection, transaction, proposed.Account, proposed.Container, proposed.Name, cancellationToken).ConfigureAwait(false);
-            var activeCurrent = current is { IsDeleted: false } ? current : null;
-            if (hierarchicalNamespace && activeCurrent is { IsDirectory: true } && !proposed.IsDirectory)
-                throw new StoragePathConflictException();
-            if (!string.Equals(activeCurrent?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
-                !string.Equals(activeCurrent?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
-                throw new StorageConcurrencyException();
-            if (activeCurrent is not null && activeCurrent.Kind != proposed.Kind)
-                throw new StorageBlobTypeMismatchException();
-
-            if (hierarchicalNamespace)
-            {
-                var (parentGroup, inheritedAcl) = await EnsureHierarchicalParentsAsync(
-                    connection,
-                    transaction,
-                    proposed,
-                    cancellationToken).ConfigureAwait(false);
-                proposed = proposed with
-                {
-                    Owner = activeCurrent?.Owner ?? proposed.Owner,
-                    Group = activeCurrent?.Group ?? parentGroup,
-                    AccessAcl = activeCurrent is null
-                        ? proposed.AccessAcl ?? inheritedAcl
-                        : activeCurrent.AccessAcl
-                };
-            }
-
-            if (stagedBlockSnapshot is not null)
-            {
-                var actualBlocks = await ListStagedBlocksAsync(
-                    connection,
-                    transaction,
-                    proposed.Account,
-                    proposed.Container,
-                    proposed.Name,
-                    cancellationToken).ConfigureAwait(false);
-                if (!EquivalentStagedBlocks(actualBlocks, stagedBlockSnapshot))
-                    throw new StorageConcurrencyException();
-            }
+            var (current, prepared) = await PrepareBlobPublicationAsync(
+                connection, transaction, proposed, expectedCurrentGeneration,
+                expectedCurrentRevision, stagedBlockSnapshot, hierarchicalNamespace,
+                cancellationToken).ConfigureAwait(false);
+            proposed = prepared;
 
             var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken).ConfigureAwait(false);
             if (current is not null)
-            {
-                if (!current.IsDeleted && string.Equals(current.Copy?.Status, "pending", StringComparison.Ordinal))
-                    throw new StoragePendingCopyException();
-                var now = _timeProvider.GetUtcNow();
-                if (current.IsDeleted && !hierarchicalNamespace)
-                {
-                    if (current.Kind == proposed.Kind)
-                    {
-                        var historical = current with
-                        {
-                            IsCurrent = false,
-                            VersionId = null,
-                            Snapshot = current.Snapshot ?? await CreateUniqueSnapshotIdAsync(
-                                connection,
-                                transaction,
-                                current.Account,
-                                current.Container,
-                                current.Name,
-                                current.DeletedAt ?? now,
-                                cancellationToken).ConfigureAwait(false),
-                            Lease = LeaseRecord.Available,
-                            Revision = NewRevision()
-                        };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        await DeleteSoftDeletedBlobRowsAsync(
-                            connection,
-                            transaction,
-                            current.Account,
-                            current.Container,
-                            current.Name,
-                            cancellationToken).ConfigureAwait(false);
-                    }
-                }
-                else
-                {
-                    var createsHistoricalVersion = serviceProperties.VersioningEnabled && !hierarchicalNamespace;
-                    var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > now;
-                    if (protectedByRetention && !createsHistoricalVersion)
-                        throw new StorageImmutabilityException(current.HasLegalHold);
-
-                    if (createsHistoricalVersion)
-                    {
-                        var historical = current with
-                        {
-                            IsCurrent = false,
-                            VersionId = current.VersionId ?? CreateVersionId(current.LastModified),
-                            Lease = LeaseRecord.Available,
-                            Revision = NewRevision()
-                        };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
-                    }
-                    else if (serviceProperties.BlobSoftDeleteEnabled && !hierarchicalNamespace)
-                    {
-                        var historical = current with
-                        {
-                            IsCurrent = false,
-                            IsDeleted = true,
-                            DeletedAt = now,
-                            DeleteRetentionUntil = now.AddDays(serviceProperties.BlobSoftDeleteRetentionDays),
-                            VersionId = null,
-                            Snapshot = await CreateUniqueSnapshotIdAsync(
-                                connection,
-                                transaction,
-                                current.Account,
-                                current.Container,
-                                current.Name,
-                                now,
-                                cancellationToken).ConfigureAwait(false),
-                            Lease = LeaseRecord.Available,
-                            Revision = NewRevision()
-                        };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
-                    }
-                    else
-                    {
-                        await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken).ConfigureAwait(false);
-                    }
-                }
-            }
+                await PreserveReplacedBlobAsync(
+                    connection, transaction, current, proposed.Kind, serviceProperties,
+                    hierarchicalNamespace, cancellationToken).ConfigureAwait(false);
 
             var published = proposed with
             {
@@ -1923,6 +1772,152 @@ public sealed class MetadataStore(
         finally
         {
             _writeGate.Release();
+        }
+    }
+
+    private static async Task<(BlobRecord? Current, BlobRecord Proposed)> PrepareBlobPublicationAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord proposed,
+        string? expectedCurrentGeneration,
+        string? expectedCurrentRevision,
+        IReadOnlyList<StagedBlockRecord>? stagedBlockSnapshot,
+        bool hierarchicalNamespace,
+        CancellationToken cancellationToken)
+    {
+        var current = await GetCurrentBlobAsync(
+            connection, transaction, proposed.Account, proposed.Container, proposed.Name,
+            cancellationToken).ConfigureAwait(false);
+        var activeCurrent = current is { IsDeleted: false } ? current : null;
+        if (hierarchicalNamespace && activeCurrent is { IsDirectory: true } && !proposed.IsDirectory)
+            throw new StoragePathConflictException();
+        if (!string.Equals(activeCurrent?.GenerationId, expectedCurrentGeneration, StringComparison.Ordinal) ||
+            !string.Equals(activeCurrent?.Revision, expectedCurrentRevision, StringComparison.Ordinal))
+            throw new StorageConcurrencyException();
+        if (activeCurrent is not null && activeCurrent.Kind != proposed.Kind)
+            throw new StorageBlobTypeMismatchException();
+
+        if (hierarchicalNamespace)
+        {
+            var (parentGroup, inheritedAcl) = await EnsureHierarchicalParentsAsync(
+                connection, transaction, proposed, cancellationToken).ConfigureAwait(false);
+            proposed = proposed with
+            {
+                Owner = activeCurrent?.Owner ?? proposed.Owner,
+                Group = activeCurrent?.Group ?? parentGroup,
+                AccessAcl = activeCurrent is null
+                    ? proposed.AccessAcl ?? inheritedAcl
+                    : activeCurrent.AccessAcl
+            };
+        }
+
+        if (stagedBlockSnapshot is not null)
+        {
+            var actualBlocks = await ListStagedBlocksAsync(
+                connection, transaction, proposed.Account, proposed.Container, proposed.Name,
+                cancellationToken).ConfigureAwait(false);
+            if (!EquivalentStagedBlocks(actualBlocks, stagedBlockSnapshot))
+                throw new StorageConcurrencyException();
+        }
+        return (current, proposed);
+    }
+
+    private async Task PreserveReplacedBlobAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord current,
+        BlobKind proposedKind,
+        ServiceProperties serviceProperties,
+        bool hierarchicalNamespace,
+        CancellationToken cancellationToken)
+    {
+        if (!current.IsDeleted && string.Equals(current.Copy?.Status, "pending", StringComparison.Ordinal))
+            throw new StoragePendingCopyException();
+        var now = _timeProvider.GetUtcNow();
+        if (current.IsDeleted && !hierarchicalNamespace)
+            await PreserveDeletedBlobAsync(
+                connection, transaction, current, proposedKind, now, cancellationToken).ConfigureAwait(false);
+        else
+            await PreserveActiveBlobAsync(
+                connection, transaction, current, serviceProperties,
+                hierarchicalNamespace, now, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task PreserveDeletedBlobAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord current,
+        BlobKind proposedKind,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (current.Kind == proposedKind)
+        {
+            var historical = current with
+            {
+                IsCurrent = false,
+                VersionId = null,
+                Snapshot = current.Snapshot ?? await CreateUniqueSnapshotIdAsync(
+                    connection, transaction, current.Account, current.Container, current.Name,
+                    current.DeletedAt ?? now, cancellationToken).ConfigureAwait(false),
+                Lease = LeaseRecord.Available,
+                Revision = NewRevision()
+            };
+            await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await DeleteSoftDeletedBlobRowsAsync(
+                connection, transaction, current.Account, current.Container, current.Name,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task PreserveActiveBlobAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord current,
+        ServiceProperties serviceProperties,
+        bool hierarchicalNamespace,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var createsHistoricalVersion = serviceProperties.VersioningEnabled && !hierarchicalNamespace;
+        var protectedByRetention = current.HasLegalHold || current.ImmutabilityUntil > now;
+        if (protectedByRetention && !createsHistoricalVersion)
+            throw new StorageImmutabilityException(current.HasLegalHold);
+
+        if (createsHistoricalVersion)
+        {
+            var historical = current with
+            {
+                IsCurrent = false,
+                VersionId = current.VersionId ?? CreateVersionId(current.LastModified),
+                Lease = LeaseRecord.Available,
+                Revision = NewRevision()
+            };
+            await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
+        }
+        else if (serviceProperties.BlobSoftDeleteEnabled && !hierarchicalNamespace)
+        {
+            var historical = current with
+            {
+                IsCurrent = false,
+                IsDeleted = true,
+                DeletedAt = now,
+                DeleteRetentionUntil = now.AddDays(serviceProperties.BlobSoftDeleteRetentionDays),
+                VersionId = null,
+                Snapshot = await CreateUniqueSnapshotIdAsync(
+                    connection, transaction, current.Account, current.Container, current.Name,
+                    now, cancellationToken).ConfigureAwait(false),
+                Lease = LeaseRecord.Available,
+                Revision = NewRevision()
+            };
+            await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -2023,147 +2018,16 @@ public sealed class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
-            var source = await GetBlobByGenerationAsync(
-                connection,
-                transaction,
-                expectedSource.GenerationId,
-                cancellationToken).ConfigureAwait(false);
-            if (source is null || !string.Equals(source.Revision, expectedSource.Revision, StringComparison.Ordinal))
-                throw new StorageConcurrencyException();
-
-            var key = new ObjectReplicationStateKey(
-                proposedState.PolicyId,
-                proposedState.RuleId,
-                source.GenerationId);
-            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
-            var mapped = state?.DestinationGenerationId is { } mappedGeneration
-                ? await GetBlobByGenerationAsync(connection, transaction, mappedGeneration, cancellationToken).ConfigureAwait(false)
-                : null;
-            var current = await GetCurrentBlobAsync(
-                connection,
-                transaction,
-                proposedDestination.Account,
-                proposedDestination.Container,
-                proposedDestination.Name,
-                cancellationToken).ConfigureAwait(false);
+            var (source, mapped, current) = await LoadObjectReplicationContextAsync(
+                connection, transaction, expectedSource, proposedDestination,
+                proposedState, cancellationToken).ConfigureAwait(false);
             var now = _timeProvider.GetUtcNow();
-
-            BlobRecord replicated;
-            if (source.IsCurrent && mapped?.IsCurrent != true)
-            {
-                if (current is not null)
-                {
-                    EnsureObjectReplicationTargetMutable(current, now);
-                    var historical = current with
-                    {
-                        IsCurrent = false,
-                        VersionId = current.VersionId ?? await CreateUniqueVersionIdAsync(
-                            connection,
-                            transaction,
-                            current.Account,
-                            current.Container,
-                            current.Name,
-                            current.LastModified,
-                            cancellationToken).ConfigureAwait(false),
-                        Lease = LeaseRecord.Available,
-                        Revision = NewRevision()
-                    };
-                    await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
-                }
-
-                replicated = proposedDestination with
-                {
-                    IsCurrent = true,
-                    IsDeleted = false,
-                    VersionId = await CreateUniqueVersionIdAsync(
-                        connection,
-                        transaction,
-                        proposedDestination.Account,
-                        proposedDestination.Container,
-                        proposedDestination.Name,
-                        proposedDestination.LastModified,
-                        cancellationToken).ConfigureAwait(false),
-                    Snapshot = null,
-                    Lease = LeaseRecord.Available
-                };
-                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
-            }
-            else if (mapped is null)
-            {
-                replicated = proposedDestination with
-                {
-                    IsCurrent = false,
-                    IsDeleted = false,
-                    VersionId = await CreateUniqueVersionIdAsync(
-                        connection,
-                        transaction,
-                        proposedDestination.Account,
-                        proposedDestination.Container,
-                        proposedDestination.Name,
-                        proposedDestination.LastModified,
-                        cancellationToken).ConfigureAwait(false),
-                    Snapshot = null,
-                    Lease = LeaseRecord.Available
-                };
-                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                EnsureObjectReplicationTargetMutable(mapped, now);
-                replicated = proposedDestination with
-                {
-                    GenerationId = mapped.GenerationId,
-                    CreatedAt = mapped.CreatedAt,
-                    VersionId = mapped.VersionId ?? await CreateUniqueVersionIdAsync(
-                        connection,
-                        transaction,
-                        mapped.Account,
-                        mapped.Container,
-                        mapped.Name,
-                        mapped.LastModified,
-                        cancellationToken).ConfigureAwait(false),
-                    Snapshot = null,
-                    IsCurrent = source.IsCurrent,
-                    IsDeleted = false,
-                    AccessTier = mapped.AccessTier,
-                    AccessTierInferred = mapped.AccessTierInferred,
-                    SmartAccessTier = mapped.SmartAccessTier,
-                    SmartTierLastAccessedAt = mapped.SmartTierLastAccessedAt,
-                    AccessTierChangedAt = mapped.AccessTierChangedAt,
-                    ArchiveStatus = mapped.ArchiveStatus,
-                    RehydratePriority = mapped.RehydratePriority,
-                    RehydrateCompleteAt = mapped.RehydrateCompleteAt,
-                    Lease = LeaseRecord.Available
-                };
-                await UpdateBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
-            }
-
-            var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
-                source.ObjectReplicationStatuses,
-                StringComparer.Ordinal)
-            {
-                [statusKey] = new ObjectReplicationStatusRecord
-                {
-                    Status = "complete",
-                    SourceFingerprint = proposedState.SourceFingerprint
-                }
-            };
-            var updatedSource = source with
-            {
-                Revision = NewRevision(),
-                ObjectReplicationStatuses = statuses
-            };
-            await UpdateBlobRowAsync(connection, transaction, updatedSource, cancellationToken).ConfigureAwait(false);
-            await UpsertObjectReplicationStateAsync(
-                connection,
-                transaction,
-                proposedState with
-                {
-                    DestinationGenerationId = replicated.GenerationId,
-                    Status = "complete",
-                    UpdatedAt = now
-                },
-                cancellationToken).ConfigureAwait(false);
+            var replicated = await WriteObjectReplicaAsync(
+                connection, transaction, source, mapped, current, proposedDestination,
+                now, cancellationToken).ConfigureAwait(false);
+            await RecordObjectReplicationSuccessAsync(
+                connection, transaction, source, proposedState, statusKey,
+                replicated, now, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return replicated;
         }
@@ -2214,35 +2078,9 @@ public sealed class MetadataStore(
                 return false;
             }
 
-            var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
-                source.ObjectReplicationStatuses,
-                StringComparer.Ordinal)
-            {
-                [statusKey] = new ObjectReplicationStatusRecord
-                {
-                    Status = "failed",
-                    SourceFingerprint = proposedState.SourceFingerprint
-                }
-            };
-            await UpdateBlobRowAsync(
-                connection,
-                transaction,
-                source with
-                {
-                    Revision = NewRevision(),
-                    ObjectReplicationStatuses = statuses
-                },
-                cancellationToken).ConfigureAwait(false);
-            await UpsertObjectReplicationStateAsync(
-                connection,
-                transaction,
-                proposedState with
-                {
-                    DestinationGenerationId = existing?.DestinationGenerationId,
-                    Status = "failed",
-                    UpdatedAt = _timeProvider.GetUtcNow()
-                },
-                cancellationToken).ConfigureAwait(false);
+            await PersistObjectReplicationFailureAsync(
+                connection, transaction, source, proposedState, existing,
+                statusKey, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
@@ -2250,6 +2088,46 @@ public sealed class MetadataStore(
         {
             _writeGate.Release();
         }
+    }
+
+    private async Task PersistObjectReplicationFailureAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord source,
+        ObjectReplicationState proposedState,
+        ObjectReplicationState? existing,
+        string statusKey,
+        CancellationToken cancellationToken)
+    {
+        var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
+            source.ObjectReplicationStatuses,
+            StringComparer.Ordinal)
+        {
+            [statusKey] = new ObjectReplicationStatusRecord
+            {
+                Status = "failed",
+                SourceFingerprint = proposedState.SourceFingerprint
+            }
+        };
+        await UpdateBlobRowAsync(
+            connection,
+            transaction,
+            source with
+            {
+                Revision = NewRevision(),
+                ObjectReplicationStatuses = statuses
+            },
+            cancellationToken).ConfigureAwait(false);
+        await UpsertObjectReplicationStateAsync(
+            connection,
+            transaction,
+            proposedState with
+            {
+                DestinationGenerationId = existing?.DestinationGenerationId,
+                Status = "failed",
+                UpdatedAt = _timeProvider.GetUtcNow()
+            },
+            cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<bool> RemoveObjectReplicaForMissingSourceAsync(
@@ -2348,15 +2226,7 @@ public sealed class MetadataStore(
     {
         if (mutations.Count == 0)
             return;
-        if (mutations.Select(item => item.GenerationId).Distinct(StringComparer.Ordinal).Count() != mutations.Count ||
-            mutations.Any(item => item.Replacement is not null &&
-                                  !string.Equals(
-                                      item.GenerationId,
-                                      item.Replacement.GenerationId,
-                                      StringComparison.Ordinal)))
-        {
-            throw new ArgumentException("Blob record mutations must target unique, stable generation identities.", nameof(mutations));
-        }
+        ValidateBlobRecordMutations(mutations);
 
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -2365,21 +2235,8 @@ public sealed class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
-            var currentRecords = new List<BlobRecord>(mutations.Count);
-            foreach (var mutation in mutations)
-            {
-                var current = await GetBlobByGenerationAsync(
-                    connection,
-                    transaction,
-                    mutation.GenerationId,
-                    cancellationToken).ConfigureAwait(false);
-                if (current is null ||
-                    !string.Equals(current.Revision, mutation.ExpectedRevision, StringComparison.Ordinal))
-                {
-                    throw new StorageConcurrencyException();
-                }
-                currentRecords.Add(current);
-            }
+            var currentRecords = await ReadCurrentMutationRecordsAsync(
+                connection, transaction, mutations, cancellationToken).ConfigureAwait(false);
 
             foreach (var mutation in mutations)
             {
@@ -2421,6 +2278,43 @@ public sealed class MetadataStore(
         {
             _writeGate.Release();
         }
+    }
+
+    private static void ValidateBlobRecordMutations(IReadOnlyList<BlobRecordMutation> mutations)
+    {
+        if (mutations.Select(item => item.GenerationId).Distinct(StringComparer.Ordinal).Count() != mutations.Count ||
+            mutations.Any(item => item.Replacement is not null &&
+                                  !string.Equals(
+                                      item.GenerationId,
+                                      item.Replacement.GenerationId,
+                                      StringComparison.Ordinal)))
+        {
+            throw new ArgumentException("Blob record mutations must target unique, stable generation identities.", nameof(mutations));
+        }
+    }
+
+    private static async Task<IReadOnlyList<BlobRecord>> ReadCurrentMutationRecordsAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<BlobRecordMutation> mutations,
+        CancellationToken cancellationToken)
+    {
+        var currentRecords = new List<BlobRecord>(mutations.Count);
+        foreach (var mutation in mutations)
+        {
+            var current = await GetBlobByGenerationAsync(
+                connection,
+                transaction,
+                mutation.GenerationId,
+                cancellationToken).ConfigureAwait(false);
+            if (current is null ||
+                !string.Equals(current.Revision, mutation.ExpectedRevision, StringComparison.Ordinal))
+            {
+                throw new StorageConcurrencyException();
+            }
+            currentRecords.Add(current);
+        }
+        return currentRecords;
     }
 
     internal async Task<bool> TryRestoreDeletedBlobAsync(
@@ -2631,33 +2525,8 @@ public sealed class MetadataStore(
             var properties = await GetServicePropertiesAsync(connection, transaction, source.Account, cancellationToken).ConfigureAwait(false);
             string? newVersionId = null;
             if (properties.VersioningEnabled && !hierarchicalNamespace)
-            {
-                var historical = source with
-                {
-                    IsCurrent = false,
-                    VersionId = source.VersionId ?? CreateVersionId(source.LastModified),
-                    Lease = LeaseRecord.Available,
-                    Revision = NewRevision()
-                };
-                await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
-                newVersionId = await CreateUniqueVersionIdAsync(
-                    connection,
-                    transaction,
-                    source.Account,
-                    source.Container,
-                    source.Name,
-                    now,
-                    cancellationToken).ConfigureAwait(false);
-                var newCurrent = source with
-                {
-                    GenerationId = Guid.NewGuid().ToString("N"),
-                    Revision = NewRevision(),
-                    VersionId = newVersionId,
-                    Snapshot = null,
-                    IsCurrent = true
-                };
-                await InsertBlobRowAsync(connection, transaction, newCurrent, cancellationToken).ConfigureAwait(false);
-            }
+                newVersionId = await PreserveCurrentVersionForSnapshotAsync(
+                    connection, transaction, source, now, cancellationToken).ConfigureAwait(false);
             await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return newVersionId is null ? snapshot : snapshot with { VersionId = newVersionId };
@@ -2666,6 +2535,41 @@ public sealed class MetadataStore(
         {
             _writeGate.Release();
         }
+    }
+
+    private static async Task<string> PreserveCurrentVersionForSnapshotAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord source,
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var historical = source with
+        {
+            IsCurrent = false,
+            VersionId = source.VersionId ?? CreateVersionId(source.LastModified),
+            Lease = LeaseRecord.Available,
+            Revision = NewRevision()
+        };
+        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
+        var newVersionId = await CreateUniqueVersionIdAsync(
+            connection,
+            transaction,
+            source.Account,
+            source.Container,
+            source.Name,
+            now,
+            cancellationToken).ConfigureAwait(false);
+        var newCurrent = source with
+        {
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = NewRevision(),
+            VersionId = newVersionId,
+            Snapshot = null,
+            IsCurrent = true
+        };
+        await InsertBlobRowAsync(connection, transaction, newCurrent, cancellationToken).ConfigureAwait(false);
+        return newVersionId;
     }
 
     public async Task<bool> DeleteBlobRecordAsync(
@@ -3448,43 +3352,10 @@ public sealed class MetadataStore(
             cancellationToken).ConfigureAwait(false);
 
         foreach (var blob in blobs)
-        {
-            var update = connection.CreateCommand();
-            await using var updateDisposal = update.ConfigureAwait(false);
-            update.Transaction = transaction;
-            update.CommandText = """
-                UPDATE blobs
-                SET logical_length = $logical, pending_copy_length = $pending
-                WHERE generation_id = $generation;
-                """;
-            update.Parameters.AddWithValue("$logical", blob.Content.Length);
-            update.Parameters.AddWithValue("$pending", blob.PendingCopyContent?.Length ?? 0);
-            update.Parameters.AddWithValue("$generation", blob.GenerationId);
-            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                throw new InvalidDataException("A blob changed while migrating the metadata schema.");
-            await ReplaceBlobChunkReferencesAsync(connection, transaction, blob, cancellationToken).ConfigureAwait(false);
-        }
+            await MigrateVersion1BlobAsync(connection, transaction, blob, cancellationToken).ConfigureAwait(false);
 
         foreach (var block in blocks)
-        {
-            var update = connection.CreateCommand();
-            await using var updateDisposal = update.ConfigureAwait(false);
-            update.Transaction = transaction;
-            update.CommandText = """
-                UPDATE staged_blocks
-                SET logical_length = $logical
-                WHERE account = $account AND container = $container
-                  AND blob_name = $blob AND block_id = $block;
-                """;
-            update.Parameters.AddWithValue("$logical", block.Content.Length);
-            update.Parameters.AddWithValue("$account", block.Account);
-            update.Parameters.AddWithValue("$container", block.Container);
-            update.Parameters.AddWithValue("$blob", block.BlobName);
-            update.Parameters.AddWithValue("$block", block.BlockId);
-            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
-                throw new InvalidDataException("A staged block changed while migrating the metadata schema.");
-            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
-        }
+            await MigrateVersion1StagedBlockAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
 
         await ExecuteNonQueryAsync(
             connection,
@@ -3492,6 +3363,53 @@ public sealed class MetadataStore(
             $"PRAGMA user_version={ChunkIndexSchemaVersion};",
             cancellationToken).ConfigureAwait(false);
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task MigrateVersion1BlobAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        BlobRecord blob,
+        CancellationToken cancellationToken)
+    {
+        var update = connection.CreateCommand();
+        await using var updateDisposal = update.ConfigureAwait(false);
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE blobs
+            SET logical_length = $logical, pending_copy_length = $pending
+            WHERE generation_id = $generation;
+            """;
+        update.Parameters.AddWithValue("$logical", blob.Content.Length);
+        update.Parameters.AddWithValue("$pending", blob.PendingCopyContent?.Length ?? 0);
+        update.Parameters.AddWithValue("$generation", blob.GenerationId);
+        if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidDataException("A blob changed while migrating the metadata schema.");
+        await ReplaceBlobChunkReferencesAsync(connection, transaction, blob, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task MigrateVersion1StagedBlockAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        StagedBlockRecord block,
+        CancellationToken cancellationToken)
+    {
+        var update = connection.CreateCommand();
+        await using var updateDisposal = update.ConfigureAwait(false);
+        update.Transaction = transaction;
+        update.CommandText = """
+            UPDATE staged_blocks
+            SET logical_length = $logical
+            WHERE account = $account AND container = $container
+              AND blob_name = $blob AND block_id = $block;
+            """;
+        update.Parameters.AddWithValue("$logical", block.Content.Length);
+        update.Parameters.AddWithValue("$account", block.Account);
+        update.Parameters.AddWithValue("$container", block.Container);
+        update.Parameters.AddWithValue("$blob", block.BlobName);
+        update.Parameters.AddWithValue("$block", block.BlockId);
+        if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
+            throw new InvalidDataException("A staged block changed while migrating the metadata schema.");
+        await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task MigrateVersion2ToVersion3Async(
@@ -3773,30 +3691,7 @@ public sealed class MetadataStore(
                 cancellationToken).ConfigureAwait(false);
             if (existing is null)
             {
-                var directory = new BlobRecord
-                {
-                    Account = path.Account,
-                    Container = path.Container,
-                    Name = directoryName,
-                    GenerationId = Guid.NewGuid().ToString("N"),
-                    Revision = NewRevision(),
-                    IsCurrent = true,
-                    IsDirectory = true,
-                    Kind = BlobKind.BlockBlob,
-                    Content = ContentManifest.Empty(path.Content.Domain),
-                    ETag = NewETag(),
-                    CreatedAt = path.CreatedAt,
-                    LastModified = path.CreatedAt,
-                    Owner = path.Owner,
-                    Group = parentGroup,
-                    AccessAcl = parentAcl is null
-                        ? null
-                        : PosixAccessControl.InheritDefaultAcl(parentAcl, childIsDirectory: true),
-                    Http = new BlobHttpProperties(),
-                    Lease = LeaseRecord.Available,
-                    AccessTier = "Hot",
-                    AccessTierInferred = true
-                };
+                var directory = CreateInheritedDirectoryRecord(path, directoryName, parentGroup, parentAcl);
                 await InsertBlobRowAsync(connection, transaction, directory, cancellationToken).ConfigureAwait(false);
                 parentAcl = directory.Acl;
             }
@@ -3817,6 +3712,35 @@ public sealed class MetadataStore(
             ? null
             : PosixAccessControl.InheritDefaultAcl(parentAcl, path.IsDirectory));
     }
+
+    private static BlobRecord CreateInheritedDirectoryRecord(
+        BlobRecord path,
+        string directoryName,
+        string parentGroup,
+        string? parentAcl) => new()
+        {
+            Account = path.Account,
+            Container = path.Container,
+            Name = directoryName,
+            GenerationId = Guid.NewGuid().ToString("N"),
+            Revision = NewRevision(),
+            IsCurrent = true,
+            IsDirectory = true,
+            Kind = BlobKind.BlockBlob,
+            Content = ContentManifest.Empty(path.Content.Domain),
+            ETag = NewETag(),
+            CreatedAt = path.CreatedAt,
+            LastModified = path.CreatedAt,
+            Owner = path.Owner,
+            Group = parentGroup,
+            AccessAcl = parentAcl is null
+            ? null
+            : PosixAccessControl.InheritDefaultAcl(parentAcl, childIsDirectory: true),
+            Http = new BlobHttpProperties(),
+            Lease = LeaseRecord.Available,
+            AccessTier = "Hot",
+            AccessTierInferred = true
+        };
 
     private static async Task DeleteSoftDeletedBlobRowsAsync(
         SqliteConnection connection,
