@@ -200,6 +200,113 @@ public sealed class StorageEnospcHarnessTests
     }
 
     [Fact]
+    public async Task ExhaustedFilesystemRollsBackFailedBlobMetadataUpdate()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "blob-metadata-data");
+        var fillerPath = Path.Combine(mountRoot, "blob-metadata-filler.bin");
+        var stableBytes = RandomNumberGenerator.GetBytes(8192);
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+
+        var acknowledged = await AssertBlobMetadataUpdateRejectedAsync(
+            dataPath, fillerPath, stableBytes, configuration).ConfigureAwait(true);
+        await AssertBlobMetadataUpdateRecoversAsync(
+            dataPath, stableBytes, acknowledged, configuration).ConfigureAwait(true);
+    }
+
+    private static async Task<BlobMetadataFailureObservation> AssertBlobMetadataUpdateRejectedAsync(
+        string dataPath,
+        string fillerPath,
+        byte[] stableBytes,
+        Dictionary<string, string?> configuration)
+    {
+        var first = CreateHarness(dataPath, configuration);
+        try
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(first).GetBlobContainerClient("enospc-blob-metadata");
+            await container.CreateAsync().ConfigureAwait(false);
+            var blob = container.GetBlobClient("stable.bin");
+            await blob.UploadAsync(BinaryData.FromBytes(stableBytes), new Azure.Storage.Blobs.Models.BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "seed" }
+            }).ConfigureAwait(false);
+            var acknowledgedState = "seed";
+            var acknowledgedETag = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag;
+            var acknowledgedUpdates = 0;
+            FillUntilNoSpace(fillerPath, 256 * 1024);
+
+            var failed = false;
+            for (var index = 0; index < 256; index++)
+            {
+                var state = $"{index:D4}-{new string('m', 4096)}";
+                try
+                {
+                    var updated = await blob.SetMetadataAsync(
+                        new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = state }).ConfigureAwait(false);
+                    acknowledgedState = state;
+                    acknowledgedETag = updated.Value.ETag;
+                    acknowledgedUpdates++;
+                }
+                catch (RequestFailedException failure)
+                {
+                    Assert.Equal(500, failure.Status);
+                    failed = true;
+                    break;
+                }
+            }
+            Assert.True(failed);
+            Assert.True(acknowledgedUpdates > 0);
+            File.Delete(fillerPath);
+
+            var properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+            Assert.Equal(acknowledgedState, properties.Metadata["state"]);
+            Assert.Equal(acknowledgedETag, properties.ETag);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            return new BlobMetadataFailureObservation(acknowledgedState, acknowledgedETag);
+        }
+        finally
+        {
+            await first.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertBlobMetadataUpdateRecoversAsync(
+        string dataPath,
+        byte[] stableBytes,
+        BlobMetadataFailureObservation acknowledged,
+        Dictionary<string, string?> configuration)
+    {
+        var restarted = CreateHarness(dataPath, configuration);
+        try
+        {
+            await restarted.InitializeAsync().ConfigureAwait(false);
+            var blob = CreateClient(restarted)
+                .GetBlobContainerClient("enospc-blob-metadata")
+                .GetBlobClient("stable.bin");
+            var properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+            Assert.Equal(acknowledged.State, properties.Metadata["state"]);
+            Assert.Equal(acknowledged.ETag, properties.ETag);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            await blob.SetMetadataAsync(
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "recovered" }).ConfigureAwait(false);
+            Assert.Equal("recovered", (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["state"]);
+            Assert.Equal(stableBytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await restarted.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    [Fact]
     public async Task ExhaustedFilesystemDuringPackAppendPreservesIndexedRecords()
     {
         var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
@@ -429,6 +536,8 @@ public sealed class StorageEnospcHarnessTests
             configurationOverrides: configuration, deleteDataPath: false, disableMaintenance: true);
 
     private sealed record MetadataFailureObservation(IReadOnlyList<string> Acknowledged, string FailedName);
+
+    private sealed record BlobMetadataFailureObservation(string State, ETag ETag);
 
     private sealed record CompactionIdentity(string PackId, string ChunkId);
 

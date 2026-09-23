@@ -80,10 +80,10 @@ DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run-enospc.sh
 ```
 
 It mounts a private 32 MiB tmpfs beneath a freshly created temporary directory,
-fills it until the kernel returns `ENOSPC`, and runs four independent boundaries:
+fills it until the kernel returns `ENOSPC`, and runs five independent boundaries:
 a 512 KiB standalone upload with only 256 KiB free, metadata-only container
-creation with 128 KiB free, a packed upload with 8 KiB free, and pack compaction
-with 4 KiB free. The tests confirm
+creation with 128 KiB free, a blob metadata update with 256 KiB free, a packed
+upload with 8 KiB free, and pack compaction with 4 KiB free. The tests confirm
 an earlier acknowledged object remains exact, failed logical publication is
 absent after restart, partial/unreachable extents can be reclaimed or discarded,
 and retry succeeds. The pack test also records that staging completed and pack
