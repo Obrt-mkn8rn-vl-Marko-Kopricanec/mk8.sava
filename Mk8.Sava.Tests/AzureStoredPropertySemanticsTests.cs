@@ -232,19 +232,22 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             Assert.Equal("metadata", overriddenProperties.Metadata["destination"]);
             Assert.False(overriddenProperties.Metadata.ContainsKey("source"));
 
-            var tagged = container.GetBlockBlobClient("tagged.bin");
-            await tagged.SyncUploadFromUriAsync(
-                source,
-                new BlobSyncUploadFromUriOptions
-                {
-                    CopySourceTagsMode = BlobCopySourceTagsMode.Copy
-                });
-            Assert.Equal("copied", (await tagged.GetTagsAsync()).Value.Tags["source-tag"]);
+            await AssertSourceTagsCopiedAsync(container, source).ConfigureAwait(true);
         }
         finally
         {
-            await application.DisposeAsync();
+            await application.DisposeAsync().ConfigureAwait(true);
         }
+    }
+
+    private static async Task AssertSourceTagsCopiedAsync(BlobContainerClient container, Uri source)
+    {
+        var tagged = container.GetBlockBlobClient("tagged.bin");
+        await tagged.SyncUploadFromUriAsync(
+            source,
+            new BlobSyncUploadFromUriOptions { CopySourceTagsMode = BlobCopySourceTagsMode.Copy })
+            .ConfigureAwait(false);
+        Assert.Equal("copied", (await tagged.GetTagsAsync().ConfigureAwait(false)).Value.Tags["source-tag"]);
     }
 
     [Fact]
@@ -435,105 +438,10 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             var container = service.GetBlobContainerClient($"remote-shape-{Guid.NewGuid():N}");
             await container.CreateAsync();
 
-            var block = container.GetBlockBlobClient("block-copy.bin");
-            var blockCopy = await block.StartCopyFromUriAsync(new Uri("https://source.example/block"));
-            var pendingBlock = (await block.GetPropertiesAsync()).Value;
-            Assert.Equal(CopyStatus.Pending, pendingBlock.CopyStatus);
-            Assert.Equal(0, pendingBlock.ContentLength);
-            Assert.Empty((await block.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks);
-            await blockCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-            var blockProperties = (await block.GetPropertiesAsync()).Value;
-            Assert.Equal(BlobType.Block, blockProperties.BlobType);
-            Assert.Equal("block", blockProperties.Metadata["shape"]);
-            Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await block.DownloadContentAsync()).Value.Content.ToArray());
-            var committed = (await block.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks;
-            Assert.Equal(CopyShapeSourceHandler.BlockIds, committed.Select(item => item.Name), StringComparer.Ordinal);
-            Assert.Equal(CopyShapeSourceHandler.BlockLengths, committed.Select(item => item.SizeLong));
+            var block = await AssertBlockCopyShapeAsync(container).ConfigureAwait(true);
 
-            var synchronousBlock = container.GetBlockBlobClient("synchronous-block-copy.bin");
-            await synchronousBlock.SyncCopyFromUriAsync(new Uri("https://source.example/block"));
-            var synchronousBlocks = (await synchronousBlock.GetBlockListAsync(BlockListTypes.Committed))
-                .Value
-                .CommittedBlocks;
-            Assert.Equal(CopyShapeSourceHandler.BlockIds, synchronousBlocks.Select(item => item.Name), StringComparer.Ordinal);
-            Assert.Equal(CopyShapeSourceHandler.BlockPayload, (await synchronousBlock.DownloadContentAsync()).Value.Content.ToArray());
-
-            var append = container.GetAppendBlobClient("append-copy.bin");
-            var appendCopy = await append.StartCopyFromUriAsync(new Uri("https://source.example/append"));
-            var pendingAppend = (await append.GetPropertiesAsync()).Value;
-            Assert.Equal(CopyStatus.Pending, pendingAppend.CopyStatus);
-            Assert.Equal(0, pendingAppend.ContentLength);
-            Assert.Equal(0, pendingAppend.BlobCommittedBlockCount);
-            Assert.False(pendingAppend.IsSealed);
-            await appendCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-            var appendProperties = (await append.GetPropertiesAsync()).Value;
-            Assert.Equal(BlobType.Append, appendProperties.BlobType);
-            Assert.Equal(2, appendProperties.BlobCommittedBlockCount);
-            Assert.True(appendProperties.IsSealed);
-            Assert.Equal(CopyShapeSourceHandler.AppendPayload, (await append.DownloadContentAsync()).Value.Content.ToArray());
-            var sealedAppend = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
-                append.AppendBlockAsync(BinaryData.FromString("rejected").ToStream()));
-            Assert.Equal("BlobIsSealed", sealedAppend.ErrorCode);
-
-            var unsealedAppend = container.GetAppendBlobClient("unsealed-append-copy.bin");
-            var unsealedCopy = await unsealedAppend.StartCopyFromUriAsync(
-                new Uri("https://source.example/append"),
-                new BlobCopyFromUriOptions { ShouldSealDestination = false });
-            await unsealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-            Assert.False((await unsealedAppend.GetPropertiesAsync()).Value.IsSealed);
-            await unsealedAppend.AppendBlockAsync(BinaryData.FromString("|allowed").ToStream());
-            Assert.Equal(
-                CopyShapeSourceHandler.AppendPayload.Concat("|allowed"u8.ToArray()).ToArray(),
-                (await unsealedAppend.DownloadContentAsync()).Value.Content.ToArray());
-
-            var invalidSeal = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
-                block.StartCopyFromUriAsync(
-                    new Uri("https://source.example/block"),
-                    new BlobCopyFromUriOptions { ShouldSealDestination = true }));
-            Assert.Equal(400, invalidSeal.Status);
-            Assert.Equal("InvalidHeaderValue", invalidSeal.ErrorCode);
-
-            var unsealedSource = container.GetAppendBlobClient("unsealed-source.bin");
-            await unsealedSource.CreateAsync();
-            await unsealedSource.AppendBlockAsync(BinaryData.FromString("seal on completion").ToStream());
-            var explicitlySealed = container.GetAppendBlobClient("explicitly-sealed-copy.bin");
-            var explicitlySealedCopy = await explicitlySealed.StartCopyFromUriAsync(
-                unsealedSource.Uri,
-                new BlobCopyFromUriOptions { ShouldSealDestination = true });
-            Assert.False((await explicitlySealed.GetPropertiesAsync()).Value.IsSealed);
-            await explicitlySealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-            Assert.True((await explicitlySealed.GetPropertiesAsync()).Value.IsSealed);
-
-            var page = container.GetPageBlobClient("page-copy.bin");
-            var pageCopy = await page.StartCopyFromUriAsync(new Uri("https://source.example/page"));
-            var pendingPage = (await page.GetPropertiesAsync()).Value;
-            Assert.Equal(BlobType.Page, pendingPage.BlobType);
-            Assert.Equal(CopyShapeSourceHandler.PagePayload.LongLength, pendingPage.ContentLength);
-            Assert.Empty((await page.GetPageRangesAsync()).Value.PageRanges);
-            await pageCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-            var pageProperties = (await page.GetPropertiesAsync()).Value;
-            Assert.Equal(42, pageProperties.BlobSequenceNumber);
-            Assert.Equal(CopyShapeSourceHandler.PagePayload, (await page.DownloadContentAsync()).Value.Content.ToArray());
-            var ranges = (await page.GetPageRangesAsync()).Value.PageRanges;
-            Assert.Collection(
-                ranges,
-                range =>
-                {
-                    Assert.Equal(0, range.Offset);
-                    Assert.Equal(512, range.Length);
-                },
-                range =>
-                {
-                    Assert.Equal(1024, range.Offset);
-                    Assert.Equal(512, range.Length);
-                });
-
-            var wrongType = container.GetBlockBlobClient("wrong-type.bin");
-            await wrongType.UploadAsync(BinaryData.FromString("existing block").ToStream());
-            var mismatch = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
-                wrongType.StartCopyFromUriAsync(new Uri("https://source.example/page")));
-            Assert.Equal(409, mismatch.Status);
-            Assert.Equal("InvalidBlobType", mismatch.ErrorCode);
+            await AssertAppendCopyShapeAsync(container, block).ConfigureAwait(true);
+            await AssertPageCopyShapeAsync(container).ConfigureAwait(true);
 
             Assert.True(sourceHandler.BlockListReadWithPinnedEtag);
             Assert.Equal(4, sourceHandler.PageListRequests);
@@ -541,8 +449,120 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         }
         finally
         {
-            await application.DisposeAsync();
+            await application.DisposeAsync().ConfigureAwait(true);
         }
+    }
+
+    private static async Task<BlockBlobClient> AssertBlockCopyShapeAsync(BlobContainerClient container)
+    {
+        var block = container.GetBlockBlobClient("block-copy.bin");
+        var blockCopy = await block.StartCopyFromUriAsync(new Uri("https://source.example/block")).ConfigureAwait(false);
+        var pendingBlock = (await block.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(CopyStatus.Pending, pendingBlock.CopyStatus);
+        Assert.Equal(0, pendingBlock.ContentLength);
+        Assert.Empty((await block.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false)).Value.CommittedBlocks);
+        await blockCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
+        var blockProperties = (await block.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(BlobType.Block, blockProperties.BlobType);
+        Assert.Equal("block", blockProperties.Metadata["shape"]);
+        Assert.Equal(CopyShapeSourceHandler.BlockPayload,
+            (await block.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var committed = (await block.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false)).Value.CommittedBlocks;
+        Assert.Equal(CopyShapeSourceHandler.BlockIds, committed.Select(item => item.Name), StringComparer.Ordinal);
+        Assert.Equal(CopyShapeSourceHandler.BlockLengths, committed.Select(item => item.SizeLong));
+
+        var synchronousBlock = container.GetBlockBlobClient("synchronous-block-copy.bin");
+        await synchronousBlock.SyncCopyFromUriAsync(new Uri("https://source.example/block")).ConfigureAwait(false);
+        var synchronousBlocks = (await synchronousBlock.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false))
+            .Value.CommittedBlocks;
+        Assert.Equal(CopyShapeSourceHandler.BlockIds, synchronousBlocks.Select(item => item.Name), StringComparer.Ordinal);
+        Assert.Equal(CopyShapeSourceHandler.BlockPayload,
+            (await synchronousBlock.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        return block;
+    }
+
+    private static async Task AssertAppendCopyShapeAsync(BlobContainerClient container, BlockBlobClient block)
+    {
+        var append = container.GetAppendBlobClient("append-copy.bin");
+        var appendCopy = await append.StartCopyFromUriAsync(new Uri("https://source.example/append")).ConfigureAwait(false);
+        var pendingAppend = (await append.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(CopyStatus.Pending, pendingAppend.CopyStatus);
+        Assert.Equal(0, pendingAppend.ContentLength);
+        Assert.Equal(0, pendingAppend.BlobCommittedBlockCount);
+        Assert.False(pendingAppend.IsSealed);
+        await appendCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
+        var appendProperties = (await append.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(BlobType.Append, appendProperties.BlobType);
+        Assert.Equal(2, appendProperties.BlobCommittedBlockCount);
+        Assert.True(appendProperties.IsSealed);
+        Assert.Equal(CopyShapeSourceHandler.AppendPayload,
+            (await append.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var sealedAppend = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            append.AppendBlockAsync(BinaryData.FromString("rejected").ToStream())).ConfigureAwait(false);
+        Assert.Equal("BlobIsSealed", sealedAppend.ErrorCode);
+
+        var unsealedAppend = container.GetAppendBlobClient("unsealed-append-copy.bin");
+        var unsealedCopy = await unsealedAppend.StartCopyFromUriAsync(
+            new Uri("https://source.example/append"),
+            new BlobCopyFromUriOptions { ShouldSealDestination = false }).ConfigureAwait(false);
+        await unsealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
+        Assert.False((await unsealedAppend.GetPropertiesAsync().ConfigureAwait(false)).Value.IsSealed);
+        await unsealedAppend.AppendBlockAsync(BinaryData.FromString("|allowed").ToStream()).ConfigureAwait(false);
+        Assert.Equal(CopyShapeSourceHandler.AppendPayload.Concat("|allowed"u8.ToArray()).ToArray(),
+            (await unsealedAppend.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+
+        var invalidSeal = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            block.StartCopyFromUriAsync(
+                new Uri("https://source.example/block"),
+                new BlobCopyFromUriOptions { ShouldSealDestination = true })).ConfigureAwait(false);
+        Assert.Equal(400, invalidSeal.Status);
+        Assert.Equal("InvalidHeaderValue", invalidSeal.ErrorCode);
+
+        var unsealedSource = container.GetAppendBlobClient("unsealed-source.bin");
+        await unsealedSource.CreateAsync().ConfigureAwait(false);
+        await unsealedSource.AppendBlockAsync(BinaryData.FromString("seal on completion").ToStream()).ConfigureAwait(false);
+        var explicitlySealed = container.GetAppendBlobClient("explicitly-sealed-copy.bin");
+        var explicitlySealedCopy = await explicitlySealed.StartCopyFromUriAsync(
+            unsealedSource.Uri,
+            new BlobCopyFromUriOptions { ShouldSealDestination = true }).ConfigureAwait(false);
+        Assert.False((await explicitlySealed.GetPropertiesAsync().ConfigureAwait(false)).Value.IsSealed);
+        await explicitlySealedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.True((await explicitlySealed.GetPropertiesAsync().ConfigureAwait(false)).Value.IsSealed);
+    }
+
+    private static async Task AssertPageCopyShapeAsync(BlobContainerClient container)
+    {
+        var page = container.GetPageBlobClient("page-copy.bin");
+        var pageCopy = await page.StartCopyFromUriAsync(new Uri("https://source.example/page")).ConfigureAwait(false);
+        var pendingPage = (await page.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(BlobType.Page, pendingPage.BlobType);
+        Assert.Equal(CopyShapeSourceHandler.PagePayload.LongLength, pendingPage.ContentLength);
+        Assert.Empty((await page.GetPageRangesAsync().ConfigureAwait(false)).Value.PageRanges);
+        await pageCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
+        var pageProperties = (await page.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(42, pageProperties.BlobSequenceNumber);
+        Assert.Equal(CopyShapeSourceHandler.PagePayload,
+            (await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var ranges = (await page.GetPageRangesAsync().ConfigureAwait(false)).Value.PageRanges;
+        Assert.Collection(ranges,
+            range =>
+            {
+                Assert.Equal(0, range.Offset);
+                Assert.Equal(512, range.Length);
+            },
+            range =>
+            {
+                Assert.Equal(1024, range.Offset);
+                Assert.Equal(512, range.Length);
+            });
+
+        var wrongType = container.GetBlockBlobClient("wrong-type.bin");
+        await wrongType.UploadAsync(BinaryData.FromString("existing block").ToStream()).ConfigureAwait(false);
+        var mismatch = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            wrongType.StartCopyFromUriAsync(new Uri("https://source.example/page"))).ConfigureAwait(false);
+        Assert.Equal(409, mismatch.Status);
+        Assert.Equal("InvalidBlobType", mismatch.ErrorCode);
     }
 
     [Fact]
@@ -597,33 +617,16 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
         var source = container.GetBlobClient("source.bin");
         await source.UploadAsync(BinaryData.FromString("leased copy source"));
 
-        var finiteDestination = container.GetBlobClient("finite.bin");
-        await finiteDestination.UploadAsync(BinaryData.FromString("original finite destination"));
-        var finiteLeaseId = Guid.NewGuid().ToString();
-        var finiteLease = finiteDestination.GetBlobLeaseClient(finiteLeaseId);
-        await finiteLease.AcquireAsync(TimeSpan.FromSeconds(30));
-        var finiteFailure = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
-            finiteDestination.StartCopyFromUriAsync(
-                source.Uri,
-                new BlobCopyFromUriOptions
-                {
-                    DestinationConditions = new BlobRequestConditions { LeaseId = finiteLeaseId }
-                }));
-        Assert.Equal(412, finiteFailure.Status);
-        Assert.Equal("InfiniteLeaseDurationRequired", finiteFailure.ErrorCode);
-        Assert.Equal(
-            "original finite destination",
-            (await finiteDestination.DownloadContentAsync()).Value.Content.ToString());
-        await finiteLease.ReleaseAsync();
+        await AssertFiniteLeaseRejectedAsync(container, source.Uri).ConfigureAwait(true);
 
         var infiniteDestination = container.GetBlobClient("infinite.bin");
-        await infiniteDestination.UploadAsync(BinaryData.FromString("original infinite destination"));
+        await infiniteDestination.UploadAsync(BinaryData.FromString("original infinite destination")).ConfigureAwait(true);
         var infiniteLeaseId = Guid.NewGuid().ToString();
         var infiniteLease = infiniteDestination.GetBlobLeaseClient(infiniteLeaseId);
-        await infiniteLease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
+        await infiniteLease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration).ConfigureAwait(true);
 
         var missingLease = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
-            infiniteDestination.StartCopyFromUriAsync(source.Uri));
+            infiniteDestination.StartCopyFromUriAsync(source.Uri)).ConfigureAwait(true);
         Assert.Equal(412, missingLease.Status);
         Assert.Equal("LeaseIdMissing", missingLease.ErrorCode);
 
@@ -633,7 +636,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
                 new BlobCopyFromUriOptions
                 {
                     DestinationConditions = new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() }
-                }));
+                })).ConfigureAwait(true);
         Assert.Equal(412, mismatchedLease.Status);
         Assert.Equal("LeaseIdMismatchWithBlobOperation", mismatchedLease.ErrorCode);
 
@@ -642,35 +645,63 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             new BlobCopyFromUriOptions
             {
                 DestinationConditions = new BlobRequestConditions { LeaseId = infiniteLeaseId }
-            });
-        var pending = (await infiniteDestination.GetPropertiesAsync()).Value;
+            }).ConfigureAwait(true);
+        var pending = (await infiniteDestination.GetPropertiesAsync().ConfigureAwait(true)).Value;
         Assert.Equal(CopyStatus.Pending, pending.CopyStatus);
         Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, pending.LeaseState);
         Assert.Equal(LeaseDurationType.Infinite, pending.LeaseDuration);
 
-        var pendingLeaseOperation = await Assert.ThrowsAsync<Azure.RequestFailedException>(() => infiniteLease.RenewAsync());
+        var pendingLeaseOperation = await Assert.ThrowsAsync<Azure.RequestFailedException>(() => infiniteLease.RenewAsync())
+            .ConfigureAwait(true);
         Assert.Equal(409, pendingLeaseOperation.Status);
         Assert.Equal("PendingCopyOperation", pendingLeaseOperation.ErrorCode);
 
-        await operation.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-        var completed = (await infiniteDestination.GetPropertiesAsync()).Value;
+        await operation.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(true);
+        var completed = (await infiniteDestination.GetPropertiesAsync().ConfigureAwait(true)).Value;
         Assert.Equal(CopyStatus.Success, completed.CopyStatus);
         Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, completed.LeaseState);
         Assert.Equal(LeaseDurationType.Infinite, completed.LeaseDuration);
-        Assert.Equal("leased copy source", (await infiniteDestination.DownloadContentAsync()).Value.Content.ToString());
-        await infiniteLease.ReleaseAsync();
+        Assert.Equal("leased copy source",
+            (await infiniteDestination.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+        await infiniteLease.ReleaseAsync().ConfigureAwait(true);
 
+        await AssertAbsentLeaseRejectedAsync(container, source.Uri).ConfigureAwait(true);
+    }
+
+    private static async Task AssertFiniteLeaseRejectedAsync(BlobContainerClient container, Uri source)
+    {
+        var finiteDestination = container.GetBlobClient("finite.bin");
+        await finiteDestination.UploadAsync(BinaryData.FromString("original finite destination")).ConfigureAwait(false);
+        var finiteLeaseId = Guid.NewGuid().ToString();
+        var finiteLease = finiteDestination.GetBlobLeaseClient(finiteLeaseId);
+        await finiteLease.AcquireAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        var finiteFailure = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
+            finiteDestination.StartCopyFromUriAsync(
+                source,
+                new BlobCopyFromUriOptions
+                {
+                    DestinationConditions = new BlobRequestConditions { LeaseId = finiteLeaseId }
+                })).ConfigureAwait(false);
+        Assert.Equal(412, finiteFailure.Status);
+        Assert.Equal("InfiniteLeaseDurationRequired", finiteFailure.ErrorCode);
+        Assert.Equal("original finite destination",
+            (await finiteDestination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        await finiteLease.ReleaseAsync().ConfigureAwait(false);
+    }
+
+    private static async Task AssertAbsentLeaseRejectedAsync(BlobContainerClient container, Uri source)
+    {
         var absentDestination = container.GetBlobClient("absent.bin");
         var absentLease = await Assert.ThrowsAsync<Azure.RequestFailedException>(() =>
             absentDestination.StartCopyFromUriAsync(
-                source.Uri,
+                source,
                 new BlobCopyFromUriOptions
                 {
                     DestinationConditions = new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() }
-                }));
+                })).ConfigureAwait(false);
         Assert.Equal(412, absentLease.Status);
         Assert.Equal("LeaseNotPresentWithBlobOperation", absentLease.ErrorCode);
-        Assert.False((await absentDestination.ExistsAsync()).Value);
+        Assert.False((await absentDestination.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
