@@ -590,7 +590,9 @@ Store the completed directory on independent durable media. Validation checks:
 - SHA-256 and length for the metadata database and every encrypted chunk file;
 - absence of undeclared chunk files and symbolic-link traversal; and
 - fingerprints of the effective account data or cross-account encryption keys
-  needed to read the restored extents.
+  needed to read the restored extents; and
+- for schema-7 backups, agreement between each configured account's
+  hierarchical-namespace mode and the mode recorded in the metadata database.
 
 Key material is never written to the backup manifest. Preserve the deployment's
 data encryption keys (or legacy account keys when no separate data key exists)
