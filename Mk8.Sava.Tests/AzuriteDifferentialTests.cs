@@ -3,6 +3,7 @@ using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
 
 namespace Mk8.Sava.Tests;
 
@@ -26,6 +27,60 @@ public sealed class AzuriteDifferentialTests
         {
             var expected = await ExerciseAsync(azuriteContainer).ConfigureAwait(false);
             var actual = await ExerciseAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task StagedSnapshotLeaseAndTagOperationsMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseStagedBlobAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseStagedBlobAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task AppendAndPageBlobOperationsMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseAppendAndPageAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseAppendAndPageAsync(localContainer).ConfigureAwait(false);
             Assert.Equal(expected, actual);
         }
         finally
@@ -111,6 +166,73 @@ public sealed class AzuriteDifferentialTests
                 new BlobRequestConditions { IfMatch = stale })).ConfigureAwait(false);
     }
 
+    private static async Task<StagedBlobObservation> ExerciseStagedBlobAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var block = container.GetBlockBlobClient("staged.bin");
+        var firstId = Convert.ToBase64String("0001"u8);
+        var secondId = Convert.ToBase64String("0002"u8);
+        using var first = new MemoryStream("north"u8.ToArray(), writable: false);
+        using var second = new MemoryStream("south"u8.ToArray(), writable: false);
+        await block.StageBlockAsync(firstId, first).ConfigureAwait(false);
+        await block.StageBlockAsync(secondId, second).ConfigureAwait(false);
+        var uncommitted = (await block.GetBlockListAsync(BlockListTypes.Uncommitted).ConfigureAwait(false))
+            .Value.UncommittedBlocks.Count();
+        var commit = await block.CommitBlockListAsync([secondId, firstId]).ConfigureAwait(false);
+        var committed = (await block.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false))
+            .Value.CommittedBlocks.Count();
+        var content = (await block.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var snapshot = (await block.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var snapshotContent = (await block.WithSnapshot(snapshot).DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString();
+        var lease = block.GetBlobLeaseClient();
+        await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            block.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["phase"] = "leased"
+            })).ConfigureAwait(false);
+        await lease.ReleaseAsync().ConfigureAwait(false);
+        await block.SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "committed"
+        }).ConfigureAwait(false);
+        var tags = (await block.GetTagsAsync().ConfigureAwait(false)).Value.Tags;
+        return new StagedBlobObservation(
+            uncommitted, commit.GetRawResponse().Status, committed,
+            content, snapshotContent, rejected.Status, rejected.ErrorCode, tags["phase"]);
+    }
+
+    private static async Task<AppendPageObservation> ExerciseAppendAndPageAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var append = container.GetAppendBlobClient("events.log");
+        var appendCreate = await append.CreateAsync().ConfigureAwait(false);
+        using var appendContent = new MemoryStream("event-one"u8.ToArray(), writable: false);
+        var appendWrite = await append.AppendBlockAsync(appendContent).ConfigureAwait(false);
+        var appended = (await append.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+
+        var page = container.GetPageBlobClient("disk.vhd");
+        var pageCreate = await page.CreateAsync(1024).ConfigureAwait(false);
+        var payload = Enumerable.Repeat((byte)0x5a, 512).ToArray();
+        using var pageContent = new MemoryStream(payload, writable: false);
+        var pageWrite = await page.UploadPagesAsync(pageContent, offset: 512).ConfigureAwait(false);
+        var range = Assert.Single((await page.GetPageRangesAsync().ConfigureAwait(false)).Value.PageRanges);
+        var download = (await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray();
+        await page.ClearPagesAsync(new HttpRange(512, 512)).ConfigureAwait(false);
+        var remaining = (await page.GetPageRangesAsync().ConfigureAwait(false)).Value.PageRanges.Count();
+        return new AppendPageObservation(
+            appendCreate.GetRawResponse().Status,
+            appendWrite.GetRawResponse().Status,
+            appended,
+            pageCreate.GetRawResponse().Status,
+            pageWrite.GetRawResponse().Status,
+            range.Offset,
+            range.Length,
+            Convert.ToBase64String(download),
+            remaining);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -135,4 +257,25 @@ public sealed class AzuriteDifferentialTests
         int MissingStatus,
         string? MissingCode,
         string ListedNames);
+
+    private sealed record StagedBlobObservation(
+        int UncommittedBlocks,
+        int CommitStatus,
+        int CommittedBlocks,
+        string Content,
+        string SnapshotContent,
+        int MissingLeaseStatus,
+        string? MissingLeaseCode,
+        string Tag);
+
+    private sealed record AppendPageObservation(
+        int AppendCreateStatus,
+        int AppendWriteStatus,
+        string AppendedContent,
+        int PageCreateStatus,
+        int PageWriteStatus,
+        long PageRangeOffset,
+        long? PageRangeLength,
+        string PageContent,
+        int RemainingRanges);
 }
