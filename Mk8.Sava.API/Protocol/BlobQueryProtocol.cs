@@ -770,31 +770,13 @@ internal static class BlobQueryProtocol
         {
             if (inQuotes)
             {
-                if (doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
-                {
-                    recordBytes = checked(recordBytes + quote.Length);
-                    if (await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
-                    {
-                        recordBytes = checked(recordBytes + quote.Length);
-                        continue;
-                    }
-                    inQuotes = false;
-                    continue;
-                }
-                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(escape, cancellationToken).ConfigureAwait(false))
-                {
-                    recordBytes = checked(recordBytes + escape.Length);
-                    recordBytes = checked(recordBytes + await reader.ConsumeUtf8ScalarAsync(cancellationToken).ConfigureAwait(false));
-                    continue;
-                }
-                if (!doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
-                {
-                    recordBytes = checked(recordBytes + quote.Length);
-                    inQuotes = false;
-                    continue;
-                }
-                _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-                recordBytes = checked(recordBytes + 1);
+                (recordBytes, inQuotes) = await ConsumeQuotedSplitInputAsync(
+                    reader,
+                    quote,
+                    escape,
+                    doubledQuoteEscaping,
+                    recordBytes,
+                    cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
@@ -818,16 +800,11 @@ internal static class BlobQueryProtocol
                 }
                 continue;
             }
-            if (await reader.TryConsumeAsync(columnSeparator, cancellationToken).ConfigureAwait(false))
-            {
-                recordBytes = checked(recordBytes + columnSeparator.Length);
-                atFieldStart = true;
-                continue;
-            }
-
-            _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            recordBytes = checked(recordBytes + 1);
-            atFieldStart = false;
+            (recordBytes, atFieldStart) = await ConsumeSplitFieldByteAsync(
+                reader,
+                columnSeparator,
+                recordBytes,
+                cancellationToken).ConfigureAwait(false);
         }
 
         if (inQuotes)
@@ -835,6 +812,45 @@ internal static class BlobQueryProtocol
         batchBytes = checked(batchBytes + recordBytes);
         if (batchBytes > 0)
             yield return new QuerySelection([outputName], [new QueryCell(batchBytes)]);
+    }
+
+    private static async Task<(long RecordBytes, bool InQuotes)> ConsumeQuotedSplitInputAsync(
+        BlobQueryByteReader reader,
+        byte[] quote,
+        byte[] escape,
+        bool doubledQuoteEscaping,
+        long recordBytes,
+        CancellationToken cancellationToken)
+    {
+        if (doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
+        {
+            recordBytes = checked(recordBytes + quote.Length);
+            if (await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
+                return (checked(recordBytes + quote.Length), true);
+            return (recordBytes, false);
+        }
+        if (!doubledQuoteEscaping && await reader.TryConsumeAsync(escape, cancellationToken).ConfigureAwait(false))
+        {
+            recordBytes = checked(recordBytes + escape.Length);
+            recordBytes = checked(recordBytes + await reader.ConsumeUtf8ScalarAsync(cancellationToken).ConfigureAwait(false));
+            return (recordBytes, true);
+        }
+        if (!doubledQuoteEscaping && await reader.TryConsumeAsync(quote, cancellationToken).ConfigureAwait(false))
+            return (checked(recordBytes + quote.Length), false);
+        _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        return (checked(recordBytes + 1), true);
+    }
+
+    private static async Task<(long RecordBytes, bool AtFieldStart)> ConsumeSplitFieldByteAsync(
+        BlobQueryByteReader reader,
+        byte[] columnSeparator,
+        long recordBytes,
+        CancellationToken cancellationToken)
+    {
+        if (await reader.TryConsumeAsync(columnSeparator, cancellationToken).ConfigureAwait(false))
+            return (checked(recordBytes + columnSeparator.Length), true);
+        _ = await reader.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        return (checked(recordBytes + 1), false);
     }
 
     private static async IAsyncEnumerable<QueryRow> ReadRowsAsync(
@@ -859,27 +875,46 @@ internal static class BlobQueryProtocol
 
         if (format.Kind == BlobQueryFormatKind.Delimited)
         {
-            string[]? headers = null;
-            var rowNumber = 0L;
-            await foreach (var fields in ReadDelimitedRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
-            {
-                rowNumber++;
-                if (headers is null && format.HasHeaders)
-                {
-                    headers = fields.ToArray();
-                    EnsureUniqueHeaders(headers, rowNumber);
-                    continue;
-                }
-
-                var names = headers is null
-                    ? Enumerable.Range(1, fields.Count).Select(index => $"_{index}").ToArray()
-                    : headers;
-                var cells = fields.Select(value => new QueryCell(value)).ToArray();
-                yield return new QueryRow(names, cells);
-            }
+            await foreach (var row in ReadDelimitedQueryRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
+                yield return row;
             yield break;
         }
 
+        await foreach (var row in ReadJsonQueryRowsAsync(reader, format, plan, cancellationToken).ConfigureAwait(false))
+            yield return row;
+    }
+
+    private static async IAsyncEnumerable<QueryRow> ReadDelimitedQueryRowsAsync(
+        TextReader reader,
+        BlobQueryTextFormat format,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        string[]? headers = null;
+        var rowNumber = 0L;
+        await foreach (var fields in ReadDelimitedRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
+        {
+            rowNumber++;
+            if (headers is null && format.HasHeaders)
+            {
+                headers = fields.ToArray();
+                EnsureUniqueHeaders(headers, rowNumber);
+                continue;
+            }
+
+            var names = headers is null
+                ? Enumerable.Range(1, fields.Count).Select(index => $"_{index}").ToArray()
+                : headers;
+            var cells = fields.Select(value => new QueryCell(value)).ToArray();
+            yield return new QueryRow(names, cells);
+        }
+    }
+
+    private static async IAsyncEnumerable<QueryRow> ReadJsonQueryRowsAsync(
+        TextReader reader,
+        BlobQueryTextFormat format,
+        BlobQueryPlan plan,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         var position = 0L;
         await foreach (var record in ReadRawRecordsAsync(reader, format.RecordSeparator, cancellationToken).ConfigureAwait(false))
         {
@@ -927,12 +962,7 @@ internal static class BlobQueryProtocol
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<char>.Shared.Rent(64 * 1024);
-        var field = new StringBuilder();
-        var fields = new List<string>();
-        var inQuotes = false;
-        var quotePending = false;
-        var escapePending = false;
-        var recordCharacters = 0;
+        var state = new DelimitedReaderState(format);
 
         try
         {
@@ -946,87 +976,111 @@ internal static class BlobQueryProtocol
 #pragma warning disable HLQ013
                 for (var index = 0; index < read; index++)
                 {
-                    var character = buffer[index];
-                    recordCharacters++;
-                    if (recordCharacters > MaximumRecordCharacters)
-                        throw new BlobQueryDataException("RecordTooLarge", "A query input record exceeds 16 MiB.", 0);
-
-                    if (escapePending)
-                    {
-                        field.Append(character);
-                        escapePending = false;
-                        continue;
-                    }
-
-                    if (quotePending)
-                    {
-                        if (character == format.Quote)
-                        {
-                            field.Append(character);
-                            quotePending = false;
-                            continue;
-                        }
-                        inQuotes = false;
-                        quotePending = false;
-                    }
-
-                    if (inQuotes)
-                    {
-                        if (character == format.Quote)
-                        {
-                            quotePending = true;
-                            continue;
-                        }
-                        if (format.Escape != format.Quote && character == format.Escape)
-                        {
-                            escapePending = true;
-                            continue;
-                        }
-                        field.Append(character);
-                        continue;
-                    }
-
-                    if (character == format.Quote && field.Length == 0)
-                    {
-                        inQuotes = true;
-                        continue;
-                    }
-
-                    field.Append(character);
-                    if (EndsWith(field, format.RecordSeparator))
-                    {
-                        field.Length -= format.RecordSeparator.Length;
-                        if (string.Equals(format.RecordSeparator, "\n", StringComparison.Ordinal) && field.Length > 0 && field[^1] == '\r')
-                            field.Length--;
-                        fields.Add(field.ToString());
-                        field.Clear();
-                        yield return fields.ToArray();
-                        fields.Clear();
-                        recordCharacters = 0;
-                    }
-                    else if (EndsWith(field, format.ColumnSeparator))
-                    {
-                        field.Length -= format.ColumnSeparator.Length;
-                        fields.Add(field.ToString());
-                        field.Clear();
-                    }
+                    var completed = state.Consume(buffer[index]);
+                    if (completed is not null)
+                        yield return completed;
                 }
 #pragma warning restore HLQ013
             }
 
-            if (inQuotes && !quotePending)
-                throw new BlobQueryDataException("UnclosedQuote", "A delimited query input field contains an unclosed quote.", 0);
-            if (escapePending)
-                field.Append(format.Escape);
-            if (field.Length > 0 || fields.Count > 0)
-            {
-                fields.Add(field.ToString());
-                yield return fields.ToArray();
-            }
+            var final = state.Complete();
+            if (final is not null)
+                yield return final;
         }
         finally
         {
             ArrayPool<char>.Shared.Return(buffer, clearArray: true);
+        }
+    }
+
+    private sealed class DelimitedReaderState(BlobQueryTextFormat format)
+    {
+        private readonly StringBuilder _field = new();
+        private readonly List<string> _fields = [];
+        private bool _inQuotes;
+        private bool _quotePending;
+        private bool _escapePending;
+        private int _recordCharacters;
+
+        public string[]? Consume(char character)
+        {
+            _recordCharacters++;
+            if (_recordCharacters > MaximumRecordCharacters)
+                throw new BlobQueryDataException("RecordTooLarge", "A query input record exceeds 16 MiB.", 0);
+
+            if (_escapePending)
+            {
+                _field.Append(character);
+                _escapePending = false;
+                return null;
+            }
+
+            if (_quotePending)
+            {
+                if (character == format.Quote)
+                {
+                    _field.Append(character);
+                    _quotePending = false;
+                    return null;
+                }
+                _inQuotes = false;
+                _quotePending = false;
+            }
+
+            return _inQuotes ? ConsumeQuoted(character) : ConsumeUnquoted(character);
+        }
+
+        private string[]? ConsumeQuoted(char character)
+        {
+            if (character == format.Quote)
+                _quotePending = true;
+            else if (format.Escape != format.Quote && character == format.Escape)
+                _escapePending = true;
+            else
+                _field.Append(character);
+            return null;
+        }
+
+        private string[]? ConsumeUnquoted(char character)
+        {
+            if (character == format.Quote && _field.Length == 0)
+            {
+                _inQuotes = true;
+                return null;
+            }
+
+            _field.Append(character);
+            if (EndsWith(_field, format.RecordSeparator))
+            {
+                _field.Length -= format.RecordSeparator.Length;
+                if (string.Equals(format.RecordSeparator, "\n", StringComparison.Ordinal) && _field.Length > 0 && _field[^1] == '\r')
+                    _field.Length--;
+                _fields.Add(_field.ToString());
+                _field.Clear();
+                var completed = _fields.ToArray();
+                _fields.Clear();
+                _recordCharacters = 0;
+                return completed;
+            }
+            if (EndsWith(_field, format.ColumnSeparator))
+            {
+                _field.Length -= format.ColumnSeparator.Length;
+                _fields.Add(_field.ToString());
+                _field.Clear();
+            }
+            return null;
+        }
+
+        public string[]? Complete()
+        {
+            if (_inQuotes && !_quotePending)
+                throw new BlobQueryDataException("UnclosedQuote", "A delimited query input field contains an unclosed quote.", 0);
+            if (_escapePending)
+                _field.Append(format.Escape);
+            if (_field.Length == 0 && _fields.Count == 0)
+                return null;
+            _fields.Add(_field.ToString());
+            return _fields.ToArray();
         }
     }
 
