@@ -171,6 +171,10 @@ conditional 304 reads; mk8.sava now emits it with an empty response body.
 The header is emitted for service versions `2017-07-29` and later, matching
 the published version boundary; older versions omit it. Conditional 304
 responses remain bodyless, while ordinary error responses retain XML bodies.
+A separate local Get Blob contract test exercises both transactional MD5 and
+CRC64 at the inclusive 4 MiB range limit, rejects a 4 MiB + 1 byte range and
+checksum-without-range with 400, and verifies that `x-ms-range` takes precedence
+over a simultaneous `Range` header.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
