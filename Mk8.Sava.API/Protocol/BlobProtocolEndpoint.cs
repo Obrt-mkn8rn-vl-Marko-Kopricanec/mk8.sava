@@ -4358,6 +4358,19 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
 
     private static BlobEncryption ReadRequestEncryption(HttpRequest request, bool write)
     {
+        var scope = ReadRequestEncryptionScope(request);
+        var encodedKey = ProtocolParsing.First(request.Headers, "x-ms-encryption-key");
+        var encodedHash = ProtocolParsing.First(request.Headers, "x-ms-encryption-key-sha256");
+        var algorithm = ProtocolParsing.First(request.Headers, "x-ms-encryption-algorithm");
+        ValidateRequestEncryptionVersion(request, scope, encodedKey, encodedHash, algorithm);
+        var hasCustomerKeyHeader = encodedKey is not null || encodedHash is not null || algorithm is not null;
+        if (!hasCustomerKeyHeader)
+            return new BlobEncryption(scope, null);
+        return ReadCustomerProvidedKey(request, write, scope, encodedKey, encodedHash, algorithm);
+    }
+
+    private static string? ReadRequestEncryptionScope(HttpRequest request)
+    {
         var scope = ProtocolParsing.First(request.Headers, "x-ms-encryption-scope");
         var signedScope = request.Query.ContainsKey("sig")
             ? NullIfEmpty(request.Query["ses"].ToString())
@@ -4375,10 +4388,16 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         if (scope is { Length: > 256 } ||
             scope is not null && (string.IsNullOrWhiteSpace(scope) || scope.Any(char.IsControl)))
             throw AzureStorageException.InvalidHeader("x-ms-encryption-scope", scope);
+        return scope;
+    }
 
-        var encodedKey = ProtocolParsing.First(request.Headers, "x-ms-encryption-key");
-        var encodedHash = ProtocolParsing.First(request.Headers, "x-ms-encryption-key-sha256");
-        var algorithm = ProtocolParsing.First(request.Headers, "x-ms-encryption-algorithm");
+    private static void ValidateRequestEncryptionVersion(
+        HttpRequest request,
+        string? scope,
+        string? encodedKey,
+        string? encodedHash,
+        string? algorithm)
+    {
         if (scope is not null || encodedKey is not null || encodedHash is not null || algorithm is not null)
         {
             RequireFeatureVersion(
@@ -4398,8 +4417,16 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             throw AzureStorageException.FeatureVersionMismatch(
                 "Customer-provided keys and encryption scopes require service version 2019-02-02 or later.");
         }
-        if (!hasCustomerKeyHeader)
-            return new BlobEncryption(scope, null);
+    }
+
+    private static BlobEncryption ReadCustomerProvidedKey(
+        HttpRequest request,
+        bool write,
+        string? scope,
+        string? encodedKey,
+        string? encodedHash,
+        string? algorithm)
+    {
         if (scope is not null)
         {
             throw new AzureStorageException(
@@ -4438,22 +4465,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                 throw AzureStorageException.InvalidHeader("x-ms-encryption-key");
             var actualHash = SHA256.HashData(key);
             if (encodedHash is not null)
-            {
-                byte[] suppliedHash;
-                try
-                {
-                    suppliedHash = Convert.FromBase64String(encodedHash);
-                }
-                catch (FormatException)
-                {
-                    throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
-                }
-                if (suppliedHash.Length != actualHash.Length ||
-                    !CryptographicOperations.FixedTimeEquals(suppliedHash, actualHash))
-                {
-                    throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
-                }
-            }
+                ValidateCustomerProvidedKeyHash(encodedHash, actualHash);
             SensitiveBufferLease? lease = new(key);
             try
             {
@@ -4470,6 +4482,24 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             CryptographicOperations.ZeroMemory(key);
             throw;
+        }
+    }
+
+    private static void ValidateCustomerProvidedKeyHash(string encodedHash, byte[] actualHash)
+    {
+        byte[] suppliedHash;
+        try
+        {
+            suppliedHash = Convert.FromBase64String(encodedHash);
+        }
+        catch (FormatException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
+        }
+        if (suppliedHash.Length != actualHash.Length ||
+            !CryptographicOperations.FixedTimeEquals(suppliedHash, actualHash))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
         }
     }
 
@@ -4742,7 +4772,6 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         var expectedCrc64 = ProtocolParsing.First(request.Headers, "x-ms-content-crc64");
         var structuredBody = ProtocolParsing.First(request.Headers, "x-ms-structured-body");
         var structuredContentLength = ProtocolParsing.First(request.Headers, "x-ms-structured-content-length");
-        var requestContext = StorageRequestContext.Get(request.HttpContext);
         var options = request.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
         var effectiveMaximumBodyBytes = Math.Min(maximumBodyBytes, options.MaximumRequestBodyBytes);
         var (logicalContentLength, logicalLengthHeader) = GetLogicalRequestContentLength(request);
@@ -4750,76 +4779,25 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             throw AzureStorageException.InvalidHeader(logicalLengthHeader);
         if (logicalContentLength.Value > effectiveMaximumBodyBytes)
             throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
-        if (expectedCrc64 is not null &&
-            !IsServiceVersionAtLeast(requestContext, new DateOnly(2019, 2, 2)))
-        {
-            throw AzureStorageException.FeatureVersionMismatch(
-                "Transactional CRC64 checksums require service version 2019-02-02 or later.");
-        }
-        if ((structuredBody is not null || structuredContentLength is not null) &&
-            !IsServiceVersionAtLeast(requestContext, new DateOnly(2025, 1, 5)))
-        {
-            throw AzureStorageException.FeatureVersionMismatch(
-                "Structured request bodies require service version 2025-01-05 or later.");
-        }
+        ValidateIntegrityFeatureVersion(
+            StorageRequestContext.Get(request.HttpContext),
+            expectedCrc64,
+            structuredBody,
+            structuredContentLength);
         if (structuredBody is not null)
         {
-            if (!allowStructured)
-                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
-            if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
-                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
-            if (expectedMd5 is not null || expectedCrc64 is not null)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "InvalidHeaderValue",
-                    "A structured request body cannot also specify a transactional checksum header.");
-            }
-            if (!long.TryParse(
-                    structuredContentLength,
-                    NumberStyles.None,
-                    CultureInfo.InvariantCulture,
-                    out var decodedLength))
-            {
-                throw AzureStorageException.InvalidHeader(
-                    "x-ms-structured-content-length",
-                    structuredContentLength);
-            }
-
-            var encodedLength = request.ContentLength
-                                ?? throw AzureStorageException.InvalidHeader("Content-Length");
-            var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
-            var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
-            try
-            {
-                var temporary = new FileStream(
-                    structuredTemporaryPath,
-                    FileMode.CreateNew,
-                    FileAccess.ReadWrite,
-                    FileShare.None,
-                    128 * 1024,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan);
-                await using (temporary.ConfigureAwait(false))
-                {
-                    await StructuredBodyDecoder.DecodeAsync(
-                    request.Body,
-                    temporary,
-                    encodedLength,
-                    decodedLength,
-                    effectiveMaximumBodyBytes,
-                    request.HttpContext.RequestAborted).ConfigureAwait(false);
-                    temporary.Position = 0;
-                    using var hashingBody = new TransactionalChecksumReadStream(temporary);
-                    await action(hashingBody).ConfigureAwait(false);
-                    request.HttpContext.Response.Headers["x-ms-structured-body"] = structuredBody;
-                    return hashingBody.Complete();
-                }
-            }
-            finally
-            {
-                if (File.Exists(structuredTemporaryPath))
-                    File.Delete(structuredTemporaryPath);
-            }
+            var decodedLength = ValidateStructuredBodyHeaders(
+                structuredBody,
+                structuredContentLength,
+                expectedMd5,
+                expectedCrc64,
+                allowStructured);
+            return await ConsumeStructuredBodyAsync(
+                request,
+                action,
+                structuredBody,
+                decodedLength,
+                effectiveMaximumBodyBytes).ConfigureAwait(false);
         }
         if (structuredContentLength is not null)
         {
@@ -4841,6 +4819,117 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             return hashingBody.Complete();
         }
 
+        return await ConsumeChecksummedBodyAsync(
+            request,
+            action,
+            expectedMd5,
+            expectedCrc64,
+            expectedMd5HeaderName,
+            effectiveMaximumBodyBytes).ConfigureAwait(false);
+    }
+
+    private static void ValidateIntegrityFeatureVersion(
+        StorageRequestContext requestContext,
+        string? expectedCrc64,
+        string? structuredBody,
+        string? structuredContentLength)
+    {
+        if (expectedCrc64 is not null &&
+            !IsServiceVersionAtLeast(requestContext, new DateOnly(2019, 2, 2)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "Transactional CRC64 checksums require service version 2019-02-02 or later.");
+        }
+        if ((structuredBody is not null || structuredContentLength is not null) &&
+            !IsServiceVersionAtLeast(requestContext, new DateOnly(2025, 1, 5)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "Structured request bodies require service version 2025-01-05 or later.");
+        }
+    }
+
+    private static long ValidateStructuredBodyHeaders(
+        string structuredBody,
+        string? structuredContentLength,
+        string? expectedMd5,
+        string? expectedCrc64,
+        bool allowStructured)
+    {
+        if (!allowStructured)
+            throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
+        if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
+            throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
+        if (expectedMd5 is not null || expectedCrc64 is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidHeaderValue",
+                "A structured request body cannot also specify a transactional checksum header.");
+        }
+        if (!long.TryParse(
+                structuredContentLength,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var decodedLength))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-structured-content-length",
+                structuredContentLength);
+        }
+        return decodedLength;
+    }
+
+    private static async Task<TransactionalChecksums> ConsumeStructuredBodyAsync(
+        HttpRequest request,
+        Func<Stream, Task> action,
+        string structuredBody,
+        long decodedLength,
+        long effectiveMaximumBodyBytes)
+    {
+        var encodedLength = request.ContentLength
+                            ?? throw AzureStorageException.InvalidHeader("Content-Length");
+        var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
+        var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
+        try
+        {
+            var temporary = new FileStream(
+                structuredTemporaryPath,
+                FileMode.CreateNew,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                128 * 1024,
+                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await using (temporary.ConfigureAwait(false))
+            {
+                await StructuredBodyDecoder.DecodeAsync(
+                    request.Body,
+                    temporary,
+                    encodedLength,
+                    decodedLength,
+                    effectiveMaximumBodyBytes,
+                    request.HttpContext.RequestAborted).ConfigureAwait(false);
+                temporary.Position = 0;
+                using var hashingBody = new TransactionalChecksumReadStream(temporary);
+                await action(hashingBody).ConfigureAwait(false);
+                request.HttpContext.Response.Headers["x-ms-structured-body"] = structuredBody;
+                return hashingBody.Complete();
+            }
+        }
+        finally
+        {
+            if (File.Exists(structuredTemporaryPath))
+                File.Delete(structuredTemporaryPath);
+        }
+    }
+
+    private static async Task<TransactionalChecksums> ConsumeChecksummedBodyAsync(
+        HttpRequest request,
+        Func<Stream, Task> action,
+        string? expectedMd5,
+        string? expectedCrc64,
+        string expectedMd5HeaderName,
+        long effectiveMaximumBodyBytes)
+    {
         var expected = DecodeChecksum(
             expectedMd5 ?? expectedCrc64!,
             expectedMd5 is null ? 8 : 16,
@@ -4860,20 +4949,12 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             {
                 using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
                 var crc64 = new StorageCrc64();
-                var buffer = new byte[128 * 1024];
-                long length = 0;
-                while (true)
-                {
-                    var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted).ConfigureAwait(false);
-                    if (read == 0)
-                        break;
-                    length = checked(length + read);
-                    if (length > effectiveMaximumBodyBytes)
-                        throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
-                    md5.AppendData(buffer, 0, read);
-                    crc64.Append(buffer.AsSpan(0, read));
-                    await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted).ConfigureAwait(false);
-                }
+                await CopyChecksummedRequestBodyAsync(
+                    request,
+                    temporary,
+                    md5,
+                    crc64,
+                    effectiveMaximumBodyBytes).ConfigureAwait(false);
 
                 var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
                 var actual = expectedMd5 is null ? checksums.Crc64 : checksums.Md5;
@@ -4894,6 +4975,29 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             if (File.Exists(temporaryPath))
                 File.Delete(temporaryPath);
+        }
+    }
+
+    private static async Task CopyChecksummedRequestBodyAsync(
+        HttpRequest request,
+        Stream temporary,
+        IncrementalHash md5,
+        StorageCrc64 crc64,
+        long effectiveMaximumBodyBytes)
+    {
+        var buffer = new byte[128 * 1024];
+        long length = 0;
+        while (true)
+        {
+            var read = await request.Body.ReadAsync(buffer, request.HttpContext.RequestAborted).ConfigureAwait(false);
+            if (read == 0)
+                break;
+            length = checked(length + read);
+            if (length > effectiveMaximumBodyBytes)
+                throw new RequestBodyTooLargeException(effectiveMaximumBodyBytes);
+            md5.AppendData(buffer, 0, read);
+            crc64.Append(buffer.AsSpan(0, read));
+            await temporary.WriteAsync(buffer.AsMemory(0, read), request.HttpContext.RequestAborted).ConfigureAwait(false);
         }
     }
 
