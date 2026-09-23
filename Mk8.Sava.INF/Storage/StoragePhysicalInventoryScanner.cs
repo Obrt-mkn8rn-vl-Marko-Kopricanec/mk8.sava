@@ -80,20 +80,43 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
 
     private void MeasureEntry(string path)
     {
-        FileAttributes attributes;
-        try
-        {
-            attributes = File.GetAttributes(path);
-        }
-        catch (FileNotFoundException)
-        {
+        if (!TryGetAttributes(path, out var attributes))
             return;
-        }
-        catch (DirectoryNotFoundException)
+
+        MeasureAllocation(path);
+        if ((attributes & FileAttributes.ReparsePoint) != FileAttributes.None)
+            return;
+        if ((attributes & FileAttributes.Directory) != FileAttributes.None)
         {
+            QueueDirectory(path);
             return;
         }
 
+        if (TryGetLength(path, out var length))
+            ClassifyFile(path, length);
+    }
+
+    private static bool TryGetAttributes(string path, out FileAttributes attributes)
+    {
+        try
+        {
+            attributes = File.GetAttributes(path);
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            attributes = default;
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            attributes = default;
+            return false;
+        }
+    }
+
+    private void MeasureAllocation(string path)
+    {
         if (_measureAllocation)
         {
             try
@@ -114,36 +137,41 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
                 _hardLinks.Clear();
             }
         }
+    }
 
-        if ((attributes & FileAttributes.ReparsePoint) != FileAttributes.None)
-            return;
-        if ((attributes & FileAttributes.Directory) != FileAttributes.None)
-        {
-            try
-            {
-                _directories.Push(Directory.EnumerateFileSystemEntries(path).GetEnumerator());
-            }
-            catch (DirectoryNotFoundException)
-            {
-                // The directory disappeared between stat and enumeration.
-            }
-            return;
-        }
-
-        long length;
+    private void QueueDirectory(string path)
+    {
         try
         {
-            length = new FileInfo(path).Length;
-        }
-        catch (FileNotFoundException)
-        {
-            return;
+            _directories.Push(Directory.EnumerateFileSystemEntries(path).GetEnumerator());
         }
         catch (DirectoryNotFoundException)
         {
-            return;
+            // The directory disappeared between stat and enumeration.
         }
+    }
 
+    private static bool TryGetLength(string path, out long length)
+    {
+        try
+        {
+            length = new FileInfo(path).Length;
+            return true;
+        }
+        catch (FileNotFoundException)
+        {
+            length = 0;
+            return false;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            length = 0;
+            return false;
+        }
+    }
+
+    private void ClassifyFile(string path, long length)
+    {
         if (path.StartsWith(paths.Chunks + Path.DirectorySeparatorChar, PathComparison) &&
             path.EndsWith(".chunk", StringComparison.Ordinal))
         {

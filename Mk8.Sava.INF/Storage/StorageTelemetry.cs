@@ -75,13 +75,25 @@ public sealed class StorageTelemetry : IStorageTelemetry
     {
         var usage = Usage;
         var integrity = Integrity;
-        var durationSeconds = Interlocked.Read(ref _requestDurationStopwatchTicks) / (double)Stopwatch.Frequency;
         var builder = new StringBuilder(4096);
+        AppendRequestMetrics(builder);
+        AppendStorageMetrics(builder, usage);
+        AppendIntegrityMetrics(builder, integrity);
+        AppendMaintenanceMetrics(builder);
+        return builder.ToString();
+    }
 
+    private void AppendRequestMetrics(StringBuilder builder)
+    {
+        var durationSeconds = Interlocked.Read(ref _requestDurationStopwatchTicks) / (double)Stopwatch.Frequency;
         AppendMetric(builder, "mk8_sava_http_requests_total", "Storage protocol requests completed.", Interlocked.Read(ref _requestCount));
         AppendMetric(builder, "mk8_sava_http_server_errors_total", "Storage protocol requests completed with a 5xx response.", Interlocked.Read(ref _serverErrorCount));
         AppendMetric(builder, "mk8_sava_http_request_duration_seconds_sum", "Cumulative storage protocol request duration.", durationSeconds);
         AppendMetric(builder, "mk8_sava_http_request_duration_seconds_count", "Storage protocol requests represented by the duration sum.", Interlocked.Read(ref _requestCount));
+    }
+
+    private static void AppendStorageMetrics(StringBuilder builder, StorageUsageSnapshot usage)
+    {
         AppendMetric(builder, "mk8_sava_storage_logical_blob_bytes", "Logical bytes referenced by blob records.", usage.LogicalBlobBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_logical_uncommitted_block_bytes", "Logical bytes referenced by uncommitted blocks.", usage.LogicalStagedBlockBytes, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_physical_chunk_bytes", "Serialized file lengths of standalone chunks and chunk packs, not allocated filesystem bytes.", usage.PhysicalChunkBytes, gauge: true);
@@ -95,11 +107,19 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_storage_uncommitted_blocks", "Uncommitted block records.", usage.StagedBlockCount, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_unique_chunks", "Unique immutable chunk identities across standalone and packed storage.", usage.UniqueChunkCount, gauge: true);
         AppendMetric(builder, "mk8_sava_storage_reachable_chunks", "Chunk identities reachable from metadata.", usage.ReachableChunkCount, gauge: true);
+    }
+
+    private static void AppendIntegrityMetrics(StringBuilder builder, StorageIntegritySnapshot integrity)
+    {
         AppendMetric(builder, "mk8_sava_integrity_checked_chunks", "Reachable chunks checked in the current or last completed integrity cycle.", integrity.CheckedChunks, gauge: true);
         AppendMetric(builder, "mk8_sava_integrity_missing_chunks", "Reachable chunks found missing in the current or last completed integrity cycle.", integrity.MissingChunks, gauge: true);
         AppendMetric(builder, "mk8_sava_integrity_corrupt_chunks", "Reachable chunks that failed authenticated decoding in the current or last completed integrity cycle.", integrity.CorruptChunks, gauge: true);
         AppendMetric(builder, "mk8_sava_integrity_customer_key_chunks", "Reachable customer-key chunks structurally checked but awaiting a caller key for authenticated decoding.", integrity.CustomerKeyChunks, gauge: true);
         AppendMetric(builder, "mk8_sava_integrity_cycle_complete", "Whether the published integrity cycle covered every reachable chunk.", integrity.Complete ? 1 : 0, gauge: true);
+    }
+
+    private void AppendMaintenanceMetrics(StringBuilder builder)
+    {
         AppendMetric(builder, "mk8_sava_maintenance_passes_total", "Completed maintenance passes.", Interlocked.Read(ref _maintenancePasses));
         AppendMetric(builder, "mk8_sava_maintenance_failures_total", "Failed maintenance passes.", Interlocked.Read(ref _maintenanceFailures));
         AppendMetric(builder, "mk8_sava_maintenance_completed_copies_total", "Asynchronous copies completed by maintenance.", Interlocked.Read(ref _completedCopies));
@@ -119,7 +139,6 @@ public sealed class StorageTelemetry : IStorageTelemetry
         AppendMetric(builder, "mk8_sava_maintenance_compacted_chunk_packs_total", "Immutable small-chunk packs compacted or unregistered crash remnants reclaimed.", Interlocked.Read(ref _compactedChunkPacks));
         AppendMetric(builder, "mk8_sava_maintenance_pack_compaction_bytes_saved_total", "Pack-file bytes removed by verified compaction or crash recovery.", Interlocked.Read(ref _packCompactionBytesSaved));
         AppendMetric(builder, "mk8_sava_maintenance_last_completed_timestamp_seconds", "Unix timestamp of the last completed maintenance pass.", Interlocked.Read(ref _lastMaintenanceCompletedUnixSeconds), gauge: true);
-        return builder.ToString();
     }
 
     private static void AppendMetric(StringBuilder builder, string name, string help, long value, bool gauge = false)
