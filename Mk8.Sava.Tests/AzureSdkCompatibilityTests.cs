@@ -2924,6 +2924,63 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalStickyDirectoryOwnerCanDeleteAnotherOwnersChild()
+    {
+        const string directoryOwnerId = "754ce7e8-1858-4837-8c20-05a3dbe0a602";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-sticky-parent-owner-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = $"user::rwx,user:{directoryOwnerId}:-wx,group::r-x,mask::rwx,other::---"
+        });
+
+        var owner = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, directoryOwnerId))
+            .GetBlobContainerClient(container.Name);
+        await container.GetBlobClient("owned-parent/seed.txt").UploadAsync(BinaryData.FromString("seed"));
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var parent = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, "owned-parent",
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(parent);
+        await metadata.PutBlobRecordAsync(
+            parent with { Owner = directoryOwnerId }, parent.Revision, CancellationToken.None);
+        parent = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, "owned-parent",
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(parent);
+        Assert.Equal(directoryOwnerId, parent.Owner);
+
+        var foreign = container.GetBlobClient("owned-parent/foreign.txt");
+        await foreign.UploadAsync(BinaryData.FromString("foreign"));
+        var foreignRecord = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, foreign.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None);
+        Assert.NotNull(foreignRecord);
+        Assert.Equal("$superuser", foreignRecord.Owner);
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "owned-parent",
+            AccessAcl = "user::rwx,group::r-x,other::---",
+            StickyBit = true
+        });
+        await owner.GetBlobClient(foreign.Name).DeleteAsync();
+        Assert.False((await foreign.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task HierarchicalStickyDirectoryHonorsSignedSuoidOwnership()
     {
         const string writerObjectId = "fabcedf4-22e7-45cf-8832-f58f4fe1bd9c";

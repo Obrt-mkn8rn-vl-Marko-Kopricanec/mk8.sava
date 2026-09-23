@@ -681,8 +681,10 @@ When the immediate parent has a sticky bit, ACL-only deletion also requires
 the caller to own the child or that parent, per Microsoft's
 [HNS sticky-bit rule](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#the-sticky-bit-in-data-lake-storage).
 Local bearer and signed `suoid` tests cover denial for a foreign child and
-permission for a child owned by the ACL identity; the parent-owner and
-superuser branches remain unqualified.
+permission for a child owned by the ACL identity. A separate local test
+seeds a directory owner in metadata and confirms that owner can delete a
+different user's child under its sticky bit. The superuser branch and public
+ownership-mutation workflow remain unqualified.
 Directory property and listing permission strings expose `t` or `T` in the
 last character when the bit is set. Shared Key and configured role grants
 still follow their separate authorization paths.
