@@ -4417,7 +4417,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 AddSharedKeyLiteAuthorization(missing);
                 using var response = await transport.SendAsync(missing);
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "MissingRequiredHeader");
             }
 
             using (var invalidDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
@@ -4593,7 +4593,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    request => request.Headers.TryAddWithoutValidation("If-Match", modernEtag)))
         {
             Assert.Equal(HttpStatusCode.PreconditionFailed, legacyQuotedMatch.StatusCode);
-            Assert.Equal("ConditionNotMet", legacyQuotedMatch.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(legacyQuotedMatch, "ConditionNotMet");
         }
         using (var modernUnquotedMatch = await SendBlobAsync(
                    HttpMethod.Get,
@@ -4617,7 +4617,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-")))
         {
             Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, legacyOpenRange.StatusCode);
-            Assert.Equal("InvalidRange", legacyOpenRange.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(legacyOpenRange, "InvalidRange");
         }
         using (var modernOpenRange = await SendBlobAsync(
                    HttpMethod.Get,
@@ -4983,7 +4983,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var oldCopyListing = await ListBlobsAsync("2011-08-18", "include=copy"))
             {
                 Assert.Equal(HttpStatusCode.Conflict, oldCopyListing.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", oldCopyListing.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(oldCopyListing, "FeatureVersionMismatch");
             }
             using (var unknownListing = await ListBlobsAsync("2023-11-03", "include=unknown"))
             {
@@ -6489,7 +6489,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 unavailable.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
                 using var response = await transport.SendAsync(unavailable);
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
                 Assert.False(response.Headers.Contains("x-ms-version"));
             }
 
@@ -6524,7 +6524,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 oldSnapshotRead.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
                 using var response = await transport.SendAsync(oldSnapshotRead);
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
                 Assert.False(response.Headers.Contains("x-ms-version"));
             }
 
@@ -6645,14 +6645,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var response = await transport.SendAsync(duration))
             {
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("UnsupportedHeader", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "UnsupportedHeader");
             }
 
             using (var change = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "change", legacyLeaseId))
             using (var response = await transport.SendAsync(change))
             {
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
             }
 
             using (var release = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "release", legacyLeaseId))
@@ -6678,7 +6678,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var response = await transport.SendAsync(missingDuration))
             {
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "MissingRequiredHeader");
             }
 
             string modernLeaseId;
@@ -6731,7 +6731,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var response = await transport.SendAsync(unavailable))
             {
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
             }
 
             var beforeLegacyContainerLease = (await container.GetPropertiesAsync()).Value;
@@ -6784,7 +6784,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 AddSharedKeyLiteAuthorization(acl);
                 using var response = await transport.SendAsync(acl);
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
                 Assert.False(response.Headers.Contains("x-ms-version"));
             }
         }
@@ -6966,7 +6966,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var legacy = await GetAclAsync("2014-02-14").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.Conflict, legacy.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", GetResponseHeader(legacy, "x-ms-error-code"));
+            await AssertVersionedErrorAsync(legacy, "FeatureVersionMismatch").ConfigureAwait(true);
         }
         using (var modern = await GetAclAsync("2015-04-05").ConfigureAwait(true))
         {
@@ -7124,7 +7124,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 request.Headers.TryAddWithoutValidation("x-forwarded-proto", "https");
                 using var response = await rawClient.SendAsync(request);
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("AccountRequiresHttps", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "AccountRequiresHttps");
                 Assert.Contains("The account being accessed does not support http.",
                     await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
             }
@@ -7520,25 +7520,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    AppendQuery(CreateSasUri("2012-02-12"), "rsct=unsigned")))
         {
             Assert.Equal(HttpStatusCode.Forbidden, unsignedOverride.StatusCode);
-            Assert.Equal(
-                "AuthenticationFailed",
-                unsignedOverride.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(unsignedOverride, "AuthenticationFailed");
         }
         using (var unsignedProtocol = await transport.GetAsync(
                    AppendQuery(CreateSasUri("2013-08-15"), "spr=https")))
         {
             Assert.Equal(HttpStatusCode.Forbidden, unsignedProtocol.StatusCode);
-            Assert.Equal(
-                "AuthenticationFailed",
-                unsignedProtocol.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(unsignedProtocol, "AuthenticationFailed");
         }
         using (var excessiveLegacyLifetime = await transport.GetAsync(
                    CreateSasUri(version: null, expiry: DateTimeOffset.UtcNow.AddHours(2))))
         {
             Assert.Equal(HttpStatusCode.Forbidden, excessiveLegacyLifetime.StatusCode);
-            Assert.Equal(
-                "AuthenticationFailed",
-                excessiveLegacyLifetime.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(excessiveLegacyLifetime, "AuthenticationFailed");
         }
     }
 
@@ -10282,7 +10276,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var response = await transport.SendAsync(request))
         {
             Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
-            Assert.Equal("LeaseIdMismatchWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "LeaseIdMismatchWithBlobOperation");
         }
         Assert.False((await mismatchedTarget.ExistsAsync()).Value);
 
@@ -10316,7 +10310,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var response = await transport.SendAsync(request))
         {
             Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
-            Assert.Equal("LeaseNotPresentWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "LeaseNotPresentWithBlobOperation");
         }
         Assert.False((await absentSourceLeaseTarget.ExistsAsync()).Value);
 
@@ -10344,7 +10338,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var response = await transport.SendAsync(request))
         {
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("CopyAcrossAccountsNotSupported", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "CopyAcrossAccountsNotSupported");
         }
         Assert.False((await crossAccountTarget.ExistsAsync()).Value);
     }
@@ -12320,7 +12314,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oversizedBlockRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
             using var oversizedBlockResponse = await transport.SendAsync(oversizedBlockRequest);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedBlockResponse.StatusCode);
-            Assert.Equal("RequestBodyTooLarge", oversizedBlockResponse.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(oversizedBlockResponse, "RequestBodyTooLarge");
         }
         var staged = await blockBlob.GetBlockListAsync(BlockListTypes.Uncommitted);
         Assert.Equal([firstBlockId], staged.Value.UncommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
@@ -12452,7 +12446,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldAppendCreateRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "AppendBlob");
             using var oldAppendCreateResponse = await transport.SendAsync(oldAppendCreateRequest);
             Assert.Equal(HttpStatusCode.Conflict, oldAppendCreateResponse.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", oldAppendCreateResponse.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(oldAppendCreateResponse, "FeatureVersionMismatch");
         }
         Assert.False((await oldAppendBlob.ExistsAsync()).Value);
 
@@ -12563,7 +12557,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldRead.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
             using var response = await transport.SendAsync(oldRead);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
         }
         using (var oldAppend = new HttpRequestMessage(HttpMethod.Put, AppendQuery(appendSas, "comp=appendblock"))
         {
@@ -12573,7 +12567,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldAppend.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
             using var response = await transport.SendAsync(oldAppend);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
         }
         using (var oldOverwrite = new HttpRequestMessage(HttpMethod.Put, appendSas)
         {
@@ -12584,7 +12578,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldOverwrite.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             using var response = await transport.SendAsync(oldOverwrite);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
         }
         Assert.Equal(
             "retained append payload",
@@ -12596,9 +12590,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldRead.Headers.TryAddWithoutValidation("x-ms-version", "2009-07-17");
             using var response = await transport.SendAsync(oldRead);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal(
-                "InvalidVersionForPageBlobOperation",
-                response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
         }
         using (var oldPageWrite = new HttpRequestMessage(HttpMethod.Put, AppendQuery(pageSas, "comp=page"))
         {
@@ -12610,9 +12602,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldPageWrite.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
             using var response = await transport.SendAsync(oldPageWrite);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal(
-                "InvalidVersionForPageBlobOperation",
-                response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
         }
         Assert.All((await page.DownloadContentAsync()).Value.Content.ToArray(), value => Assert.Equal(0, value));
 
@@ -12631,9 +12621,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldCreate.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
             using var response = await transport.SendAsync(oldCreate);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal(
-                "InvalidVersionForPageBlobOperation",
-                response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
         }
         Assert.False((await oldPageCreate.ExistsAsync()).Value);
 
@@ -12649,7 +12637,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
             using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
         }
         await AssertOldListRejectsAsync(append.Name, "2014-02-14");
         await AssertOldListRejectsAsync(page.Name, "2009-07-17");
@@ -12668,7 +12656,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldCopy.Headers.TryAddWithoutValidation("x-ms-copy-source", appendSas.ToString());
             using var response = await transport.SendAsync(oldCopy);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
         }
         Assert.False((await copied.ExistsAsync()).Value);
     }
@@ -12695,7 +12683,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             using (var response = await client.SendAsync(request).ConfigureAwait(false))
             {
                 Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
             }
         }
 
@@ -13078,13 +13066,13 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
                    $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Conflict, denied.StatusCode);
-            Assert.Equal("PublicAccessNotPermitted", denied.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(denied, "PublicAccessNotPermitted");
         }
         using (var deniedList = await anonymous.GetAsync(new Uri(
                    $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list", UriKind.RelativeOrAbsolute)))
         {
             Assert.Equal(HttpStatusCode.Conflict, deniedList.StatusCode);
-            Assert.Equal("PublicAccessNotPermitted", deniedList.Headers.GetValues("x-ms-error-code").Single());
+            await AssertVersionedErrorAsync(deniedList, "PublicAccessNotPermitted");
         }
 
         var authorized = CreateClient(
@@ -14218,6 +14206,24 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
     private static string GetResponseHeader(HttpResponseMessage response, string name) =>
         GetResponseHeaderOrDefault(response, name)
         ?? throw new Xunit.Sdk.XunitException($"Missing response header: {name}");
+
+    private static async Task AssertVersionedErrorAsync(HttpResponseMessage response, string expectedCode)
+    {
+        var version = GetResponseHeaderOrDefault(response, "x-ms-version");
+        var hasErrorCodeHeader = version is not null &&
+                                 DateOnly.TryParse(version, CultureInfo.InvariantCulture, out var parsed) &&
+                                 parsed >= new DateOnly(2017, 7, 29);
+        if (hasErrorCodeHeader)
+            Assert.Equal(expectedCode, GetResponseHeader(response, "x-ms-error-code"));
+        else
+            Assert.False(response.Headers.Contains("x-ms-error-code"));
+
+        var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (response.RequestMessage?.Method == HttpMethod.Head || response.StatusCode == HttpStatusCode.NotModified)
+            Assert.Empty(body);
+        else
+            Assert.Contains($"<Code>{expectedCode}</Code>", body, StringComparison.Ordinal);
+    }
 
     private static string? GetResponseHeaderOrDefault(HttpResponseMessage response, string name)
     {
