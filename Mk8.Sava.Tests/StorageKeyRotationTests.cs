@@ -3,6 +3,7 @@ using Azure;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
@@ -11,6 +12,91 @@ namespace Mk8.Sava.Tests;
 
 public sealed class StorageKeyRotationTests
 {
+    [Fact]
+    public async Task FirstDataKeyBindingRejectsASecondPhysicalChunkEncryptedWithAnotherKey()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-mixed-key-{Guid.NewGuid():N}");
+        var foreignPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-foreign-key-{Guid.NewGuid():N}");
+        var account = SavaWebApplicationFactory.AccountName;
+        var containerName = $"mixed-key-{Guid.NewGuid():N}";
+        var retainedBytes = RandomNumberGenerator.GetBytes(80);
+        var orphanBytes = RandomNumberGenerator.GetBytes(80);
+        var foreignKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        string orphanChunkPath = string.Empty;
+        try
+        {
+            var baseConfiguration = new Dictionary<string, string?>
+            {
+                ["Sava:EnableSmallChunkPacking"] = "false",
+                ["Sava:MaintenanceScanInterval"] = "01:00:00"
+            };
+            await using (var first = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false))
+            {
+                await first.InitializeAsync();
+                var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
+                    .GetBlobContainerClient(containerName);
+                await container.CreateAsync();
+                await container.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromBytes(retainedBytes));
+            }
+
+            await using (var foreign = new SavaWebApplicationFactory(
+                             foreignPath,
+                             new NullStorageFaultInjector(),
+                             analyticsSink: null,
+                             configurationOverrides: new Dictionary<string, string?>(baseConfiguration)
+                             {
+                                 [$"Sava:DataEncryptionKeys:{account}"] = foreignKey
+                             },
+                             deleteDataPath: false,
+                             disableMaintenance: true))
+            {
+                await foreign.InitializeAsync();
+                var chunks = foreign.Services.GetRequiredService<ChunkStore>();
+                using var stored = await chunks.StorePinnedAsync(
+                    account,
+                    new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null),
+                    new MemoryStream(orphanBytes, writable: false),
+                    CancellationToken.None);
+                var id = Assert.Single(stored.Manifest.Chunks).Id;
+                var relative = id.Replace('/', Path.DirectorySeparatorChar) + ".chunk";
+                orphanChunkPath = Path.Combine(dataPath, "chunks", relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(orphanChunkPath)!);
+                File.Copy(Path.Combine(foreignPath, "chunks", relative), orphanChunkPath);
+            }
+
+            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
+            {
+                await connection.OpenAsync();
+                await using var clear = connection.CreateCommand();
+                clear.CommandText = "DELETE FROM data_encryption_keys;";
+                await clear.ExecuteNonQueryAsync();
+            }
+
+            await using (var rejected = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false))
+            {
+                var failure = await Assert.ThrowsAsync<InvalidDataException>(rejected.InitializeAsync);
+                Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
+                Assert.Contains("Corrupt", failure.Message, StringComparison.Ordinal);
+            }
+
+            File.Delete(orphanChunkPath);
+            await using var recovered = new SavaWebApplicationFactory(dataPath, baseConfiguration, deleteDataPath: false);
+            await recovered.InitializeAsync();
+            var retained = await CreateClient(recovered, SavaWebApplicationFactory.AccountKey)
+                .GetBlobContainerClient(containerName)
+                .GetBlobClient("retained.bin")
+                .DownloadContentAsync();
+            Assert.Equal(retainedBytes, retained.Value.Content.ToArray());
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+            if (Directory.Exists(foreignPath))
+                Directory.Delete(foreignPath, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task StartupRejectsChangedDataKeyWhileCrashOrphanExtentStillExists()
     {

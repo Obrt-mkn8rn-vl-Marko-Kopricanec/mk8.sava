@@ -254,7 +254,7 @@ public sealed class MetadataStore(
                     if (!string.Equals(previous, fingerprint, StringComparison.Ordinal))
                     {
                         throw new InvalidDataException(
-                            $"The configured data encryption key for '{keyId}' differs from the key recorded for reachable content.");
+                            $"The configured data encryption key for '{keyId}' differs from the key recorded for stored content.");
                     }
                     continue;
                 }
