@@ -3,22 +3,12 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
 using System.IO.Pipelines;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 
 namespace Mk8.Sava.Storage;
-
-public sealed class StoredContent(
-    ContentManifest manifest,
-    IDisposable pin,
-    string? contentMd5 = null) : IDisposable
-{
-    public ContentManifest Manifest { get; } = manifest;
-    public string? ContentMd5 { get; } = contentMd5;
-
-    public void Dispose() => pin.Dispose();
-}
 
 public sealed class ChunkStore
 {
@@ -39,7 +29,7 @@ public sealed class ChunkStore
     private readonly SavaOptions _options;
     private readonly ContentDefinedChunker _chunker;
     private readonly Func<byte[], byte[]> _chunkDigest;
-    private readonly object _pinGate = new();
+    private readonly Lock _pinGate = new();
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
@@ -55,6 +45,7 @@ public sealed class ChunkStore
         IStorageFaultInjector faultInjector,
         IOptions<SavaOptions> options)
     {
+        ArgumentNullException.ThrowIfNull(options);
         _paths = paths;
         _metadata = metadata;
         _faultInjector = faultInjector;
@@ -96,6 +87,7 @@ public sealed class ChunkStore
         ContentManifest source,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(source);
         ValidateManifest(source);
         if (IsInDomain(destinationAccount, destinationEncryption, source))
             return new StoredContent(source, Pin(source));
@@ -123,15 +115,17 @@ public sealed class ChunkStore
         catch
         {
             copied?.Dispose();
-            transferCancellation.Cancel();
+            await transferCancellation.CancelAsync().ConfigureAwait(false);
             try
             {
                 await producer.ConfigureAwait(false);
             }
+#pragma warning disable CA1031 // Preserve the original storage failure after observing producer cancellation.
             catch
             {
                 // Preserve the transfer/storage exception that caused cancellation.
             }
+#pragma warning restore CA1031
             throw;
         }
         finally
@@ -189,7 +183,7 @@ public sealed class ChunkStore
                 if (bytes.AsSpan().IndexOfAnyExcept((byte)0) < 0)
                 {
                     var zeroId = ZeroId(domain);
-                    if (references.Count > 0 && references[^1].Id == zeroId)
+                    if (references.Count > 0 && string.Equals(references[^1].Id, zeroId, StringComparison.Ordinal))
                         references[^1] = references[^1] with { Length = checked(references[^1].Length + bytes.Length) };
                     else
                         references.Add(new ChunkReference(zeroId, offset, bytes.Length));
@@ -225,6 +219,7 @@ public sealed class ChunkStore
 
     public IDisposable Pin(ContentManifest manifest)
     {
+        ArgumentNullException.ThrowIfNull(manifest);
         ValidateManifest(manifest);
         var ids = manifest.Chunks
             .Where(chunk => !IsZero(chunk, manifest.Domain))
@@ -261,7 +256,7 @@ public sealed class ChunkStore
         await using var outputDisposal = output.ConfigureAwait(false);
         await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
     }
 
     public ContentManifest Empty(string account, BlobEncryption encryption) =>
@@ -269,8 +264,7 @@ public sealed class ChunkStore
 
     public ContentManifest Sparse(string account, BlobEncryption encryption, long length)
     {
-        if (length < 0)
-            throw new ArgumentOutOfRangeException(nameof(length));
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
         var domain = ResolveDomain(account, encryption);
         return length == 0
             ? ContentManifest.Empty(domain)
@@ -281,8 +275,11 @@ public sealed class ChunkStore
                 [new ChunkReference(ZeroId(domain), 0, length)]);
     }
 
-    public bool IsInDomain(string account, BlobEncryption encryption, ContentManifest manifest) =>
-        string.Equals(ResolveDomain(account, encryption), manifest.Domain, StringComparison.Ordinal);
+    public bool IsInDomain(string account, BlobEncryption encryption, ContentManifest manifest)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        return string.Equals(ResolveDomain(account, encryption), manifest.Domain, StringComparison.Ordinal);
+    }
 
     public async Task<ContentManifest> ComposeAsync(
         string account,
@@ -290,11 +287,12 @@ public sealed class ChunkStore
         IReadOnlyList<ContentManifest> manifests,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(manifests);
         var domain = ResolveDomain(account, encryption);
         if (manifests.Any(manifest => !string.Equals(manifest.Domain, domain, StringComparison.Ordinal)))
             throw new InvalidOperationException("Content from different encryption domains must be copied through verified plaintext.");
 
-        if (manifests.Any(manifest => manifest.Sha256 == ContentManifest.SparseHash))
+        if (manifests.Any(manifest => string.Equals(manifest.Sha256, ContentManifest.SparseHash, StringComparison.Ordinal)))
         {
             var sparseReferences = new List<ChunkReference>();
             foreach (var manifest in manifests)
@@ -318,7 +316,7 @@ public sealed class ChunkStore
                 if (IsZero(chunk, domain))
                 {
                     AppendZeroesToHash(hash, chunk.Length);
-                    if (references.Count > 0 && references[^1].Id == chunk.Id)
+                    if (references.Count > 0 && string.Equals(references[^1].Id, chunk.Id, StringComparison.Ordinal))
                         references[^1] = references[^1] with { Length = checked(references[^1].Length + chunk.Length) };
                     else
                         references.Add(new ChunkReference(chunk.Id, offset, chunk.Length));
@@ -347,6 +345,7 @@ public sealed class ChunkStore
         bool clear,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         ValidateManifest(current);
         if (!IsInDomain(account, encryption, current) || start < 0 || length < 0 || start > current.Length || length > current.Length - start)
             throw new ArgumentOutOfRangeException(nameof(start));
@@ -384,7 +383,7 @@ public sealed class ChunkStore
         }
         catch
         {
-            foreach (var pin in temporaryPins)
+            foreach (ref var pin in CollectionsMarshal.AsSpan(temporaryPins))
                 pin.Dispose();
             throw;
         }
@@ -397,6 +396,7 @@ public sealed class ChunkStore
         long length,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         ValidateManifest(current);
         if (!IsInDomain(account, encryption, current) || length < 0)
             throw new ArgumentOutOfRangeException(nameof(length));
@@ -415,7 +415,7 @@ public sealed class ChunkStore
         }
         catch
         {
-            foreach (var pin in temporaryPins)
+            foreach (ref var pin in CollectionsMarshal.AsSpan(temporaryPins))
                 pin.Dispose();
             throw;
         }
@@ -429,6 +429,8 @@ public sealed class ChunkStore
         Stream destination,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(destination);
         ValidateManifest(manifest);
         if (encryption.CustomerProvidedKeySha256 is not null &&
             !string.Equals(manifest.Domain, ResolveDomain(manifest.Domain.Split('/', 2)[0], encryption), StringComparison.Ordinal))
@@ -443,7 +445,7 @@ public sealed class ChunkStore
         using var pin = Pin(manifest);
         IncrementalHash? completeHash = offset == 0 &&
                                         length == manifest.Length &&
-                                        manifest.Sha256 != ContentManifest.SparseHash
+                                        !string.Equals(manifest.Sha256, ContentManifest.SparseHash, StringComparison.Ordinal)
             ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
             : null;
         try
@@ -492,6 +494,7 @@ public sealed class ChunkStore
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(manifest);
         if (manifest.Length > int.MaxValue)
             throw new InvalidOperationException("The content is too large to materialize in memory.");
         using var buffer = new MemoryStream((int)manifest.Length);
@@ -504,12 +507,13 @@ public sealed class ChunkStore
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(manifest);
         var path = Path.Combine(_paths.Staging, $"materialized-{Guid.NewGuid():N}.tmp");
         var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
         await using var outputDisposal = output.ConfigureAwait(false);
         await WriteRangeAsync(manifest, encryption, 0, manifest.Length, output, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
         return path;
     }
 
@@ -518,8 +522,7 @@ public sealed class ChunkStore
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
         var standalone = EnumerateStorageIdsOrdered(_paths.Chunks, relativeDirectory: string.Empty, after, ".chunk")
             .Take(checked(maximum + 1))
             .ToList();
@@ -665,7 +668,7 @@ public sealed class ChunkStore
                                 });
                             }
                             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
-                            destination.Flush(flushToDisk: true);
+                            StorageDurability.FlushFileToDisk(destination);
                         }
                     }
 
@@ -692,7 +695,7 @@ public sealed class ChunkStore
             }
             finally
             {
-                foreach (var reservation in reservations)
+                foreach (ref var reservation in CollectionsMarshal.AsSpan(reservations))
                     reservation.Dispose();
             }
         }
@@ -707,8 +710,7 @@ public sealed class ChunkStore
         int maximumPacks,
         CancellationToken cancellationToken)
     {
-        if (maximumPacks <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximumPacks));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumPacks);
 
         var page = EnumerateStorageIdsOrdered(_paths.Packs, string.Empty, _orphanPackCursor, ".pack")
             .Take(checked(maximumPacks + 1))
@@ -719,7 +721,9 @@ public sealed class ChunkStore
 
         var reclaimed = 0;
         long bytesSaved = 0;
+#pragma warning disable HLQ012 // A Span enumerator cannot live across awaited pack cleanup.
         foreach (var packId in page)
+#pragma warning restore HLQ012
         {
             cancellationToken.ThrowIfCancellationRequested();
             var separator = packId.LastIndexOf('/');
@@ -812,12 +816,12 @@ public sealed class ChunkStore
             {
                 continue;
             }
-            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            if ((attributes & FileAttributes.ReparsePoint) != FileAttributes.None)
                 continue;
 
             var name = Path.GetFileName(path);
             var relative = relativeDirectory.Length == 0 ? name : relativeDirectory + "/" + name;
-            if ((attributes & FileAttributes.Directory) != 0)
+            if ((attributes & FileAttributes.Directory) != FileAttributes.None)
             {
                 var prefix = relative + "/";
                 if (after is null ||
@@ -906,8 +910,7 @@ public sealed class ChunkStore
 
     internal StoragePhysicalUsage? ScanPhysicalUsageBatch(int maximumEntries)
     {
-        if (maximumEntries <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximumEntries));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumEntries);
 
         var scanner = _physicalInventoryScanner ??= new StoragePhysicalInventoryScanner(_paths);
         try
@@ -932,8 +935,7 @@ public sealed class ChunkStore
 
     public int DeleteAbandonedStagingFiles(DateTimeOffset olderThan, int maximumFiles)
     {
-        if (maximumFiles <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximumFiles));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumFiles);
 
         var deleted = 0;
         foreach (var path in Directory.EnumerateFiles(_paths.Staging, "*.tmp", SearchOption.TopDirectoryOnly))
@@ -942,7 +944,7 @@ public sealed class ChunkStore
                 break;
             try
             {
-                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 ||
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != FileAttributes.None ||
                     File.GetLastWriteTimeUtc(path) > olderThan.UtcDateTime)
                 {
                     continue;
@@ -975,6 +977,7 @@ public sealed class ChunkStore
 
     public async Task<ChunkIntegrityStatus> VerifyChunkAsync(string id, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(id);
         if (id.EndsWith("/$zero", StringComparison.Ordinal))
             return ChunkIntegrityStatus.Verified;
 
@@ -1024,6 +1027,7 @@ public sealed class ChunkStore
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(id);
         if (id.EndsWith("/$zero", StringComparison.Ordinal))
             return ChunkRecompressionResult.Skipped;
 
@@ -1195,17 +1199,17 @@ public sealed class ChunkStore
         }
         finally
         {
-            foreach (var pin in temporaryPins)
+            foreach (ref var pin in CollectionsMarshal.AsSpan(temporaryPins))
                 pin.Dispose();
             temporaryPins.Clear();
         }
     }
 
-    private static ContentManifest CreateSparseManifest(string domain, IReadOnlyList<ChunkReference> references)
+    private static ContentManifest CreateSparseManifest(string domain, List<ChunkReference> references)
     {
         var normalized = new List<ChunkReference>(references.Count);
         long offset = 0;
-        foreach (var reference in references)
+        foreach (ref var reference in CollectionsMarshal.AsSpan(references))
         {
             normalized.Add(reference with { Offset = offset });
             offset = checked(offset + reference.Length);
@@ -1224,8 +1228,8 @@ public sealed class ChunkStore
         if (length == 0)
             return;
         if (references.Count > 0 &&
-            id == ZeroId(domain) &&
-            references[^1].Id == id)
+            string.Equals(id, ZeroId(domain), StringComparison.Ordinal) &&
+            string.Equals(references[^1].Id, id, StringComparison.Ordinal))
         {
             references[^1] = references[^1] with { Length = checked(references[^1].Length + length) };
             return;
@@ -1493,7 +1497,7 @@ public sealed class ChunkStore
             // A previous append may have failed or crashed before its location was
             // committed. Never append behind bytes that have no authoritative index.
             output.SetLength(committedLength);
-            output.Flush(flushToDisk: true);
+            StorageDurability.FlushFileToDisk(output);
         }
         output.Position = committedLength;
         var recordOffset = committedLength;
@@ -1506,7 +1510,7 @@ public sealed class ChunkStore
         await output.WriteAsync(payload.AsMemory(firstHalf), cancellationToken).ConfigureAwait(false);
         await output.WriteAsync(footer, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
         if (recordOffset == 0)
             StorageDurability.FlushDirectory(Path.GetDirectoryName(path)!);
         return new PackedChunkLocation(
@@ -1577,7 +1581,7 @@ public sealed class ChunkStore
         _faultInjector.Inject(StorageFaultPoint.DuringChunkStagingWrite);
         await output.WriteAsync(ciphertext, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
     }
 
     private async Task<byte[]> ReadVerifiedChunkAsync(
@@ -1798,7 +1802,7 @@ public sealed class ChunkStore
         }
 
         string encodedRoot;
-        if (domain == "$global")
+        if (string.Equals(domain, "$global", StringComparison.Ordinal))
             encodedRoot = _options.CrossAccountEncryptionKey ?? throw new InvalidOperationException("The cross-account encryption key is not configured.");
         else
             encodedRoot = _options.ResolveAccountDataEncryptionKey(domain.Split('/', 2)[0]);
@@ -1930,7 +1934,7 @@ public sealed class ChunkStore
     {
         if (string.IsNullOrEmpty(manifest.Domain) ||
             manifest.Length < 0 ||
-            manifest.Sha256.Length != 64 && manifest.Sha256 != ContentManifest.SparseHash)
+            manifest.Sha256.Length != 64 && !string.Equals(manifest.Sha256, ContentManifest.SparseHash, StringComparison.Ordinal))
             throw new InvalidDataException("The content manifest is invalid.");
         long expectedOffset = 0;
         foreach (var chunk in manifest.Chunks)
@@ -1980,7 +1984,9 @@ public sealed class ChunkStore
                 }
             }
 
+#pragma warning disable VSTHRD002 // Pin is a synchronous lease API; this waits only for an in-flight chunk mutation to release its reservation.
             reservationCompletion.GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
         }
     }
 

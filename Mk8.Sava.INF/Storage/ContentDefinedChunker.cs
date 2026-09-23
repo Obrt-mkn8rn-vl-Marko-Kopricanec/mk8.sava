@@ -39,7 +39,9 @@ internal sealed class ContentDefinedChunker
             if (total > maximumLength)
                 throw new RequestBodyTooLargeException(maximumLength);
 
+#pragma warning disable HLQ013 // Only the bytes actually read from the reused buffer are valid input.
             for (var index = 0; index < read; index++)
+#pragma warning restore HLQ013
             {
                 var value = buffer[index];
                 var outgoing = window[windowPosition];
@@ -67,22 +69,16 @@ internal sealed class ContentDefinedChunker
     {
         var table = new ulong[256];
         var value = 0x9E3779B97F4A7C15UL;
-        for (var index = 0; index < table.Length; index++)
+        foreach (ref var entry in table.AsSpan())
         {
             value += 0x9E3779B97F4A7C15UL;
             var mixed = value;
             mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9UL;
             mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBUL;
-            table[index] = mixed ^ (mixed >> 31);
+            entry = mixed ^ (mixed >> 31);
         }
 
         return table;
     }
-}
-
-public sealed class RequestBodyTooLargeException(long maximumLength)
-    : Exception($"The request body exceeds the configured limit of {maximumLength} bytes.")
-{
-    public long MaximumLength { get; } = maximumLength;
 }
 

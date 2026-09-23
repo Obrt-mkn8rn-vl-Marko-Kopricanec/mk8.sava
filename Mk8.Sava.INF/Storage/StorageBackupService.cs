@@ -102,8 +102,11 @@ public sealed class StorageBackupService(
     public static Task<StorageBackupValidation> ValidateBackupAsync(
         string backupPath,
         SavaOptions options,
-        CancellationToken cancellationToken) =>
-        ValidateCoreAsync(Path.GetFullPath(backupPath), options, cancellationToken);
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return ValidateCoreAsync(Path.GetFullPath(backupPath), options, cancellationToken);
+    }
 
     public static async Task<StorageBackupValidation> RestoreAsync(
         string backupPath,
@@ -111,6 +114,7 @@ public sealed class StorageBackupService(
         SavaOptions options,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
         var backup = Path.GetFullPath(backupPath);
         var target = Path.GetFullPath(targetDataPath);
         if (Directory.Exists(target) || File.Exists(target))
@@ -133,7 +137,9 @@ public sealed class StorageBackupService(
                 Path.Combine(temporary, MetadataFileName),
                 cancellationToken).ConfigureAwait(false);
             EnsureFileMatches("metadata database", manifest.Metadata, metadataCopy);
+#pragma warning disable HLQ012 // A Span enumerator cannot live across awaited file copies.
             foreach (var chunk in manifest.Chunks)
+#pragma warning restore HLQ012
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var source = GetChunkPath(Path.Combine(backup, "chunks"), chunk.Id);
@@ -248,7 +254,9 @@ public sealed class StorageBackupService(
 
         long physicalBytes = actualMetadata.Length;
         var declaredPaths = new HashSet<string>(StringComparer.Ordinal);
+#pragma warning disable HLQ012 // A Span enumerator cannot live across awaited file verification.
         foreach (var chunk in manifest.Chunks)
+#pragma warning restore HLQ012
         {
             cancellationToken.ThrowIfCancellationRequested();
             ValidateDigest(chunk.Sha256, $"chunk '{chunk.Id}'");
@@ -318,8 +326,8 @@ public sealed class StorageBackupService(
     }
 
     private static bool DictionaryEqual(
-        IReadOnlyDictionary<string, string> left,
-        IReadOnlyDictionary<string, string> right) =>
+        SortedDictionary<string, string> left,
+        SortedDictionary<string, string> right) =>
         left.Count == right.Count && left.All(pair =>
             right.TryGetValue(pair.Key, out var value) &&
             string.Equals(pair.Value, value, StringComparison.Ordinal));
@@ -368,7 +376,7 @@ public sealed class StorageBackupService(
         await using var outputDisposal = output.ConfigureAwait(false);
         await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
     }
 
     private static async Task<BackupFileEntry> CopyAndHashAsync(
@@ -406,7 +414,7 @@ public sealed class StorageBackupService(
             length = checked(length + read);
         }
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-        output.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(output);
         StorageDurability.FlushDirectory(Path.GetDirectoryName(destination)!);
         return new BackupFileEntry(length, Convert.ToHexStringLower(hash.GetHashAndReset()));
     }
@@ -439,7 +447,7 @@ public sealed class StorageBackupService(
     private static void FlushFileToDisk(string path)
     {
         using var file = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, bufferSize: 1);
-        file.Flush(flushToDisk: true);
+        StorageDurability.FlushFileToDisk(file);
     }
 
     private static void EnsureFileMatches(string description, BackupFileEntry expected, BackupFileEntry actual)
@@ -506,13 +514,13 @@ public sealed class StorageBackupService(
     {
         if (!File.Exists(path))
             throw new FileNotFoundException($"The {description} is missing.", path);
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != FileAttributes.None)
             throw new InvalidDataException($"The {description} must not be a symbolic link or reparse point.");
     }
 
     private static void EnsureNotReparsePoint(string path, string description)
     {
-        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != FileAttributes.None)
             throw new InvalidDataException($"The {description} must not be a symbolic link or reparse point.");
     }
 

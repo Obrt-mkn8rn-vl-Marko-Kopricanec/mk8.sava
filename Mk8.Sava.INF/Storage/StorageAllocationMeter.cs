@@ -42,8 +42,8 @@ internal static class StorageAllocationMeter
                     continue;
                 }
 
-                var isDirectory = (attributes & FileAttributes.Directory) != 0;
-                if (isDirectory && (attributes & FileAttributes.ReparsePoint) == 0)
+                var isDirectory = (attributes & FileAttributes.Directory) != FileAttributes.None;
+                if (isDirectory && (attributes & FileAttributes.ReparsePoint) == FileAttributes.None)
                 {
                     try
                     {
@@ -104,6 +104,7 @@ internal static class StorageAllocationMeter
         return true;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
     internal readonly record struct AllocationStat(
         long AllocatedBytes,
         uint LinkCount,
@@ -111,7 +112,9 @@ internal static class StorageAllocationMeter
         uint DeviceMajor,
         uint DeviceMinor);
 
-    [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+    [DllImport("libc", EntryPoint = "statx", CharSet = CharSet.Unicode, ExactSpelling = true,
+        BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
     private static extern int Statx(
         int directoryFileDescriptor,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string path,

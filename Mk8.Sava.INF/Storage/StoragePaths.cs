@@ -6,13 +6,15 @@ namespace Mk8.Sava.Storage;
 
 public sealed class StoragePaths : IStoragePaths, IDisposable
 {
-    private readonly object _directoryGate = new();
+    private readonly Lock _directoryGate = new();
     private readonly HashSet<string> _durableDirectories = new(
         OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
     private readonly FileStream _rootLease;
 
     public StoragePaths(IHostEnvironment environment, IOptions<SavaOptions> options)
     {
+        ArgumentNullException.ThrowIfNull(environment);
+        ArgumentNullException.ThrowIfNull(options);
         Root = ResolveRoot(environment.ContentRootPath, options.Value.DataPath);
         Chunks = Path.Combine(Root, "chunks");
         Packs = Path.Combine(Root, "packs");
@@ -90,7 +92,7 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
     {
         lock (_directoryGate)
         {
-            if ((File.GetAttributes(Chunks) & FileAttributes.ReparsePoint) != 0)
+            if ((File.GetAttributes(Chunks) & FileAttributes.ReparsePoint) != FileAttributes.None)
                 return 0;
 
             var removed = 0;
@@ -103,7 +105,7 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
                     pending.Push((entry.Path, true));
                     foreach (var child in Directory.EnumerateDirectories(entry.Path))
                     {
-                        if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                        if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == FileAttributes.None)
                             pending.Push((child, false));
                     }
                     continue;

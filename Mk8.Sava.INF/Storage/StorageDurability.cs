@@ -9,9 +9,20 @@ internal static class StorageDurability
     private const uint MoveFileReplaceExisting = 0x1;
     private const uint MoveFileWriteThrough = 0x8;
 
-    [DllImport("libc", EntryPoint = "open", CharSet = CharSet.Ansi, SetLastError = true)]
-    private static extern int OpenDirectory(string path, int flags);
+    internal static void FlushFileToDisk(FileStream stream)
+    {
+        // FlushAsync is not a substitute for the durable Flush(true) fsync boundary.
+#pragma warning disable CA1849 // This synchronous fsync is required before publishing durable storage state.
+        stream.Flush(flushToDisk: true);
+#pragma warning restore CA1849
+    }
 
+    [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+    [DllImport("libc", EntryPoint = "open", CharSet = CharSet.Unicode, ExactSpelling = true,
+        BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
+    private static extern int OpenDirectory([MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
+
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [DllImport("kernel32.dll", EntryPoint = "MoveFileExW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool MoveFileEx(string source, string destination, uint flags);
