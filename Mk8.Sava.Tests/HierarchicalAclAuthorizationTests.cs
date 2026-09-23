@@ -38,12 +38,14 @@ public sealed class HierarchicalAclAuthorizationTests
     [InlineData("PUT", "", "", 'w')]
     [InlineData("PUT", "block", "", 'w')]
     [InlineData("PUT", "blocklist", "", 'w')]
+    [InlineData("PUT", "metadata", "", 'w')]
+    [InlineData("PUT", "properties", "", 'w')]
     [InlineData("DELETE", "", "", 'd')]
     [InlineData("GET", "", "", null)]
-    [InlineData("PUT", "metadata", "", null)]
+    [InlineData("PUT", "tags", "", null)]
     [InlineData("DELETE", "", "deletetype=permanent", null)]
     [InlineData("DELETE", "", "snapshot=2026-01-01", null)]
-    public void ParentMutationFallbackTargetsCurrentBlobPutBlockWriteAndDelete(
+    public void ParentMutationFallbackTargetsCurrentBlobWritesAndDelete(
         string method, string component, string additionalQuery, char? expected)
     {
         ArgumentNullException.ThrowIfNull(additionalQuery);

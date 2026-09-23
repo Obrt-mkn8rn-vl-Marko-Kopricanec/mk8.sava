@@ -2181,6 +2181,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         CancellationToken cancellationToken)
     {
         Require(request, 'w');
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
         EnsureMutableVersion(blob);
         RequireZeroContentLength(http.Request);
         await EnsureBlobEncryptionAsync(
@@ -2229,6 +2230,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         CancellationToken cancellationToken)
     {
         Require(request, 'w');
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
         EnsureMutableVersion(blob);
         RequireZeroContentLength(http.Request);
         var suppliedEncryption = await EnsureBlobEncryptionAsync(
