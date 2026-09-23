@@ -44,6 +44,10 @@ public sealed class ChunkStore
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
     private string? _orphanPackCursor;
+    private StoragePhysicalInventoryScanner? _physicalInventoryScanner;
+
+    internal bool IsPhysicalUsageScanInProgress => _physicalInventoryScanner is not null;
+    internal int PhysicalUsageScanStepsLastPass { get; private set; }
 
     public ChunkStore(
         StoragePaths paths,
@@ -890,6 +894,32 @@ public sealed class ChunkStore
             metadataBytes,
             chunkCount,
             StorageAllocationMeter.MeasureRoot(_paths.Root));
+    }
+
+    internal StoragePhysicalUsage? ScanPhysicalUsageBatch(int maximumEntries)
+    {
+        if (maximumEntries <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumEntries));
+
+        var scanner = _physicalInventoryScanner ??= new StoragePhysicalInventoryScanner(_paths);
+        try
+        {
+            var complete = scanner.Advance(maximumEntries);
+            PhysicalUsageScanStepsLastPass = scanner.LastPassSteps;
+            if (!complete)
+                return null;
+
+            var result = scanner.ToPhysicalUsage(_metadata.CountPackedChunks());
+            scanner.Dispose();
+            _physicalInventoryScanner = null;
+            return result;
+        }
+        catch
+        {
+            scanner.Dispose();
+            _physicalInventoryScanner = null;
+            throw;
+        }
     }
 
     public int DeleteAbandonedStagingFiles(DateTimeOffset olderThan, int maximumFiles)

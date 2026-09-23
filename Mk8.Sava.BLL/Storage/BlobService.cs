@@ -2621,14 +2621,20 @@ public sealed class BlobService(
         var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken);
         await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken);
         var recompression = await RecompressColdChunksAsync(now, cancellationToken);
-        if (_lastPhysicalUsage is null ||
+        if (chunks.IsPhysicalUsageScanInProgress ||
+            _lastPhysicalUsage is null ||
             Stopwatch.GetElapsedTime(_lastPhysicalScanTicks) >= _options.PhysicalUsageScanInterval)
         {
-            _lastPhysicalUsage = chunks.MeasurePhysicalUsage();
-            _lastPhysicalScanTicks = Stopwatch.GetTimestamp();
-            _lastPhysicalScanUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var completedPhysicalUsage = chunks.ScanPhysicalUsageBatch(
+                _options.PhysicalUsageEntriesPerMaintenancePass);
+            if (completedPhysicalUsage is not null)
+            {
+                _lastPhysicalUsage = completedPhysicalUsage;
+                _lastPhysicalScanTicks = Stopwatch.GetTimestamp();
+                _lastPhysicalScanUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            }
         }
-        var physical = _lastPhysicalUsage;
+        var physical = _lastPhysicalUsage ?? new StoragePhysicalUsage(0, 0, 0, 0);
         var usage = new StorageUsageSnapshot(
             summary.LogicalBlobBytes,
             summary.LogicalStagedBlockBytes,

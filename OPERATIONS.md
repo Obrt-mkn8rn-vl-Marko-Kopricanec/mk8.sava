@@ -586,8 +586,13 @@ lengths. On Linux, `mk8_sava_storage_allocated_root_bytes` additionally measures
 actual 512-byte filesystem blocks under the complete data root, including
 SQLite journals, staging files, directories, and the root lease. It does not
 follow symlinks or count a hard-linked inode twice. The value is refreshed by a
-full inventory no more often than `Sava:PhysicalUsageScanInterval` (one minute
-by default), not on every maintenance pass. The metric
+sampled inventory no more often than `Sava:PhysicalUsageScanInterval` (one minute
+by default), not on every maintenance pass. Each pass advances at most
+`Sava:PhysicalUsageEntriesPerMaintenancePass` filesystem steps (1024 by
+default), including directory enumeration and entry inspection. On a large
+root, the inventory spans multiple passes and the previous complete sample
+remains published until the next one finishes. Before the first complete
+sample, physical gauges and the last-scan timestamp are zero. The metric
 `mk8_sava_storage_physical_last_scan_timestamp_seconds` reports when the last
 complete inventory finished. Physical chunk, staging, metadata, allocation,
 and unique-chunk gauges share that sampling cadence; logical blob/block bytes,
@@ -595,8 +600,9 @@ record counts, and reachable-chunk counts still update each maintenance pass.
 The allocation gauge is absent on platforms without the Linux `statx` block
 accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
 valid measurement and distinguishes an unmeasured or unsupported host from
-an empty root. A full inventory still adds I/O on large roots, and an individual
-scan is not yet bounded by a per-pass file limit.
+an empty root. A full inventory still adds I/O on large roots, but it no longer
+monopolizes one maintenance pass. Like any live filesystem walk, it is a sampled
+inventory rather than an atomic snapshot of concurrent writes.
 The serialized chunk and pack inventory also skips linked files and directories,
 so an external or cyclic link cannot inflate or trap its maintenance scan.
 

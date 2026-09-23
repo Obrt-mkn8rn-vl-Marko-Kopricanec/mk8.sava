@@ -24,6 +24,23 @@ public sealed class StorageConfigurationTests
             error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageScanInterval)));
     }
 
+    [Fact]
+    public void PhysicalUsageMaintenanceBudgetMustBePositive()
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
+            },
+            PhysicalUsageEntriesPerMaintenancePass = 0
+        };
+
+        Assert.Contains(
+            options.Validate(new ValidationContext(options)),
+            error => error.MemberNames.Contains(nameof(SavaOptions.PhysicalUsageEntriesPerMaintenancePass)));
+    }
+
     [Theory]
     [InlineData("")]
     [InlineData(" localhost ")]
