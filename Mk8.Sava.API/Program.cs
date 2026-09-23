@@ -63,13 +63,19 @@ builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<AzureResponseWriter>();
 builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
     .RemoveAllLoggers()
-    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    .ConfigurePrimaryHttpMessageHandler(services =>
     {
-        // Source-only authorization and customer-provided encryption headers must not
-        // be forwarded to an authority chosen by a redirecting copy source.
-        AllowAutoRedirect = false,
-        MaxAutomaticRedirections = 5,
-        AutomaticDecompression = DecompressionMethods.None
+        var egress = new UrlSourceEgressPolicy(services.GetRequiredService<IOptions<SavaOptions>>().Value);
+        return new SocketsHttpHandler
+        {
+            // Source-only authorization and customer-provided encryption headers must not
+            // be forwarded to an authority chosen by a redirecting copy source.
+            AllowAutoRedirect = false,
+            AutomaticDecompression = DecompressionMethods.None,
+            UseProxy = false,
+            ConnectTimeout = TimeSpan.FromSeconds(10),
+            ConnectCallback = egress.ConnectAsync
+        };
     });
 
 var app = builder.Build();

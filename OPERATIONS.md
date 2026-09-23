@@ -215,6 +215,17 @@ fails with `CannotVerifyCopySource` without contacting the redirect target, so
 source bearer tokens and customer-provided encryption-key headers cannot be
 forwarded to an authority selected by the source. This fail-closed behavior
 needs differential validation against Azure before claiming redirect parity.
+Outbound URL-source connections resolve and select a permitted IP at connection
+time. By default, only public global-unicast addresses are permitted; loopback,
+private, link-local, carrier-grade NAT, multicast, and reserved ranges are
+blocked even if a DNS name resolves to them. Set
+`Sava:UrlTransferAllowedPrivateHosts` to an array of exact DNS names or IP
+addresses to trust a private source endpoint deliberately. Entries have no
+scheme, port, or wildcard, and trust only that host (not suffix matches).
+Source transfers connect directly rather than through an ambient HTTP proxy,
+which could bypass the local address policy. Operators using private Azure
+endpoints or a controlled egress proxy must account for this deployment setting;
+proxy support with an equivalent enforced destination policy remains open.
 
 Version-aware Get Blob and Get Blob Properties responses expose both
 `x-ms-version-id` and `x-ms-is-current-version` from service version
