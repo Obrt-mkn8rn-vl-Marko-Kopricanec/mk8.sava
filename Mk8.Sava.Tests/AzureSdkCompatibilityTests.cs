@@ -2930,7 +2930,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
-            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "d",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "wd",
             [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
             [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
         });
@@ -2965,7 +2965,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             .GetBlobContainerClient(container.Name);
         var owned = writer.GetBlobClient("sticky/owned.txt");
         await owned.UploadAsync(BinaryData.FromString("owned"));
-        await AssertSignedStickyDeletionAsync(application, container, foreign, owned, writerObjectId);
+        var batchOwned = writer.GetBlobClient("sticky/batch-owned.txt");
+        await batchOwned.UploadAsync(BinaryData.FromString("batch-owned"));
+        await AssertSignedStickyDeletionAsync(application, container, foreign, owned, batchOwned, writerObjectId);
     }
 
     private static async Task AssertSignedStickyDeletionAsync(
@@ -2973,6 +2975,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         BlobContainerClient container,
         BlobClient foreign,
         BlobClient owned,
+        BlobClient batchOwned,
         string writerObjectId)
     {
         var delegator = CreateBearerClient(application, CreateJwt(
@@ -2994,6 +2997,55 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         await Signed(owned.Name).DeleteAsync().ConfigureAwait(false);
         Assert.False((await owned.ExistsAsync().ConfigureAwait(false)).Value);
+
+        var deniedBatch = await SubmitSignedBatchAsync(
+            application, container, Signed(foreign.Name).Uri, "DELETE", null, null).ConfigureAwait(false);
+        Assert.Contains("HTTP/1.1 403 Forbidden", deniedBatch, StringComparison.Ordinal);
+        Assert.Contains("AuthorizationFailure", deniedBatch, StringComparison.Ordinal);
+        Assert.Equal("retained", (await foreign.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+
+        var allowedBatch = await SubmitSignedBatchAsync(
+            application, container, Signed(batchOwned.Name).Uri, "DELETE", null, null).ConfigureAwait(false);
+        Assert.Contains("HTTP/1.1 202 Accepted", allowedBatch, StringComparison.Ordinal);
+        Assert.False((await batchOwned.ExistsAsync().ConfigureAwait(false)).Value);
+
+        var signedTier = CreateSuoidBlobClient(
+            application, key, container.Name, foreign.Name, writerObjectId, "w", startsOn, expiresOn);
+        await signedTier.SetAccessTierAsync(AccessTier.Cool).ConfigureAwait(false);
+        var tierBatch = await SubmitSignedBatchAsync(
+            application, container, signedTier.Uri, "PUT", "tier", "x-ms-access-tier: Hot\r\n")
+            .ConfigureAwait(false);
+        Assert.True(tierBatch.Contains("HTTP/1.1 200 OK", StringComparison.Ordinal), tierBatch);
+        Assert.Equal(AccessTier.Hot, (await foreign.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
+    }
+
+    private static async Task<string> SubmitSignedBatchAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        Uri signedBlobUri,
+        string method,
+        string? component,
+        string? subrequestHeader)
+    {
+        var boundary = $"batch_{Guid.NewGuid():N}";
+        var target = component is null ? signedBlobUri : AppendQuery(signedBlobUri, $"comp={component}");
+        var payload = $"--{boundary}\r\nContent-Type: application/http\r\n" +
+                      "Content-Transfer-Encoding: binary\r\n\r\n" +
+                      $"{method} {target.PathAndQuery} HTTP/1.1\r\n{subrequestHeader}\r\n" +
+                      $"--{boundary}--\r\n";
+        var endpoint = AppendQuery(
+            container.GenerateSasUri(BlobContainerSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "restype=container&comp=batch");
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+        {
+            Content = new ByteArrayContent(Encoding.Latin1.GetBytes(payload))
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse($"multipart/mixed; boundary={boundary}");
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
     }
 
     private static async Task AssertParentAclMutationsAsync(

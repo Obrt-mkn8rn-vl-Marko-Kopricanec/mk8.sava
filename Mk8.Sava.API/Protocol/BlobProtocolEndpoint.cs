@@ -1096,6 +1096,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         Require(context, permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
         EvaluateWriteConditions(request, blob);
         EnsureLease(request, blob.Lease, "blob");
+        await RecheckParentMutationAclAsync(request.HttpContext, context, cancellationToken).ConfigureAwait(false);
         if (permanentDelete)
         {
             await service.PermanentlyDeleteBlobAsync(
@@ -1145,6 +1146,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                    ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
         ValidateAccessTierVersion(request, tier);
         var rehydratePriority = ReadRehydratePriority(request);
+        await RecheckParentMutationAclAsync(request.HttpContext, context, cancellationToken).ConfigureAwait(false);
         var tierUpdate = await service.SetTierAsync(
             blob,
             tier,
