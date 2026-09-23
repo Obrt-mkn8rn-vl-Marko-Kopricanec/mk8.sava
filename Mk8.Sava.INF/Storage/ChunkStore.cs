@@ -38,6 +38,7 @@ public sealed class ChunkStore
     private readonly IStorageFaultInjector _faultInjector;
     private readonly SavaOptions _options;
     private readonly ContentDefinedChunker _chunker;
+    private readonly Func<byte[], byte[]> _chunkDigest;
     private readonly object _pinGate = new();
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
@@ -54,10 +55,22 @@ public sealed class ChunkStore
         _metadata = metadata;
         _faultInjector = faultInjector;
         _options = options.Value;
+        _chunkDigest = SHA256.HashData;
         _chunker = new ContentDefinedChunker(
             _options.MinimumChunkBytes,
             _options.TargetChunkBytes,
             _options.MaximumChunkBytes);
+    }
+
+    internal ChunkStore(
+        StoragePaths paths,
+        MetadataStore metadata,
+        IStorageFaultInjector faultInjector,
+        IOptions<SavaOptions> options,
+        Func<byte[], byte[]> chunkDigest)
+        : this(paths, metadata, faultInjector, options)
+    {
+        _chunkDigest = chunkDigest ?? throw new ArgumentNullException(nameof(chunkDigest));
     }
 
     public async Task<StoredContent> StorePinnedAsync(
@@ -1231,7 +1244,7 @@ public sealed class ChunkStore
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
-        var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
+        var hash = Convert.ToHexStringLower(ComputeChunkDigest(bytes));
         var baseName = $"{hash}-{bytes.Length}";
 
         for (var collision = 0; ; collision++)
@@ -1479,7 +1492,7 @@ public sealed class ChunkStore
         header[sizeof(ulong)] = codec;
         header[sizeof(ulong) + sizeof(byte)] = EncryptionVersion;
         BinaryPrimitives.WriteInt32LittleEndian(header.AsSpan(sizeof(ulong) + 2 * sizeof(byte)), bytes.Length);
-        SHA256.HashData(bytes, header.AsSpan(sizeof(ulong) + 2 * sizeof(byte) + sizeof(int), 32));
+        ComputeChunkDigest(bytes).CopyTo(header, sizeof(ulong) + 2 * sizeof(byte) + sizeof(int));
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
         RandomNumberGenerator.Fill(header.AsSpan(nonceOffset, NonceLength));
         var ciphertext = new byte[encoded.Length];
@@ -1607,11 +1620,19 @@ public sealed class ChunkStore
         }
 
         var expectedHashOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int);
-        var actualHash = SHA256.HashData(decoded);
+        var actualHash = ComputeChunkDigest(decoded);
         if (!CryptographicOperations.FixedTimeEquals(actualHash, header.AsSpan(expectedHashOffset, 32)))
             throw new InvalidDataException($"Chunk '{id}' failed its plaintext integrity check.");
         ValidateChunkIdentity(id, decoded.Length, actualHash);
         return decoded;
+    }
+
+    private byte[] ComputeChunkDigest(byte[] bytes)
+    {
+        var digest = _chunkDigest(bytes);
+        if (digest.Length != SHA256.HashSizeInBytes)
+            throw new InvalidOperationException("A chunk digest must contain exactly 256 bits.");
+        return digest;
     }
 
     private async Task VerifyCustomerKeyChunkStructureAsync(string id, CancellationToken cancellationToken)

@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.DependencyInjection;
 using Mk8.Sava.Storage;
 
@@ -10,6 +13,57 @@ namespace Mk8.Sava.Tests;
 
 public sealed class StorageSpaceEfficiencyTests
 {
+    [Fact]
+    public async Task LegacyMsavaMarkerCannotProveEqualityOrChangeClientBytes()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"msava-marker-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var originalBytes = RandomNumberGenerator.GetBytes(32 * 1024);
+        var declaredHash = Convert.ToHexStringLower(SHA256.HashData(originalBytes));
+        var marker = $"MSAVA:v1:{declaredHash}:42:1760000000";
+        var markerBytes = Encoding.ASCII.GetBytes(marker);
+        var markedBytes = new byte[originalBytes.Length + markerBytes.Length];
+        originalBytes.CopyTo(markedBytes, 0);
+        markerBytes.CopyTo(markedBytes, originalBytes.Length);
+
+        var original = container.GetBlobClient("original.bin");
+        var marked = container.GetBlobClient("marked.bin");
+        await original.UploadAsync(BinaryData.FromBytes(originalBytes));
+        await marked.UploadAsync(BinaryData.FromBytes(markedBytes), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string> { ["MsavaSignature"] = marker }
+        });
+
+        Assert.Equal(originalBytes, (await original.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(markedBytes, (await marked.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(marker, (await marked.GetPropertiesAsync()).Value.Metadata["MsavaSignature"]);
+        var service = application.Services.GetRequiredService<BlobService>();
+        var originalRecord = await service.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            original.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        var markedRecord = await service.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            marked.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotEqual(originalRecord.Content.Sha256, markedRecord.Content.Sha256);
+        Assert.Equal(markedBytes.Length, markedRecord.Content.Length);
+    }
+
     [Fact]
     public async Task PhysicalUsageInventoryDoesNotFollowExternalOrCyclicStorageLinks()
     {
