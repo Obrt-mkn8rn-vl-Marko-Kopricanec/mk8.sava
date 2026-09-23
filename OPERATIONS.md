@@ -159,9 +159,15 @@ and exact downloaded bytes. A blob-list scenario compares filtered metadata,
 one-item pages and continuations, and delimiter-based hierarchy prefixes with
 an out-of-prefix blob. A stored-access-policy scenario compares a read-only
 service SAS, denied overwrite, and revocation after policy removal. Azurite
-returns the generic `ConditionNotMet` for
-a stale copy-source ETag; mk8.sava retains the published Blob-specific
-`SourceConditionNotMet` code, and the test records this emulator divergence.
+and mk8.sava also agree on ranged bytes, content-range and MD5, plus conditional
+read statuses and error codes. The ranged-read scenario records an emulator
+divergence: Azurite accepts `x-ms-range-get-content-md5: true` without a Range
+header, while the published Get Blob contract requires 400; mk8.sava returns
+400 `InvalidHeaderValue`. Azurite returns the generic `ConditionNotMet` for a
+stale copy-source ETag; mk8.sava retains the published Blob-specific
+`SourceConditionNotMet` code. The published common error catalog and modern
+error-header contract also require `ConditionNotMet` in `x-ms-error-code` on
+conditional 304 reads; mk8.sava now emits it with an empty response body.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
