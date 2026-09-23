@@ -186,6 +186,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(maximumProperties.ETag, afterTooLarge.ETag);
         Assert.Equal(maximumValue, afterTooLarge.Metadata["k"]);
 
+        await VerifyBlobMetadataRawRequestsAsync(blob);
+        await VerifyContainerMetadataRawRequestsAsync(container, blob, maximumProperties.ETag);
+        await VerifyInvalidMetadataPublicationsAsync(service, container, blob);
+    }
+
+    private async Task VerifyBlobMetadataRawRequestsAsync(BlobClient blob)
+    {
         var metadataUri = AppendQuery(
             blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
             "comp=metadata");
@@ -197,7 +204,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             duplicateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             duplicateRequest.Headers.TryAddWithoutValidation("x-ms-meta-Duplicate", ["one", "two"]);
-            using var response = await transport.SendAsync(duplicateRequest);
+            using var response = await transport.SendAsync(duplicateRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidMetadata", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -209,7 +216,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             nonAsciiRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             nonAsciiRequest.Headers.TryAddWithoutValidation("x-ms-meta-Value", "olé");
-            using var response = await transport.SendAsync(nonAsciiRequest);
+            using var response = await transport.SendAsync(nonAsciiRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidMetadata", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -221,7 +228,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             nonemptyMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             nonemptyMetadata.Headers.TryAddWithoutValidation("x-ms-meta-k", "must-not-publish");
-            using var response = await transport.SendAsync(nonemptyMetadata);
+            using var response = await transport.SendAsync(nonemptyMetadata).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -235,14 +242,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             nonemptyProperties.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(nonemptyProperties);
+            using var response = await transport.SendAsync(nonemptyProperties).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
+    private async Task VerifyContainerMetadataRawRequestsAsync(
+        BlobContainerClient container, BlobClient blob, ETag expectedBlobETag)
+    {
         var containerMetadataUri = AppendQuery(
             container.Uri,
             "restype=container&comp=metadata");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
         using (var nonemptyContainerMetadata = new HttpRequestMessage(HttpMethod.Put, containerMetadataUri)
         {
             Content = new ByteArrayContent([1])
@@ -251,7 +263,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             nonemptyContainerMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             nonemptyContainerMetadata.Headers.TryAddWithoutValidation("x-ms-meta-k", "must-not-publish");
             AddSharedKeyLiteAuthorization(nonemptyContainerMetadata);
-            using var response = await transport.SendAsync(nonemptyContainerMetadata);
+            using var response = await transport.SendAsync(nonemptyContainerMetadata).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -263,36 +275,41 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             validContainerMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             validContainerMetadata.Headers.TryAddWithoutValidation("x-ms-meta-fromowner", "allowed");
             AddSharedKeyLiteAuthorization(validContainerMetadata);
-            using var response = await transport.SendAsync(validContainerMetadata);
+            using var response = await transport.SendAsync(validContainerMetadata).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
-        Assert.Equal(maximumProperties.ETag, (await blob.GetPropertiesAsync()).Value.ETag);
-        Assert.False((await container.GetPropertiesAsync()).Value.Metadata.ContainsKey("k"));
-        Assert.Equal("allowed", (await container.GetPropertiesAsync()).Value.Metadata["fromowner"]);
+        Assert.Equal(expectedBlobETag, (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag);
+        Assert.False((await container.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata.ContainsKey("k"));
+        Assert.Equal("allowed", (await container.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["fromowner"]);
+    }
 
+    private static async Task VerifyInvalidMetadataPublicationsAsync(
+        BlobServiceClient service, BlobContainerClient container, BlobClient blob)
+    {
         var invalidContainer = service.GetBlobContainerClient($"metadata-invalid-{Guid.NewGuid():N}");
         var invalidContainerCreate = await Assert.ThrowsAsync<RequestFailedException>(() =>
             invalidContainer.CreateAsync(
                 PublicAccessType.None,
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["invalid-name"] = "value" }));
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["invalid-name"] = "value" })).ConfigureAwait(false);
         Assert.Equal("InvalidMetadata", invalidContainerCreate.ErrorCode);
-        Assert.False((await invalidContainer.ExistsAsync()).Value);
+        Assert.False((await invalidContainer.ExistsAsync().ConfigureAwait(false)).Value);
 
         var invalidUpload = container.GetBlobClient("invalid-upload.bin");
         var invalidBlobCreate = await Assert.ThrowsAsync<RequestFailedException>(() =>
             invalidUpload.UploadAsync(BinaryData.FromString("must not publish"), new BlobUploadOptions
             {
                 Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["invalid-name"] = "value" }
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal("InvalidMetadata", invalidBlobCreate.ErrorCode);
-        Assert.False((await invalidUpload.ExistsAsync()).Value);
+        Assert.False((await invalidUpload.ExistsAsync().ConfigureAwait(false)).Value);
 
         var invalidSnapshot = await Assert.ThrowsAsync<RequestFailedException>(() =>
             blob.CreateSnapshotAsync(
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["invalid-name"] = "value" }));
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["invalid-name"] = "value" })).ConfigureAwait(false);
         Assert.Equal("InvalidMetadata", invalidSnapshot.ErrorCode);
         var snapshots = new List<BlobItem>();
-        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { States = BlobStates.Snapshots }))
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { States = BlobStates.Snapshots })
+                           .ConfigureAwait(false))
         {
             if (item.Snapshot is not null)
                 snapshots.Add(item);
@@ -326,20 +343,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.False(setContainerMetadata.GetRawResponse().Headers.TryGetValue("x-ms-meta-scope", out _));
         Assert.False(setContainerMetadata.GetRawResponse().Headers.TryGetValue("x-ms-lease-state", out _));
 
-        var accountSas = new AccountSasBuilder
-        {
-            Services = AccountSasServices.Blobs,
-            ResourceTypes = AccountSasResourceTypes.Container,
-            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
-            Protocol = SasProtocol.HttpsAndHttp
-        };
-        accountSas.SetPermissions(AccountSasPermissions.Read);
-        var credential = new StorageSharedKeyCredential(
-            SavaWebApplicationFactory.AccountName,
-            SavaWebApplicationFactory.AccountKey);
-        var containerMetadataUri = AppendQuery(
-            container.Uri,
-            $"restype=container&comp=metadata&{accountSas.ToSasQueryParameters(credential)}");
+        var containerMetadataUri = CreateReadContainerMetadataUri(container);
 
         var blob = container.GetBlobClient("metadata.bin");
         await blob.UploadAsync(
@@ -362,6 +366,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blobMetadataUri = AppendQuery(
             blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)),
             "comp=metadata");
+        await VerifyMetadataReadHeadersAsync(containerMetadataUri, blobMetadataUri);
+    }
+
+    private static Uri CreateReadContainerMetadataUri(BlobContainerClient container)
+    {
+        var accountSas = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountSas.SetPermissions(AccountSasPermissions.Read);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        return AppendQuery(container.Uri,
+            $"restype=container&comp=metadata&{accountSas.ToSasQueryParameters(credential)}");
+    }
+
+    private async Task VerifyMetadataReadHeadersAsync(Uri containerMetadataUri, Uri blobMetadataUri)
+    {
         using var transport = new HttpClient(factory.Server.CreateHandler());
         foreach (var (method, uri, metadataName, metadataValue) in new[]
                  {
@@ -373,7 +399,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             using var request = new HttpRequestMessage(method, uri);
             request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.Equal(metadataValue, response.Headers.GetValues(metadataName).Single());
             Assert.False(response.Headers.Contains("x-ms-blob-type"));
@@ -381,7 +407,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.False(response.Headers.Contains("x-ms-lease-state"));
             Assert.False(response.Headers.Contains("x-ms-server-encrypted"));
             Assert.False(response.Headers.Contains("x-ms-tag-count"));
-            Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+            Assert.Empty(await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false));
         }
     }
 
@@ -409,39 +435,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(pair.Value, content.Value.Content.ToString());
         }
 
-        async Task PutAndReadDirectAsync(string blobName, string escapedBlobPath, string value)
-        {
-            var sas = new BlobSasBuilder
-            {
-                BlobContainerName = container.Name,
-                BlobName = blobName,
-                Resource = "b",
-                ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
-            };
-            sas.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read);
-            var uri = new Uri(
-                $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{container.Name}/{escapedBlobPath}?" +
-                sas.ToSasQueryParameters(new StorageSharedKeyCredential(
-                    SavaWebApplicationFactory.AccountName,
-                    SavaWebApplicationFactory.AccountKey)));
-
-            using var transport = new HttpClient(factory.Server.CreateHandler());
-            using var put = new HttpRequestMessage(HttpMethod.Put, uri)
-            {
-                Content = new ByteArrayContent(Encoding.UTF8.GetBytes(value))
-            };
-            put.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            put.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            using var putResponse = await transport.SendAsync(put).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.Created, putResponse.StatusCode);
-
-            using var getResponse = await transport.GetAsync(uri).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
-            Assert.Equal(value, await getResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
-        }
-
-        await PutAndReadDirectAsync("/a", "/a", "leading separator");
-        await PutAndReadDirectAsync("tail/", "tail/", "trailing separator");
+        await PutAndReadDirectNamedBlobAsync(service, container, "/a", "/a", "leading separator");
+        await PutAndReadDirectNamedBlobAsync(service, container, "tail/", "tail/", "trailing separator");
         expected.Add("/a", "leading separator");
         expected.Add("tail/", "trailing separator");
 
@@ -450,8 +445,47 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             listed.Add(item.Name);
         Assert.Equal(expected.Keys.Order(StringComparer.Ordinal), listed.Order(StringComparer.Ordinal));
 
+        await VerifyImplicitRootBlobAsync(service);
+        await VerifyBlobNameLimitsAsync(container);
+    }
+
+    private async Task PutAndReadDirectNamedBlobAsync(
+        BlobServiceClient service, BlobContainerClient container,
+        string blobName, string escapedBlobPath, string value)
+    {
+        var sas = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = blobName,
+            Resource = "b",
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
+        };
+        sas.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read);
+        var uri = new Uri(
+            $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{container.Name}/{escapedBlobPath}?" +
+            sas.ToSasQueryParameters(new StorageSharedKeyCredential(
+                SavaWebApplicationFactory.AccountName,
+                SavaWebApplicationFactory.AccountKey)));
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var put = new HttpRequestMessage(HttpMethod.Put, uri)
+        {
+            Content = new ByteArrayContent(Encoding.UTF8.GetBytes(value))
+        };
+        put.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        put.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        using var putResponse = await transport.SendAsync(put).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Created, putResponse.StatusCode);
+
+        using var getResponse = await transport.GetAsync(uri).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
+        Assert.Equal(value, await getResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
+    }
+
+    private async Task VerifyImplicitRootBlobAsync(BlobServiceClient service)
+    {
         var root = service.GetBlobContainerClient("$root");
-        await root.CreateIfNotExistsAsync();
+        await root.CreateIfNotExistsAsync().ConfigureAwait(false);
         var rootName = $"implicit-root-{Guid.NewGuid():N}.bin";
         var rootUri = new Uri(service.Uri, Uri.EscapeDataString(rootName));
         using (var transport = new HttpClient(factory.Server.CreateHandler()) { BaseAddress = service.Uri })
@@ -464,33 +498,40 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     Transport = new HttpClientTransport(transport),
                     Retry = { MaxRetries = 0 }
                 });
-            await implicitRoot.UploadAsync(BinaryData.FromString("root payload"));
+            await implicitRoot.UploadAsync(BinaryData.FromString("root payload")).ConfigureAwait(false);
         }
         Assert.Equal(
             "root payload",
-            (await root.GetBlobClient(rootName).DownloadContentAsync()).Value.Content.ToString());
+            (await root.GetBlobClient(rootName).DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+    }
 
+    private static async Task VerifyBlobNameLimitsAsync(BlobContainerClient container)
+    {
         var maximumUnicodeName = new string('é', 1024);
-        await container.GetBlobClient(maximumUnicodeName).UploadAsync(BinaryData.FromString("maximum name"));
+        await container.GetBlobClient(maximumUnicodeName).UploadAsync(BinaryData.FromString("maximum name"))
+            .ConfigureAwait(false);
         Assert.Equal(
             "maximum name",
-            (await container.GetBlobClient(maximumUnicodeName).DownloadContentAsync()).Value.Content.ToString());
+            (await container.GetBlobClient(maximumUnicodeName).DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
 
         var oversizedName = new string('é', 1025);
         var oversized = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient(oversizedName).UploadAsync(BinaryData.FromString("must not publish")));
+            container.GetBlobClient(oversizedName).UploadAsync(BinaryData.FromString("must not publish")))
+            .ConfigureAwait(false);
         Assert.Equal(400, oversized.Status);
         Assert.Equal("InvalidResourceName", oversized.ErrorCode);
 
         var maximumSegments = string.Join('/', Enumerable.Repeat("s", 254));
-        await container.GetBlobClient(maximumSegments).UploadAsync(BinaryData.FromString("maximum segments"));
+        await container.GetBlobClient(maximumSegments).UploadAsync(BinaryData.FromString("maximum segments"))
+            .ConfigureAwait(false);
         Assert.Equal(
             "maximum segments",
-            (await container.GetBlobClient(maximumSegments).DownloadContentAsync()).Value.Content.ToString());
+            (await container.GetBlobClient(maximumSegments).DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
 
         var tooManySegments = string.Join('/', Enumerable.Repeat("s", 255));
         var tooMany = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient(tooManySegments).UploadAsync(BinaryData.FromString("must not publish")));
+            container.GetBlobClient(tooManySegments).UploadAsync(BinaryData.FromString("must not publish")))
+            .ConfigureAwait(false);
         Assert.Equal(400, tooMany.Status);
         Assert.Equal("InvalidResourceName", tooMany.ErrorCode);
     }
