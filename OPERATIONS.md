@@ -79,14 +79,16 @@ separate real-ENOSPC lane:
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run-enospc.sh
 ```
 
-It mounts a private 16 MiB tmpfs beneath a freshly created temporary directory,
-fills it until the kernel returns `ENOSPC`, then leaves only 256 KiB free for a
-512 KiB random upload. The test confirms partial physical chunks were written
-but no logical blob was published, an earlier acknowledged blob remains exact,
-orphan chunks are reclaimed after capacity is restored and the host restarts,
-and retry succeeds. The mount is private to the harness process and is unmounted
-on exit. This covers an actual capacity failure during upload, not every SQLite
-commit, pack-compaction, filesystem, Windows, or power-loss boundary.
+It mounts a private 32 MiB tmpfs beneath a freshly created temporary directory,
+fills it until the kernel returns `ENOSPC`, and runs three independent boundaries:
+a 512 KiB standalone upload with only 256 KiB free, metadata-only container
+creation with 128 KiB free, and a packed upload with 8 KiB free. The tests confirm
+an earlier acknowledged object remains exact, failed logical publication is
+absent after restart, partial/unreachable extents can be reclaimed or discarded,
+and retry succeeds. The pack test also records that staging completed and pack
+append began before the kernel failure. The mount is private to the harness
+process and is unmounted on exit. This does not cover every SQLite commit,
+pack-compaction, filesystem, Windows, or power-loss boundary.
 
 ## SDK substitution checks
 

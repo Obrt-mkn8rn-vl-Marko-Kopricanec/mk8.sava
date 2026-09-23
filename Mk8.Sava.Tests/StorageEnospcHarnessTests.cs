@@ -8,6 +8,10 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
+[CollectionDefinition("Isolated ENOSPC harness", DisableParallelization = true)]
+public sealed class StorageEnospcHarnessCollection;
+
+[Collection("Isolated ENOSPC harness")]
 public sealed class StorageEnospcHarnessTests
 {
     private const string DataPathVariable = "MK8_SAVA_ENOSPC_DATA_PATH";
@@ -19,14 +23,8 @@ public sealed class StorageEnospcHarnessTests
         if (string.IsNullOrWhiteSpace(dataPath))
             return;
 
+        var mountRoot = ValidateMountRoot(dataPath);
         dataPath = Path.GetFullPath(dataPath);
-        var mountRoot = Path.GetDirectoryName(dataPath)
-                        ?? throw new InvalidOperationException("The ENOSPC data path has no mount root.");
-        if (Path.GetFileName(dataPath) != "data" ||
-            !Path.GetFileName(mountRoot).StartsWith("mk8-sava-enospc-", StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException("The ENOSPC test requires an isolated mk8-sava-enospc-* mount.");
-        }
 
         var stableBytes = RandomNumberGenerator.GetBytes(32 * 1024);
         var attemptedBytes = RandomNumberGenerator.GetBytes(512 * 1024);
@@ -55,7 +53,7 @@ public sealed class StorageEnospcHarnessTests
             await stable.UploadAsync(BinaryData.FromBytes(stableBytes));
             var priorChunkCount = CountStandaloneChunks(dataPath);
 
-            FillUntilNoSpace(fillerPath);
+            FillUntilNoSpace(fillerPath, 256 * 1024);
             var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
                 attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes)));
             Assert.Equal(500, failure.Status);
@@ -96,7 +94,197 @@ public sealed class StorageEnospcHarnessTests
         }
     }
 
-    private static void FillUntilNoSpace(string path)
+    [Fact]
+    public async Task ExhaustedFilesystemRollsBackFailedContainerMetadataCommit()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "metadata-data");
+        var fillerPath = Path.Combine(mountRoot, "metadata-filler.bin");
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["payload"] = new string('x', 4096)
+        };
+        var acknowledged = new List<string>();
+        string? failedName = null;
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+        var first = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await first.InitializeAsync();
+            var client = CreateClient(first);
+            await client.GetBlobContainerClient("metadata-stable").CreateAsync();
+            FillUntilNoSpace(fillerPath, 128 * 1024);
+
+            for (var index = 0; index < 128; index++)
+            {
+                var name = $"metadata-commit-{index:D4}";
+                try
+                {
+                    await client.GetBlobContainerClient(name).CreateAsync(metadata: metadata);
+                    acknowledged.Add(name);
+                }
+                catch (RequestFailedException failure)
+                {
+                    Assert.Equal(500, failure.Status);
+                    failedName = name;
+                    break;
+                }
+            }
+            Assert.NotNull(failedName);
+            Assert.NotEmpty(acknowledged);
+            File.Delete(fillerPath);
+
+            Assert.False((await client.GetBlobContainerClient(failedName).ExistsAsync()).Value);
+            Assert.True((await client.GetBlobContainerClient("metadata-stable").ExistsAsync()).Value);
+        }
+        finally
+        {
+            await first.DisposeAsync();
+        }
+
+        var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await restarted.InitializeAsync();
+            var client = CreateClient(restarted);
+            Assert.True((await client.GetBlobContainerClient("metadata-stable").ExistsAsync()).Value);
+            foreach (var name in acknowledged)
+            {
+                var properties = await client.GetBlobContainerClient(name).GetPropertiesAsync();
+                Assert.Equal(metadata["payload"], properties.Value.Metadata["payload"]);
+            }
+            var failed = client.GetBlobContainerClient(failedName!);
+            Assert.False((await failed.ExistsAsync()).Value);
+            await failed.CreateAsync(metadata: metadata);
+            Assert.Equal(metadata["payload"], (await failed.GetPropertiesAsync()).Value.Metadata["payload"]);
+        }
+        finally
+        {
+            await restarted.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ExhaustedFilesystemDuringPackAppendPreservesIndexedRecords()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "pack-data");
+        var fillerPath = Path.Combine(mountRoot, "pack-filler.bin");
+        var stableBytes = RandomNumberGenerator.GetBytes(1024);
+        var attemptedBytes = RandomNumberGenerator.GetBytes(4096);
+        var recorder = new RecordingStorageFaultInjector();
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096"
+        };
+        string packId;
+        long priorIndexedLength;
+        var first = new SavaWebApplicationFactory(
+            dataPath,
+            recorder,
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await first.InitializeAsync();
+            var container = CreateClient(first).GetBlobContainerClient("enospc-pack");
+            await container.CreateAsync();
+            var stable = container.GetBlobClient("stable.bin");
+            await stable.UploadAsync(BinaryData.FromBytes(stableBytes));
+            var metadata = first.Services.GetRequiredService<MetadataStore>();
+            var pack = await metadata.GetActiveChunkPackAsync(
+                SavaWebApplicationFactory.AccountName, CancellationToken.None);
+            Assert.NotNull(pack);
+            packId = pack.PackId;
+            priorIndexedLength = await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None);
+            recorder.Reset();
+
+            FillUntilNoSpace(fillerPath, 8 * 1024);
+            var attempted = container.GetBlobClient("interrupted.bin");
+            var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes)));
+            Assert.Equal(500, failure.Status);
+            Assert.True(recorder.StagingCompleted);
+            Assert.True(recorder.PackAppendStarted);
+            Assert.Equal(1, metadata.CountPackedChunks());
+            Assert.Equal(priorIndexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None));
+            File.Delete(fillerPath);
+
+            Assert.False((await attempted.ExistsAsync()).Value);
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync()).Value.Content.ToArray());
+        }
+        finally
+        {
+            await first.DisposeAsync();
+        }
+
+        var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await restarted.InitializeAsync();
+            var container = CreateClient(restarted).GetBlobContainerClient("enospc-pack");
+            Assert.Equal(stableBytes,
+                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
+            var attempted = container.GetBlobClient("interrupted.bin");
+            await attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes));
+            Assert.Equal(attemptedBytes, (await attempted.DownloadContentAsync()).Value.Content.ToArray());
+            var metadata = restarted.Services.GetRequiredService<MetadataStore>();
+            Assert.Equal(2, metadata.CountPackedChunks());
+            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            Assert.Equal(await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None), new FileInfo(packPath).Length);
+        }
+        finally
+        {
+            await restarted.DisposeAsync();
+        }
+    }
+
+    private static string ValidateMountRoot(string dataPath)
+    {
+        var fullPath = Path.GetFullPath(dataPath);
+        var mountRoot = Path.GetDirectoryName(fullPath)
+                        ?? throw new InvalidOperationException("The ENOSPC data path has no mount root.");
+        if (Path.GetFileName(fullPath) != "data" ||
+            !Path.GetFileName(mountRoot).StartsWith("mk8-sava-enospc-", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The ENOSPC test requires an isolated mk8-sava-enospc-* mount.");
+        }
+        return mountRoot;
+    }
+
+    private static void FillUntilNoSpace(string path, int releaseBytes)
     {
         var bytes = new byte[1024 * 1024];
         IOException? noSpace = null;
@@ -124,7 +312,7 @@ public sealed class StorageEnospcHarnessTests
         Assert.Contains("No space left on device", noSpace.Message, StringComparison.OrdinalIgnoreCase);
         using var release = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
         Assert.True(release.Length >= 8 * 1024 * 1024);
-        release.SetLength(release.Length - 256 * 1024);
+        release.SetLength(release.Length - releaseBytes);
         release.Flush(flushToDisk: true);
     }
 
@@ -147,5 +335,28 @@ public sealed class StorageEnospcHarnessTests
                 }),
                 Retry = { MaxRetries = 0 }
             });
+    }
+
+    private sealed class RecordingStorageFaultInjector : IStorageFaultInjector
+    {
+        private int _stagingCompleted;
+        private int _packAppendStarted;
+
+        public bool StagingCompleted => Volatile.Read(ref _stagingCompleted) != 0;
+        public bool PackAppendStarted => Volatile.Read(ref _packAppendStarted) != 0;
+
+        public void Reset()
+        {
+            Interlocked.Exchange(ref _stagingCompleted, 0);
+            Interlocked.Exchange(ref _packAppendStarted, 0);
+        }
+
+        public void Inject(StorageFaultPoint point)
+        {
+            if (point == StorageFaultPoint.BeforeChunkPublication)
+                Interlocked.Exchange(ref _stagingCompleted, 1);
+            if (point == StorageFaultPoint.DuringPackRecordAppend)
+                Interlocked.Exchange(ref _packAppendStarted, 1);
+        }
     }
 }
