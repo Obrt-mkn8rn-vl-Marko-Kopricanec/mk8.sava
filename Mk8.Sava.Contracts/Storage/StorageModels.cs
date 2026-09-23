@@ -362,7 +362,8 @@ internal sealed class MetadataBackupSnapshot(
 
 internal sealed record MetadataDatabaseInspection(
     int SchemaVersion,
-    StorageMetadataInventory Inventory);
+    StorageMetadataInventory Inventory,
+    IReadOnlyDictionary<string, bool> AccountNamespaceModes);
 
 public sealed record StorageUsageSnapshot(
     long LogicalBlobBytes,

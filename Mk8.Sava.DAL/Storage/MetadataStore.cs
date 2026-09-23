@@ -2885,7 +2885,16 @@ public sealed class MetadataStore(
 
         var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
         var inventory = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken);
-        return new MetadataDatabaseInspection(schemaVersion, inventory);
+        var namespaceModes = new Dictionary<string, bool>(StringComparer.Ordinal);
+        if (schemaVersion >= CurrentSchemaVersion)
+        {
+            await using var modes = connection.CreateCommand();
+            modes.CommandText = "SELECT account, hierarchical_namespace_enabled FROM account_namespace_modes;";
+            await using var reader = await modes.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+                namespaceModes.Add(reader.GetString(0), reader.GetInt32(1) == 1);
+        }
+        return new MetadataDatabaseInspection(schemaVersion, inventory, namespaceModes);
     }
 
     internal static async Task NormalizePackedLocationsForStandaloneBackupAsync(

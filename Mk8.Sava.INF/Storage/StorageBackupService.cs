@@ -208,6 +208,16 @@ public sealed class StorageBackupService(
         var inspection = await MetadataStore.InspectDatabaseAsync(metadataPath, cancellationToken);
         if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
             throw new InvalidDataException("The backup manifest and metadata database schema versions do not match.");
+        foreach (var (account, recordedMode) in inspection.AccountNamespaceModes)
+        {
+            if (options.Accounts.ContainsKey(account) &&
+                (options.AccountCapabilities.TryGetValue(account, out var capabilities) &&
+                 capabilities.HierarchicalNamespaceEnabled) != recordedMode)
+            {
+                throw new InvalidDataException(
+                    $"The configured hierarchical namespace mode for account '{account}' differs from the backed-up mode.");
+            }
+        }
         if (inspection.Inventory.BlobRecordCount != manifest.BlobRecordCount ||
             inspection.Inventory.StagedBlockCount != manifest.StagedBlockCount ||
             inspection.Inventory.LogicalBlobBytes != manifest.LogicalBlobBytes ||
