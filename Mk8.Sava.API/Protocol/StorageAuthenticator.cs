@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Claims;
 using System.Text;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
@@ -153,6 +154,87 @@ internal sealed class StorageAuthenticator(
         StorageRequestContext request,
         bool requireDataAuthorization)
     {
+        var (principal, subject, objectId, granted, accountWide, canGenerateUserDelegationKey) =
+            await AuthenticateBearerClaimsAsync(context, request).ConfigureAwait(false);
+
+        var acl = await GrantBearerAclsAsync(
+            context,
+            request,
+            principal,
+            objectId,
+            granted,
+            requireDataAuthorization).ConfigureAwait(false);
+
+        if (requireDataAuthorization && granted.Count == 0)
+            throw AzureStorageException.AuthorizationFailure();
+        var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
+        return new StorageAuthorization(
+            StorageAuthorizationKind.Bearer,
+            permissions,
+            Identifier: subject,
+            TenantId: principal.FindFirst("tid")?.Value,
+            CanGenerateUserDelegationKey: canGenerateUserDelegationKey,
+            ApplicationId: principal.FindFirst("appid")?.Value ?? principal.FindFirst("azp")?.Value,
+            Audience: principal.FindFirst("aud")?.Value,
+            Issuer: principal.FindFirst("iss")?.Value,
+            UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value,
+            AccountWidePermissions: new string("racwdxytlfmeiopk".Where(accountWide.Contains).ToArray()),
+            AclReadChecked: acl.ReadChecked,
+            AclAuthorizedGenerationId: acl.AuthorizedGenerationId,
+            AclListChecked: acl.ListChecked,
+            AclListObjectId: acl.ListChecked ? objectId : null,
+            AclListGroups: acl.ListGroups,
+            AclMutationChecked: acl.MutationChecked,
+            AclMutationObjectId: acl.MutationChecked ? objectId : null,
+            AclMutationGroups: acl.MutationGroups,
+            AclAppendChecked: acl.AppendChecked,
+            AclAppendObjectId: acl.AppendChecked ? objectId : null,
+            AclAppendGroups: acl.AppendGroups);
+    }
+
+    private async Task<BearerAclGrants> GrantBearerAclsAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        ClaimsPrincipal principal,
+        string? objectId,
+        HashSet<char> granted,
+        bool requireDataAuthorization)
+    {
+        var (readChecked, authorizedGenerationId) = await TryGrantAclReadAsync(
+            context, request, principal, objectId, granted, requireDataAuthorization).ConfigureAwait(false);
+        var (listChecked, listGroups) = await TryGrantAclListAsync(
+            context, request, principal, objectId, granted, requireDataAuthorization).ConfigureAwait(false);
+        var (mutationChecked, mutationGroups) = await TryGrantAclMutationAsync(
+            context, request, principal, objectId, granted, requireDataAuthorization).ConfigureAwait(false);
+        var (appendChecked, appendGroups, appendGenerationId) = await TryGrantAclAppendAsync(
+            context, request, principal, objectId, granted, requireDataAuthorization).ConfigureAwait(false);
+        if (appendChecked)
+            authorizedGenerationId = appendGenerationId;
+        return new BearerAclGrants(
+            readChecked,
+            authorizedGenerationId,
+            listChecked,
+            listGroups,
+            mutationChecked,
+            mutationGroups,
+            appendChecked,
+            appendGroups);
+    }
+
+    private readonly record struct BearerAclGrants(
+        bool ReadChecked,
+        string? AuthorizedGenerationId,
+        bool ListChecked,
+        HashSet<string>? ListGroups,
+        bool MutationChecked,
+        HashSet<string>? MutationGroups,
+        bool AppendChecked,
+        HashSet<string>? AppendGroups);
+
+    private async Task<(ClaimsPrincipal Principal, string Subject, string? ObjectId,
+        HashSet<char> Granted, HashSet<char> AccountWide, bool CanGenerateUserDelegationKey)>
+        AuthenticateBearerClaimsAsync(HttpContext context, StorageRequestContext request)
+    {
         var configuration = _options.BearerAuthentication;
         if (!configuration.Enabled)
             throw AzureStorageException.BearerAuthenticationRequired();
@@ -170,13 +252,13 @@ internal sealed class StorageAuthenticator(
             throw AzureStorageException.AuthorizationFailure();
 
         var granted = new HashSet<char>();
-        var mappedAccessApplies = false;
+        var canGenerateUserDelegationKey = false;
         if (configuration.Principals.TryGetValue(subject, out var access) &&
             Covers(access.Accounts, request.Account) &&
             (request.Container is null || Covers(access.Containers, request.Container)))
         {
             granted.UnionWith(access.Permissions);
-            mappedAccessApplies = true;
+            canGenerateUserDelegationKey = access.CanGenerateUserDelegationKey;
         }
 
         var accountWide = new HashSet<char>();
@@ -188,150 +270,159 @@ internal sealed class StorageAuthenticator(
                 accountWide.UnionWith(rolePermissions);
             }
         }
+        return (principal, subject, objectId, granted, accountWide, canGenerateUserDelegationKey);
+    }
 
-        var aclReadChecked = false;
-        string? aclAuthorizedGenerationId = null;
-        if (requireDataAuthorization &&
-            !granted.Contains('r') &&
-            objectId is not null &&
-            Guid.TryParse(objectId, out _) &&
-            IsHierarchicalNamespaceEnabled(request.Account) &&
-            request.ResourceKind == StorageResourceKind.Blob &&
-            HierarchicalAclAuthorization.IsBlobReadOperation(context.Request))
+    private async Task<(bool Checked, string? GenerationId)> TryGrantAclReadAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        ClaimsPrincipal principal,
+        string? objectId,
+        HashSet<char> granted,
+        bool requireDataAuthorization)
+    {
+        if (!requireDataAuthorization ||
+            granted.Contains('r') ||
+            objectId is null ||
+            !Guid.TryParse(objectId, out _) ||
+            !IsHierarchicalNamespaceEnabled(request.Account) ||
+            request.ResourceKind != StorageResourceKind.Blob ||
+            !HierarchicalAclAuthorization.IsBlobReadOperation(context.Request))
+            return (false, null);
+        try
         {
-            try
-            {
-                var groups = principal.FindAll("groups")
-                    .Select(claim => claim.Value)
-                    .Where(value => Guid.TryParse(value, out _))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
-                    metadata,
-                    context.Request,
-                    request,
-                    objectId,
-                    groups,
-                    "r",
-                    context.RequestAborted).ConfigureAwait(false);
-                aclReadChecked = true;
-                granted.Add('r');
-            }
-            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
-            {
-                // An ACL cannot grant this read; retain only the configured RBAC grants.
-            }
+            var generationId = await HierarchicalAclAuthorization.EnsureReadAsync(
+                metadata,
+                context.Request,
+                request,
+                objectId,
+                GetAclGroups(principal),
+                "r",
+                context.RequestAborted).ConfigureAwait(false);
+            granted.Add('r');
+            return (true, generationId);
         }
-
-        var aclListChecked = false;
-        HashSet<string>? aclListGroups = null;
-        if (requireDataAuthorization &&
-            !granted.Contains('l') &&
-            objectId is not null &&
-            Guid.TryParse(objectId, out _) &&
-            IsHierarchicalNamespaceEnabled(request.Account) &&
-            HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
+        catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
         {
-            try
-            {
-                var groups = principal.FindAll("groups")
-                    .Select(claim => claim.Value)
-                    .Where(value => Guid.TryParse(value, out _))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                    metadata, context.Request, request, objectId, groups, "l", context.RequestAborted).ConfigureAwait(false);
-                aclListGroups = groups;
-                aclListChecked = true;
-                granted.Add('l');
-            }
-            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
-            {
-                // An ACL cannot grant this list; retain only the configured RBAC grants.
-            }
+            // An ACL cannot grant this read; retain only the configured RBAC grants.
+            return (false, null);
         }
+    }
 
-        var aclMutationChecked = false;
-        HashSet<string>? aclMutationGroups = null;
+    private static HashSet<string> GetAclGroups(ClaimsPrincipal principal) => principal.FindAll("groups")
+        .Select(claim => claim.Value)
+        .Where(value => Guid.TryParse(value, out _))
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private async Task<(bool Checked, HashSet<string>? Groups)> TryGrantAclListAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        ClaimsPrincipal principal,
+        string? objectId,
+        HashSet<char> granted,
+        bool requireDataAuthorization)
+    {
+        if (!requireDataAuthorization ||
+            granted.Contains('l') ||
+            objectId is null ||
+            !Guid.TryParse(objectId, out _) ||
+            !IsHierarchicalNamespaceEnabled(request.Account) ||
+            !HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
+            return (false, null);
+        try
+        {
+            var groups = GetAclGroups(principal);
+            await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
+                metadata,
+                context.Request,
+                request,
+                objectId,
+                groups,
+                "l",
+                context.RequestAborted).ConfigureAwait(false);
+            granted.Add('l');
+            return (true, groups);
+        }
+        catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
+        {
+            // An ACL cannot grant this list; retain only the configured RBAC grants.
+            return (false, null);
+        }
+    }
+
+    private async Task<(bool Checked, HashSet<string>? Groups)> TryGrantAclMutationAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        ClaimsPrincipal principal,
+        string? objectId,
+        HashSet<char> granted,
+        bool requireDataAuthorization)
+    {
         var parentMutationPermission = HierarchicalAclAuthorization.GetParentMutationPermission(
             context.Request, request);
-        if (requireDataAuthorization &&
-            parentMutationPermission is { } mutationPermission &&
-            !granted.Contains(mutationPermission) &&
-            objectId is not null &&
-            Guid.TryParse(objectId, out _) &&
-            IsHierarchicalNamespaceEnabled(request.Account))
+        if (!requireDataAuthorization ||
+            parentMutationPermission is not { } mutationPermission ||
+            granted.Contains(mutationPermission) ||
+            objectId is null ||
+            !Guid.TryParse(objectId, out _) ||
+            !IsHierarchicalNamespaceEnabled(request.Account))
+            return (false, null);
+        try
         {
-            try
-            {
-                var groups = principal.FindAll("groups")
-                    .Select(claim => claim.Value)
-                    .Where(value => Guid.TryParse(value, out _))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                await HierarchicalAclAuthorization.EnsureParentMutationAsync(
-                    metadata, context.Request, request, objectId, groups,
-                    mutationPermission.ToString(), context.RequestAborted).ConfigureAwait(false);
-                aclMutationGroups = groups;
-                aclMutationChecked = true;
-                granted.Add(mutationPermission);
-            }
-            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
-            {
-                // An ACL cannot grant this mutation; retain only the configured RBAC grants.
-            }
+            var groups = GetAclGroups(principal);
+            await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+                metadata,
+                context.Request,
+                request,
+                objectId,
+                groups,
+                mutationPermission.ToString(),
+                context.RequestAborted).ConfigureAwait(false);
+            granted.Add(mutationPermission);
+            return (true, groups);
         }
-
-        var aclAppendChecked = false;
-        HashSet<string>? aclAppendGroups = null;
-        if (requireDataAuthorization &&
-            !granted.Contains('a') &&
-            !granted.Contains('w') &&
-            objectId is not null &&
-            Guid.TryParse(objectId, out _) &&
-            IsHierarchicalNamespaceEnabled(request.Account) &&
-            HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
+        catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
         {
-            try
-            {
-                var groups = principal.FindAll("groups")
-                    .Select(claim => claim.Value)
-                    .Where(value => Guid.TryParse(value, out _))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
-                    metadata, context.Request, request, objectId, groups, "a", context.RequestAborted).ConfigureAwait(false);
-                aclAppendGroups = groups;
-                aclAppendChecked = true;
-                granted.Add('a');
-            }
-            catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
-            {
-                // An ACL cannot grant this append; retain only the configured RBAC grants.
-            }
+            // An ACL cannot grant this mutation; retain only the configured RBAC grants.
+            return (false, null);
         }
+    }
 
-        if (requireDataAuthorization && granted.Count == 0)
-            throw AzureStorageException.AuthorizationFailure();
-        var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
-        return new StorageAuthorization(
-            StorageAuthorizationKind.Bearer,
-            permissions,
-            Identifier: subject,
-            TenantId: principal.FindFirst("tid")?.Value,
-            CanGenerateUserDelegationKey: mappedAccessApplies && access!.CanGenerateUserDelegationKey,
-            ApplicationId: principal.FindFirst("appid")?.Value ?? principal.FindFirst("azp")?.Value,
-            Audience: principal.FindFirst("aud")?.Value,
-            Issuer: principal.FindFirst("iss")?.Value,
-            UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value,
-            AccountWidePermissions: new string("racwdxytlfmeiopk".Where(accountWide.Contains).ToArray()),
-            AclReadChecked: aclReadChecked,
-            AclAuthorizedGenerationId: aclAuthorizedGenerationId,
-            AclListChecked: aclListChecked,
-            AclListObjectId: aclListChecked ? objectId : null,
-            AclListGroups: aclListGroups,
-            AclMutationChecked: aclMutationChecked,
-            AclMutationObjectId: aclMutationChecked ? objectId : null,
-            AclMutationGroups: aclMutationGroups,
-            AclAppendChecked: aclAppendChecked,
-            AclAppendObjectId: aclAppendChecked ? objectId : null,
-            AclAppendGroups: aclAppendGroups);
+    private async Task<(bool Checked, HashSet<string>? Groups, string? GenerationId)> TryGrantAclAppendAsync(
+        HttpContext context,
+        StorageRequestContext request,
+        ClaimsPrincipal principal,
+        string? objectId,
+        HashSet<char> granted,
+        bool requireDataAuthorization)
+    {
+        if (!requireDataAuthorization ||
+            granted.Contains('a') ||
+            granted.Contains('w') ||
+            objectId is null ||
+            !Guid.TryParse(objectId, out _) ||
+            !IsHierarchicalNamespaceEnabled(request.Account) ||
+            !HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
+            return (false, null, null);
+        try
+        {
+            var groups = GetAclGroups(principal);
+            var generationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
+                metadata,
+                context.Request,
+                request,
+                objectId,
+                groups,
+                "a",
+                context.RequestAborted).ConfigureAwait(false);
+            granted.Add('a');
+            return (true, groups, generationId);
+        }
+        catch (AzureStorageException error) when (string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal))
+        {
+            // An ACL cannot grant this append; retain only the configured RBAC grants.
+            return (false, null, null);
+        }
     }
 
     private StorageAuthorization AuthenticateSharedKey(
