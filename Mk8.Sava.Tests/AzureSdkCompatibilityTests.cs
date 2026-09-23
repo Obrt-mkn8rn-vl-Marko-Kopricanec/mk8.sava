@@ -2236,6 +2236,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 .DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedStranger.Status);
 
+        await AssertBearerAclNegativeCasesAsync(application, owner, ownerObjectId, containerName);
+    }
+
+    private static async Task AssertBearerAclNegativeCasesAsync(
+        SavaWebApplicationFactory application, BlobServiceClient owner, string ownerObjectId, string containerName)
+    {
         var appOnlyKey = new SymmetricSecurityKey(
             Convert.FromBase64String(SavaWebApplicationFactory.AccountKey))
         {
@@ -2252,16 +2258,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var deniedWithoutOid = await Assert.ThrowsAsync<RequestFailedException>(() =>
             appOnly.GetBlobContainerClient(containerName)
                 .GetBlobClient("parent/owned.txt")
-                .DownloadContentAsync());
+                .DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedWithoutOid.Status);
 
         var sharedContainerName = $"hns-shared-root-{Guid.NewGuid():N}";
-        await CreateClient(application).GetBlobContainerClient(sharedContainerName).CreateAsync();
+        await CreateClient(application).GetBlobContainerClient(sharedContainerName).CreateAsync().ConfigureAwait(false);
         var sharedRootBlob = owner.GetBlobContainerClient(sharedContainerName)
             .GetBlobClient("owner-file.txt");
-        await sharedRootBlob.UploadAsync(BinaryData.FromString("owned-file"));
+        await sharedRootBlob.UploadAsync(BinaryData.FromString("owned-file")).ConfigureAwait(false);
         var deniedRoot = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            sharedRootBlob.DownloadContentAsync());
+            sharedRootBlob.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedRoot.Status);
     }
 
@@ -2790,33 +2796,39 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 AccessAcl = folderAcl
             });
 
+        await AssertParentAclMutationsAsync(application, container, writerObjectId);
+    }
+
+    private static async Task AssertParentAclMutationsAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, string writerObjectId)
+    {
         var writer = CreateBearerClient(application,
             CreateJwt(SavaWebApplicationFactory.AccountKey, writerObjectId))
             .GetBlobContainerClient(container.Name);
-        await writer.GetBlobClient("folder/new.txt").UploadAsync(BinaryData.FromString("new"));
+        await writer.GetBlobClient("folder/new.txt").UploadAsync(BinaryData.FromString("new")).ConfigureAwait(false);
         await writer.GetBlobClient("folder/existing.txt")
-            .UploadAsync(BinaryData.FromString("replaced"), overwrite: true);
-        await writer.GetBlobClient("folder/delete.txt").DeleteAsync();
+            .UploadAsync(BinaryData.FromString("replaced"), overwrite: true).ConfigureAwait(false);
+        await writer.GetBlobClient("folder/delete.txt").DeleteAsync().ConfigureAwait(false);
         var staged = writer.GetBlockBlobClient("folder/staged.txt");
         var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes("block-1"));
-        await staged.StageBlockAsync(blockId, new MemoryStream("staged"u8.ToArray(), writable: false));
-        await staged.CommitBlockListAsync([blockId]);
-        Assert.Equal("new", (await container.GetBlobClient("folder/new.txt").DownloadContentAsync())
+        await staged.StageBlockAsync(blockId, new MemoryStream("staged"u8.ToArray(), writable: false)).ConfigureAwait(false);
+        await staged.CommitBlockListAsync([blockId]).ConfigureAwait(false);
+        Assert.Equal("new", (await container.GetBlobClient("folder/new.txt").DownloadContentAsync().ConfigureAwait(false))
             .Value.Content.ToString());
-        Assert.Equal("replaced", (await container.GetBlobClient("folder/existing.txt").DownloadContentAsync())
+        Assert.Equal("replaced", (await container.GetBlobClient("folder/existing.txt").DownloadContentAsync().ConfigureAwait(false))
             .Value.Content.ToString());
-        Assert.False((await container.GetBlobClient("folder/delete.txt").ExistsAsync()).Value);
-        Assert.Equal("staged", (await container.GetBlobClient("folder/staged.txt").DownloadContentAsync())
+        Assert.False((await container.GetBlobClient("folder/delete.txt").ExistsAsync().ConfigureAwait(false)).Value);
+        Assert.Equal("staged", (await container.GetBlobClient("folder/staged.txt").DownloadContentAsync().ConfigureAwait(false))
             .Value.Content.ToString());
 
         var rootDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
             writer.GetBlobClient("root-existing.txt").UploadAsync(
-                BinaryData.FromString("forbidden"), overwrite: true));
+                BinaryData.FromString("forbidden"), overwrite: true)).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, rootDenied.Status);
         var missingParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            writer.GetBlobClient("missing/child.txt").UploadAsync(BinaryData.FromString("forbidden")));
+            writer.GetBlobClient("missing/child.txt").UploadAsync(BinaryData.FromString("forbidden"))).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, missingParent.Status);
-        Assert.Equal("root", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync())
+        Assert.Equal("root", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync().ConfigureAwait(false))
             .Value.Content.ToString());
 
         await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
@@ -2825,10 +2837,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Container = container.Name,
             Path = string.Empty,
             AccessAcl = $"user::rwx,user:{writerObjectId}:-wx,group::r-x,mask::rwx,other::---"
-        });
+        }).ConfigureAwait(false);
         await writer.GetBlobClient("root-existing.txt")
-            .UploadAsync(BinaryData.FromString("root-replaced"), overwrite: true);
-        Assert.Equal("root-replaced", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync())
+            .UploadAsync(BinaryData.FromString("root-replaced"), overwrite: true).ConfigureAwait(false);
+        Assert.Equal("root-replaced", (await container.GetBlobClient("root-existing.txt").DownloadContentAsync().ConfigureAwait(false))
             .Value.Content.ToString());
     }
 
@@ -3182,38 +3194,44 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("before snapshot", (await snapshot.DownloadContentAsync()).Value.Content.ToString());
         Assert.Equal("after snapshot", (await blob.DownloadContentAsync()).Value.Content.ToString());
 
+        await AssertHierarchicalSnapshotFamilyAsync(container, blob, snapshot, snapshotInfo.Snapshot, metadata);
+    }
+
+    private static async Task AssertHierarchicalSnapshotFamilyAsync(
+        BlobContainerClient container, BlobClient blob, BlobClient snapshot, string snapshotId, MetadataStore metadata)
+    {
         var listed = await container.GetBlobsAsync(new GetBlobsOptions
         {
             States = BlobStates.Snapshots,
             Prefix = blob.Name
-        }).ToListAsync();
-        Assert.Contains(listed, item => string.Equals(item.Snapshot, snapshotInfo.Snapshot, StringComparison.Ordinal));
+        }).ToListAsync().ConfigureAwait(false);
+        Assert.Contains(listed, item => string.Equals(item.Snapshot, snapshotId, StringComparison.Ordinal));
 
         var family = await metadata.ListBlobFamilyAsync(
             SavaWebApplicationFactory.SecondAccountName,
             container.Name,
             blob.Name,
             includeDeleted: true,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.All(family, item => Assert.Null(item.VersionId));
-        Assert.Single(family, item => string.Equals(item.Snapshot, snapshotInfo.Snapshot, StringComparison.Ordinal));
+        Assert.Single(family, item => string.Equals(item.Snapshot, snapshotId, StringComparison.Ordinal));
 
-        await snapshot.DeleteAsync();
+        await snapshot.DeleteAsync().ConfigureAwait(false);
         var deletedSnapshot = await metadata.GetBlobAsync(
             SavaWebApplicationFactory.SecondAccountName,
             container.Name,
             blob.Name,
             versionId: null,
-            snapshotInfo.Snapshot,
+            snapshotId,
             includeDeleted: true,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(deletedSnapshot);
         Assert.True(deletedSnapshot.IsDeleted);
-        Assert.Equal(snapshotInfo.Snapshot, deletedSnapshot.Snapshot);
+        Assert.Equal(snapshotId, deletedSnapshot.Snapshot);
         Assert.Null(deletedSnapshot.DeletionId);
 
         var directorySnapshot = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlobClient("folder").CreateSnapshotAsync());
+            container.GetBlobClient("folder").CreateSnapshotAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status409Conflict, directorySnapshot.Status);
         Assert.Equal("BlobOperationNotSupported", directorySnapshot.ErrorCode);
     }
@@ -3986,15 +4004,29 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             matches.Add($"{item.BlobContainerName}/{item.BlobName}");
         Assert.Equal([$"{container.Name}/{tagged.Name}"], matches);
 
+        await AssertObjectScopedAccountSasBatchAsync(sasService, container, deleteTarget, tierTarget);
+
+        var deniedServiceOperation = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sasService.GetPropertiesAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedServiceOperation.Status);
+        Assert.Equal("AuthorizationResourceTypeMismatch", deniedServiceOperation.ErrorCode);
+    }
+
+    private static async Task AssertObjectScopedAccountSasBatchAsync(
+        BlobServiceClient sasService,
+        BlobContainerClient container,
+        BlobClient deleteTarget,
+        BlobClient tierTarget)
+    {
         var serviceBatchClient = sasService.GetBlobBatchClient();
         using (var batch = serviceBatchClient.CreateBatch())
         {
             var deleted = batch.DeleteBlob(container.Name, deleteTarget.Name);
-            var submitted = await serviceBatchClient.SubmitBatchAsync(batch);
+            var submitted = await serviceBatchClient.SubmitBatchAsync(batch).ConfigureAwait(false);
             Assert.Equal(StatusCodes.Status202Accepted, submitted.Status);
             Assert.Equal(StatusCodes.Status202Accepted, deleted.Status);
         }
-        Assert.False((await deleteTarget.ExistsAsync()).Value);
+        Assert.False((await deleteTarget.ExistsAsync().ConfigureAwait(false)).Value);
 
         var containerBatchClient = sasService
             .GetBlobContainerClient(container.Name)
@@ -4002,16 +4034,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var batch = containerBatchClient.CreateBatch())
         {
             var tiered = batch.SetBlobAccessTier(container.Name, tierTarget.Name, AccessTier.Cool);
-            var submitted = await containerBatchClient.SubmitBatchAsync(batch);
+            var submitted = await containerBatchClient.SubmitBatchAsync(batch).ConfigureAwait(false);
             Assert.Equal(StatusCodes.Status202Accepted, submitted.Status);
             Assert.Equal(StatusCodes.Status200OK, tiered.Status);
         }
-        Assert.Equal(AccessTier.Cool, (await tierTarget.GetPropertiesAsync()).Value.AccessTier);
-
-        var deniedServiceOperation = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            sasService.GetPropertiesAsync());
-        Assert.Equal(StatusCodes.Status403Forbidden, deniedServiceOperation.Status);
-        Assert.Equal("AuthorizationResourceTypeMismatch", deniedServiceOperation.ErrorCode);
+        Assert.Equal(AccessTier.Cool, (await tierTarget.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
     }
 
     [Fact]
@@ -5702,29 +5729,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var secondSnapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
             var firstSnapshot = blob.WithSnapshot(firstSnapshotId);
             var secondSnapshot = blob.WithSnapshot(secondSnapshotId);
-            using var transport = new HttpClient(factory.Server.CreateHandler());
-
-            using (var invalidValue = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       blob.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                invalidValue.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                invalidValue.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "Include");
-                using var response = await transport.SendAsync(invalidValue);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            using (var scopedToSnapshot = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       firstSnapshot.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "include");
-                using var response = await transport.SendAsync(scopedToSnapshot);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertSnapshotDeleteHeaderValidationAsync(blob, firstSnapshot, factory);
 
             var snapshotsPresent = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DeleteAsync());
             Assert.Equal(409, snapshotsPresent.Status);
@@ -5754,6 +5759,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
                 original,
                 CancellationToken.None);
+        }
+    }
+
+    private static async Task AssertSnapshotDeleteHeaderValidationAsync(
+        BlobClient blob, BlobClient firstSnapshot, SavaWebApplicationFactory application)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using (var invalidValue = new HttpRequestMessage(
+                   HttpMethod.Delete,
+                   blob.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            invalidValue.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            invalidValue.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "Include");
+            using var response = await transport.SendAsync(invalidValue).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var scopedToSnapshot = new HttpRequestMessage(
+                   HttpMethod.Delete,
+                   firstSnapshot.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "include");
+            using var response = await transport.SendAsync(scopedToSnapshot).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
     }
 
@@ -5867,39 +5899,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(historicalVersionId, historicalProperties.VersionId);
             Assert.False(historicalProperties.IsLatestVersion);
 
-            using var transport = new HttpClient(factory.Server.CreateHandler());
-            using (var currentRequest = new HttpRequestMessage(
-                       HttpMethod.Get,
-                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                currentRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(currentRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal(currentVersionId, response.Headers.GetValues("x-ms-version-id").Single());
-                Assert.Equal("true", response.Headers.GetValues("x-ms-is-current-version").Single());
-            }
-
-            using (var historicalRequest = new HttpRequestMessage(
-                       HttpMethod.Get,
-                       historical.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                historicalRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(historicalRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal(historicalVersionId, response.Headers.GetValues("x-ms-version-id").Single());
-                Assert.Equal("false", response.Headers.GetValues("x-ms-is-current-version").Single());
-            }
-
-            using (var legacyRequest = new HttpRequestMessage(
-                       HttpMethod.Head,
-                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                legacyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
-                using var response = await transport.SendAsync(legacyRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.False(response.Headers.Contains("x-ms-version-id"));
-                Assert.False(response.Headers.Contains("x-ms-is-current-version"));
-            }
+            await AssertVersionedReadHeadersAsync(
+                blob, historical, currentVersionId, historicalVersionId, factory);
         }
         finally
         {
@@ -5907,6 +5908,48 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
                 original,
                 CancellationToken.None);
+        }
+    }
+
+    private static async Task AssertVersionedReadHeadersAsync(
+        BlobClient blob,
+        BlobClient historical,
+        string currentVersionId,
+        string historicalVersionId,
+        SavaWebApplicationFactory application)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using (var currentRequest = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            currentRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(currentRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(currentVersionId, response.Headers.GetValues("x-ms-version-id").Single());
+            Assert.Equal("true", response.Headers.GetValues("x-ms-is-current-version").Single());
+        }
+
+        using (var historicalRequest = new HttpRequestMessage(
+                   HttpMethod.Get,
+                   historical.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            historicalRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(historicalRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(historicalVersionId, response.Headers.GetValues("x-ms-version-id").Single());
+            Assert.Equal("false", response.Headers.GetValues("x-ms-is-current-version").Single());
+        }
+
+        using (var legacyRequest = new HttpRequestMessage(
+                   HttpMethod.Head,
+                   blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            legacyRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
+            using var response = await transport.SendAsync(legacyRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(response.Headers.Contains("x-ms-version-id"));
+            Assert.False(response.Headers.Contains("x-ms-is-current-version"));
         }
     }
 
