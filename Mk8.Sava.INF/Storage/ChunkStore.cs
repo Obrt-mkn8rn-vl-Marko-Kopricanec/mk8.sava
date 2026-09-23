@@ -87,7 +87,7 @@ public sealed class ChunkStore
             encryption,
             source,
             _options.MaximumRequestBodyBytes,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
     public async Task<StoredContent> CopyToDomainPinnedAsync(
         string destinationAccount,
@@ -115,8 +115,8 @@ public sealed class ChunkStore
                 destinationEncryption,
                 input,
                 long.MaxValue,
-                cancellationToken);
-            await producer;
+                cancellationToken).ConfigureAwait(false);
+            await producer.ConfigureAwait(false);
             return copied;
         }
         catch
@@ -125,7 +125,7 @@ public sealed class ChunkStore
             transferCancellation.Cancel();
             try
             {
-                await producer;
+                await producer.ConfigureAwait(false);
             }
             catch
             {
@@ -135,7 +135,7 @@ public sealed class ChunkStore
         }
         finally
         {
-            await pipe.Reader.CompleteAsync();
+            await pipe.Reader.CompleteAsync().ConfigureAwait(false);
         }
 
         async Task ProduceAsync()
@@ -150,7 +150,7 @@ public sealed class ChunkStore
                     0,
                     source.Length,
                     output,
-                    transferCancellation.Token);
+                    transferCancellation.Token).ConfigureAwait(false);
             }
             catch (Exception exception)
             {
@@ -159,7 +159,7 @@ public sealed class ChunkStore
             }
             finally
             {
-                await pipe.Writer.CompleteAsync(failure);
+                await pipe.Writer.CompleteAsync(failure).ConfigureAwait(false);
             }
         }
     }
@@ -180,7 +180,7 @@ public sealed class ChunkStore
 
         try
         {
-            await foreach (var bytes in _chunker.ReadChunksAsync(source, maximumBytes, cancellationToken))
+            await foreach (var bytes in _chunker.ReadChunksAsync(source, maximumBytes, cancellationToken).ConfigureAwait(false))
             {
                 completeHash.AppendData(bytes);
                 completeMd5.AppendData(bytes);
@@ -194,7 +194,7 @@ public sealed class ChunkStore
                 }
                 else
                 {
-                    var id = await StoreVerifiedChunkAsync(domain, bytes, encryption.CustomerProvidedKey, cancellationToken);
+                    var id = await StoreVerifiedChunkAsync(domain, bytes, encryption.CustomerProvidedKey, cancellationToken).ConfigureAwait(false);
                     if (!pinnedIds.Add(id))
                         UnpinId(id);
                     references.Add(new ChunkReference(id, offset, bytes.Length));
@@ -248,7 +248,7 @@ public sealed class ChunkStore
         string destination,
         CancellationToken cancellationToken)
     {
-        var bytes = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        var bytes = await ReadStoredChunkFileBytesAsync(id, cancellationToken).ConfigureAwait(false);
         await using var output = new FileStream(
             destination,
             FileMode.CreateNew,
@@ -256,8 +256,8 @@ public sealed class ChunkStore
             FileShare.None,
             128 * 1024,
             FileOptions.Asynchronous);
-        await output.WriteAsync(bytes, cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
     }
 
@@ -322,7 +322,7 @@ public sealed class ChunkStore
                     offset += chunk.Length;
                     continue;
                 }
-                var bytes = await ReadVerifiedChunkAsync(chunk.Id, domain, encryption.CustomerProvidedKey, cancellationToken);
+                var bytes = await ReadVerifiedChunkAsync(chunk.Id, domain, encryption.CustomerProvidedKey, cancellationToken).ConfigureAwait(false);
                 if (bytes.LongLength != chunk.Length)
                     throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
                 hash.AppendData(bytes);
@@ -354,14 +354,14 @@ public sealed class ChunkStore
         var temporaryPins = new List<IDisposable>();
         try
         {
-            await AppendSliceAsync(account, encryption, current, 0, start, references, temporaryPins, cancellationToken);
+            await AppendSliceAsync(account, encryption, current, 0, start, references, temporaryPins, cancellationToken).ConfigureAwait(false);
             if (clear)
             {
                 AddReference(references, ZeroId(current.Domain), length, current.Domain);
             }
             else
             {
-                var stored = await StorePinnedAsync(account, encryption, replacement!, cancellationToken);
+                var stored = await StorePinnedAsync(account, encryption, replacement!, cancellationToken).ConfigureAwait(false);
                 temporaryPins.Add(stored);
                 if (stored.Manifest.Length != length)
                     throw new EndOfStreamException("The replacement stream length did not match the requested range.");
@@ -376,7 +376,7 @@ public sealed class ChunkStore
                 current.Length - start - length,
                 references,
                 temporaryPins,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return PinSparseManifest(current.Domain, references, temporaryPins);
         }
         catch
@@ -405,7 +405,7 @@ public sealed class ChunkStore
         try
         {
             var retained = Math.Min(length, current.Length);
-            await AppendSliceAsync(account, encryption, current, 0, retained, references, temporaryPins, cancellationToken);
+            await AppendSliceAsync(account, encryption, current, 0, retained, references, temporaryPins, cancellationToken).ConfigureAwait(false);
             if (length > current.Length)
                 AddReference(references, ZeroId(current.Domain), length - current.Length, current.Domain);
             return PinSparseManifest(current.Domain, references, temporaryPins);
@@ -459,16 +459,16 @@ public sealed class ChunkStore
                 var sliceLength = endInChunk - startInChunk;
                 if (IsZero(chunk, manifest.Domain))
                 {
-                    await WriteZeroesAsync(destination, sliceLength, completeHash, cancellationToken);
+                    await WriteZeroesAsync(destination, sliceLength, completeHash, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
-                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken);
+                var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken).ConfigureAwait(false);
                 if (bytes.LongLength != chunk.Length)
                     throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
                 var slice = bytes.AsMemory(checked((int)startInChunk), checked((int)sliceLength));
                 completeHash?.AppendData(slice.Span);
-                await destination.WriteAsync(slice, cancellationToken);
+                await destination.WriteAsync(slice, cancellationToken).ConfigureAwait(false);
             }
 
             if (completeHash is not null)
@@ -492,7 +492,7 @@ public sealed class ChunkStore
         if (manifest.Length > int.MaxValue)
             throw new InvalidOperationException("The content is too large to materialize in memory.");
         using var buffer = new MemoryStream((int)manifest.Length);
-        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, buffer, cancellationToken);
+        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, buffer, cancellationToken).ConfigureAwait(false);
         return buffer.ToArray();
     }
 
@@ -503,8 +503,8 @@ public sealed class ChunkStore
     {
         var path = Path.Combine(_paths.Staging, $"materialized-{Guid.NewGuid():N}.tmp");
         await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
-        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, output, cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await WriteRangeAsync(manifest, encryption, 0, manifest.Length, output, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
         return path;
     }
@@ -519,7 +519,7 @@ public sealed class ChunkStore
         var standalone = EnumerateStorageIdsOrdered(_paths.Chunks, relativeDirectory: string.Empty, after, ".chunk")
             .Take(checked(maximum + 1))
             .ToList();
-        var packed = await _metadata.ListPackedChunkIdsAsync(after, maximum, cancellationToken);
+        var packed = await _metadata.ListPackedChunkIdsAsync(after, maximum, cancellationToken).ConfigureAwait(false);
         var items = standalone
             .Concat(packed.Items)
             .Distinct(StringComparer.Ordinal)
@@ -551,7 +551,7 @@ public sealed class ChunkStore
         string? after = null;
         while (true)
         {
-            var page = await _metadata.ListPackedChunkIdsAsync(after, 512, cancellationToken);
+            var page = await _metadata.ListPackedChunkIdsAsync(after, 512, cancellationToken).ConfigureAwait(false);
             foreach (var id in page.Items)
                 yield return id;
             if (!page.HasMore)
@@ -569,11 +569,11 @@ public sealed class ChunkStore
         if (!pack.Sealed)
             return PackCompactionResult.Skipped;
         var gate = _packGates.GetOrAdd(pack.Domain, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var oldPath = GetPackPath(pack.PackId);
-            var locations = await _metadata.ListPackedChunkLocationsAsync(pack.PackId, cancellationToken);
+            var locations = await _metadata.ListPackedChunkLocationsAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
             long oldLength;
             try
             {
@@ -583,7 +583,7 @@ public sealed class ChunkStore
             {
                 if (locations.Count == 0)
                 {
-                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken);
+                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken).ConfigureAwait(false);
                     return new PackCompactionResult(1, 1, 0, 0);
                 }
                 throw new InvalidDataException($"Chunk pack '{pack.PackId}' is missing.");
@@ -614,7 +614,7 @@ public sealed class ChunkStore
 
                 if (locations.Count == 0)
                 {
-                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken);
+                    await _metadata.ReplaceChunkPackAsync(pack, null, locations, [], cancellationToken).ConfigureAwait(false);
                     File.Delete(oldPath);
                     return new PackCompactionResult(1, 1, 0, oldLength);
                 }
@@ -646,10 +646,10 @@ public sealed class ChunkStore
                     {
                         foreach (var location in locations)
                         {
-                            _ = await ReadPackedChunkPayloadAsync(location, cancellationToken);
+                            _ = await ReadPackedChunkPayloadAsync(location, cancellationToken).ConfigureAwait(false);
                             var newOffset = destination.Position;
                             source.Position = location.RecordOffset;
-                            await CopyExactlyAsync(source, destination, location.RecordLength, cancellationToken);
+                            await CopyExactlyAsync(source, destination, location.RecordLength, cancellationToken).ConfigureAwait(false);
                             replacements.Add(location with
                             {
                                 PackId = replacement.PackId,
@@ -657,7 +657,7 @@ public sealed class ChunkStore
                                 PayloadOffset = checked(newOffset + location.PayloadOffset - location.RecordOffset)
                             });
                         }
-                        await destination.FlushAsync(cancellationToken);
+                        await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
                         destination.Flush(flushToDisk: true);
                     }
 
@@ -671,7 +671,7 @@ public sealed class ChunkStore
                         replacement,
                         locations,
                         replacements,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                     File.Delete(oldPath);
                     var newLength = new FileInfo(replacementPath).Length;
                     return new PackCompactionResult(1, 1, 0, oldLength - newLength);
@@ -719,7 +719,7 @@ public sealed class ChunkStore
                 continue;
             var domain = packId[..separator];
             var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
-            await gate.WaitAsync(cancellationToken);
+            await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
                 var path = GetPackPath(packId);
@@ -974,7 +974,7 @@ public sealed class ChunkStore
         try
         {
             domain = GetDomainFromChunkId(id);
-            if (!await TryPinIdAsync(id, cancellationToken))
+            if (!await TryPinIdAsync(id, cancellationToken).ConfigureAwait(false))
                 return ChunkIntegrityStatus.Missing;
         }
         catch (FileNotFoundException)
@@ -990,11 +990,11 @@ public sealed class ChunkStore
         {
             if (domain.Contains("/$cpk-", StringComparison.Ordinal))
             {
-                await VerifyCustomerKeyChunkStructureAsync(id, cancellationToken);
+                await VerifyCustomerKeyChunkStructureAsync(id, cancellationToken).ConfigureAwait(false);
                 return ChunkIntegrityStatus.RequiresCustomerKey;
             }
 
-            _ = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken);
+            _ = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken).ConfigureAwait(false);
             return ChunkIntegrityStatus.Verified;
         }
         catch (FileNotFoundException)
@@ -1056,7 +1056,7 @@ public sealed class ChunkStore
         byte[] plaintext;
         try
         {
-            plaintext = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken);
+            plaintext = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is InvalidDataException or FileNotFoundException or UnauthorizedAccessException)
         {
@@ -1074,13 +1074,13 @@ public sealed class ChunkStore
                 customerProvidedKey: null,
                 _options.BackgroundCompressionQuality,
                 _options.CompressionMinimumSavingsBytes,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var verified = await ReadVerifiedChunkFileAsync(
                 temporaryPath,
                 id,
                 domain,
                 customerProvidedKey: null,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             try
             {
                 if (!CryptographicOperations.FixedTimeEquals(verified, plaintext))
@@ -1162,13 +1162,13 @@ public sealed class ChunkStore
                 continue;
             }
 
-            var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken);
+            var bytes = await ReadVerifiedChunkAsync(chunk.Id, manifest.Domain, encryption.CustomerProvidedKey, cancellationToken).ConfigureAwait(false);
             if (bytes.LongLength != chunk.Length)
                 throw new InvalidDataException($"Chunk '{chunk.Id}' has an unexpected decoded length.");
             var offset = checked((int)(overlapStart - chunk.Offset));
             var count = checked((int)overlapLength);
             using var slice = new MemoryStream(bytes, offset, count, writable: false);
-            var stored = await StorePinnedAsync(account, encryption, slice, cancellationToken);
+            var stored = await StorePinnedAsync(account, encryption, slice, cancellationToken).ConfigureAwait(false);
             temporaryPins.Add(stored);
             foreach (var storedChunk in stored.Manifest.Chunks)
                 AddReference(destination, storedChunk.Id, storedChunk.Length, manifest.Domain);
@@ -1236,7 +1236,7 @@ public sealed class ChunkStore
         {
             var count = (int)Math.Min(buffer.Length, length);
             hash?.AppendData(buffer.AsSpan(0, count));
-            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
             length -= count;
         }
     }
@@ -1251,8 +1251,8 @@ public sealed class ChunkStore
         while (length > 0)
         {
             var count = (int)Math.Min(buffer.Length, length);
-            await source.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken);
-            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+            await source.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+            await destination.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
             length -= count;
         }
     }
@@ -1284,12 +1284,12 @@ public sealed class ChunkStore
             var finalPath = GetChunkPath(id);
             while (true)
             {
-                if (await TryPinIdAsync(id, cancellationToken))
+                if (await TryPinIdAsync(id, cancellationToken).ConfigureAwait(false))
                 {
                     var keepPin = false;
                     try
                     {
-                        var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken);
+                        var existing = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey, cancellationToken).ConfigureAwait(false);
                         if (CryptographicOperations.FixedTimeEquals(existing, bytes))
                         {
                             keepPin = true;
@@ -1314,7 +1314,7 @@ public sealed class ChunkStore
                         customerProvidedKey,
                         _options.CompressionQuality,
                         _options.CompressionMinimumSavingsBytes,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                     _faultInjector.Inject(StorageFaultPoint.BeforeChunkPublication);
                     if (_options.EnableSmallChunkPacking &&
                         bytes.Length <= _options.SmallChunkPackingThresholdBytes)
@@ -1323,8 +1323,8 @@ public sealed class ChunkStore
                             id,
                             domain,
                             temporaryPath,
-                            cancellationToken);
-                        if (published && await TryPinIdAsync(id, cancellationToken))
+                            cancellationToken).ConfigureAwait(false);
+                        if (published && await TryPinIdAsync(id, cancellationToken).ConfigureAwait(false))
                         {
                             var keepPin = false;
                             try
@@ -1333,7 +1333,7 @@ public sealed class ChunkStore
                                     id,
                                     domain,
                                     customerProvidedKey,
-                                    cancellationToken);
+                                    cancellationToken).ConfigureAwait(false);
                                 if (!CryptographicOperations.FixedTimeEquals(stored, bytes))
                                     throw new InvalidDataException($"Packed chunk '{id}' changed while it was published.");
                                 keepPin = true;
@@ -1367,7 +1367,7 @@ public sealed class ChunkStore
                     if (created)
                         return id;
                     if (reservationCompletion is not null)
-                        await reservationCompletion.WaitAsync(cancellationToken);
+                        await reservationCompletion.WaitAsync(cancellationToken).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -1385,7 +1385,7 @@ public sealed class ChunkStore
         CancellationToken cancellationToken)
     {
         var gate = _packGates.GetOrAdd(domain, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken);
+        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             // Another writer may have published the same verified bytes while this
@@ -1396,28 +1396,28 @@ public sealed class ChunkStore
             var payloadLength = checked((int)new FileInfo(chunkFilePath).Length);
             var idLength = Encoding.UTF8.GetByteCount(id);
             var recordLength = checked(PackRecordHeaderLength + idLength + payloadLength + PackRecordFooterLength);
-            var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken);
+            var pack = await _metadata.GetActiveChunkPackAsync(domain, cancellationToken).ConfigureAwait(false);
             long committedLength = 0;
             if (pack is not null)
             {
                 var path = GetPackPath(pack.PackId);
-                committedLength = await _metadata.GetPackIndexedLengthAsync(pack.PackId, cancellationToken);
+                committedLength = await _metadata.GetPackIndexedLengthAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
                 if (!File.Exists(path))
                 {
                     if (committedLength != 0)
                         throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is missing.");
-                    await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+                    await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
                     pack = null;
                 }
                 else
                 {
                     if (new FileInfo(path).Length < committedLength)
                         throw new InvalidDataException($"Active chunk pack '{pack.PackId}' is shorter than its indexed records.");
-                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken);
+                    var records = await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
                     if (records >= _options.ChunkPackMaximumRecords ||
                         committedLength + recordLength > _options.ChunkPackTargetBytes)
                     {
-                        await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+                        await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
                         pack = null;
                     }
                 }
@@ -1430,14 +1430,14 @@ public sealed class ChunkStore
                 domain,
                 _metadata.GetUtcNow(),
                 Sealed: false);
-            var location = await AppendPackRecordAsync(pack, id, chunkFilePath, committedLength, cancellationToken);
-            var inserted = await _metadata.TryRegisterPackedChunkAsync(pack, location, cancellationToken);
+            var location = await AppendPackRecordAsync(pack, id, chunkFilePath, committedLength, cancellationToken).ConfigureAwait(false);
+            var inserted = await _metadata.TryRegisterPackedChunkAsync(pack, location, cancellationToken).ConfigureAwait(false);
             if (inserted &&
                 (new FileInfo(GetPackPath(pack.PackId)).Length >= _options.ChunkPackTargetBytes ||
-                 await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken) >=
+                 await _metadata.CountPackedChunksAsync(pack.PackId, cancellationToken).ConfigureAwait(false) >=
                  _options.ChunkPackMaximumRecords))
             {
-                await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken);
+                await _metadata.SealChunkPackAsync(pack.PackId, cancellationToken).ConfigureAwait(false);
             }
             return inserted;
         }
@@ -1457,7 +1457,7 @@ public sealed class ChunkStore
         var idBytes = Encoding.UTF8.GetBytes(id);
         if (idBytes.Length == 0 || idBytes.Length > ushort.MaxValue)
             throw new InvalidDataException("A chunk identifier is too long to pack.");
-        var payload = await File.ReadAllBytesAsync(chunkFilePath, cancellationToken);
+        var payload = await File.ReadAllBytesAsync(chunkFilePath, cancellationToken).ConfigureAwait(false);
         var header = new byte[PackRecordHeaderLength];
         BinaryPrimitives.WriteUInt64LittleEndian(header, PackRecordMagic);
         BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(sizeof(ulong)), checked((ushort)idBytes.Length));
@@ -1488,15 +1488,15 @@ public sealed class ChunkStore
         }
         output.Position = committedLength;
         var recordOffset = committedLength;
-        await output.WriteAsync(header, cancellationToken);
-        await output.WriteAsync(idBytes, cancellationToken);
+        await output.WriteAsync(header, cancellationToken).ConfigureAwait(false);
+        await output.WriteAsync(idBytes, cancellationToken).ConfigureAwait(false);
         var payloadOffset = output.Position;
         var firstHalf = Math.Max(1, payload.Length / 2);
-        await output.WriteAsync(payload.AsMemory(0, firstHalf), cancellationToken);
+        await output.WriteAsync(payload.AsMemory(0, firstHalf), cancellationToken).ConfigureAwait(false);
         _faultInjector.Inject(StorageFaultPoint.DuringPackRecordAppend);
-        await output.WriteAsync(payload.AsMemory(firstHalf), cancellationToken);
-        await output.WriteAsync(footer, cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await output.WriteAsync(payload.AsMemory(firstHalf), cancellationToken).ConfigureAwait(false);
+        await output.WriteAsync(footer, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
         if (recordOffset == 0)
             StorageDurability.FlushDirectory(Path.GetDirectoryName(path)!);
@@ -1527,7 +1527,7 @@ public sealed class ChunkStore
                 Quality = compressionQuality
             }, leaveOpen: true))
             {
-                await brotli.WriteAsync(bytes, cancellationToken);
+                await brotli.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
             }
             if (compressed.Length + compressionMinimumSavingsBytes < bytes.Length)
             {
@@ -1562,10 +1562,10 @@ public sealed class ChunkStore
         }
 
         await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous);
-        await output.WriteAsync(header, cancellationToken);
+        await output.WriteAsync(header, cancellationToken).ConfigureAwait(false);
         _faultInjector.Inject(StorageFaultPoint.DuringChunkStagingWrite);
-        await output.WriteAsync(ciphertext, cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await output.WriteAsync(ciphertext, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
     }
 
@@ -1575,9 +1575,9 @@ public sealed class ChunkStore
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
-        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken).ConfigureAwait(false);
         using var input = new MemoryStream(stored, writable: false);
-        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken);
+        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<byte[]> ReadVerifiedChunkFileAsync(
@@ -1594,7 +1594,7 @@ public sealed class ChunkStore
             FileShare.Read,
             128 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken);
+        return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<byte[]> ReadVerifiedChunkStreamAsync(
@@ -1607,7 +1607,7 @@ public sealed class ChunkStore
         if (!id.StartsWith(domain + "/", StringComparison.Ordinal))
             throw new InvalidDataException("A chunk reference escaped its encryption domain.");
         var header = new byte[HeaderLength];
-        await input.ReadExactlyAsync(header, cancellationToken);
+        await input.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
         if (BinaryPrimitives.ReadUInt64LittleEndian(header) != Magic)
             throw new InvalidDataException($"Chunk '{id}' has an invalid format marker.");
         if (header[sizeof(ulong) + sizeof(byte)] != EncryptionVersion)
@@ -1621,7 +1621,7 @@ public sealed class ChunkStore
         if (ciphertextLength < 0 || ciphertextLength > _options.MaximumChunkBytes)
             throw new InvalidDataException($"Chunk '{id}' has an invalid encoded length.");
         var ciphertext = new byte[ciphertextLength];
-        await input.ReadExactlyAsync(ciphertext, cancellationToken);
+        await input.ReadExactlyAsync(ciphertext, cancellationToken).ConfigureAwait(false);
         var encoded = new byte[ciphertextLength];
         var nonceOffset = sizeof(ulong) + 2 * sizeof(byte) + sizeof(int) + 32;
         var encryptionKey = DeriveEncryptionKey(domain, customerProvidedKey);
@@ -1660,7 +1660,7 @@ public sealed class ChunkStore
                 using (var encodedStream = new MemoryStream(encoded, writable: false))
                 using (var brotli = new BrotliStream(encodedStream, CompressionMode.Decompress))
                 {
-                    await brotli.ReadExactlyAsync(decoded, cancellationToken);
+                    await brotli.ReadExactlyAsync(decoded, cancellationToken).ConfigureAwait(false);
                     if (brotli.ReadByte() != -1)
                         throw new InvalidDataException($"Compressed chunk '{id}' expands beyond its recorded length.");
                 }
@@ -1687,10 +1687,10 @@ public sealed class ChunkStore
 
     private async Task VerifyCustomerKeyChunkStructureAsync(string id, CancellationToken cancellationToken)
     {
-        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken);
+        var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken).ConfigureAwait(false);
         using var input = new MemoryStream(stored, writable: false);
         var header = new byte[HeaderLength];
-        await input.ReadExactlyAsync(header, cancellationToken);
+        await input.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
         if (BinaryPrimitives.ReadUInt64LittleEndian(header) != Magic)
             throw new InvalidDataException($"Chunk '{id}' has an invalid format marker.");
         if (header[sizeof(ulong) + sizeof(byte)] != EncryptionVersion)
@@ -1804,7 +1804,7 @@ public sealed class ChunkStore
             var length = new FileInfo(standalone).Length;
             if (length < HeaderLength || length > _options.MaximumChunkBytes + HeaderLength)
                 throw new InvalidDataException($"Chunk '{id}' has an invalid stored length.");
-            return await File.ReadAllBytesAsync(standalone, cancellationToken);
+            return await File.ReadAllBytesAsync(standalone, cancellationToken).ConfigureAwait(false);
         }
         catch (FileNotFoundException)
         {
@@ -1815,9 +1815,9 @@ public sealed class ChunkStore
             // Packed storage is consulted below.
         }
 
-        var location = await _metadata.GetPackedChunkLocationAsync(id, cancellationToken)
+        var location = await _metadata.GetPackedChunkLocationAsync(id, cancellationToken).ConfigureAwait(false)
                        ?? throw new FileNotFoundException($"Chunk '{id}' is missing.");
-        return await ReadPackedChunkPayloadAsync(location, cancellationToken);
+        return await ReadPackedChunkPayloadAsync(location, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<byte[]> ReadPackedChunkPayloadAsync(
@@ -1845,7 +1845,7 @@ public sealed class ChunkStore
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' extends beyond its pack file.");
         input.Position = location.RecordOffset;
         var header = new byte[PackRecordHeaderLength];
-        await input.ReadExactlyAsync(header, cancellationToken);
+        await input.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
         if (BinaryPrimitives.ReadUInt64LittleEndian(header) != PackRecordMagic)
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has an invalid record marker.");
         var idLength = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(sizeof(ulong)));
@@ -1863,11 +1863,11 @@ public sealed class ChunkStore
         }
 
         var idBytes = new byte[idLength];
-        await input.ReadExactlyAsync(idBytes, cancellationToken);
+        await input.ReadExactlyAsync(idBytes, cancellationToken).ConfigureAwait(false);
         if (!string.Equals(Encoding.UTF8.GetString(idBytes), location.ChunkId, StringComparison.Ordinal))
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has a mismatched record identity.");
         var payload = new byte[payloadLength];
-        await input.ReadExactlyAsync(payload, cancellationToken);
+        await input.ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false);
         var actualHash = SHA256.HashData(payload);
         var expectedHashOffset = sizeof(ulong) + sizeof(ushort) + sizeof(int);
         if (!CryptographicOperations.FixedTimeEquals(
@@ -1877,7 +1877,7 @@ public sealed class ChunkStore
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' failed its record integrity check.");
         }
         var footer = new byte[PackRecordFooterLength];
-        await input.ReadExactlyAsync(footer, cancellationToken);
+        await input.ReadExactlyAsync(footer, cancellationToken).ConfigureAwait(false);
         if (BinaryPrimitives.ReadUInt64LittleEndian(footer) != PackRecordFooterMagic)
             throw new InvalidDataException($"Packed chunk '{location.ChunkId}' has an invalid record footer.");
         return payload;
@@ -1991,7 +1991,7 @@ public sealed class ChunkStore
                 }
             }
 
-            await reservationCompletion.WaitAsync(cancellationToken);
+            await reservationCompletion.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -2046,7 +2046,7 @@ public sealed class ChunkStore
                 return false;
             try
             {
-                return await _owner.CompleteMutationAsync(this, cancellationToken);
+                return await _owner.CompleteMutationAsync(this, cancellationToken).ConfigureAwait(false);
             }
             catch
             {
@@ -2089,7 +2089,7 @@ public sealed class ChunkStore
             }
             deleted = await _metadata.DeletePackedChunkLocationAsync(
                 reservation.Id,
-                cancellationToken) || deleted;
+                cancellationToken).ConfigureAwait(false) || deleted;
             return deleted;
         }
         finally

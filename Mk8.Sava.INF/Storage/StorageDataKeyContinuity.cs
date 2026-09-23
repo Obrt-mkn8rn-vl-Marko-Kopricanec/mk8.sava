@@ -12,11 +12,11 @@ public sealed class StorageDataKeyContinuity(
 
     public async Task EnsureAsync(CancellationToken cancellationToken)
     {
-        var inventory = await metadata.GetStorageInventoryAsync(cancellationToken);
+        var inventory = await metadata.GetStorageInventoryAsync(cancellationToken).ConfigureAwait(false);
         var requiredKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var id in inventory.ReachableChunkIds)
             AddRequiredKey(id);
-        await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(cancellationToken))
+        await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(cancellationToken).ConfigureAwait(false))
             AddRequiredKey(id);
 
         void AddRequiredKey(string id)
@@ -42,19 +42,19 @@ public sealed class StorageDataKeyContinuity(
                 foreach (var id in inventory.ReachableChunkIds)
                 {
                     if (KeyIdForChunk(id) == keyId)
-                        await VerifyAsync(id, keyId, token);
+                        await VerifyAsync(id, keyId, token).ConfigureAwait(false);
                 }
-                await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(token))
+                await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(token).ConfigureAwait(false))
                 {
                     if (!inventory.ReachableChunkIds.Contains(id) && KeyIdForChunk(id) == keyId)
-                        await VerifyAsync(id, keyId, token);
+                        await VerifyAsync(id, keyId, token).ConfigureAwait(false);
                 }
             },
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
         async Task VerifyAsync(string id, string keyId, CancellationToken token)
         {
-            var status = await chunks.VerifyChunkAsync(id, token);
+            var status = await chunks.VerifyChunkAsync(id, token).ConfigureAwait(false);
             if (status != ChunkIntegrityStatus.Verified)
             {
                 throw new InvalidDataException(

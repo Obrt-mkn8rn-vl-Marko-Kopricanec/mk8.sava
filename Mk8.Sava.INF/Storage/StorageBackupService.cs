@@ -41,10 +41,10 @@ public sealed class StorageBackupService(
             using var snapshot = await metadata.CreateBackupSnapshotAsync(
                 metadataPath,
                 chunks.PinChunkIds,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             await MetadataStore.NormalizePackedLocationsForStandaloneBackupAsync(
                 metadataPath,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             FlushFileToDisk(metadataPath);
             StorageDurability.FlushDirectory(temporary);
             var chunkEntries = new List<BackupChunkEntry>();
@@ -53,19 +53,19 @@ public sealed class StorageBackupService(
                          .Order(StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var status = await chunks.VerifyChunkAsync(id, cancellationToken);
+                var status = await chunks.VerifyChunkAsync(id, cancellationToken).ConfigureAwait(false);
                 if (status is ChunkIntegrityStatus.Missing or ChunkIntegrityStatus.Corrupt)
                     throw new InvalidDataException($"Cannot back up chunk '{id}' because its integrity status is {status}.");
 
                 var destinationChunk = GetChunkPath(Path.Combine(temporary, "chunks"), id);
                 StorageDurability.EnsureDirectory(Path.GetDirectoryName(destinationChunk)!);
-                await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken);
+                await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken).ConfigureAwait(false);
                 StorageDurability.FlushDirectory(Path.GetDirectoryName(destinationChunk)!);
-                var copied = await HashFileAsync(destinationChunk, cancellationToken);
+                var copied = await HashFileAsync(destinationChunk, cancellationToken).ConfigureAwait(false);
                 chunkEntries.Add(new BackupChunkEntry(id, copied.Length, copied.Sha256));
             }
 
-            var metadataEntry = await HashFileAsync(metadataPath, cancellationToken);
+            var metadataEntry = await HashFileAsync(metadataPath, cancellationToken).ConfigureAwait(false);
             var manifest = new BackupManifest
             {
                 Format = BackupFormat,
@@ -80,9 +80,9 @@ public sealed class StorageBackupService(
                 KeyRequirements = BuildKeyRequirements(snapshot.Inventory.ReachableChunkIds, _options),
                 Chunks = chunkEntries
             };
-            await WriteManifestAsync(Path.Combine(temporary, ManifestFileName), manifest, cancellationToken);
+            await WriteManifestAsync(Path.Combine(temporary, ManifestFileName), manifest, cancellationToken).ConfigureAwait(false);
             StorageDurability.FlushDirectory(temporary);
-            var validation = await ValidateCoreAsync(temporary, _options, cancellationToken);
+            var validation = await ValidateCoreAsync(temporary, _options, cancellationToken).ConfigureAwait(false);
             StorageDurability.PublishDirectory(temporary, destination);
             return validation with { BackupPath = destination };
         }
@@ -118,8 +118,8 @@ public sealed class StorageBackupService(
         if (IsWithin(target, backup) || IsWithin(backup, target))
             throw new InvalidOperationException("The backup and restore target must not contain one another.");
 
-        var validation = await ValidateCoreAsync(backup, options, cancellationToken);
-        var manifest = await ReadManifestAsync(backup, cancellationToken);
+        var validation = await ValidateCoreAsync(backup, options, cancellationToken).ConfigureAwait(false);
+        var manifest = await ReadManifestAsync(backup, cancellationToken).ConfigureAwait(false);
         var parent = Directory.GetParent(target)?.FullName
             ?? throw new InvalidOperationException("The restore target has no parent directory.");
         StorageDurability.EnsureDirectory(parent);
@@ -131,7 +131,7 @@ public sealed class StorageBackupService(
             var metadataCopy = await CopyAndHashAsync(
                 Path.Combine(backup, MetadataFileName),
                 Path.Combine(temporary, MetadataFileName),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             EnsureFileMatches("metadata database", manifest.Metadata, metadataCopy);
             foreach (var chunk in manifest.Chunks)
             {
@@ -139,13 +139,13 @@ public sealed class StorageBackupService(
                 var source = GetChunkPath(Path.Combine(backup, "chunks"), chunk.Id);
                 var destination = GetChunkPath(Path.Combine(temporary, "chunks"), chunk.Id);
                 StorageDurability.EnsureDirectory(Path.GetDirectoryName(destination)!);
-                var copied = await CopyAndHashAsync(source, destination, cancellationToken);
+                var copied = await CopyAndHashAsync(source, destination, cancellationToken).ConfigureAwait(false);
                 EnsureFileMatches($"chunk '{chunk.Id}'", new BackupFileEntry(chunk.Length, chunk.Sha256), copied);
             }
 
             var inspection = await MetadataStore.InspectDatabaseAsync(
                 Path.Combine(temporary, MetadataFileName),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
                 throw new InvalidDataException("The restored metadata schema version changed while copying the backup.");
             StorageDurability.PublishDirectory(temporary, target);
@@ -167,7 +167,7 @@ public sealed class StorageBackupService(
         if (!Directory.Exists(backup))
             throw new DirectoryNotFoundException($"The backup directory '{backup}' does not exist.");
         EnsureNotReparsePoint(backup, "backup root");
-        var manifest = await ReadManifestAsync(backup, cancellationToken);
+        var manifest = await ReadManifestAsync(backup, cancellationToken).ConfigureAwait(false);
         if (manifest.Metadata is null || manifest.KeyRequirements is null || manifest.Chunks is null)
             throw new InvalidDataException("The backup manifest is missing required fields.");
         if (!string.Equals(manifest.Format, BackupFormat, StringComparison.Ordinal) ||
@@ -203,9 +203,9 @@ public sealed class StorageBackupService(
 
         var metadataPath = Path.Combine(backup, MetadataFileName);
         EnsureRegularFile(metadataPath, "metadata database");
-        var actualMetadata = await HashFileAsync(metadataPath, cancellationToken);
+        var actualMetadata = await HashFileAsync(metadataPath, cancellationToken).ConfigureAwait(false);
         EnsureFileMatches("metadata database", manifest.Metadata, actualMetadata);
-        var inspection = await MetadataStore.InspectDatabaseAsync(metadataPath, cancellationToken);
+        var inspection = await MetadataStore.InspectDatabaseAsync(metadataPath, cancellationToken).ConfigureAwait(false);
         if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
             throw new InvalidDataException("The backup manifest and metadata database schema versions do not match.");
         foreach (var (account, recordedMode) in inspection.AccountNamespaceModes)
@@ -256,7 +256,7 @@ public sealed class StorageBackupService(
                 throw new InvalidDataException($"Chunk '{chunk.Id}' has an invalid physical length.");
             var path = GetChunkPath(Path.Combine(backup, "chunks"), chunk.Id);
             EnsureRegularFile(path, $"chunk '{chunk.Id}'");
-            var actual = await HashFileAsync(path, cancellationToken);
+            var actual = await HashFileAsync(path, cancellationToken).ConfigureAwait(false);
             EnsureFileMatches($"chunk '{chunk.Id}'", new BackupFileEntry(chunk.Length, chunk.Sha256), actual);
             physicalBytes = checked(physicalBytes + actual.Length);
             declaredPaths.Add(Path.GetFullPath(path));
@@ -342,7 +342,7 @@ public sealed class StorageBackupService(
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         try
         {
-            return await JsonSerializer.DeserializeAsync<BackupManifest>(input, JsonOptions, cancellationToken)
+            return await JsonSerializer.DeserializeAsync<BackupManifest>(input, JsonOptions, cancellationToken).ConfigureAwait(false)
                 ?? throw new InvalidDataException("The backup manifest is empty.");
         }
         catch (JsonException exception)
@@ -364,8 +364,8 @@ public sealed class StorageBackupService(
             FileShare.None,
             64 * 1024,
             FileOptions.Asynchronous | FileOptions.WriteThrough);
-        await output.WriteAsync(bytes, cancellationToken);
-        await output.FlushAsync(cancellationToken);
+        await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
     }
 
@@ -394,14 +394,14 @@ public sealed class StorageBackupService(
         long length = 0;
         while (true)
         {
-            var read = await input.ReadAsync(buffer, cancellationToken);
+            var read = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 break;
             hash.AppendData(buffer, 0, read);
-            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
             length = checked(length + read);
         }
-        await output.FlushAsync(cancellationToken);
+        await output.FlushAsync(cancellationToken).ConfigureAwait(false);
         output.Flush(flushToDisk: true);
         StorageDurability.FlushDirectory(Path.GetDirectoryName(destination)!);
         return new BackupFileEntry(length, Convert.ToHexStringLower(hash.GetHashAndReset()));
@@ -422,7 +422,7 @@ public sealed class StorageBackupService(
         long length = 0;
         while (true)
         {
-            var read = await input.ReadAsync(buffer, cancellationToken);
+            var read = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 break;
             hash.AppendData(buffer, 0, read);

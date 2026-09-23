@@ -1,0 +1,2 @@
+T:System.Runtime.Serialization.Formatters.Binary.BinaryFormatter; BinaryFormatter is unsafe for untrusted data. Use explicit, versioned formats.
+T:System.Net.WebRequest; WebRequest bypasses the service's controlled HTTP egress policy. Use the vetted HttpClient path.
