@@ -32,7 +32,9 @@ public sealed record StorageAuthorization(
     string? Issuer = null,
     string? UserPrincipalName = null,
     string AccountWidePermissions = "",
-    string? DelegatedObjectId = null)
+    string? DelegatedObjectId = null,
+    bool AclReadChecked = false,
+    string? AclAuthorizedGenerationId = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
@@ -209,7 +211,8 @@ public sealed class StorageAuthenticator(
             throw AzureStorageException.BearerAuthenticationRequired();
 
         var principal = result.Principal;
-        var subject = principal.FindFirst("oid")?.Value
+        var objectId = principal.FindFirst("oid")?.Value;
+        var subject = objectId
                       ?? principal.FindFirst("sub")?.Value
                       ?? principal.FindFirst("appid")?.Value;
         if (string.IsNullOrEmpty(subject))
@@ -235,6 +238,35 @@ public sealed class StorageAuthenticator(
             }
         }
 
+        var aclReadChecked = false;
+        string? aclAuthorizedGenerationId = null;
+        if (requireDataAuthorization &&
+            !granted.Contains('r') &&
+            objectId is not null &&
+            Guid.TryParse(objectId, out _) &&
+            IsHierarchicalNamespaceEnabled(request.Account) &&
+            request.ResourceKind == StorageResourceKind.Blob &&
+            (HttpMethods.IsGet(context.Request.Method) || HttpMethods.IsHead(context.Request.Method)) &&
+            string.IsNullOrEmpty(context.Request.Query["comp"].ToString()))
+        {
+            try
+            {
+                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureOwnerReadAsync(
+                    metadata,
+                    context.Request,
+                    request,
+                    objectId,
+                    "r",
+                    context.RequestAborted);
+                aclReadChecked = true;
+                granted.Add('r');
+            }
+            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            {
+                // An ACL cannot grant this read; retain only the configured RBAC grants.
+            }
+        }
+
         if (requireDataAuthorization && granted.Count == 0)
             throw AzureStorageException.AuthorizationFailure();
         var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
@@ -248,7 +280,9 @@ public sealed class StorageAuthenticator(
             Audience: principal.FindFirst("aud")?.Value,
             Issuer: principal.FindFirst("iss")?.Value,
             UserPrincipalName: principal.FindFirst("upn")?.Value ?? principal.FindFirst("preferred_username")?.Value,
-            AccountWidePermissions: new string("racwdxytlfmeiopk".Where(accountWide.Contains).ToArray()));
+            AccountWidePermissions: new string("racwdxytlfmeiopk".Where(accountWide.Contains).ToArray()),
+            AclReadChecked: aclReadChecked,
+            AclAuthorizedGenerationId: aclAuthorizedGenerationId);
     }
 
     private StorageAuthorization AuthenticateSharedKey(
@@ -662,9 +696,10 @@ public sealed class StorageAuthenticator(
         ApplyUserBoundSasPolicy(
             request,
             isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
+        string? aclAuthorizedGenerationId = null;
         if (aclObjectId is not null)
         {
-            await HierarchicalAclAuthorization.EnsureReadAsync(
+            aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureOwnerReadAsync(
                 metadata,
                 context.Request,
                 request,
@@ -682,7 +717,9 @@ public sealed class StorageAuthenticator(
             isAccountSas,
             signedResource,
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
-            DelegatedObjectId: delegatedCreatorObjectId);
+            DelegatedObjectId: delegatedCreatorObjectId,
+            AclReadChecked: aclObjectId is not null,
+            AclAuthorizedGenerationId: aclAuthorizedGenerationId);
     }
 
     private static string BuildSharedKeyString(

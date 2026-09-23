@@ -2040,6 +2040,80 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceBearerReadFallsBackToOwnerAclOnlyWithoutAnRbacGrant()
+    {
+        const string ownerObjectId = "475a2329-f852-4d23-acba-b11dde00ff74";
+        const string readerObjectId = "3a90b230-d1cf-4691-9b1e-916d0a5d850c";
+        const string strangerObjectId = "45064256-b8fb-45c6-89a7-589030389341";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Permissions"] = "cw",
+            [$"Sava:BearerAuthentication:Principals:{readerObjectId}:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{readerObjectId}:Permissions"] = "r"
+        });
+        await application.InitializeAsync();
+        var owner = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, ownerObjectId, SavaWebApplicationFactory.TenantId));
+        var reader = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId, SavaWebApplicationFactory.TenantId));
+        var stranger = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, strangerObjectId, SavaWebApplicationFactory.TenantId));
+        var containerName = $"hns-bearer-acl-{Guid.NewGuid():N}";
+        var ownerContainer = owner.GetBlobContainerClient(containerName);
+        await ownerContainer.CreateAsync();
+        var owned = ownerContainer.GetBlobClient("parent/owned.txt");
+        await owned.UploadAsync(BinaryData.FromString("owner-bytes"));
+
+        Assert.Equal("owner-bytes", (await owned.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal(11, (await owned.GetPropertiesAsync()).Value.ContentLength);
+        Assert.Equal(
+            "owner-bytes",
+            (await reader.GetBlobContainerClient(containerName)
+                .GetBlobClient("parent/owned.txt")
+                .DownloadContentAsync()).Value.Content.ToString());
+        var deniedStranger = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            stranger.GetBlobContainerClient(containerName)
+                .GetBlobClient("parent/owned.txt")
+                .DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedStranger.Status);
+
+        var appOnlyKey = new SymmetricSecurityKey(
+            Convert.FromBase64String(SavaWebApplicationFactory.AccountKey))
+        {
+            KeyId = "test-key"
+        };
+        var appOnlyToken = new JwtSecurityTokenHandler().WriteToken(new JwtSecurityToken(
+            issuer: "https://issuer.mk8.test",
+            audience: "https://storage.azure.com/",
+            claims: [new Claim("appid", ownerObjectId), new Claim("tid", SavaWebApplicationFactory.TenantId)],
+            notBefore: DateTime.UtcNow.AddMinutes(-1),
+            expires: DateTime.UtcNow.AddMinutes(10),
+            signingCredentials: new SigningCredentials(appOnlyKey, SecurityAlgorithms.HmacSha256)));
+        var appOnly = CreateBearerClient(application, appOnlyToken);
+        var deniedWithoutOid = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            appOnly.GetBlobContainerClient(containerName)
+                .GetBlobClient("parent/owned.txt")
+                .DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedWithoutOid.Status);
+
+        var sharedContainerName = $"hns-shared-root-{Guid.NewGuid():N}";
+        await CreateClient(application).GetBlobContainerClient(sharedContainerName).CreateAsync();
+        var sharedRootBlob = owner.GetBlobContainerClient(sharedContainerName)
+            .GetBlobClient("owner-file.txt");
+        await sharedRootBlob.UploadAsync(BinaryData.FromString("owned-file"));
+        var deniedRoot = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sharedRootBlob.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedRoot.Status);
+    }
+
+    [Fact]
     public async Task HierarchicalNamespaceBlobIndexTagsRequireTheExplicitPreviewCapability()
     {
         await using var application = new SavaWebApplicationFactory(

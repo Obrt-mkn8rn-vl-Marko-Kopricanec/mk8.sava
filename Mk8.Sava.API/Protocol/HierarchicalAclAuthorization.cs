@@ -4,7 +4,16 @@ namespace Mk8.Sava.Protocol;
 
 internal static class HierarchicalAclAuthorization
 {
-    internal static async Task EnsureReadAsync(
+    internal static void EnsureAuthorizedGeneration(StorageAuthorization authorization, string generationId)
+    {
+        if (authorization.AclReadChecked &&
+            !string.Equals(authorization.AclAuthorizedGenerationId, generationId, StringComparison.Ordinal))
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+    }
+
+    internal static async Task<string?> EnsureOwnerReadAsync(
         MetadataStore metadata,
         HttpRequest http,
         StorageRequestContext request,
@@ -68,7 +77,7 @@ internal static class HierarchicalAclAuthorization
                     cancellationToken);
             }
             if (directory is null && blob is null)
-                return;
+                return null;
             if (directory is null || !directory.IsDirectory ||
                 !HasOwnerPermission(directory.Owner, directory.Permissions, objectId, 'x'))
             {
@@ -82,6 +91,7 @@ internal static class HierarchicalAclAuthorization
         {
             throw AzureStorageException.AuthorizationFailure();
         }
+        return blob?.GenerationId;
     }
 
     private static bool HasOwnerPermission(
