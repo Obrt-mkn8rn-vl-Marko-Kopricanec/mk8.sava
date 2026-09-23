@@ -781,6 +781,34 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         ResolvedBatchSubrequest resolved,
         CancellationToken cancellationToken)
     {
+        var (inner, subrequestContext) = CreateBatchSubrequestContext(outer, outerRequest, resolved);
+        try
+        {
+            return await ExecuteBatchSubrequestCoreAsync(
+                outer,
+                inner,
+                subrequestContext,
+                service,
+                resolved,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+#pragma warning disable CA1031 // Blob Batch reports each subrequest failure as an independent protocol response.
+        catch (Exception exception)
+        {
+            return CreateFailedBatchSubresponse(outer, inner, subrequestContext, resolved, exception);
+        }
+#pragma warning restore CA1031
+    }
+
+    private static (DefaultHttpContext Http, StorageRequestContext Context) CreateBatchSubrequestContext(
+        HttpContext outer,
+        StorageRequestContext outerRequest,
+        ResolvedBatchSubrequest resolved)
+    {
         var inner = new DefaultHttpContext
         {
             RequestServices = outer.RequestServices
@@ -813,135 +841,175 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             Authorization = StorageAuthorization.Anonymous
         };
         StorageRequestContext.Set(inner, subrequestContext);
+        return (inner, subrequestContext);
+    }
 
-        try
+    private static async Task<BlobBatchSubresponse> ExecuteBatchSubrequestCoreAsync(
+        HttpContext outer,
+        HttpContext inner,
+        StorageRequestContext subrequestContext,
+        BlobService service,
+        ResolvedBatchSubrequest resolved,
+        CancellationToken cancellationToken)
+    {
+        ValidateBlobVersionRequest(subrequestContext);
+        var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
+        subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken).ConfigureAwait(false);
+        if (resolved.Snapshot is not null)
+            RequireBlobSnapshots(subrequestContext, service);
+        if (string.Equals(resolved.Container, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
+            resolved.Request.Kind != BlobBatchOperationKind.Delete)
         {
-            ValidateBlobVersionRequest(subrequestContext);
-            var authenticator = outer.RequestServices.GetRequiredService<StorageAuthenticator>();
-            subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken).ConfigureAwait(false);
-            if (resolved.Snapshot is not null)
-                RequireBlobSnapshots(subrequestContext, service);
-            if (string.Equals(resolved.Container, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
-                resolved.Request.Kind != BlobBatchOperationKind.Delete)
-            {
-                throw AzureStorageException.AuthorizationPermissionMismatch();
-            }
-            var permanentDelete = resolved.DeleteType is not null;
-            if (permanentDelete)
-            {
-                if (resolved.Request.Kind != BlobBatchOperationKind.Delete)
-                    throw AzureStorageException.InvalidQuery("deletetype");
-                ValidatePermanentDeleteRequest(subrequestContext, resolved.DeleteType!);
-            }
-            var blob = await service.GetBlobAsync(
-                subrequestContext.Account,
-                resolved.Container,
-                resolved.Blob,
-                resolved.VersionId,
-                resolved.Snapshot,
-                includeDeleted: permanentDelete,
-                cancellationToken).ConfigureAwait(false);
-
-            var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
-            switch (resolved.Request.Kind)
-            {
-                case BlobBatchOperationKind.Delete:
-                    var hasExplicitSnapshotOrVersion = resolved.Snapshot is not null || resolved.VersionId is not null;
-                    var deleteSnapshots = ReadDeleteSnapshotsOption(inner.Request, hasExplicitSnapshotOrVersion);
-                    Require(
-                        subrequestContext,
-                        permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
-                    EvaluateWriteConditions(inner.Request, blob);
-                    EnsureLease(inner.Request, blob.Lease, "blob");
-                    if (permanentDelete)
-                    {
-                        await service.PermanentlyDeleteBlobAsync(
-                            blob,
-                            hasExplicitSnapshotOrVersion,
-                            cancellationToken).ConfigureAwait(false);
-                        headers["x-ms-delete-type-permanent"] = "true";
-                    }
-                    else
-                    {
-                        var properties = await service.GetServicePropertiesAsync(subrequestContext.Account, cancellationToken).ConfigureAwait(false);
-                        await service.DeleteBlobAsync(
-                            blob,
-                            hasExplicitSnapshotOrVersion,
-                            deleteSnapshots,
-                            cancellationToken).ConfigureAwait(false);
-                        if (IsServiceVersionAtLeast(subrequestContext, new DateOnly(2017, 7, 29)))
-                            headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
-                    }
-                    return new BlobBatchSubresponse(
-                        StatusCodes.Status202Accepted,
-                        headers,
-                        [],
-                        resolved.Request.ContentId);
-
-                case BlobBatchOperationKind.SetTier:
-                    if (resolved.Snapshot is not null)
-                    {
-                        RequireFeatureVersion(
-                            subrequestContext,
-                            new DateOnly(2019, 12, 12),
-                            "Set Blob Tier on a snapshot");
-                    }
-                    Require(subrequestContext, 'w');
-                    EvaluateTagCondition(inner.Request, blob, "x-ms-if-tags", source: false);
-                    ValidateOptionalLease(inner.Request, blob.Lease, "blob");
-                    var tier = ProtocolParsing.First(inner.Request.Headers, "x-ms-access-tier")
-                               ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
-                    ValidateAccessTierVersion(inner.Request, tier);
-                    var rehydratePriority = ReadRehydratePriority(inner.Request);
-                    var tierUpdate = await service.SetTierAsync(
-                        blob,
-                        tier,
-                        rehydratePriority,
-                        IsServiceVersionAtLeast(subrequestContext, new DateOnly(2020, 6, 12)),
-                        IsServiceVersionAtLeast(subrequestContext, new DateOnly(2023, 8, 3)),
-                        cancellationToken).ConfigureAwait(false);
-                    return new BlobBatchSubresponse(
-                        tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
-                        headers,
-                        [],
-                        resolved.Request.ContentId);
-
-                default:
-                    throw new InvalidOperationException("Unsupported batch operation kind.");
-            }
+            throw AzureStorageException.AuthorizationPermissionMismatch();
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        var permanentDelete = resolved.DeleteType is not null;
+        if (permanentDelete)
         {
-            throw;
+            if (resolved.Request.Kind != BlobBatchOperationKind.Delete)
+                throw AzureStorageException.InvalidQuery("deletetype");
+            ValidatePermanentDeleteRequest(subrequestContext, resolved.DeleteType!);
         }
-#pragma warning disable CA1031 // Blob Batch reports each subrequest failure as an independent protocol response.
-        catch (Exception exception)
+        var blob = await service.GetBlobAsync(
+            subrequestContext.Account,
+            resolved.Container,
+            resolved.Blob,
+            resolved.VersionId,
+            resolved.Snapshot,
+            includeDeleted: permanentDelete,
+            cancellationToken).ConfigureAwait(false);
+
+        var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
+        return resolved.Request.Kind switch
         {
-            var storageException = MapBatchException(exception);
-            if (string.Equals(storageException.ErrorCode, "InternalError", StringComparison.Ordinal))
-            {
-                StorageLogMessages.BlobBatchSubrequestFailed(
-                    outer.RequestServices
-                        .GetRequiredService<ILoggerFactory>()
-                        .CreateLogger(typeof(BlobProtocolEndpoint)),
-                    exception,
-                    subrequestContext.RequestId);
-            }
-            var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
-            headers["x-ms-error-code"] = storageException.ErrorCode;
-            foreach (var header in storageException.ResponseHeaders)
-                headers[header.Key] = header.Value;
-            headers["Content-Type"] = "application/xml";
-            if (storageException.StatusCode == StatusCodes.Status401Unauthorized)
-                headers["WWW-Authenticate"] = "Bearer resource_id=\"https://storage.azure.com/\"";
-            var body = BuildBatchErrorBody(storageException, subrequestContext.RequestId);
-            return new BlobBatchSubresponse(
-                storageException.StatusCode,
+            BlobBatchOperationKind.Delete => await ExecuteBatchDeleteAsync(
+                inner.Request,
+                subrequestContext,
+                service,
+                resolved,
+                blob,
+                permanentDelete,
                 headers,
-                body,
-                resolved.Request.ContentId);
+                cancellationToken).ConfigureAwait(false),
+            BlobBatchOperationKind.SetTier => await ExecuteBatchSetTierAsync(
+                inner.Request,
+                subrequestContext,
+                service,
+                resolved,
+                blob,
+                headers,
+                cancellationToken).ConfigureAwait(false),
+            _ => throw new InvalidOperationException("Unsupported batch operation kind.")
+        };
+    }
+
+    private static async Task<BlobBatchSubresponse> ExecuteBatchDeleteAsync(
+        HttpRequest request,
+        StorageRequestContext context,
+        BlobService service,
+        ResolvedBatchSubrequest resolved,
+        BlobRecord blob,
+        bool permanentDelete,
+        Dictionary<string, string> headers,
+        CancellationToken cancellationToken)
+    {
+        var hasExplicitSnapshotOrVersion = resolved.Snapshot is not null || resolved.VersionId is not null;
+        var deleteSnapshots = ReadDeleteSnapshotsOption(request, hasExplicitSnapshotOrVersion);
+        Require(context, permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
+        EvaluateWriteConditions(request, blob);
+        EnsureLease(request, blob.Lease, "blob");
+        if (permanentDelete)
+        {
+            await service.PermanentlyDeleteBlobAsync(
+                blob,
+                hasExplicitSnapshotOrVersion,
+                cancellationToken).ConfigureAwait(false);
+            headers["x-ms-delete-type-permanent"] = "true";
         }
-#pragma warning restore CA1031
+        else
+        {
+            var properties = await service.GetServicePropertiesAsync(context.Account, cancellationToken).ConfigureAwait(false);
+            await service.DeleteBlobAsync(
+                blob,
+                hasExplicitSnapshotOrVersion,
+                deleteSnapshots,
+                cancellationToken).ConfigureAwait(false);
+            if (IsServiceVersionAtLeast(context, new DateOnly(2017, 7, 29)))
+                headers["x-ms-delete-type-permanent"] = properties.BlobSoftDeleteEnabled ? "false" : "true";
+        }
+        return new BlobBatchSubresponse(
+            StatusCodes.Status202Accepted,
+            headers,
+            [],
+            resolved.Request.ContentId);
+    }
+
+    private static async Task<BlobBatchSubresponse> ExecuteBatchSetTierAsync(
+        HttpRequest request,
+        StorageRequestContext context,
+        BlobService service,
+        ResolvedBatchSubrequest resolved,
+        BlobRecord blob,
+        Dictionary<string, string> headers,
+        CancellationToken cancellationToken)
+    {
+        if (resolved.Snapshot is not null)
+        {
+            RequireFeatureVersion(
+                context,
+                new DateOnly(2019, 12, 12),
+                "Set Blob Tier on a snapshot");
+        }
+        Require(context, 'w');
+        EvaluateTagCondition(request, blob, "x-ms-if-tags", source: false);
+        ValidateOptionalLease(request, blob.Lease, "blob");
+        var tier = ProtocolParsing.First(request.Headers, "x-ms-access-tier")
+                   ?? throw AzureStorageException.InvalidHeader("x-ms-access-tier");
+        ValidateAccessTierVersion(request, tier);
+        var rehydratePriority = ReadRehydratePriority(request);
+        var tierUpdate = await service.SetTierAsync(
+            blob,
+            tier,
+            rehydratePriority,
+            IsServiceVersionAtLeast(context, new DateOnly(2020, 6, 12)),
+            IsServiceVersionAtLeast(context, new DateOnly(2023, 8, 3)),
+            cancellationToken).ConfigureAwait(false);
+        return new BlobBatchSubresponse(
+            tierUpdate.Pending ? StatusCodes.Status202Accepted : StatusCodes.Status200OK,
+            headers,
+            [],
+            resolved.Request.ContentId);
+    }
+
+    private static BlobBatchSubresponse CreateFailedBatchSubresponse(
+        HttpContext outer,
+        HttpContext inner,
+        StorageRequestContext subrequestContext,
+        ResolvedBatchSubrequest resolved,
+        Exception exception)
+    {
+        var storageException = MapBatchException(exception);
+        if (string.Equals(storageException.ErrorCode, "InternalError", StringComparison.Ordinal))
+        {
+            StorageLogMessages.BlobBatchSubrequestFailed(
+                outer.RequestServices
+                    .GetRequiredService<ILoggerFactory>()
+                    .CreateLogger(typeof(BlobProtocolEndpoint)),
+                exception,
+                subrequestContext.RequestId);
+        }
+        var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
+        headers["x-ms-error-code"] = storageException.ErrorCode;
+        foreach (var header in storageException.ResponseHeaders)
+            headers[header.Key] = header.Value;
+        headers["Content-Type"] = "application/xml";
+        if (storageException.StatusCode == StatusCodes.Status401Unauthorized)
+            headers["WWW-Authenticate"] = "Bearer resource_id=\"https://storage.azure.com/\"";
+        var body = BuildBatchErrorBody(storageException, subrequestContext.RequestId);
+        return new BlobBatchSubresponse(
+            storageException.StatusCode,
+            headers,
+            body,
+            resolved.Request.ContentId);
     }
 
     private static Dictionary<string, string> CreateBatchCommonHeaders(
@@ -2331,6 +2399,59 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        var (start, end, rangeHeader) = ResolveBlobReadRange(http, blob);
+        var length = blob.Content.Length == 0 ? 0 : end - start + 1;
+        if (HttpMethods.IsHead(http.Request.Method))
+        {
+            WriteHeadBlobResponse(http, service, blob, length);
+            return;
+        }
+
+        var (wantMd5, wantCrc64) = ReadRangeChecksumRequests(http);
+
+        var structuredBody = ProtocolParsing.First(http.Request.Headers, "x-ms-structured-body");
+        if (structuredBody is not null)
+        {
+            await WriteStructuredBlobAsync(
+                http,
+                service,
+                blob,
+                encryption,
+                start,
+                length,
+                structuredBody,
+                wantMd5,
+                wantCrc64,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        if (wantMd5 || wantCrc64)
+        {
+            if (rangeHeader is null || length > 4 * 1024 * 1024)
+            {
+                throw AzureStorageException.InvalidHeader(
+                    wantMd5 ? "x-ms-range-get-content-md5" : "x-ms-range-get-content-crc64",
+                    "true");
+            }
+        }
+
+        await WriteRegularBlobAsync(
+            http,
+            service,
+            blob,
+            encryption,
+            start,
+            length,
+            wantMd5,
+            wantCrc64,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static (long Start, long End, string? RangeHeader) ResolveBlobReadRange(
+        HttpContext http,
+        BlobRecord blob)
+    {
         long start = 0;
         long end = blob.Content.Length - 1;
         var rangeHeader = HttpMethods.IsGet(http.Request.Method)
@@ -2347,20 +2468,22 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             http.Response.StatusCode = StatusCodes.Status206PartialContent;
             http.Response.Headers.ContentRange = $"bytes {start}-{end}/{blob.Content.Length}";
         }
+        return (start, end, rangeHeader);
+    }
 
-        var length = blob.Content.Length == 0 ? 0 : end - start + 1;
-        if (HttpMethods.IsHead(http.Request.Method))
-        {
-            AzureResponseWriter.AddBlobHeaders(
-                http.Response,
-                blob,
-                service.IsHierarchicalNamespaceEnabled(blob.Account),
-                service.IsLastAccessTimeTrackingEnabled(blob.Account));
-            ApplySasResponseOverrides(http);
-            http.Response.ContentLength = length;
-            return;
-        }
+    private static void WriteHeadBlobResponse(HttpContext http, BlobService service, BlobRecord blob, long length)
+    {
+        AzureResponseWriter.AddBlobHeaders(
+            http.Response,
+            blob,
+            service.IsHierarchicalNamespaceEnabled(blob.Account),
+            service.IsLastAccessTimeTrackingEnabled(blob.Account));
+        ApplySasResponseOverrides(http);
+        http.Response.ContentLength = length;
+    }
 
+    private static (bool WantMd5, bool WantCrc64) ReadRangeChecksumRequests(HttpContext http)
+    {
         var wantMd5 = string.Equals(
             ProtocolParsing.First(http.Request.Headers, "x-ms-range-get-content-md5"),
             "true",
@@ -2383,66 +2506,77 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                 new DateOnly(2019, 2, 2),
                 "Transactional range CRC64 checksums");
         }
+        return (wantMd5, wantCrc64);
+    }
 
-        var structuredBody = ProtocolParsing.First(http.Request.Headers, "x-ms-structured-body");
-        if (structuredBody is not null)
-        {
-            if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
-                throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
-            if (wantMd5 || wantCrc64)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    "InvalidHeaderValue",
-                    "A structured response cannot also request a transactional range checksum.");
-            }
-            var request = StorageRequestContext.Get(http);
-            if (!DateOnly.TryParseExact(
-                    request.ServiceVersion,
-                    "yyyy-MM-dd",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.None,
-                    out var serviceVersion) || serviceVersion < new DateOnly(2025, 1, 5))
-            {
-                throw AzureStorageException.FeatureVersionMismatch(
-                    "Structured response bodies require service version 2025-01-05 or later.");
-            }
-
-            blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
-            AzureResponseWriter.AddBlobHeaders(
-                http.Response,
-                blob,
-                service.IsHierarchicalNamespaceEnabled(blob.Account),
-                service.IsLastAccessTimeTrackingEnabled(blob.Account));
-            ApplySasResponseOverrides(http);
-            http.Response.Headers["x-ms-structured-body"] = structuredBody;
-            http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
-            http.Response.ContentLength = StructuredBodyEncoder.GetEncodedLength(length);
-            await StructuredBodyEncoder.WriteAsync(
-                length,
-                async (rangeStart, rangeLength, destination, token) =>
-                    await service.WriteContentAsync(
-                        blob,
-                        encryption,
-                        start + rangeStart,
-                        rangeLength,
-                        destination,
-                        token).ConfigureAwait(false),
-                http.Response.Body,
-                cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
+    private static async Task WriteStructuredBlobAsync(
+        HttpContext http,
+        BlobService service,
+        BlobRecord blob,
+        BlobEncryption encryption,
+        long start,
+        long length,
+        string structuredBody,
+        bool wantMd5,
+        bool wantCrc64,
+        CancellationToken cancellationToken)
+    {
+        if (!string.Equals(structuredBody, StructuredBodyDecoder.ContentType, StringComparison.Ordinal))
+            throw AzureStorageException.InvalidHeader("x-ms-structured-body", structuredBody);
         if (wantMd5 || wantCrc64)
         {
-            if (rangeHeader is null || length > 4 * 1024 * 1024)
-            {
-                throw AzureStorageException.InvalidHeader(
-                    wantMd5 ? "x-ms-range-get-content-md5" : "x-ms-range-get-content-crc64",
-                    "true");
-            }
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidHeaderValue",
+                "A structured response cannot also request a transactional range checksum.");
+        }
+        var request = StorageRequestContext.Get(http);
+        if (!DateOnly.TryParseExact(
+                request.ServiceVersion,
+                "yyyy-MM-dd",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var serviceVersion) || serviceVersion < new DateOnly(2025, 1, 5))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "Structured response bodies require service version 2025-01-05 or later.");
         }
 
+        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
+        AzureResponseWriter.AddBlobHeaders(
+            http.Response,
+            blob,
+            service.IsHierarchicalNamespaceEnabled(blob.Account),
+            service.IsLastAccessTimeTrackingEnabled(blob.Account));
+        ApplySasResponseOverrides(http);
+        http.Response.Headers["x-ms-structured-body"] = structuredBody;
+        http.Response.Headers["x-ms-structured-content-length"] = length.ToString(CultureInfo.InvariantCulture);
+        http.Response.ContentLength = StructuredBodyEncoder.GetEncodedLength(length);
+        await StructuredBodyEncoder.WriteAsync(
+            length,
+            async (rangeStart, rangeLength, destination, token) =>
+                await service.WriteContentAsync(
+                    blob,
+                    encryption,
+                    start + rangeStart,
+                    rangeLength,
+                    destination,
+                    token).ConfigureAwait(false),
+            http.Response.Body,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task WriteRegularBlobAsync(
+        HttpContext http,
+        BlobService service,
+        BlobRecord blob,
+        BlobEncryption encryption,
+        long start,
+        long length,
+        bool wantMd5,
+        bool wantCrc64,
+        CancellationToken cancellationToken)
+    {
         blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
