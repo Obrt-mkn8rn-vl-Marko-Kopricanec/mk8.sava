@@ -463,6 +463,69 @@ public sealed class MetadataStore(
         }
     }
 
+    internal async Task ApplyHierarchicalAclEntriesAsync(
+        IReadOnlyList<HierarchicalAclManifestEntry> entries,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            foreach (var entry in entries)
+            {
+                if (entry.Path.Length == 0)
+                {
+                    var container = await GetContainerAsync(
+                        connection, transaction, entry.Account, entry.Container,
+                        includeDeleted: false, cancellationToken);
+                    if (container is null)
+                        throw new InvalidDataException($"The HNS ACL target container '{entry.Account}/{entry.Container}' does not exist.");
+                    PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
+                    if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+                        continue;
+
+                    await using var update = connection.CreateCommand();
+                    update.Transaction = transaction;
+                    update.CommandText = """
+                        UPDATE containers SET modified_ticks = $modified, data = $data
+                        WHERE account = $account AND name = $name AND deleted = 0;
+                        """;
+                    AddContainerParameters(update, container with
+                    {
+                        AccessAcl = entry.AccessAcl,
+                        Revision = NewRevision(),
+                        ETag = NewETag(),
+                        LastModified = _timeProvider.GetUtcNow()
+                    });
+                    if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                        throw new StorageConcurrencyException();
+                    continue;
+                }
+
+                var blob = await GetCurrentBlobAsync(
+                    connection, transaction, entry.Account, entry.Container, entry.Path, cancellationToken);
+                if (blob is null || blob.IsDeleted)
+                    throw new InvalidDataException($"The HNS ACL target path '{entry.Account}/{entry.Container}/{entry.Path}' does not exist.");
+                PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, blob.IsDirectory);
+                if (string.Equals(blob.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
+                    continue;
+                await UpdateBlobRowAsync(connection, transaction, blob with
+                {
+                    AccessAcl = entry.AccessAcl,
+                    Revision = NewRevision(),
+                    ETag = NewETag(),
+                    LastModified = _timeProvider.GetUtcNow()
+                }, cancellationToken);
+            }
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
     public Task<bool> TryRestoreContainerAsync(
         string sourceName,
         ContainerRecord restored,
@@ -1596,7 +1659,7 @@ public sealed class MetadataStore(
 
             if (hierarchicalNamespace)
             {
-                var parentGroup = await EnsureHierarchicalParentsAsync(
+                var (parentGroup, inheritedAcl) = await EnsureHierarchicalParentsAsync(
                     connection,
                     transaction,
                     proposed,
@@ -1605,7 +1668,9 @@ public sealed class MetadataStore(
                 {
                     Owner = activeCurrent?.Owner ?? proposed.Owner,
                     Group = activeCurrent?.Group ?? parentGroup,
-                    AccessAcl = activeCurrent?.AccessAcl ?? proposed.AccessAcl
+                    AccessAcl = activeCurrent is null
+                        ? proposed.AccessAcl ?? inheritedAcl
+                        : activeCurrent.AccessAcl
                 };
             }
 
@@ -3444,7 +3509,7 @@ public sealed class MetadataStore(
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
     }
 
-    private static async Task<string> EnsureHierarchicalParentsAsync(
+    private static async Task<(string Group, string? InheritedAcl)> EnsureHierarchicalParentsAsync(
         SqliteConnection connection,
         SqliteTransaction transaction,
         BlobRecord path,
@@ -3458,6 +3523,7 @@ public sealed class MetadataStore(
             includeDeleted: false,
             cancellationToken);
         var parentGroup = root?.Group ?? "$superuser";
+        var parentAcl = root?.Acl;
         var separator = path.Name.IndexOf('/', StringComparison.Ordinal);
         while (separator > 0)
         {
@@ -3487,12 +3553,16 @@ public sealed class MetadataStore(
                     LastModified = path.CreatedAt,
                     Owner = path.Owner,
                     Group = parentGroup,
+                    AccessAcl = parentAcl is null
+                        ? null
+                        : PosixAccessControl.InheritDefaultAcl(parentAcl, childIsDirectory: true),
                     Http = new BlobHttpProperties(),
                     Lease = LeaseRecord.Available,
                     AccessTier = "Hot",
                     AccessTierInferred = true
                 };
                 await InsertBlobRowAsync(connection, transaction, directory, cancellationToken);
+                parentAcl = directory.Acl;
             }
             else if (!existing.IsDirectory)
             {
@@ -3501,12 +3571,15 @@ public sealed class MetadataStore(
             else
             {
                 parentGroup = existing.Group;
+                parentAcl = existing.Acl;
             }
 
             separator = path.Name.IndexOf('/', separator + 1);
         }
 
-        return parentGroup;
+        return (parentGroup, parentAcl is null
+            ? null
+            : PosixAccessControl.InheritDefaultAcl(parentAcl, path.IsDirectory));
     }
 
     private static async Task DeleteSoftDeletedBlobRowsAsync(

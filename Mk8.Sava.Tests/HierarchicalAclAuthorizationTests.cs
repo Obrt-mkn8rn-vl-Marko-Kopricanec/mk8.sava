@@ -22,6 +22,12 @@ public sealed class HierarchicalAclAuthorizationTests
         Assert.False(PosixAccessControl.Allows(acl, "owner", "owning-group", "member", team, 'r'));
         Assert.True(PosixAccessControl.Allows(acl, "owner", "owning-group", "stranger", noGroups, 'x'));
         Assert.Equal("rw-r----x", PosixAccessControl.FormatMode(acl));
+
+        const string permissiveOther = "user::---,group::---,group:team:---,mask::---,other::rwx";
+        Assert.True(PosixAccessControl.Allows(
+            permissiveOther, "owner", "owning-group", "member", team, 'r'));
+        Assert.True(PosixAccessControl.Allows(
+            permissiveOther, "owner", "owning-group", "stranger", noGroups, 'r'));
     }
 
     [Fact]
@@ -41,6 +47,21 @@ public sealed class HierarchicalAclAuthorizationTests
             "user::rwx,group::r-x,other::---,user::rwx"));
         Assert.Throws<InvalidDataException>(() => PosixAccessControl.FormatMode(
             "user::rwx,group::bad,other::---"));
+
+        const string inherited = "user::rwx,group::r-x,other::---," +
+                                 "default:user::rwx,default:user:reader:r-x," +
+                                 "default:group::r-x,default:mask::r-x,default:other::---";
+        PosixAccessControl.ValidateStoredAcl(inherited, isDirectory: true);
+        var childFile = PosixAccessControl.InheritDefaultAcl(inherited, childIsDirectory: false);
+        Assert.Equal("user::rwx,user:reader:r-x,group::r-x,mask::r-x,other::---", childFile);
+        Assert.Equal(childFile + ",default:user::rwx,default:user:reader:r-x," +
+                     "default:group::r-x,default:mask::r-x,default:other::---",
+            PosixAccessControl.InheritDefaultAcl(inherited, childIsDirectory: true));
+        Assert.Throws<InvalidDataException>(() => PosixAccessControl.ValidateStoredAcl(
+            inherited, isDirectory: false));
+        Assert.Throws<InvalidDataException>(() => PosixAccessControl.ValidateStoredAcl(
+            "user::rwx,group::r-x,other::---,default:user::rwx,default:user::r--," +
+            "default:group::r-x,default:other::---", isDirectory: true));
     }
 
     [Fact]
