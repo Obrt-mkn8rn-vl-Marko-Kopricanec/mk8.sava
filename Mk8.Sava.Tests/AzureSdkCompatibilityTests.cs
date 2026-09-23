@@ -2580,10 +2580,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var reader = CreateBearerClient(application,
             CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId))
             .GetBlobContainerClient(container.Name);
+        await AssertAuthorizedDirectoryListingAsync(reader);
+    }
+
+    private static async Task AssertAuthorizedDirectoryListingAsync(BlobContainerClient reader)
+    {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var rootNames = new List<string>();
         var rootListing = reader.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions { Delimiter = "/" });
-        await foreach (var page in rootListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token))
+        await foreach (var page in rootListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token).ConfigureAwait(false))
         {
             Assert.Single(page.Values);
             rootNames.Add(page.Values[0].Prefix);
@@ -2598,7 +2603,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Delimiter = "/",
             Prefix = "visible/"
         });
-        await foreach (var page in visibleListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token))
+        await foreach (var page in visibleListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token).ConfigureAwait(false))
         {
             Assert.Single(page.Values);
             visibleNames.Add(page.Values[0].Blob.Name);
@@ -2616,7 +2621,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await foreach (var _ in hiddenListing.ConfigureAwait(false))
             {
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, hidden.Status);
 
         var recursive = await Assert.ThrowsAsync<RequestFailedException>(async () =>
@@ -2624,7 +2629,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await foreach (var _ in reader.GetBlobsAsync().ConfigureAwait(false))
             {
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, recursive.Status);
     }
 
@@ -2669,12 +2674,24 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
         var key = (await delegator.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+        var sas = BuildSignedDirectoryListSas(key, startsOn, expiresOn, container.Name, readerObjectId);
+
+        await AssertSignedDirectoryListingAsync(application, container.Name, sas, readerObjectId);
+    }
+
+    private static string BuildSignedDirectoryListSas(
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn,
+        string containerName,
+        string readerObjectId)
+    {
         var signedStart = startsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
         var signedExpiry = expiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
         var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
         var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
         const string signedVersion = "2023-11-03";
-        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}";
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{containerName}";
         var stringToSign = string.Join('\n',
             "l", signedStart, signedExpiry, canonicalResource,
             key.SignedObjectId, key.SignedTenantId, keyStart, keyExpiry,
@@ -2691,30 +2708,39 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             $"&sks={key.SignedService}&skv={key.SignedVersion}" +
             $"&suoid={readerObjectId}&spr=https%2Chttp&sv={signedVersion}&sr=c" +
             $"&sig={Uri.EscapeDataString(signature)}";
-        var endpoint = $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}";
+        return sas;
+    }
+
+    private static async Task AssertSignedDirectoryListingAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        string sas,
+        string readerObjectId)
+    {
+        var endpoint = $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}";
         using var transport = new HttpClient(application.Server.CreateHandler());
 
         using (var root = await transport.GetAsync(new Uri(
-                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&{sas}", UriKind.RelativeOrAbsolute)))
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&{sas}", UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, root.StatusCode);
-            Assert.Contains("<Name>visible/</Name>", await root.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+            Assert.Contains("<Name>visible/</Name>", await root.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
         }
         using (var nested = await transport.GetAsync(new Uri(
-                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&prefix=visible%2F&{sas}", UriKind.RelativeOrAbsolute)))
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&prefix=visible%2F&{sas}", UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, nested.StatusCode);
-            Assert.Contains("<Name>visible/item.txt</Name>", await nested.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+            Assert.Contains("<Name>visible/item.txt</Name>", await nested.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
         }
         using (var unsupported = await transport.GetAsync(new Uri(
-                   $"{endpoint}?restype=container&comp=list&{sas}", UriKind.RelativeOrAbsolute)))
+                   $"{endpoint}?restype=container&comp=list&{sas}", UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Forbidden, unsupported.StatusCode);
             Assert.Equal("AuthorizationFailure", unsupported.Headers.GetValues("x-ms-error-code").Single());
         }
         using (var tampered = await transport.GetAsync(new Uri(
                    $"{endpoint}?restype=container&comp=list&delimiter=%2F&" +
-                   sas.Replace(readerObjectId, Guid.NewGuid().ToString(), StringComparison.Ordinal), UriKind.RelativeOrAbsolute)))
+                   sas.Replace(readerObjectId, Guid.NewGuid().ToString(), StringComparison.Ordinal), UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Forbidden, tampered.StatusCode);
             Assert.Equal("AuthenticationFailed", tampered.Headers.GetValues("x-ms-error-code").Single());
@@ -9864,25 +9890,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var chunksBeforeFirstCopy = EnumerateChunkFiles(factory.DataPath).Count();
 
         var destination = container.GetPageBlobClient("backup.vhd");
-        var firstCopy = await destination.StartCopyIncrementalAsync(source.Uri, firstSourceSnapshot);
-        Assert.Equal(202, firstCopy.GetRawResponse().Status);
-        await firstCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-        var firstProperties = (await destination.GetPropertiesAsync()).Value;
-        Assert.True(firstProperties.IsIncrementalCopy);
-        Assert.Equal(CopyStatus.Success, firstProperties.CopyStatus);
-        Assert.NotNull(firstProperties.DestinationSnapshot);
-        Assert.Equal(chunksBeforeFirstCopy, EnumerateChunkFiles(factory.DataPath).Count());
-
-        var baseRead = await Assert.ThrowsAsync<RequestFailedException>(() => destination.DownloadContentAsync());
-        Assert.Equal(409, baseRead.Status);
-        Assert.Equal("OperationNotAllowedOnIncrementalCopyBlob", baseRead.ErrorCode);
         var firstExpected = new byte[2048];
         firstPage.CopyTo(firstExpected, 0);
         secondPage.CopyTo(firstExpected, 512);
-        var firstDestinationSnapshot = firstProperties.DestinationSnapshot!;
-        Assert.Equal(
-            firstExpected,
-            (await destination.WithSnapshot(firstDestinationSnapshot).DownloadContentAsync()).Value.Content.ToArray());
+        var firstDestinationSnapshot = await AssertFirstIncrementalCopyAsync(
+            destination, source.Uri, firstSourceSnapshot, firstExpected, chunksBeforeFirstCopy, factory.DataPath);
 
         var changedPage = Enumerable.Repeat((byte)0x73, 512).ToArray();
         await source.UploadPagesAsync(new MemoryStream(changedPage), offset: 0);
@@ -9906,6 +9918,34 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         await AssertIncrementalCopyRejectedTransitionsAsync(source, destination, firstSourceSnapshot);
         await AssertIncrementalCopyListingsAsync(container, destination, secondProperties.DestinationSnapshot);
+    }
+
+    private static async Task<string> AssertFirstIncrementalCopyAsync(
+        PageBlobClient destination,
+        Uri sourceUri,
+        string sourceSnapshot,
+        byte[] expected,
+        int chunkCount,
+        string dataPath)
+    {
+        var firstCopy = await destination.StartCopyIncrementalAsync(sourceUri, sourceSnapshot).ConfigureAwait(false);
+        Assert.Equal(202, firstCopy.GetRawResponse().Status);
+        await firstCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
+        var firstProperties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.True(firstProperties.IsIncrementalCopy);
+        Assert.Equal(CopyStatus.Success, firstProperties.CopyStatus);
+        Assert.NotNull(firstProperties.DestinationSnapshot);
+        Assert.Equal(chunkCount, EnumerateChunkFiles(dataPath).Count());
+
+        var baseRead = await Assert.ThrowsAsync<RequestFailedException>(() => destination.DownloadContentAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(409, baseRead.Status);
+        Assert.Equal("OperationNotAllowedOnIncrementalCopyBlob", baseRead.ErrorCode);
+        var snapshot = firstProperties.DestinationSnapshot!;
+        Assert.Equal(
+            expected,
+            (await destination.WithSnapshot(snapshot).DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        return snapshot;
     }
 
     private static async Task AssertIncrementalCopyRejectedTransitionsAsync(
