@@ -8,7 +8,7 @@ namespace Mk8.Sava.Storage;
 public sealed class MetadataStore(
     IStoragePaths paths,
     IStorageFaultInjector faultInjector,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null) : IDisposable
 {
     public const int CurrentSchemaVersion = 7;
     private const int RetainedWalLimitBytes = 1024 * 1024;
@@ -33,15 +33,22 @@ public sealed class MetadataStore(
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
 
+    public void Dispose()
+    {
+        _writeGate.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode=WAL;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken);
-            var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA journal_mode=WAL;", cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
+            var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
             if (schemaVersion > CurrentSchemaVersion)
             {
                 throw new InvalidDataException(
@@ -187,24 +194,24 @@ public sealed class MetadataStore(
                 CREATE INDEX IF NOT EXISTS ix_object_replication_destination
                     ON object_replication_states(destination_generation_id)
                     WHERE destination_generation_id IS NOT NULL;
-                """, cancellationToken);
+                """, cancellationToken).ConfigureAwait(false);
             if (schemaVersion == 1)
             {
-                await MigrateVersion1ToVersion2Async(connection, cancellationToken);
+                await MigrateVersion1ToVersion2Async(connection, cancellationToken).ConfigureAwait(false);
                 schemaVersion = ChunkIndexSchemaVersion;
             }
             if (schemaVersion == ChunkIndexSchemaVersion)
             {
-                await MigrateVersion2ToVersion3Async(connection, cancellationToken);
+                await MigrateVersion2ToVersion3Async(connection, cancellationToken).ConfigureAwait(false);
                 schemaVersion = TagIndexSchemaVersion;
             }
             if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion or
                 ObjectReplicationSchemaVersion or DataKeyContinuitySchemaVersion)
-                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
+                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken).ConfigureAwait(false);
             else if (schemaVersion == 0)
-                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
-            await VerifyForeignKeysAsync(connection, cancellationToken);
-            _ = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken);
+                await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken).ConfigureAwait(false);
+            await VerifyForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
+            _ = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -216,10 +223,12 @@ public sealed class MetadataStore(
     {
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = "SELECT 1;";
-            return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture) == 1;
+            return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture) == 1;
         }
         catch (SqliteException)
         {
@@ -232,18 +241,24 @@ public sealed class MetadataStore(
         Func<string, CancellationToken, Task> verifyUnrecordedKey,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(expected);
+        ArgumentNullException.ThrowIfNull(verifyUnrecordedKey);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var recorded = new Dictionary<string, string>(StringComparer.Ordinal);
-            await using (var read = connection.CreateCommand())
+            var read = connection.CreateCommand();
+            await using (read.ConfigureAwait(false))
             {
                 read.Transaction = transaction;
                 read.CommandText = "SELECT key_id, fingerprint FROM data_encryption_keys;";
-                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
-                while (await reader.ReadAsync(cancellationToken))
+                var reader = (await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+                await using var readerDisposal = reader.ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     recorded.Add(reader.GetString(0), reader.GetString(1));
             }
 
@@ -259,25 +274,27 @@ public sealed class MetadataStore(
                     continue;
                 }
 
-                await verifyUnrecordedKey(keyId, cancellationToken);
-                await using var insert = connection.CreateCommand();
+                await verifyUnrecordedKey(keyId, cancellationToken).ConfigureAwait(false);
+                var insert = connection.CreateCommand();
+                await using var insertDisposal = insert.ConfigureAwait(false);
                 insert.Transaction = transaction;
                 insert.CommandText = "INSERT INTO data_encryption_keys(key_id, fingerprint) VALUES ($key, $fingerprint);";
                 insert.Parameters.AddWithValue("$key", keyId);
                 insert.Parameters.AddWithValue("$fingerprint", fingerprint);
-                await insert.ExecuteNonQueryAsync(cancellationToken);
+                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
             foreach (var keyId in recorded.Keys.Except(expected.Keys, StringComparer.Ordinal))
             {
-                await using var delete = connection.CreateCommand();
+                var delete = connection.CreateCommand();
+                await using var deleteDisposal = delete.ConfigureAwait(false);
                 delete.Transaction = transaction;
                 delete.CommandText = "DELETE FROM data_encryption_keys WHERE key_id = $key;";
                 delete.Parameters.AddWithValue("$key", keyId);
-                await delete.ExecuteNonQueryAsync(cancellationToken);
+                await delete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -289,18 +306,23 @@ public sealed class MetadataStore(
         IReadOnlyDictionary<string, bool> expected,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(expected);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var recorded = new Dictionary<string, bool>(StringComparer.Ordinal);
-            await using (var read = connection.CreateCommand())
+            var read = connection.CreateCommand();
+            await using (read.ConfigureAwait(false))
             {
                 read.Transaction = transaction;
                 read.CommandText = "SELECT account, hierarchical_namespace_enabled FROM account_namespace_modes;";
-                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
-                while (await reader.ReadAsync(cancellationToken))
+                var reader = (await read.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+                await using var readerDisposal = reader.ConfigureAwait(false);
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                     recorded.Add(reader.GetString(0), reader.GetInt32(1) == 1);
             }
 
@@ -317,7 +339,8 @@ public sealed class MetadataStore(
                     continue;
                 }
 
-                await using var insert = connection.CreateCommand();
+                var insert = connection.CreateCommand();
+                await using var insertDisposal = insert.ConfigureAwait(false);
                 insert.Transaction = transaction;
                 insert.CommandText = """
                     INSERT INTO account_namespace_modes(account, hierarchical_namespace_enabled)
@@ -325,10 +348,10 @@ public sealed class MetadataStore(
                     """;
                 insert.Parameters.AddWithValue("$account", account);
                 insert.Parameters.AddWithValue("$enabled", enabled ? 1 : 0);
-                await insert.ExecuteNonQueryAsync(cancellationToken);
+                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -341,13 +364,16 @@ public sealed class MetadataStore(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
-        command.CommandText = includeDeleted
-            ? "SELECT data FROM containers WHERE account = $account ORDER BY name;"
-            : "SELECT data FROM containers WHERE account = $account AND deleted = 0 ORDER BY name;";
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        if (includeDeleted)
+            command.CommandText = "SELECT data FROM containers WHERE account = $account ORDER BY name;";
+        else
+            command.CommandText = "SELECT data FROM containers WHERE account = $account AND deleted = 0 ORDER BY name;";
         command.Parameters.AddWithValue("$account", account);
-        return await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken);
+        return await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<ContainerListPage> ListContainersPageAsync(
@@ -359,10 +385,11 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = $"""
             SELECT data FROM containers
             WHERE account = $account
@@ -378,7 +405,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$prefix", prefix);
         command.Parameters.AddWithValue("$marker", marker);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
-        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken)).ToList();
+        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken).ConfigureAwait(false)).ToList();
         var hasMore = records.Count > maximum;
         if (hasMore)
             records.RemoveAt(records.Count - 1);
@@ -391,8 +418,9 @@ public sealed class MetadataStore(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await GetContainerAsync(connection, transaction: null, account, name, includeDeleted, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await GetContainerAsync(connection, transaction: null, account, name, includeDeleted, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<ContainerRecord?> GetContainerAsync(
@@ -403,29 +431,34 @@ public sealed class MetadataStore(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
-        command.CommandText = includeDeleted
-            ? "SELECT data FROM containers WHERE account = $account AND name = $name;"
-            : "SELECT data FROM containers WHERE account = $account AND name = $name AND deleted = 0;";
+        if (includeDeleted)
+            command.CommandText = "SELECT data FROM containers WHERE account = $account AND name = $name;";
+        else
+            command.CommandText = "SELECT data FROM containers WHERE account = $account AND name = $name AND deleted = 0;";
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$name", name);
-        return await ReadSingleJsonAsync<ContainerRecord>(command, cancellationToken);
+        return await ReadSingleJsonAsync<ContainerRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> TryCreateContainerAsync(ContainerRecord container, CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(container);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = """
                 INSERT OR IGNORE INTO containers(account, name, deleted, modified_ticks, data)
                 VALUES ($account, $name, $deleted, $modified, $data);
                 """;
             AddContainerParameters(command, container);
-            return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
         }
         finally
         {
@@ -438,24 +471,28 @@ public sealed class MetadataStore(
         string expectedRevision,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(container);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetContainerAsync(connection, transaction, container.Account, container.Name, includeDeleted: true, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetContainerAsync(connection, transaction, container.Account, container.Name, includeDeleted: true, cancellationToken).ConfigureAwait(false);
             if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
-            await using var command = connection.CreateCommand();
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = """
                 UPDATE containers SET deleted = $deleted, modified_ticks = $modified, data = $data
                 WHERE account = $account AND name = $name;
                 """;
             AddContainerParameters(command, container);
-            if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+            if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new StorageConcurrencyException();
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -467,25 +504,28 @@ public sealed class MetadataStore(
         IReadOnlyList<HierarchicalAclManifestEntry> entries,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             foreach (var entry in entries)
             {
                 if (entry.Path.Length == 0)
                 {
                     var container = await GetContainerAsync(
                         connection, transaction, entry.Account, entry.Container,
-                        includeDeleted: false, cancellationToken);
+                        includeDeleted: false, cancellationToken).ConfigureAwait(false);
                     if (container is null)
                         throw new InvalidDataException($"The HNS ACL target container '{entry.Account}/{entry.Container}' does not exist.");
                     PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, isDirectory: true);
                     if (string.Equals(container.AccessAcl, entry.AccessAcl, StringComparison.Ordinal))
                         continue;
 
-                    await using var update = connection.CreateCommand();
+                    var update = connection.CreateCommand();
+                    await using var updateDisposal = update.ConfigureAwait(false);
                     update.Transaction = transaction;
                     update.CommandText = """
                         UPDATE containers SET modified_ticks = $modified, data = $data
@@ -498,13 +538,13 @@ public sealed class MetadataStore(
                         ETag = NewETag(),
                         LastModified = _timeProvider.GetUtcNow()
                     });
-                    if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                         throw new StorageConcurrencyException();
                     continue;
                 }
 
                 var blob = await GetCurrentBlobAsync(
-                    connection, transaction, entry.Account, entry.Container, entry.Path, cancellationToken);
+                    connection, transaction, entry.Account, entry.Container, entry.Path, cancellationToken).ConfigureAwait(false);
                 if (blob is null || blob.IsDeleted)
                     throw new InvalidDataException($"The HNS ACL target path '{entry.Account}/{entry.Container}/{entry.Path}' does not exist.");
                 PosixAccessControl.ValidateStoredAcl(entry.AccessAcl, blob.IsDirectory);
@@ -516,9 +556,9 @@ public sealed class MetadataStore(
                     Revision = NewRevision(),
                     ETag = NewETag(),
                     LastModified = _timeProvider.GetUtcNow()
-                }, cancellationToken);
+                }, cancellationToken).ConfigureAwait(false);
             }
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -530,25 +570,31 @@ public sealed class MetadataStore(
         string sourceName,
         ContainerRecord restored,
         string expectedSourceRevision,
-        CancellationToken cancellationToken) =>
-        TryRelocateContainerAsync(
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(restored);
+        return TryRelocateContainerAsync(
             sourceName,
             restored,
             expectedSourceRevision,
             allowSameName: true,
             cancellationToken);
+    }
 
     public Task<bool> TryRenameContainerAsync(
         string sourceName,
         ContainerRecord renamed,
         string expectedSourceRevision,
-        CancellationToken cancellationToken) =>
-        TryRelocateContainerAsync(
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(renamed);
+        return TryRelocateContainerAsync(
             sourceName,
             renamed,
             expectedSourceRevision,
             allowSameName: false,
             cancellationToken);
+    }
 
     private async Task<bool> TryRelocateContainerAsync(
         string sourceName,
@@ -557,18 +603,20 @@ public sealed class MetadataStore(
         bool allowSameName,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var source = await GetContainerAsync(
                 connection,
                 transaction,
                 destination.Account,
                 sourceName,
                 includeDeleted: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (source is null || !string.Equals(source.Revision, expectedSourceRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
@@ -576,14 +624,15 @@ public sealed class MetadataStore(
             {
                 if (!allowSameName)
                     return false;
-                await using var update = connection.CreateCommand();
+                var update = connection.CreateCommand();
+                await using var updateDisposal = update.ConfigureAwait(false);
                 update.Transaction = transaction;
                 update.CommandText = """
                     UPDATE containers SET deleted = $deleted, modified_ticks = $modified, data = $data
                     WHERE account = $account AND name = $name;
                     """;
                 AddContainerParameters(update, destination);
-                if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                     throw new StorageConcurrencyException();
             }
             else
@@ -594,11 +643,12 @@ public sealed class MetadataStore(
                     destination.Account,
                     destination.Name,
                     includeDeleted: true,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (existingDestination is not null)
                     return false;
 
-                await using (var addContainer = connection.CreateCommand())
+                var addContainer = connection.CreateCommand();
+                await using (addContainer.ConfigureAwait(false))
                 {
                     addContainer.Transaction = transaction;
                     addContainer.CommandText = """
@@ -606,11 +656,12 @@ public sealed class MetadataStore(
                         VALUES ($account, $name, $deleted, $modified, $data);
                         """;
                     AddContainerParameters(addContainer, destination);
-                    if (await addContainer.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    if (await addContainer.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                         throw new StorageConcurrencyException();
                 }
 
-                await using (var updateBlobs = connection.CreateCommand())
+                var updateBlobs = connection.CreateCommand();
+                await using (updateBlobs.ConfigureAwait(false))
                 {
                     updateBlobs.Transaction = transaction;
                     updateBlobs.CommandText = """
@@ -622,10 +673,11 @@ public sealed class MetadataStore(
                     updateBlobs.Parameters.AddWithValue("$destination", destination.Name);
                     updateBlobs.Parameters.AddWithValue("$account", destination.Account);
                     updateBlobs.Parameters.AddWithValue("$container", sourceName);
-                    await updateBlobs.ExecuteNonQueryAsync(cancellationToken);
+                    await updateBlobs.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                await using (var addBlocks = connection.CreateCommand())
+                var addBlocks = connection.CreateCommand();
+                await using (addBlocks.ConfigureAwait(false))
                 {
                     addBlocks.Transaction = transaction;
                     addBlocks.CommandText = """
@@ -644,10 +696,11 @@ public sealed class MetadataStore(
                     addBlocks.Parameters.AddWithValue("$destination", destination.Name);
                     addBlocks.Parameters.AddWithValue("$account", destination.Account);
                     addBlocks.Parameters.AddWithValue("$container", sourceName);
-                    await addBlocks.ExecuteNonQueryAsync(cancellationToken);
+                    await addBlocks.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                await using (var addBlockReferences = connection.CreateCommand())
+                var addBlockReferences = connection.CreateCommand();
+                await using (addBlockReferences.ConfigureAwait(false))
                 {
                     addBlockReferences.Transaction = transaction;
                     addBlockReferences.CommandText = """
@@ -660,10 +713,11 @@ public sealed class MetadataStore(
                     addBlockReferences.Parameters.AddWithValue("$destination", destination.Name);
                     addBlockReferences.Parameters.AddWithValue("$account", destination.Account);
                     addBlockReferences.Parameters.AddWithValue("$container", sourceName);
-                    await addBlockReferences.ExecuteNonQueryAsync(cancellationToken);
+                    await addBlockReferences.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                await using (var deleteBlocks = connection.CreateCommand())
+                var deleteBlocks = connection.CreateCommand();
+                await using (deleteBlocks.ConfigureAwait(false))
                 {
                     deleteBlocks.Transaction = transaction;
                     deleteBlocks.CommandText = """
@@ -672,10 +726,11 @@ public sealed class MetadataStore(
                         """;
                     deleteBlocks.Parameters.AddWithValue("$account", destination.Account);
                     deleteBlocks.Parameters.AddWithValue("$container", sourceName);
-                    await deleteBlocks.ExecuteNonQueryAsync(cancellationToken);
+                    await deleteBlocks.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
                 }
 
-                await using (var deleteSource = connection.CreateCommand())
+                var deleteSource = connection.CreateCommand();
+                await using (deleteSource.ConfigureAwait(false))
                 {
                     deleteSource.Transaction = transaction;
                     deleteSource.CommandText = """
@@ -684,12 +739,12 @@ public sealed class MetadataStore(
                         """;
                     deleteSource.Parameters.AddWithValue("$account", destination.Account);
                     deleteSource.Parameters.AddWithValue("$name", sourceName);
-                    if (await deleteSource.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    if (await deleteSource.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                         throw new StorageConcurrencyException();
                 }
             }
 
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -704,35 +759,40 @@ public sealed class MetadataStore(
         string expectedRevision,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetContainerAsync(connection, transaction, account, name, includeDeleted: true, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetContainerAsync(connection, transaction, account, name, includeDeleted: true, cancellationToken).ConfigureAwait(false);
             if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
-            await using var blobs = connection.CreateCommand();
+            var blobs = connection.CreateCommand();
+            await using var blobsDisposal = blobs.ConfigureAwait(false);
             blobs.Transaction = transaction;
             blobs.CommandText = "DELETE FROM blobs WHERE account = $account AND container = $container;";
             blobs.Parameters.AddWithValue("$account", account);
             blobs.Parameters.AddWithValue("$container", name);
-            await blobs.ExecuteNonQueryAsync(cancellationToken);
+            await blobs.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
-            await using var blocks = connection.CreateCommand();
+            var blocks = connection.CreateCommand();
+            await using var blocksDisposal = blocks.ConfigureAwait(false);
             blocks.Transaction = transaction;
             blocks.CommandText = "DELETE FROM staged_blocks WHERE account = $account AND container = $container;";
             blocks.Parameters.AddWithValue("$account", account);
             blocks.Parameters.AddWithValue("$container", name);
-            await blocks.ExecuteNonQueryAsync(cancellationToken);
+            await blocks.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
-            await using var container = connection.CreateCommand();
+            var container = connection.CreateCommand();
+            await using var containerDisposal = container.ConfigureAwait(false);
             container.Transaction = transaction;
             container.CommandText = "DELETE FROM containers WHERE account = $account AND name = $name;";
             container.Parameters.AddWithValue("$account", account);
             container.Parameters.AddWithValue("$name", name);
-            var deleted = await container.ExecuteNonQueryAsync(cancellationToken) == 1;
-            await transaction.CommitAsync(cancellationToken);
+            var deleted = await container.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return deleted;
         }
         finally
@@ -750,8 +810,10 @@ public sealed class MetadataStore(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         var deletedClause = includeDeleted ? string.Empty : " AND is_deleted = 0";
         if (versionId is not null)
         {
@@ -771,7 +833,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
-        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
+        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<string?> GetLastBlobNameAsync(
@@ -780,8 +842,10 @@ public sealed class MetadataStore(
         string prefix,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT name FROM blobs
             WHERE account = $account
@@ -793,7 +857,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$prefix", prefix);
-        return (string?)await command.ExecuteScalarAsync(cancellationToken);
+        return (string?)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyList<BlobRecord>> ListBlobsAsync(
@@ -814,12 +878,17 @@ public sealed class MetadataStore(
         if (!includeDeleted)
             predicates.Add("is_deleted = 0");
 
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        // Every predicate is a fixed SQL fragment; account and container are bound parameters.
+#pragma warning disable CA2100
         command.CommandText = $"SELECT data FROM blobs WHERE {string.Join(" AND ", predicates)} ORDER BY name, modified_ticks DESC;";
+#pragma warning restore CA2100
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
-        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<IReadOnlyList<BlobRecord>> ListBlobFamilyAsync(
@@ -829,8 +898,10 @@ public sealed class MetadataStore(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = $"""
             SELECT data FROM blobs
             WHERE account = $account AND container = $container AND name = $name
@@ -840,7 +911,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
-        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+        return await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     internal bool PackedChunkExists(string chunkId)
@@ -876,24 +947,29 @@ public sealed class MetadataStore(
         string chunkId,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
             FROM packed_chunks
             WHERE chunk_id = $chunk;
             """;
         command.Parameters.AddWithValue("$chunk", chunkId);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        return await reader.ReadAsync(cancellationToken) ? ReadPackedChunkLocation(reader) : null;
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadPackedChunkLocation(reader) : null;
     }
 
     internal async Task<ChunkPackRecord?> GetActiveChunkPackAsync(
         string domain,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT pack_id, domain, created_ticks, sealed
             FROM chunk_packs
@@ -902,30 +978,35 @@ public sealed class MetadataStore(
             LIMIT 1;
             """;
         command.Parameters.AddWithValue("$domain", domain);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        return await reader.ReadAsync(cancellationToken) ? ReadChunkPack(reader) : null;
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadChunkPack(reader) : null;
     }
 
     internal async Task<int> CountPackedChunksAsync(
         string packId,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = "SELECT COUNT(*) FROM packed_chunks WHERE pack_id = $pack;";
         command.Parameters.AddWithValue("$pack", packId);
-        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
     }
 
     internal async Task<long> GetPackIndexedLengthAsync(
         string packId,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = "SELECT COALESCE(MAX(record_offset + record_length), 0) FROM packed_chunks WHERE pack_id = $pack;";
         command.Parameters.AddWithValue("$pack", packId);
-        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
     }
 
     internal async Task<bool> TryRegisterPackedChunkAsync(
@@ -936,12 +1017,15 @@ public sealed class MetadataStore(
         if (!string.Equals(pack.PackId, location.PackId, StringComparison.Ordinal))
             throw new ArgumentException("The packed chunk location does not belong to the supplied pack.", nameof(location));
 
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            await using (var addPack = connection.CreateCommand())
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var addPack = connection.CreateCommand();
+            await using (addPack.ConfigureAwait(false))
             {
                 addPack.Transaction = transaction;
                 addPack.CommandText = """
@@ -953,10 +1037,11 @@ public sealed class MetadataStore(
                 addPack.Parameters.AddWithValue("$domain", pack.Domain);
                 addPack.Parameters.AddWithValue("$created", pack.CreatedAt.UtcTicks);
                 addPack.Parameters.AddWithValue("$sealed", pack.Sealed ? 1 : 0);
-                await addPack.ExecuteNonQueryAsync(cancellationToken);
+                await addPack.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await using var addLocation = connection.CreateCommand();
+            var addLocation = connection.CreateCommand();
+            await using var addLocationDisposal = addLocation.ConfigureAwait(false);
             addLocation.Transaction = transaction;
             addLocation.CommandText = """
                 INSERT INTO packed_chunks(
@@ -965,8 +1050,8 @@ public sealed class MetadataStore(
                 ON CONFLICT(chunk_id) DO NOTHING;
                 """;
             AddPackedChunkLocationParameters(addLocation, location);
-            var inserted = await addLocation.ExecuteNonQueryAsync(cancellationToken) == 1;
-            await transaction.CommitAsync(cancellationToken);
+            var inserted = await addLocation.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return inserted;
         }
         finally
@@ -977,14 +1062,16 @@ public sealed class MetadataStore(
 
     internal async Task SealChunkPackAsync(string packId, CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = "UPDATE chunk_packs SET sealed = 1 WHERE pack_id = $pack;";
             command.Parameters.AddWithValue("$pack", packId);
-            await command.ExecuteNonQueryAsync(cancellationToken);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -997,13 +1084,14 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = """
                 UPDATE chunk_packs SET sealed = 1
                 WHERE pack_id IN (
@@ -1015,7 +1103,7 @@ public sealed class MetadataStore(
                 """;
             command.Parameters.AddWithValue("$older", olderThan.UtcTicks);
             command.Parameters.AddWithValue("$limit", maximum);
-            return await command.ExecuteNonQueryAsync(cancellationToken);
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1027,14 +1115,16 @@ public sealed class MetadataStore(
         string chunkId,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = "DELETE FROM packed_chunks WHERE chunk_id = $chunk;";
             command.Parameters.AddWithValue("$chunk", chunkId);
-            return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
         }
         finally
         {
@@ -1047,10 +1137,11 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT chunk_id FROM packed_chunks
             WHERE $has_after = 0 OR chunk_id > $after
@@ -1061,8 +1152,9 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$after", after ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
         var ids = new List<string>(maximum + 1);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             ids.Add(reader.GetString(0));
         var hasMore = ids.Count > maximum;
         if (hasMore)
@@ -1075,10 +1167,11 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT pack_id, domain, created_ticks, sealed
             FROM chunk_packs
@@ -1090,8 +1183,9 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$after", after ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
         var packs = new List<ChunkPackRecord>(maximum + 1);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             packs.Add(ReadChunkPack(reader));
         var hasMore = packs.Count > maximum;
         if (hasMore)
@@ -1103,8 +1197,10 @@ public sealed class MetadataStore(
         string packId,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
             FROM packed_chunks
@@ -1113,8 +1209,9 @@ public sealed class MetadataStore(
             """;
         command.Parameters.AddWithValue("$pack", packId);
         var locations = new List<PackedChunkLocation>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             locations.Add(ReadPackedChunkLocation(reader));
         return locations;
     }
@@ -1134,18 +1231,21 @@ public sealed class MetadataStore(
             throw new ArgumentException("The replacement pack and chunk locations are inconsistent.", nameof(replacementLocations));
         }
 
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var actual = await ListPackedChunkLocationsAsync(connection, transaction, oldPack.PackId, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var actual = await ListPackedChunkLocationsAsync(connection, transaction, oldPack.PackId, cancellationToken).ConfigureAwait(false);
             if (!EquivalentPackedLocations(actual, oldLocations))
                 throw new StorageConcurrencyException();
 
             if (replacementPack is not null)
             {
-                await using var addPack = connection.CreateCommand();
+                var addPack = connection.CreateCommand();
+                await using var addPackDisposal = addPack.ConfigureAwait(false);
                 addPack.Transaction = transaction;
                 addPack.CommandText = """
                     INSERT INTO chunk_packs(pack_id, domain, created_ticks, sealed)
@@ -1154,11 +1254,12 @@ public sealed class MetadataStore(
                 addPack.Parameters.AddWithValue("$pack", replacementPack.PackId);
                 addPack.Parameters.AddWithValue("$domain", replacementPack.Domain);
                 addPack.Parameters.AddWithValue("$created", replacementPack.CreatedAt.UtcTicks);
-                await addPack.ExecuteNonQueryAsync(cancellationToken);
+                await addPack.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
 
                 foreach (var location in replacementLocations)
                 {
-                    await using var update = connection.CreateCommand();
+                    var update = connection.CreateCommand();
+                    await using var updateDisposal = update.ConfigureAwait(false);
                     update.Transaction = transaction;
                     update.CommandText = """
                         UPDATE packed_chunks SET
@@ -1171,19 +1272,20 @@ public sealed class MetadataStore(
                         """;
                     AddPackedChunkLocationParameters(update, location);
                     update.Parameters.AddWithValue("$old_pack", oldPack.PackId);
-                    if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                         throw new StorageConcurrencyException();
                 }
             }
 
-            await using var removeOld = connection.CreateCommand();
+            var removeOld = connection.CreateCommand();
+            await using var removeOldDisposal = removeOld.ConfigureAwait(false);
             removeOld.Transaction = transaction;
             removeOld.CommandText = "DELETE FROM chunk_packs WHERE pack_id = $pack;";
             removeOld.Parameters.AddWithValue("$pack", oldPack.PackId);
-            if (await removeOld.ExecuteNonQueryAsync(cancellationToken) != 1)
+            if (await removeOld.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new StorageConcurrencyException();
             faultInjector.Inject(StorageFaultPoint.BeforePackMetadataCommit);
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             faultInjector.Inject(StorageFaultPoint.AfterPackMetadataCommit);
         }
         finally
@@ -1210,10 +1312,8 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        if (legacyOffset < 0)
-            throw new ArgumentOutOfRangeException(nameof(legacyOffset));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        ArgumentOutOfRangeException.ThrowIfNegative(legacyOffset);
 
         var predicates = new List<string>
         {
@@ -1398,8 +1498,12 @@ public sealed class MetadataStore(
                 )
                 """;
 
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        // The query is assembled only from fixed SQL fragments; all request values are bound below.
+#pragma warning disable CA2100
         command.CommandText = $"""
             {entries}
             SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
@@ -1435,6 +1539,7 @@ public sealed class MetadataStore(
                      generation_id
             LIMIT $limit OFFSET $offset;
             """;
+#pragma warning restore CA2100
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$prefix", prefix);
@@ -1458,12 +1563,15 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$offset", legacyOffset);
 
         var items = new List<BlobListEntry>(maximum + 1);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             items.Add(reader.GetInt32(2) == 0
                 ? new BlobListEntry(
-                    reader.IsDBNull(0) ? null : Deserialize<BlobRecord>(reader.GetString(0)),
+                    await reader.IsDBNullAsync(0, cancellationToken).ConfigureAwait(false)
+                        ? null
+                        : Deserialize<BlobRecord>(reader.GetString(0)),
                     reader.GetString(1))
                 : reader.GetInt32(7) == 1
                     ? new BlobListEntry(null, null, reader.GetString(1))
@@ -1482,8 +1590,7 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
         if (filter.Predicates.Count == 0)
             throw new ArgumentException("At least one tag predicate is required.", nameof(filter));
 
@@ -1517,8 +1624,12 @@ public sealed class MetadataStore(
                 """);
         }
 
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        // Predicate operators come from a closed enum; tag keys and values are bound parameters.
+#pragma warning disable CA2100
         command.CommandText = $"""
             SELECT blob.data
             FROM blobs AS blob
@@ -1533,6 +1644,7 @@ public sealed class MetadataStore(
                      blob.generation_id
             LIMIT $limit;
             """;
+#pragma warning restore CA2100
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", filter.Container ?? string.Empty);
         command.Parameters.AddWithValue("$has_cursor", cursor is null ? 0 : 1);
@@ -1546,7 +1658,7 @@ public sealed class MetadataStore(
             command.Parameters.AddWithValue($"$value{index}", filter.Predicates[index].Value);
         }
 
-        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken)).ToList();
+        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false)).ToList();
         var hasMore = records.Count > maximum;
         if (hasMore)
             records.RemoveAt(records.Count - 1);
@@ -1558,10 +1670,11 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT data FROM blobs
             WHERE generation_id > $after
@@ -1570,7 +1683,7 @@ public sealed class MetadataStore(
             """;
         command.Parameters.AddWithValue("$after", afterGenerationId ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
-        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken)).ToList();
+        var records = (await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false)).ToList();
         var hasMore = records.Count > maximum;
         if (hasMore)
             records.RemoveAt(records.Count - 1);
@@ -1582,10 +1695,11 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT data FROM containers
             WHERE $has_after = 0
@@ -1598,41 +1712,48 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", after?.Account ?? string.Empty);
         command.Parameters.AddWithValue("$name", after?.Name ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
-        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken)).ToList();
+        var records = (await ReadJsonRowsAsync<ContainerRecord>(command, cancellationToken).ConfigureAwait(false)).ToList();
         var hasMore = records.Count > maximum;
         if (hasMore)
             records.RemoveAt(records.Count - 1);
         return new KeysetPage<ContainerRecord>(records, hasMore);
     }
 
-    public async Task<BlobRecord> PublishBlobAsync(
+    public Task<BlobRecord> PublishBlobAsync(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
         bool hierarchicalNamespace,
-        CancellationToken cancellationToken) =>
-        await PublishBlobCoreAsync(
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(proposed);
+        return PublishBlobCoreAsync(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
             stagedBlockSnapshot: null,
             hierarchicalNamespace,
             cancellationToken);
+    }
 
-    public async Task<BlobRecord> PublishBlockListAsync(
+    public Task<BlobRecord> PublishBlockListAsync(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
         IReadOnlyList<StagedBlockRecord> stagedBlockSnapshot,
         bool hierarchicalNamespace,
-        CancellationToken cancellationToken) =>
-        await PublishBlobCoreAsync(
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(proposed);
+        ArgumentNullException.ThrowIfNull(stagedBlockSnapshot);
+        return PublishBlobCoreAsync(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
             stagedBlockSnapshot,
             hierarchicalNamespace,
             cancellationToken);
+    }
 
     private async Task<BlobRecord> PublishBlobCoreAsync(
         BlobRecord proposed,
@@ -1642,12 +1763,14 @@ public sealed class MetadataStore(
         bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetCurrentBlobAsync(connection, transaction, proposed.Account, proposed.Container, proposed.Name, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetCurrentBlobAsync(connection, transaction, proposed.Account, proposed.Container, proposed.Name, cancellationToken).ConfigureAwait(false);
             var activeCurrent = current is { IsDeleted: false } ? current : null;
             if (hierarchicalNamespace && activeCurrent is { IsDirectory: true } && !proposed.IsDirectory)
                 throw new StoragePathConflictException();
@@ -1663,7 +1786,7 @@ public sealed class MetadataStore(
                     connection,
                     transaction,
                     proposed,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 proposed = proposed with
                 {
                     Owner = activeCurrent?.Owner ?? proposed.Owner,
@@ -1682,15 +1805,15 @@ public sealed class MetadataStore(
                     proposed.Account,
                     proposed.Container,
                     proposed.Name,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (!EquivalentStagedBlocks(actualBlocks, stagedBlockSnapshot))
                     throw new StorageConcurrencyException();
             }
 
-            var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken);
+            var serviceProperties = await GetServicePropertiesAsync(connection, transaction, proposed.Account, cancellationToken).ConfigureAwait(false);
             if (current is not null)
             {
-                if (!current.IsDeleted && current.Copy?.Status == "pending")
+                if (!current.IsDeleted && string.Equals(current.Copy?.Status, "pending", StringComparison.Ordinal))
                     throw new StoragePendingCopyException();
                 var now = _timeProvider.GetUtcNow();
                 if (current.IsDeleted && !hierarchicalNamespace)
@@ -1708,11 +1831,11 @@ public sealed class MetadataStore(
                                 current.Container,
                                 current.Name,
                                 current.DeletedAt ?? now,
-                                cancellationToken),
+                                cancellationToken).ConfigureAwait(false),
                             Lease = LeaseRecord.Available,
                             Revision = NewRevision()
                         };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
@@ -1722,7 +1845,7 @@ public sealed class MetadataStore(
                             current.Account,
                             current.Container,
                             current.Name,
-                            cancellationToken);
+                            cancellationToken).ConfigureAwait(false);
                     }
                 }
                 else
@@ -1741,7 +1864,7 @@ public sealed class MetadataStore(
                             Lease = LeaseRecord.Available,
                             Revision = NewRevision()
                         };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
                     }
                     else if (serviceProperties.BlobSoftDeleteEnabled && !hierarchicalNamespace)
                     {
@@ -1759,15 +1882,15 @@ public sealed class MetadataStore(
                                 current.Container,
                                 current.Name,
                                 now,
-                                cancellationToken),
+                                cancellationToken).ConfigureAwait(false),
                             Lease = LeaseRecord.Available,
                             Revision = NewRevision()
                         };
-                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                        await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
                     }
                     else
                     {
-                        await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken);
+                        await DeleteBlobRowAsync(connection, transaction, current.GenerationId, cancellationToken).ConfigureAwait(false);
                     }
                 }
             }
@@ -1784,16 +1907,16 @@ public sealed class MetadataStore(
                     : null,
                 Snapshot = null
             };
-            await InsertBlobRowAsync(connection, transaction, published, cancellationToken);
+            await InsertBlobRowAsync(connection, transaction, published, cancellationToken).ConfigureAwait(false);
             await DeleteStagedBlocksAsync(
                 connection,
                 transaction,
                 proposed.Account,
                 proposed.Container,
                 proposed.Name,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             faultInjector.Inject(StorageFaultPoint.BeforeBlobMetadataCommit);
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             faultInjector.Inject(StorageFaultPoint.AfterBlobMetadataCommit);
             return published;
         }
@@ -1808,16 +1931,19 @@ public sealed class MetadataStore(
         string expectedRevision,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(record);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetBlobByGenerationAsync(connection, transaction, record.GenerationId, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetBlobByGenerationAsync(connection, transaction, record.GenerationId, cancellationToken).ConfigureAwait(false);
             if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
-            await UpdateBlobRowAsync(connection, transaction, record, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await UpdateBlobRowAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -1829,16 +1955,18 @@ public sealed class MetadataStore(
         string generationId,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await GetBlobByGenerationAsync(connection, null, generationId, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await GetBlobByGenerationAsync(connection, null, generationId, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<ObjectReplicationState?> GetObjectReplicationStateAsync(
         ObjectReplicationStateKey key,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await GetObjectReplicationStateAsync(connection, null, key, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await GetObjectReplicationStateAsync(connection, null, key, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<ObjectReplicationStatePage> ListObjectReplicationStatesPageAsync(
@@ -1846,11 +1974,12 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
 
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT policy_id, rule_id, source_generation_id,
                    source_account, source_container, source_name,
@@ -1870,8 +1999,9 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$generation", cursor?.SourceGenerationId ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
         var states = new List<ObjectReplicationState>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             states.Add(ReadObjectReplicationState(reader));
         var hasMore = states.Count > maximum;
         if (hasMore)
@@ -1886,16 +2016,18 @@ public sealed class MetadataStore(
         string statusKey,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var source = await GetBlobByGenerationAsync(
                 connection,
                 transaction,
                 expectedSource.GenerationId,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (source is null || !string.Equals(source.Revision, expectedSource.Revision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
@@ -1903,9 +2035,9 @@ public sealed class MetadataStore(
                 proposedState.PolicyId,
                 proposedState.RuleId,
                 source.GenerationId);
-            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
             var mapped = state?.DestinationGenerationId is { } mappedGeneration
-                ? await GetBlobByGenerationAsync(connection, transaction, mappedGeneration, cancellationToken)
+                ? await GetBlobByGenerationAsync(connection, transaction, mappedGeneration, cancellationToken).ConfigureAwait(false)
                 : null;
             var current = await GetCurrentBlobAsync(
                 connection,
@@ -1913,7 +2045,7 @@ public sealed class MetadataStore(
                 proposedDestination.Account,
                 proposedDestination.Container,
                 proposedDestination.Name,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var now = _timeProvider.GetUtcNow();
 
             BlobRecord replicated;
@@ -1932,11 +2064,11 @@ public sealed class MetadataStore(
                             current.Container,
                             current.Name,
                             current.LastModified,
-                            cancellationToken),
+                            cancellationToken).ConfigureAwait(false),
                         Lease = LeaseRecord.Available,
                         Revision = NewRevision()
                     };
-                    await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                    await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
                 }
 
                 replicated = proposedDestination with
@@ -1950,11 +2082,11 @@ public sealed class MetadataStore(
                         proposedDestination.Container,
                         proposedDestination.Name,
                         proposedDestination.LastModified,
-                        cancellationToken),
+                        cancellationToken).ConfigureAwait(false),
                     Snapshot = null,
                     Lease = LeaseRecord.Available
                 };
-                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken);
+                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
             }
             else if (mapped is null)
             {
@@ -1969,11 +2101,11 @@ public sealed class MetadataStore(
                         proposedDestination.Container,
                         proposedDestination.Name,
                         proposedDestination.LastModified,
-                        cancellationToken),
+                        cancellationToken).ConfigureAwait(false),
                     Snapshot = null,
                     Lease = LeaseRecord.Available
                 };
-                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken);
+                await InsertBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
             }
             else
             {
@@ -1989,7 +2121,7 @@ public sealed class MetadataStore(
                         mapped.Container,
                         mapped.Name,
                         mapped.LastModified,
-                        cancellationToken),
+                        cancellationToken).ConfigureAwait(false),
                     Snapshot = null,
                     IsCurrent = source.IsCurrent,
                     IsDeleted = false,
@@ -2003,7 +2135,7 @@ public sealed class MetadataStore(
                     RehydrateCompleteAt = mapped.RehydrateCompleteAt,
                     Lease = LeaseRecord.Available
                 };
-                await UpdateBlobRowAsync(connection, transaction, replicated, cancellationToken);
+                await UpdateBlobRowAsync(connection, transaction, replicated, cancellationToken).ConfigureAwait(false);
             }
 
             var statuses = new Dictionary<string, ObjectReplicationStatusRecord>(
@@ -2021,7 +2153,7 @@ public sealed class MetadataStore(
                 Revision = NewRevision(),
                 ObjectReplicationStatuses = statuses
             };
-            await UpdateBlobRowAsync(connection, transaction, updatedSource, cancellationToken);
+            await UpdateBlobRowAsync(connection, transaction, updatedSource, cancellationToken).ConfigureAwait(false);
             await UpsertObjectReplicationStateAsync(
                 connection,
                 transaction,
@@ -2031,8 +2163,8 @@ public sealed class MetadataStore(
                     Status = "complete",
                     UpdatedAt = now
                 },
-                cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+                cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return replicated;
         }
         finally
@@ -2047,16 +2179,18 @@ public sealed class MetadataStore(
         string statusKey,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var source = await GetBlobByGenerationAsync(
                 connection,
                 transaction,
                 expectedSource.GenerationId,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (source is null || !string.Equals(source.Revision, expectedSource.Revision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
@@ -2064,7 +2198,7 @@ public sealed class MetadataStore(
                 proposedState.PolicyId,
                 proposedState.RuleId,
                 source.GenerationId);
-            var existing = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            var existing = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
             if (source.ObjectReplicationStatuses.TryGetValue(statusKey, out var status) &&
                 string.Equals(status.Status, "failed", StringComparison.Ordinal) &&
                 string.Equals(status.SourceFingerprint, proposedState.SourceFingerprint, StringComparison.Ordinal) &&
@@ -2075,8 +2209,8 @@ public sealed class MetadataStore(
                     connection,
                     transaction,
                     existing with { UpdatedAt = _timeProvider.GetUtcNow() },
-                    cancellationToken);
-                await transaction.CommitAsync(cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
@@ -2098,7 +2232,7 @@ public sealed class MetadataStore(
                     Revision = NewRevision(),
                     ObjectReplicationStatuses = statuses
                 },
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             await UpsertObjectReplicationStateAsync(
                 connection,
                 transaction,
@@ -2108,8 +2242,8 @@ public sealed class MetadataStore(
                     Status = "failed",
                     UpdatedAt = _timeProvider.GetUtcNow()
                 },
-                cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+                cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -2122,25 +2256,27 @@ public sealed class MetadataStore(
         ObjectReplicationState expectedState,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var key = new ObjectReplicationStateKey(
                 expectedState.PolicyId,
                 expectedState.RuleId,
                 expectedState.SourceGenerationId);
-            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
             if (state is null ||
                 !string.Equals(state.SourceFingerprint, expectedState.SourceFingerprint, StringComparison.Ordinal) ||
                 await GetBlobByGenerationAsync(
                     connection,
                     transaction,
                     state.SourceGenerationId,
-                    cancellationToken) is not null)
+                    cancellationToken).ConfigureAwait(false) is not null)
             {
-                await transaction.CommitAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
@@ -2150,16 +2286,16 @@ public sealed class MetadataStore(
                     connection,
                     transaction,
                     destinationGeneration,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (destination is not null)
                 {
                     EnsureObjectReplicationTargetMutable(destination, _timeProvider.GetUtcNow());
-                    await DeleteBlobRowAsync(connection, transaction, destination.GenerationId, cancellationToken);
+                    await DeleteBlobRowAsync(connection, transaction, destination.GenerationId, cancellationToken).ConfigureAwait(false);
                 }
             }
 
-            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -2172,16 +2308,18 @@ public sealed class MetadataStore(
         ObjectReplicationState expectedState,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var key = new ObjectReplicationStateKey(
                 expectedState.PolicyId,
                 expectedState.RuleId,
                 expectedState.SourceGenerationId);
-            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
+            var state = await GetObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
             if (state is null ||
                 !string.Equals(state.SourceFingerprint, expectedState.SourceFingerprint, StringComparison.Ordinal) ||
                 !string.Equals(
@@ -2189,12 +2327,12 @@ public sealed class MetadataStore(
                     expectedState.DestinationGenerationId,
                     StringComparison.Ordinal))
             {
-                await transaction.CommitAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
-            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await DeleteObjectReplicationStateAsync(connection, transaction, key, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -2220,11 +2358,13 @@ public sealed class MetadataStore(
             throw new ArgumentException("Blob record mutations must target unique, stable generation identities.", nameof(mutations));
         }
 
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var currentRecords = new List<BlobRecord>(mutations.Count);
             foreach (var mutation in mutations)
             {
@@ -2232,7 +2372,7 @@ public sealed class MetadataStore(
                     connection,
                     transaction,
                     mutation.GenerationId,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (current is null ||
                     !string.Equals(current.Revision, mutation.ExpectedRevision, StringComparison.Ordinal))
                 {
@@ -2249,7 +2389,7 @@ public sealed class MetadataStore(
                         connection,
                         transaction,
                         mutation.GenerationId,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {
@@ -2257,7 +2397,7 @@ public sealed class MetadataStore(
                         connection,
                         transaction,
                         mutation.Replacement,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
             }
             if (clearStagedBlocksForCurrentBlobs)
@@ -2272,10 +2412,10 @@ public sealed class MetadataStore(
                         current.Account,
                         current.Container,
                         current.Name,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
             }
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2288,16 +2428,18 @@ public sealed class MetadataStore(
         string expectedRevision,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             var source = await GetBlobByGenerationAsync(
                 connection,
                 transaction,
                 restored.GenerationId,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (source is null ||
                 !source.IsDeleted ||
                 !string.Equals(source.Revision, expectedRevision, StringComparison.Ordinal))
@@ -2305,7 +2447,7 @@ public sealed class MetadataStore(
                 throw new StorageConcurrencyException();
             }
 
-            await EnsureHierarchicalParentsAsync(connection, transaction, restored, cancellationToken);
+            await EnsureHierarchicalParentsAsync(connection, transaction, restored, cancellationToken).ConfigureAwait(false);
 
             var destination = await GetCurrentBlobAsync(
                 connection,
@@ -2313,16 +2455,16 @@ public sealed class MetadataStore(
                 restored.Account,
                 restored.Container,
                 restored.Name,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (destination is not null &&
                 !string.Equals(destination.GenerationId, restored.GenerationId, StringComparison.Ordinal))
             {
-                await transaction.RollbackAsync(cancellationToken);
+                await transaction.RollbackAsync(cancellationToken).ConfigureAwait(false);
                 return false;
             }
 
-            await UpdateBlobRowAsync(connection, transaction, restored, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await UpdateBlobRowAsync(connection, transaction, restored, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return true;
         }
         finally
@@ -2336,12 +2478,15 @@ public sealed class MetadataStore(
         string container,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = """
                 SELECT data FROM blobs
@@ -2353,10 +2498,10 @@ public sealed class MetadataStore(
                 """;
             command.Parameters.AddWithValue("$account", account);
             command.Parameters.AddWithValue("$container", container);
-            var records = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+            var records = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
             foreach (var record in records.Where(item => !item.IsDirectory))
-                await EnsureHierarchicalParentsAsync(connection, transaction, record, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+                await EnsureHierarchicalParentsAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2370,8 +2515,10 @@ public sealed class MetadataStore(
         string directoryName,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = """
             SELECT 1 FROM blobs
             WHERE account = $account
@@ -2386,7 +2533,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$directory", directoryName);
         command.Parameters.AddWithValue("$prefix", directoryName + "/");
-        return await command.ExecuteScalarAsync(cancellationToken) is not null;
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
     }
 
     public async Task<BlobRecord> CompleteIncrementalCopyAsync(
@@ -2395,12 +2542,15 @@ public sealed class MetadataStore(
         DateTimeOffset now,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(record);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetBlobByGenerationAsync(connection, transaction, record.GenerationId, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetBlobByGenerationAsync(connection, transaction, record.GenerationId, cancellationToken).ConfigureAwait(false);
             if (current is null ||
                 !current.IsCurrent ||
                 !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
@@ -2415,9 +2565,9 @@ public sealed class MetadataStore(
                 record.Container,
                 record.Name,
                 now,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var completed = record with { CopyDestinationSnapshot = snapshotId };
-            await UpdateBlobRowAsync(connection, transaction, completed, cancellationToken);
+            await UpdateBlobRowAsync(connection, transaction, completed, cancellationToken).ConfigureAwait(false);
             var snapshot = completed with
             {
                 GenerationId = Guid.NewGuid().ToString("N"),
@@ -2427,8 +2577,8 @@ public sealed class MetadataStore(
                 IsCurrent = false,
                 Lease = LeaseRecord.Available
             };
-            await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return completed;
         }
         finally
@@ -2439,18 +2589,22 @@ public sealed class MetadataStore(
 
     public async Task<BlobRecord> CreateSnapshotAsync(
         BlobRecord source,
-        Dictionary<string, string>? snapshotMetadata,
+        IReadOnlyDictionary<string, string>? snapshotMetadata,
         DateTimeOffset now,
         bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(source);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetCurrentBlobAsync(connection, transaction, source.Account, source.Container, source.Name, cancellationToken);
-            if (current?.GenerationId != source.GenerationId || current.Revision != source.Revision)
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetCurrentBlobAsync(connection, transaction, source.Account, source.Container, source.Name, cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(current?.GenerationId, source.GenerationId, StringComparison.Ordinal) ||
+                !string.Equals(current?.Revision, source.Revision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
 
             var snapshotId = await CreateUniqueSnapshotIdAsync(
@@ -2460,7 +2614,7 @@ public sealed class MetadataStore(
                 source.Container,
                 source.Name,
                 now,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var snapshot = source with
             {
                 GenerationId = Guid.NewGuid().ToString("N"),
@@ -2474,7 +2628,7 @@ public sealed class MetadataStore(
                 Lease = LeaseRecord.Available
             };
 
-            var properties = await GetServicePropertiesAsync(connection, transaction, source.Account, cancellationToken);
+            var properties = await GetServicePropertiesAsync(connection, transaction, source.Account, cancellationToken).ConfigureAwait(false);
             string? newVersionId = null;
             if (properties.VersioningEnabled && !hierarchicalNamespace)
             {
@@ -2485,7 +2639,7 @@ public sealed class MetadataStore(
                     Lease = LeaseRecord.Available,
                     Revision = NewRevision()
                 };
-                await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken);
+                await UpdateBlobRowAsync(connection, transaction, historical, cancellationToken).ConfigureAwait(false);
                 newVersionId = await CreateUniqueVersionIdAsync(
                     connection,
                     transaction,
@@ -2493,7 +2647,7 @@ public sealed class MetadataStore(
                     source.Container,
                     source.Name,
                     now,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 var newCurrent = source with
                 {
                     GenerationId = Guid.NewGuid().ToString("N"),
@@ -2502,10 +2656,10 @@ public sealed class MetadataStore(
                     Snapshot = null,
                     IsCurrent = true
                 };
-                await InsertBlobRowAsync(connection, transaction, newCurrent, cancellationToken);
+                await InsertBlobRowAsync(connection, transaction, newCurrent, cancellationToken).ConfigureAwait(false);
             }
-            await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await InsertBlobRowAsync(connection, transaction, snapshot, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return newVersionId is null ? snapshot : snapshot with { VersionId = newVersionId };
         }
         finally
@@ -2519,21 +2673,24 @@ public sealed class MetadataStore(
         string expectedRevision,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            var current = await GetBlobByGenerationAsync(connection, transaction, generationId, cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var current = await GetBlobByGenerationAsync(connection, transaction, generationId, cancellationToken).ConfigureAwait(false);
             if (current is null)
                 return false;
             if (!string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
                 throw new StorageConcurrencyException();
-            await using var command = connection.CreateCommand();
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = "DELETE FROM blobs WHERE generation_id = $generation;";
             command.Parameters.AddWithValue("$generation", generationId);
-            var deleted = await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+            var deleted = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) == 1;
             if (deleted && current.IsCurrent && current.Snapshot is null)
             {
                 await DeleteStagedBlocksAsync(
@@ -2542,9 +2699,9 @@ public sealed class MetadataStore(
                     current.Account,
                     current.Container,
                     current.Name,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
             return deleted;
         }
         finally
@@ -2555,12 +2712,16 @@ public sealed class MetadataStore(
 
     public async Task PutStagedBlockAsync(StagedBlockRecord block, CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentNullException.ThrowIfNull(block);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO staged_blocks(
@@ -2578,9 +2739,9 @@ public sealed class MetadataStore(
             command.Parameters.AddWithValue("$created", block.CreatedAt.UtcTicks);
             command.Parameters.AddWithValue("$logical", block.Content.Length);
             command.Parameters.AddWithValue("$data", Serialize(block));
-            await command.ExecuteNonQueryAsync(cancellationToken);
-            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2594,8 +2755,9 @@ public sealed class MetadataStore(
         string blobName,
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await ListStagedBlocksAsync(connection, transaction: null, account, container, blobName, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await ListStagedBlocksAsync(connection, transaction: null, account, container, blobName, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<IReadOnlyList<StagedBlockRecord>> ListStagedBlocksAsync(
@@ -2606,7 +2768,8 @@ public sealed class MetadataStore(
         string blobName,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             SELECT data FROM staged_blocks
@@ -2616,7 +2779,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$blob", blobName);
-        return await ReadJsonRowsAsync<StagedBlockRecord>(command, cancellationToken);
+        return await ReadJsonRowsAsync<StagedBlockRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<int> DeleteStagedBlocksAsync(
@@ -2627,7 +2790,8 @@ public sealed class MetadataStore(
         string blobName,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             DELETE FROM staged_blocks
@@ -2636,7 +2800,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$blob", blobName);
-        return await command.ExecuteNonQueryAsync(cancellationToken);
+        return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<bool> DeleteStagedBlocksAsync(
@@ -2645,11 +2809,13 @@ public sealed class MetadataStore(
         string blobName,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = """
                 DELETE FROM staged_blocks
                 WHERE account = $account
@@ -2668,7 +2834,7 @@ public sealed class MetadataStore(
             command.Parameters.AddWithValue("$account", account);
             command.Parameters.AddWithValue("$container", container);
             command.Parameters.AddWithValue("$blob", blobName);
-            return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) > 0;
         }
         finally
         {
@@ -2684,14 +2850,17 @@ public sealed class MetadataStore(
         IReadOnlyCollection<string> removeIds,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+            await using var transactionDisposal = transaction.ConfigureAwait(false);
             foreach (var blockId in committedIds.Concat(removeIds).Distinct(StringComparer.Ordinal))
             {
-                await using var command = connection.CreateCommand();
+                var command = connection.CreateCommand();
+                await using var commandDisposal = command.ConfigureAwait(false);
                 command.Transaction = transaction;
                 command.CommandText = """
                     DELETE FROM staged_blocks
@@ -2701,9 +2870,9 @@ public sealed class MetadataStore(
                 command.Parameters.AddWithValue("$container", container);
                 command.Parameters.AddWithValue("$blob", blobName);
                 command.Parameters.AddWithValue("$block", blockId);
-                await command.ExecuteNonQueryAsync(cancellationToken);
+                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
-            await transaction.CommitAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2716,13 +2885,14 @@ public sealed class MetadataStore(
         int maximum,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await _writeGate.WaitAsync(cancellationToken);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = """
                 DELETE FROM staged_blocks
                 WHERE rowid IN (
@@ -2734,7 +2904,7 @@ public sealed class MetadataStore(
                 """;
             command.Parameters.AddWithValue("$cutoff", cutoff.UtcTicks);
             command.Parameters.AddWithValue("$limit", maximum);
-            return await command.ExecuteNonQueryAsync(cancellationToken);
+            return await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2744,24 +2914,27 @@ public sealed class MetadataStore(
 
     public async Task<ServiceProperties> GetServicePropertiesAsync(string account, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await GetServicePropertiesAsync(connection, transaction: null, account, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await GetServicePropertiesAsync(connection, transaction: null, account, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task PutServicePropertiesAsync(string account, ServiceProperties properties, CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            await using var connection = await OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
+            var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var connectionDisposal = connection.ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.CommandText = """
                 INSERT INTO service_properties(account, data) VALUES ($account, $data)
                 ON CONFLICT(account) DO UPDATE SET data = excluded.data;
                 """;
             command.Parameters.AddWithValue("$account", account);
             command.Parameters.AddWithValue("$data", Serialize(properties));
-            await command.ExecuteNonQueryAsync(cancellationToken);
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2775,10 +2948,11 @@ public sealed class MetadataStore(
         bool excludeCustomerProvidedKeyDomains,
         CancellationToken cancellationToken)
     {
-        if (maximum <= 0)
-            throw new ArgumentOutOfRangeException(nameof(maximum));
-        await using var connection = await OpenAsync(cancellationToken);
-        await using var command = connection.CreateCommand();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = $"""
             SELECT chunk_id
             FROM (
@@ -2795,8 +2969,9 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$after", after ?? string.Empty);
         command.Parameters.AddWithValue("$limit", checked(maximum + 1));
         var ids = new List<string>(maximum + 1);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             ids.Add(reader.GetString(0));
         var hasMore = ids.Count > maximum;
         if (hasMore)
@@ -2814,12 +2989,14 @@ public sealed class MetadataStore(
 
         const int maximumParametersPerQuery = 512;
         var uniqueCandidates = candidates.Distinct(StringComparer.Ordinal).ToArray();
-        await using var connection = await OpenAsync(cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
         for (var offset = 0; offset < uniqueCandidates.Length; offset += maximumParametersPerQuery)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var count = Math.Min(maximumParametersPerQuery, uniqueCandidates.Length - offset);
-            await using var command = connection.CreateCommand();
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             var parameterNames = new string[count];
             for (var index = 0; index < count; index++)
             {
@@ -2827,13 +3004,17 @@ public sealed class MetadataStore(
                 command.Parameters.AddWithValue(parameterNames[index], uniqueCandidates[offset + index]);
             }
             var values = string.Join(',', parameterNames);
+            // Parameter names are generated from bounded integer indexes, never from chunk IDs.
+#pragma warning disable CA2100
             command.CommandText = $"""
                 SELECT chunk_id FROM blob_chunk_references WHERE chunk_id IN ({values})
                 UNION
                 SELECT chunk_id FROM staged_block_chunk_references WHERE chunk_id IN ({values});
                 """;
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+#pragma warning restore CA2100
+            var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 reachable.Add(reader.GetString(0));
         }
         return reachable;
@@ -2842,17 +3023,20 @@ public sealed class MetadataStore(
     public async Task<StorageInventorySummary> GetStorageInventorySummaryAsync(
         CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
         long logicalBlobBytes;
         int blobRecordCount;
-        await using (var blobs = connection.CreateCommand())
+        var blobs = connection.CreateCommand();
+        await using (blobs.ConfigureAwait(false))
         {
             blobs.CommandText = """
                 SELECT COALESCE(SUM(logical_length + pending_copy_length), 0), COUNT(*)
                 FROM blobs;
                 """;
-            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
+            var reader = (await blobs.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 throw new InvalidDataException("The blob inventory query returned no aggregate row.");
             logicalBlobBytes = reader.GetInt64(0);
             blobRecordCount = checked((int)reader.GetInt64(1));
@@ -2860,18 +3044,21 @@ public sealed class MetadataStore(
 
         long logicalStagedBlockBytes;
         int stagedBlockCount;
-        await using (var blocks = connection.CreateCommand())
+        var blocks = connection.CreateCommand();
+        await using (blocks.ConfigureAwait(false))
         {
             blocks.CommandText = "SELECT COALESCE(SUM(logical_length), 0), COUNT(*) FROM staged_blocks;";
-            await using var reader = await blocks.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
+            var reader = (await blocks.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 throw new InvalidDataException("The staged-block inventory query returned no aggregate row.");
             logicalStagedBlockBytes = reader.GetInt64(0);
             stagedBlockCount = checked((int)reader.GetInt64(1));
         }
 
         int reachableChunkCount;
-        await using (var chunks = connection.CreateCommand())
+        var chunks = connection.CreateCommand();
+        await using (chunks.ConfigureAwait(false))
         {
             chunks.CommandText = """
                 SELECT COUNT(*)
@@ -2883,7 +3070,7 @@ public sealed class MetadataStore(
                 WHERE chunk_id NOT LIKE '%/$zero';
                 """;
             reachableChunkCount = checked(Convert.ToInt32(
-                await chunks.ExecuteScalarAsync(cancellationToken),
+                await chunks.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
                 CultureInfo.InvariantCulture));
         }
 
@@ -2897,8 +3084,9 @@ public sealed class MetadataStore(
 
     public async Task<StorageMetadataInventory> GetStorageInventoryAsync(CancellationToken cancellationToken)
     {
-        await using var connection = await OpenAsync(cancellationToken);
-        return await ReadStorageInventoryAsync(connection, cancellationToken);
+        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await ReadStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     internal async Task<MetadataBackupSnapshot> CreateBackupSnapshotAsync(
@@ -2906,12 +3094,13 @@ public sealed class MetadataStore(
         Func<IReadOnlySet<string>, IDisposable> acquireContentPins,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken);
+        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         IDisposable? pins = null;
         try
         {
-            await using var source = await OpenAsync(cancellationToken);
-            var inventory = await ReadVerifiedStorageInventoryAsync(source, cancellationToken);
+            var source = (await OpenAsync(cancellationToken).ConfigureAwait(false));
+            await using var sourceDisposal = source.ConfigureAwait(false);
+            var inventory = await ReadVerifiedStorageInventoryAsync(source, cancellationToken).ConfigureAwait(false);
             pins = acquireContentPins(inventory.ReachableChunkIds);
             var destinationConnectionString = new SqliteConnectionStringBuilder
             {
@@ -2920,16 +3109,18 @@ public sealed class MetadataStore(
                 Cache = SqliteCacheMode.Private,
                 Pooling = false
             }.ToString();
-            await using (var destination = new SqliteConnection(destinationConnectionString))
+            var destination = new SqliteConnection(destinationConnectionString);
+            await using (destination.ConfigureAwait(false))
             {
-                await destination.OpenAsync(cancellationToken);
+                await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
                 source.BackupDatabase(destination);
                 cancellationToken.ThrowIfCancellationRequested();
-                await using var journalMode = destination.CreateCommand();
+                var journalMode = destination.CreateCommand();
+                await using var journalModeDisposal = journalMode.ConfigureAwait(false);
                 journalMode.CommandText = "PRAGMA journal_mode=DELETE;";
                 var selectedMode = Convert.ToString(
-                    await journalMode.ExecuteScalarAsync(cancellationToken),
+                    await journalMode.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
                     CultureInfo.InvariantCulture);
                 if (!string.Equals(selectedMode, "delete", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException("The metadata backup could not be normalized to a standalone database file.");
@@ -2956,30 +3147,35 @@ public sealed class MetadataStore(
             Cache = SqliteCacheMode.Private,
             Pooling = false
         }.ToString();
-        await using var connection = new SqliteConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
-        await using (var integrity = connection.CreateCommand())
+        var connection = new SqliteConnection(connectionString);
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        var integrity = connection.CreateCommand();
+        await using (integrity.ConfigureAwait(false))
         {
             integrity.CommandText = "PRAGMA integrity_check;";
-            await using var reader = await integrity.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await integrity.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var result = reader.GetString(0);
                 if (!string.Equals(result, "ok", StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"The metadata database failed SQLite integrity checking: {result}");
             }
         }
-        await VerifyForeignKeysAsync(connection, cancellationToken);
+        await VerifyForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
 
-        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
-        var inventory = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken);
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
+        var inventory = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
         var namespaceModes = new Dictionary<string, bool>(StringComparer.Ordinal);
         if (schemaVersion >= CurrentSchemaVersion)
         {
-            await using var modes = connection.CreateCommand();
+            var modes = connection.CreateCommand();
+            await using var modesDisposal = modes.ConfigureAwait(false);
             modes.CommandText = "SELECT account, hierarchical_namespace_enabled FROM account_namespace_modes;";
-            await using var reader = await modes.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await modes.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 namespaceModes.Add(reader.GetString(0), reader.GetInt32(1) == 1);
         }
         return new MetadataDatabaseInspection(schemaVersion, inventory, namespaceModes);
@@ -2996,37 +3192,39 @@ public sealed class MetadataStore(
             Cache = SqliteCacheMode.Private,
             Pooling = false
         }.ToString();
-        await using var connection = new SqliteConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
-        await using (var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken))
+        var connection = new SqliteConnection(connectionString);
+        await using var connectionDisposal = connection.ConfigureAwait(false);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+        await using (transaction.ConfigureAwait(false))
         {
-            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM packed_chunks;", cancellationToken);
-            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM chunk_packs;", cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM packed_chunks;", cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, transaction, "DELETE FROM chunk_packs;", cancellationToken).ConfigureAwait(false);
+            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
-        await ExecuteNonQueryAsync(connection, "VACUUM;", cancellationToken);
+        await ExecuteNonQueryAsync(connection, "VACUUM;", cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<StorageMetadataInventory> ReadStorageInventoryAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
-        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
         return schemaVersion >= 2
-            ? await ReadIndexedStorageInventoryAsync(connection, cancellationToken)
-            : await ReadManifestStorageInventoryAsync(connection, cancellationToken);
+            ? await ReadIndexedStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false)
+            : await ReadManifestStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<StorageMetadataInventory> ReadVerifiedStorageInventoryAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
-        var authoritative = await ReadManifestStorageInventoryAsync(connection, cancellationToken);
-        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
+        var authoritative = await ReadManifestStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
+        var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
         if (schemaVersion < ChunkIndexSchemaVersion)
             return authoritative;
 
-        var indexed = await ReadIndexedStorageInventoryAsync(connection, cancellationToken);
+        var indexed = await ReadIndexedStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
         if (authoritative.LogicalBlobBytes != indexed.LogicalBlobBytes ||
             authoritative.LogicalStagedBlockBytes != indexed.LogicalStagedBlockBytes ||
             authoritative.BlobRecordCount != indexed.BlobRecordCount ||
@@ -3036,7 +3234,7 @@ public sealed class MetadataStore(
             throw new InvalidDataException("The metadata chunk-reference index does not match the authoritative manifests.");
         }
         if (schemaVersion >= 3)
-            await VerifyBlobTagIndexAsync(connection, cancellationToken);
+            await VerifyBlobTagIndexAsync(connection, cancellationToken).ConfigureAwait(false);
         return authoritative;
     }
 
@@ -3045,11 +3243,13 @@ public sealed class MetadataStore(
         CancellationToken cancellationToken)
     {
         var expected = new Dictionary<(string GenerationId, string Key), string>();
-        await using (var blobs = connection.CreateCommand())
+        var blobs = connection.CreateCommand();
+        await using (blobs.ConfigureAwait(false))
         {
             blobs.CommandText = "SELECT data FROM blobs;";
-            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await blobs.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var blob = Deserialize<BlobRecord>(reader.GetString(0));
                 foreach (var (key, value) in blob.Tags)
@@ -3058,11 +3258,13 @@ public sealed class MetadataStore(
         }
 
         var actual = new Dictionary<(string GenerationId, string Key), string>();
-        await using (var tags = connection.CreateCommand())
+        var tags = connection.CreateCommand();
+        await using (tags.ConfigureAwait(false))
         {
             tags.CommandText = "SELECT generation_id, tag_key, tag_value FROM blob_tags;";
-            await using var reader = await tags.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await tags.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 actual.Add((reader.GetString(0), reader.GetString(1)), reader.GetString(2));
         }
 
@@ -3079,28 +3281,32 @@ public sealed class MetadataStore(
         CancellationToken cancellationToken)
     {
         var reachable = new HashSet<string>(StringComparer.Ordinal);
-        await using (var chunks = connection.CreateCommand())
+        var chunks = connection.CreateCommand();
+        await using (chunks.ConfigureAwait(false))
         {
             chunks.CommandText = """
                 SELECT chunk_id FROM blob_chunk_references
                 UNION
                 SELECT chunk_id FROM staged_block_chunk_references;
                 """;
-            await using var reader = await chunks.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await chunks.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 reachable.Add(reader.GetString(0));
         }
 
         long logicalBlobBytes;
         int blobRecordCount;
-        await using (var blobs = connection.CreateCommand())
+        var blobs = connection.CreateCommand();
+        await using (blobs.ConfigureAwait(false))
         {
             blobs.CommandText = """
                 SELECT COALESCE(SUM(logical_length + pending_copy_length), 0), COUNT(*)
                 FROM blobs;
                 """;
-            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
+            var reader = (await blobs.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 throw new InvalidDataException("The blob inventory query returned no aggregate row.");
             logicalBlobBytes = reader.GetInt64(0);
             blobRecordCount = reader.GetInt32(1);
@@ -3108,11 +3314,13 @@ public sealed class MetadataStore(
 
         long logicalStagedBlockBytes;
         int stagedBlockCount;
-        await using (var blocks = connection.CreateCommand())
+        var blocks = connection.CreateCommand();
+        await using (blocks.ConfigureAwait(false))
         {
             blocks.CommandText = "SELECT COALESCE(SUM(logical_length), 0), COUNT(*) FROM staged_blocks;";
-            await using var reader = await blocks.ExecuteReaderAsync(cancellationToken);
-            if (!await reader.ReadAsync(cancellationToken))
+            var reader = (await blocks.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 throw new InvalidDataException("The staged-block inventory query returned no aggregate row.");
             logicalStagedBlockBytes = reader.GetInt64(0);
             stagedBlockCount = reader.GetInt32(1);
@@ -3136,11 +3344,13 @@ public sealed class MetadataStore(
         var blobRecordCount = 0;
         var stagedBlockCount = 0;
 
-        await using (var blobs = connection.CreateCommand())
+        var blobs = connection.CreateCommand();
+        await using (blobs.ConfigureAwait(false))
         {
             blobs.CommandText = "SELECT data FROM blobs;";
-            await using var reader = await blobs.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await blobs.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var blob = Deserialize<BlobRecord>(reader.GetString(0));
                 blobRecordCount++;
@@ -3156,11 +3366,13 @@ public sealed class MetadataStore(
             }
         }
 
-        await using (var blocks = connection.CreateCommand())
+        var blocks = connection.CreateCommand();
+        await using (blocks.ConfigureAwait(false))
         {
             blocks.CommandText = "SELECT data FROM staged_blocks;";
-            await using var reader = await blocks.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
+            var reader = (await blocks.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+            await using var readerDisposal = reader.ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var block = Deserialize<StagedBlockRecord>(reader.GetString(0));
                 stagedBlockCount++;
@@ -3204,37 +3416,41 @@ public sealed class MetadataStore(
     {
         IReadOnlyList<BlobRecord> blobs;
         IReadOnlyList<StagedBlockRecord> blocks;
-        await using (var command = connection.CreateCommand())
+        var command = connection.CreateCommand();
+        await using (command.ConfigureAwait(false))
         {
             command.CommandText = "SELECT data FROM blobs;";
-            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
         }
-        await using (var command = connection.CreateCommand())
+        var blocksCommand = connection.CreateCommand();
+        await using (blocksCommand.ConfigureAwait(false))
         {
-            command.CommandText = "SELECT data FROM staged_blocks;";
-            blocks = await ReadJsonRowsAsync<StagedBlockRecord>(command, cancellationToken);
+            blocksCommand.CommandText = "SELECT data FROM staged_blocks;";
+            blocks = await ReadJsonRowsAsync<StagedBlockRecord>(blocksCommand, cancellationToken).ConfigureAwait(false);
         }
 
-        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+        await using var transactionDisposal = transaction.ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             "ALTER TABLE blobs ADD COLUMN logical_length INTEGER NOT NULL DEFAULT 0;",
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             "ALTER TABLE blobs ADD COLUMN pending_copy_length INTEGER NOT NULL DEFAULT 0;",
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             "ALTER TABLE staged_blocks ADD COLUMN logical_length INTEGER NOT NULL DEFAULT 0;",
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
         foreach (var blob in blobs)
         {
-            await using var update = connection.CreateCommand();
+            var update = connection.CreateCommand();
+            await using var updateDisposal = update.ConfigureAwait(false);
             update.Transaction = transaction;
             update.CommandText = """
                 UPDATE blobs
@@ -3244,14 +3460,15 @@ public sealed class MetadataStore(
             update.Parameters.AddWithValue("$logical", blob.Content.Length);
             update.Parameters.AddWithValue("$pending", blob.PendingCopyContent?.Length ?? 0);
             update.Parameters.AddWithValue("$generation", blob.GenerationId);
-            if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new InvalidDataException("A blob changed while migrating the metadata schema.");
-            await ReplaceBlobChunkReferencesAsync(connection, transaction, blob, cancellationToken);
+            await ReplaceBlobChunkReferencesAsync(connection, transaction, blob, cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var block in blocks)
         {
-            await using var update = connection.CreateCommand();
+            var update = connection.CreateCommand();
+            await using var updateDisposal = update.ConfigureAwait(false);
             update.Transaction = transaction;
             update.CommandText = """
                 UPDATE staged_blocks
@@ -3264,17 +3481,17 @@ public sealed class MetadataStore(
             update.Parameters.AddWithValue("$container", block.Container);
             update.Parameters.AddWithValue("$blob", block.BlobName);
             update.Parameters.AddWithValue("$block", block.BlockId);
-            if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+            if (await update.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
                 throw new InvalidDataException("A staged block changed while migrating the metadata schema.");
-            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken);
+            await ReplaceStagedBlockChunkReferencesAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
         }
 
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             $"PRAGMA user_version={ChunkIndexSchemaVersion};",
-            cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task MigrateVersion2ToVersion3Async(
@@ -3282,47 +3499,53 @@ public sealed class MetadataStore(
         CancellationToken cancellationToken)
     {
         IReadOnlyList<BlobRecord> blobs;
-        await using (var command = connection.CreateCommand())
+        var command = connection.CreateCommand();
+        await using (command.ConfigureAwait(false))
         {
             command.CommandText = "SELECT data FROM blobs;";
-            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken);
+            blobs = await ReadJsonRowsAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
         }
 
-        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+        var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
+        await using var transactionDisposal = transaction.ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             "DELETE FROM blob_tags;",
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         foreach (var blob in blobs)
-            await ReplaceBlobTagsAsync(connection, transaction, blob, cancellationToken);
+            await ReplaceBlobTagsAsync(connection, transaction, blob, cancellationToken).ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             transaction,
             $"PRAGMA user_version={TagIndexSchemaVersion};",
-            cancellationToken);
-        await transaction.CommitAsync(cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(_connectionString);
-        await connection.OpenAsync(cancellationToken);
-        await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
         await ExecuteNonQueryAsync(
             connection,
             $"PRAGMA journal_size_limit={RetainedWalLimitBytes};",
-            cancellationToken);
-        await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken);
-        await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken).ConfigureAwait(false);
+        await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken).ConfigureAwait(false);
         return connection;
     }
 
     private static async Task ExecuteNonQueryAsync(SqliteConnection connection, string text, CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
+        // Private callers supply only built-in schema and migration SQL, never request text.
+#pragma warning disable CA2100
         command.CommandText = text;
-        await command.ExecuteNonQueryAsync(cancellationToken);
+#pragma warning restore CA2100
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ExecuteNonQueryAsync(
@@ -3331,29 +3554,36 @@ public sealed class MetadataStore(
         string text,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
+        // Private callers supply only built-in migration SQL, never request text.
+#pragma warning disable CA2100
         command.CommandText = text;
-        await command.ExecuteNonQueryAsync(cancellationToken);
+#pragma warning restore CA2100
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<int> ReadSchemaVersionAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = "PRAGMA user_version;";
-        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+        return Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
     }
 
     private static async Task VerifyForeignKeysAsync(
         SqliteConnection connection,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.CommandText = "PRAGMA foreign_key_check;";
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        if (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             throw new InvalidDataException("The metadata database contains an invalid chunk-reference relationship.");
     }
 
@@ -3372,7 +3602,8 @@ public sealed class MetadataStore(
         ObjectReplicationStateKey key,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             SELECT policy_id, rule_id, source_generation_id,
@@ -3385,8 +3616,9 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$policy", key.PolicyId);
         command.Parameters.AddWithValue("$rule", key.RuleId);
         command.Parameters.AddWithValue("$generation", key.SourceGenerationId);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        return await reader.ReadAsync(cancellationToken) ? ReadObjectReplicationState(reader) : null;
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) ? ReadObjectReplicationState(reader) : null;
     }
 
     private static async Task UpsertObjectReplicationStateAsync(
@@ -3395,7 +3627,8 @@ public sealed class MetadataStore(
         ObjectReplicationState state,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO object_replication_states(
@@ -3433,7 +3666,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$fingerprint", state.SourceFingerprint);
         command.Parameters.AddWithValue("$status", state.Status);
         command.Parameters.AddWithValue("$updated", state.UpdatedAt.UtcTicks);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task DeleteObjectReplicationStateAsync(
@@ -3442,7 +3675,8 @@ public sealed class MetadataStore(
         ObjectReplicationStateKey key,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             DELETE FROM object_replication_states
@@ -3451,7 +3685,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$policy", key.PolicyId);
         command.Parameters.AddWithValue("$rule", key.RuleId);
         command.Parameters.AddWithValue("$generation", key.SourceGenerationId);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static ObjectReplicationState ReadObjectReplicationState(SqliteDataReader reader) => new()
@@ -3484,7 +3718,8 @@ public sealed class MetadataStore(
         string name,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             SELECT data FROM blobs
@@ -3493,7 +3728,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
-        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
+        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<BlobRecord?> GetBlobByGenerationAsync(
@@ -3502,11 +3737,12 @@ public sealed class MetadataStore(
         string generationId,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = "SELECT data FROM blobs WHERE generation_id = $generation;";
         command.Parameters.AddWithValue("$generation", generationId);
-        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken);
+        return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<(string Group, string? InheritedAcl)> EnsureHierarchicalParentsAsync(
@@ -3521,7 +3757,7 @@ public sealed class MetadataStore(
             path.Account,
             path.Container,
             includeDeleted: false,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var parentGroup = root?.Group ?? "$superuser";
         var parentAcl = root?.Acl;
         var separator = path.Name.IndexOf('/', StringComparison.Ordinal);
@@ -3534,7 +3770,7 @@ public sealed class MetadataStore(
                 path.Account,
                 path.Container,
                 directoryName,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (existing is null)
             {
                 var directory = new BlobRecord
@@ -3561,7 +3797,7 @@ public sealed class MetadataStore(
                     AccessTier = "Hot",
                     AccessTierInferred = true
                 };
-                await InsertBlobRowAsync(connection, transaction, directory, cancellationToken);
+                await InsertBlobRowAsync(connection, transaction, directory, cancellationToken).ConfigureAwait(false);
                 parentAcl = directory.Acl;
             }
             else if (!existing.IsDirectory)
@@ -3590,7 +3826,8 @@ public sealed class MetadataStore(
         string name,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             DELETE FROM blobs
@@ -3599,7 +3836,7 @@ public sealed class MetadataStore(
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", container);
         command.Parameters.AddWithValue("$name", name);
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<string> CreateUniqueSnapshotIdAsync(
@@ -3614,7 +3851,8 @@ public sealed class MetadataStore(
         for (var tickOffset = 0L; ; tickOffset++)
         {
             var candidate = CreateVersionId(time.AddTicks(tickOffset));
-            await using var command = connection.CreateCommand();
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = """
                 SELECT 1 FROM blobs
@@ -3625,7 +3863,7 @@ public sealed class MetadataStore(
             command.Parameters.AddWithValue("$container", container);
             command.Parameters.AddWithValue("$name", name);
             command.Parameters.AddWithValue("$snapshot", candidate);
-            if (await command.ExecuteScalarAsync(cancellationToken) is null)
+            if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
                 return candidate;
         }
     }
@@ -3642,7 +3880,8 @@ public sealed class MetadataStore(
         for (var tickOffset = 0L; ; tickOffset++)
         {
             var candidate = CreateVersionId(time.AddTicks(tickOffset));
-            await using var command = connection.CreateCommand();
+            var command = connection.CreateCommand();
+            await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
             command.CommandText = """
                 SELECT 1 FROM blobs
@@ -3653,7 +3892,7 @@ public sealed class MetadataStore(
             command.Parameters.AddWithValue("$container", container);
             command.Parameters.AddWithValue("$name", name);
             command.Parameters.AddWithValue("$version", candidate);
-            if (await command.ExecuteScalarAsync(cancellationToken) is null)
+            if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is null)
                 return candidate;
         }
     }
@@ -3664,7 +3903,8 @@ public sealed class MetadataStore(
         BlobRecord record,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO blobs(
@@ -3676,9 +3916,9 @@ public sealed class MetadataStore(
                 $current, $deleted, $modified, $logical, $pending, $data);
             """;
         AddBlobParameters(command, record);
-        await command.ExecuteNonQueryAsync(cancellationToken);
-        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
-        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
+        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task UpdateBlobRowAsync(
@@ -3687,7 +3927,8 @@ public sealed class MetadataStore(
         BlobRecord record,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             UPDATE blobs SET
@@ -3705,10 +3946,10 @@ public sealed class MetadataStore(
             WHERE generation_id = $generation;
             """;
         AddBlobParameters(command, record);
-        if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             throw new StorageConcurrencyException();
-        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken);
-        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken);
+        await ReplaceBlobChunkReferencesAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
+        await ReplaceBlobTagsAsync(connection, transaction, record, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task DeleteBlobRowAsync(
@@ -3717,11 +3958,12 @@ public sealed class MetadataStore(
         string generationId,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = "DELETE FROM blobs WHERE generation_id = $generation;";
         command.Parameters.AddWithValue("$generation", generationId);
-        if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+        if (await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false) != 1)
             throw new StorageConcurrencyException();
     }
 
@@ -3731,17 +3973,19 @@ public sealed class MetadataStore(
         BlobRecord record,
         CancellationToken cancellationToken)
     {
-        await using (var clear = connection.CreateCommand())
+        var clear = connection.CreateCommand();
+        await using (clear.ConfigureAwait(false))
         {
             clear.Transaction = transaction;
             clear.CommandText = "DELETE FROM blob_chunk_references WHERE generation_id = $generation;";
             clear.Parameters.AddWithValue("$generation", record.GenerationId);
-            await clear.ExecuteNonQueryAsync(cancellationToken);
+            await clear.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var chunkId in EnumerateChunkIds(record).Distinct(StringComparer.Ordinal))
         {
-            await using var insert = connection.CreateCommand();
+            var insert = connection.CreateCommand();
+            await using var insertDisposal = insert.ConfigureAwait(false);
             insert.Transaction = transaction;
             insert.CommandText = """
                 INSERT INTO blob_chunk_references(generation_id, chunk_id)
@@ -3749,7 +3993,7 @@ public sealed class MetadataStore(
                 """;
             insert.Parameters.AddWithValue("$generation", record.GenerationId);
             insert.Parameters.AddWithValue("$chunk", chunkId);
-            await insert.ExecuteNonQueryAsync(cancellationToken);
+            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3759,17 +4003,19 @@ public sealed class MetadataStore(
         BlobRecord record,
         CancellationToken cancellationToken)
     {
-        await using (var clear = connection.CreateCommand())
+        var clear = connection.CreateCommand();
+        await using (clear.ConfigureAwait(false))
         {
             clear.Transaction = transaction;
             clear.CommandText = "DELETE FROM blob_tags WHERE generation_id = $generation;";
             clear.Parameters.AddWithValue("$generation", record.GenerationId);
-            await clear.ExecuteNonQueryAsync(cancellationToken);
+            await clear.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var (key, value) in record.Tags)
         {
-            await using var insert = connection.CreateCommand();
+            var insert = connection.CreateCommand();
+            await using var insertDisposal = insert.ConfigureAwait(false);
             insert.Transaction = transaction;
             insert.CommandText = """
                 INSERT INTO blob_tags(generation_id, tag_key, tag_value)
@@ -3778,7 +4024,7 @@ public sealed class MetadataStore(
             insert.Parameters.AddWithValue("$generation", record.GenerationId);
             insert.Parameters.AddWithValue("$key", key);
             insert.Parameters.AddWithValue("$value", value);
-            await insert.ExecuteNonQueryAsync(cancellationToken);
+            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3788,7 +4034,8 @@ public sealed class MetadataStore(
         string packId,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = """
             SELECT chunk_id, pack_id, record_offset, record_length, payload_offset, payload_length
@@ -3798,8 +4045,9 @@ public sealed class MetadataStore(
             """;
         command.Parameters.AddWithValue("$pack", packId);
         var locations = new List<PackedChunkLocation>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             locations.Add(ReadPackedChunkLocation(reader));
         return locations;
     }
@@ -3841,7 +4089,8 @@ public sealed class MetadataStore(
         StagedBlockRecord block,
         CancellationToken cancellationToken)
     {
-        await using (var clear = connection.CreateCommand())
+        var clear = connection.CreateCommand();
+        await using (clear.ConfigureAwait(false))
         {
             clear.Transaction = transaction;
             clear.CommandText = """
@@ -3853,12 +4102,13 @@ public sealed class MetadataStore(
             clear.Parameters.AddWithValue("$container", block.Container);
             clear.Parameters.AddWithValue("$blob", block.BlobName);
             clear.Parameters.AddWithValue("$block", block.BlockId);
-            await clear.ExecuteNonQueryAsync(cancellationToken);
+            await clear.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
         foreach (var chunkId in block.Content.Chunks.Select(chunk => chunk.Id).Distinct(StringComparer.Ordinal))
         {
-            await using var insert = connection.CreateCommand();
+            var insert = connection.CreateCommand();
+            await using var insertDisposal = insert.ConfigureAwait(false);
             insert.Transaction = transaction;
             insert.CommandText = """
                 INSERT INTO staged_block_chunk_references(
@@ -3870,7 +4120,7 @@ public sealed class MetadataStore(
             insert.Parameters.AddWithValue("$blob", block.BlobName);
             insert.Parameters.AddWithValue("$block", block.BlockId);
             insert.Parameters.AddWithValue("$chunk", chunkId);
-            await insert.ExecuteNonQueryAsync(cancellationToken);
+            await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -3907,25 +4157,27 @@ public sealed class MetadataStore(
         string account,
         CancellationToken cancellationToken)
     {
-        await using var command = connection.CreateCommand();
+        var command = connection.CreateCommand();
+        await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
         command.CommandText = "SELECT data FROM service_properties WHERE account = $account;";
         command.Parameters.AddWithValue("$account", account);
-        return await ReadSingleJsonAsync<ServiceProperties>(command, cancellationToken) ?? new ServiceProperties();
+        return await ReadSingleJsonAsync<ServiceProperties>(command, cancellationToken).ConfigureAwait(false) ?? new ServiceProperties();
     }
 
     private static async Task<T?> ReadSingleJsonAsync<T>(SqliteCommand command, CancellationToken cancellationToken)
         where T : class
     {
-        var result = await command.ExecuteScalarAsync(cancellationToken);
+        var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
         return result is string json ? Deserialize<T>(json) : null;
     }
 
     private static async Task<IReadOnlyList<T>> ReadJsonRowsAsync<T>(SqliteCommand command, CancellationToken cancellationToken)
     {
         var values = new List<T>();
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
+        var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
+        await using var readerDisposal = reader.ConfigureAwait(false);
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             values.Add(Deserialize<T>(reader.GetString(0)));
         return values;
     }
@@ -3950,32 +4202,4 @@ public sealed class MetadataStore(
     private static T Deserialize<T>(string value) =>
         JsonSerializer.Deserialize<T>(value, JsonOptions)
         ?? throw new InvalidDataException($"Stored {typeof(T).Name} metadata was null.");
-}
-
-public sealed class StorageConcurrencyException : Exception
-{
-    public StorageConcurrencyException() : base("The logical storage resource changed concurrently.") { }
-}
-
-public sealed class StorageImmutabilityException(bool legalHold) : Exception(
-    legalHold
-        ? "The blob is protected by a legal hold."
-        : "The blob is protected by a time-based retention policy.")
-{
-    public bool LegalHold { get; } = legalHold;
-}
-
-public sealed class StoragePendingCopyException : Exception
-{
-    public StoragePendingCopyException() : base("There is currently a pending copy operation.") { }
-}
-
-public sealed class StorageBlobTypeMismatchException : Exception
-{
-    public StorageBlobTypeMismatchException() : base("The blob type is invalid for this operation.") { }
-}
-
-public sealed class StoragePathConflictException : Exception
-{
-    public StoragePathConflictException() : base("A hierarchical path component has an incompatible resource type.") { }
 }
