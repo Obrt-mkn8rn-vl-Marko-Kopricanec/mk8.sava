@@ -1604,7 +1604,8 @@ public sealed class MetadataStore(
                 proposed = proposed with
                 {
                     Owner = activeCurrent?.Owner ?? proposed.Owner,
-                    Group = activeCurrent?.Group ?? parentGroup
+                    Group = activeCurrent?.Group ?? parentGroup,
+                    AccessAcl = activeCurrent?.AccessAcl ?? proposed.AccessAcl
                 };
             }
 

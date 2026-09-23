@@ -2037,6 +2037,45 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var missingParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
             WithSuoid("missing-parent/missing.txt", ownerObjectId).DownloadContentAsync());
         Assert.Equal("BlobNotFound", missingParent.ErrorCode);
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var root = await metadata.GetContainerAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(root);
+        await metadata.PutContainerAsync(
+            root with { AccessAcl = $"user::rwx,user:{foreignObjectId}:--x,group::r-x,mask::r-x,other::---" },
+            root.Revision,
+            CancellationToken.None);
+        var parent = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            "parent",
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(parent);
+        await metadata.PutBlobRecordAsync(
+            parent with { AccessAcl = $"user::rwx,user:{foreignObjectId}:--x,group::r-x,mask::r-x,other::---" },
+            parent.Revision,
+            CancellationToken.None);
+        var target = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            "parent/child.txt",
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(target);
+        await metadata.PutBlobRecordAsync(
+            target with { AccessAcl = $"user::rw-,user:{foreignObjectId}:r--,group::r--,mask::r--,other::---" },
+            target.Revision,
+            CancellationToken.None);
+        Assert.Equal("owned-content", (await foreignAgent.DownloadContentAsync()).Value.Content.ToString());
     }
 
     [Fact]
@@ -2111,6 +2150,102 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var deniedRoot = await Assert.ThrowsAsync<RequestFailedException>(() =>
             sharedRootBlob.DownloadContentAsync());
         Assert.Equal(StatusCodes.Status403Forbidden, deniedRoot.Status);
+    }
+
+    [Fact]
+    public async Task HierarchicalNamespaceBearerReadEvaluatesNamedAndGroupAclsWithAncestorTraversal()
+    {
+        const string namedObjectId = "4d7ec17e-ae95-4bc6-84e0-b95c5ee4c15b";
+        const string groupMemberObjectId = "bd107df5-cd2e-437c-b3ca-5c99f4602ed5";
+        const string groupId = "a91490fb-9d7f-4c82-abba-114cc59a3de9";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-named-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("parent/data.txt");
+        await blob.UploadAsync(BinaryData.FromString("acl-content"));
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var root = await metadata.GetContainerAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(root);
+        var traverseAcl = $"user::rwx,user:{namedObjectId}:--x,group::r-x," +
+                          $"group:{groupId}:--x,mask::r-x,other::---";
+        await metadata.PutContainerAsync(root with { AccessAcl = traverseAcl }, root.Revision, CancellationToken.None);
+
+        var parent = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            "parent",
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(parent);
+        await metadata.PutBlobRecordAsync(
+            parent with { AccessAcl = traverseAcl },
+            parent.Revision,
+            CancellationToken.None);
+
+        var record = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(record);
+        var readAcl = $"user::rw-,user:{namedObjectId}:r--,group::r--," +
+                      $"group:{groupId}:r--,mask::r--,other::---";
+        await metadata.PutBlobRecordAsync(
+            record with { AccessAcl = readAcl },
+            record.Revision,
+            CancellationToken.None);
+
+        var named = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, namedObjectId));
+        var groupMember = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, groupMemberObjectId, groups: [groupId]));
+        var namedBlob = named.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
+        var groupBlob = groupMember.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
+        Assert.Equal("acl-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("acl-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.True((await namedBlob.GetPropertiesAsync()).GetRawResponse().Headers
+            .TryGetValue("x-ms-permissions", out var mode));
+        Assert.Equal("rw-r-----", mode);
+
+        await blob.UploadAsync(BinaryData.FromString("replaced-content"), overwrite: true);
+        Assert.Equal("replaced-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("replaced-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
+        record = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+        Assert.NotNull(record);
+
+        await metadata.PutBlobRecordAsync(
+            record with { AccessAcl = readAcl.Replace("mask::r--", "mask::---", StringComparison.Ordinal) },
+            record.Revision,
+            CancellationToken.None);
+        var deniedNamed = await Assert.ThrowsAsync<RequestFailedException>(() => namedBlob.DownloadContentAsync());
+        var deniedGroup = await Assert.ThrowsAsync<RequestFailedException>(() => groupBlob.DownloadContentAsync());
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedNamed.Status);
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedGroup.Status);
+        Assert.Equal("replaced-content", (await blob.DownloadContentAsync()).Value.Content.ToString());
     }
 
     [Fact]
@@ -13324,12 +13459,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         });
     }
 
-    private static string CreateJwt(string base64Key, string objectId, string? tenantId = null)
+    private static string CreateJwt(
+        string base64Key,
+        string objectId,
+        string? tenantId = null,
+        IEnumerable<string>? groups = null)
     {
         var key = new SymmetricSecurityKey(Convert.FromBase64String(base64Key)) { KeyId = "test-key" };
         var claims = new List<Claim> { new("oid", objectId) };
         if (tenantId is not null)
             claims.Add(new Claim("tid", tenantId));
+        if (groups is not null)
+            claims.AddRange(groups.Select(group => new Claim("groups", group)));
         var token = new JwtSecurityToken(
             issuer: "https://issuer.mk8.test",
             audience: "https://storage.azure.com/",
