@@ -154,10 +154,13 @@ header, and rejects a conflicting `x-ms-encryption-scope` header. Adding `ses`
 to an older token cannot inject an unsigned storage policy.
 
 User-delegation `scid` is signature-validated from version `2020-02-10`.
-`saoid` and `suoid` are restricted to HNS accounts but currently fail closed:
-`saoid` requires an ownership/superuser grant for the delegation-key owner and
-changes the effective file owner, while `suoid` requires a POSIX ACL decision.
-Neither is implemented by trusting the signed object identifier alone.
+`saoid` and `suoid` are restricted to HNS accounts. `saoid` is accepted only
+when the delegation-key owner has the explicit
+`Sava:BearerAuthentication:Principals:<object-id>:CanManageOwnership` grant;
+it attributes new file ownership to the signed authorized object ID without
+an additional POSIX ACL check. `suoid` still fails closed because it requires
+a POSIX ACL decision for the impersonated user; a signed object identifier or
+ownership grant alone is insufficient.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,

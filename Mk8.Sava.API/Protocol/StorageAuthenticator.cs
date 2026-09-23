@@ -357,6 +357,7 @@ public sealed class StorageAuthenticator(
         var signedResource = string.Empty;
         var signingKey = encodedKey;
         var isCrossTenantUserBoundSas = false;
+        string? delegatedCreatorObjectId = null;
         if (isAccountSas)
         {
             if (!string.IsNullOrEmpty(query["si"].ToString()))
@@ -410,6 +411,7 @@ public sealed class StorageAuthenticator(
                 signedVersion);
 
             var objectId = query["skoid"].ToString();
+            delegatedCreatorObjectId = objectId;
             var tenantId = query["sktid"].ToString();
             var keyStartText = query["skt"].ToString();
             var keyExpiryText = query["ske"].ToString();
@@ -463,14 +465,17 @@ public sealed class StorageAuthenticator(
             {
                 throw AzureStorageException.AuthorizationFailure();
             }
-            if (hasAuthorizedObjectId || hasUnauthorizedObjectId)
+            if ((hasAuthorizedObjectId || hasUnauthorizedObjectId) &&
+                !delegatedPrincipal.CanManageOwnership)
+                throw AzureStorageException.AuthorizationFailure();
+            if (hasUnauthorizedObjectId)
             {
-                // saoid requires the delegation-key owner to have an HNS
-                // ownership/superuser action and changes ownership semantics.
-                // suoid additionally requires a POSIX ACL decision. Neither
-                // can be granted by a signed identity alone in this model.
+                // suoid requires a POSIX ACL decision for the impersonated
+                // user in addition to the signer's ownership action.
                 throw AzureStorageException.AuthorizationFailure();
             }
+            if (hasAuthorizedObjectId)
+                delegatedCreatorObjectId = authorizedObjectId;
 
             var delegatedUserTenantId = query["skdutid"].ToString();
             var delegatedUserObjectId = query["sduoid"].ToString();
@@ -667,7 +672,7 @@ public sealed class StorageAuthenticator(
             isAccountSas,
             signedResource,
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
-            DelegatedObjectId: isUserDelegationSas ? query["skoid"].ToString() : null);
+            DelegatedObjectId: delegatedCreatorObjectId);
     }
 
     private static string BuildSharedKeyString(

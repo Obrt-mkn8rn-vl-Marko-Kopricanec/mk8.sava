@@ -1732,6 +1732,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     {
         const string creatorId = "1a26a4bf-1ae9-40de-8834-678601f7f508";
         const string delegatedCreatorId = "08737b1c-dcce-4a21-8278-6b7cd25fe946";
+        const string impersonatedCreatorId = "d6d4280e-c209-4c18-9cfa-1df44fd5da08";
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-hns-owner-{Guid.NewGuid():N}");
         var containerName = $"hns-owner-{Guid.NewGuid():N}";
         var configuration = new Dictionary<string, string?>
@@ -1745,7 +1746,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:Permissions"] = "cw",
             [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:UserPrincipalName"] =
                 "delegated@example.test",
-            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:CanGenerateUserDelegationKey"] = "true"
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:CanGenerateUserDelegationKey"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:CanManageOwnership"] = "true"
         };
 
         try
@@ -1791,6 +1793,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                         $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
                         $"{containerName}/parent/delegated.txt?{sas}"));
                 await delegated.UploadAsync(BinaryData.FromString("delegated"));
+
+                sasBuilder.BlobName = "parent/impersonated.txt";
+                sasBuilder.PreauthorizedAgentObjectId = impersonatedCreatorId;
+                var impersonationSas = sasBuilder.ToSasQueryParameters(
+                    key.Value,
+                    SavaWebApplicationFactory.AccountName);
+                var impersonated = CreateBlobClient(
+                    application,
+                    new Uri(
+                        $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                        $"{containerName}/parent/impersonated.txt?{impersonationSas}"));
+                await impersonated.UploadAsync(BinaryData.FromString("impersonated"));
                 await AssertHierarchicalOwnershipAsync(application, shared);
             }
 
@@ -1825,6 +1839,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.True(delegatedProperties.GetRawResponse().Headers.TryGetValue("x-ms-group", out var delegatedGroup));
             Assert.Equal(delegatedCreatorId, delegatedOwner);
             Assert.Equal(creatorId, delegatedGroup);
+            var impersonatedProperties = await container.GetBlobClient("parent/impersonated.txt")
+                .GetPropertiesAsync();
+            Assert.True(impersonatedProperties.GetRawResponse().Headers.TryGetValue("x-ms-owner", out var impersonatedOwner));
+            Assert.True(impersonatedProperties.GetRawResponse().Headers.TryGetValue("x-ms-group", out var impersonatedGroup));
+            Assert.Equal(impersonatedCreatorId, impersonatedOwner);
+            Assert.Equal(creatorId, impersonatedGroup);
 
             var listUri = AppendQuery(
                 container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
