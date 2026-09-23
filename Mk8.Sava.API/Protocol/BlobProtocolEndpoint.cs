@@ -2154,18 +2154,8 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         string blobName,
         CancellationToken cancellationToken)
     {
-        var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
-        ValidateBlobTypeVersion(request, current?.Kind);
-        RequireAny(request, current is null ? 'c' : 'w', 'w');
-        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
-        EvaluateWriteConditions(http.Request, current);
-        if (current is not null ||
-            http.Request.Headers.ContainsKey("x-ms-lease-id") &&
-            IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
-        {
-            EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
-        }
-        EnsureNoPendingCopyDestination(current);
+        var current = await ValidatePutBlobDestinationAsync(
+            http, request, service, containerName, blobName, cancellationToken).ConfigureAwait(false);
 
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source");
         if (copySource is not null)
@@ -2178,43 +2168,8 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             }
             else
             {
-                RejectExpiryHeaders(http.Request);
-                if (request.Authorization.Kind != StorageAuthorizationKind.SharedKey)
-                    throw AzureStorageException.AuthorizationFailure();
-                RequireZeroContentLength(http.Request);
-                EnsureDestinationCanBeOverwritten(current);
-                var legacySourceReference = ResolveLegacyCopySource(http.Request, request, copySource);
-                if (legacySourceReference.Snapshot is not null)
-                    RequireBlobSnapshots(request, service, legacySourceReference.Account);
-                var legacySource = await service.GetBlobAsync(
-                    legacySourceReference.Account,
-                    legacySourceReference.Container,
-                    legacySourceReference.Blob,
-                    versionId: null,
-                    legacySourceReference.Snapshot,
-                    includeDeleted: false,
-                    cancellationToken).ConfigureAwait(false);
-                ValidateBlobTypeVersion(request, legacySource.Kind);
-                ValidateOptionalLease(
-                    http.Request,
-                    legacySource.Lease,
-                    "blob",
-                    "x-ms-source-lease-id");
-                EvaluateCopySourceConditions(http.Request, legacySource);
-                ValidateCopySourceTier(http.Request, legacySource, allowArchivedSource: false);
-                ValidateDestinationBlobType(current, legacySource.Kind);
-                var legacyCopy = await service.CopyBlobFromBlobSynchronouslyAsync(
-                    request.Account,
-                    containerName,
-                    blobName,
-                    legacySource,
-                    ReadCopyWriteOptions(http.Request, legacySource, current, synchronous: true),
-                    current?.Lease ?? LeaseRecord.Available,
-                    current?.GenerationId,
-                    current?.Revision,
-                    cancellationToken).ConfigureAwait(false);
-                AzureResponseWriter.AddBlobWriteHeaders(http.Response, legacyCopy);
-                http.Response.StatusCode = StatusCodes.Status201Created;
+                await HandleLegacyCopyBlobAsync(
+                    http, request, service, containerName, blobName, current, copySource, cancellationToken).ConfigureAwait(false);
                 return;
             }
             var requestedType = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type");
@@ -2228,249 +2183,447 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
 
             if (requestedType is not null)
             {
-                RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
-                if (!string.Equals(requestedType, "BlockBlob", StringComparison.Ordinal))
-                    throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
-                if (requiresSync)
-                    throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
-                RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Put Blob From URL");
-                if (http.Request.Headers.ContainsKey("x-ms-seal-blob"))
-                {
-                    throw AzureStorageException.InvalidHeader(
-                        "x-ms-seal-blob",
-                        ProtocolParsing.First(http.Request.Headers, "x-ms-seal-blob"));
-                }
-                RequireZeroContentLength(http.Request);
-                if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
-                    throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
-                var urlExpiry = ReadWriteExpiry(http.Request, service, request.Account, fallback: null);
-                var copySourceTags = ReadCopySourceTags(http.Request);
-                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
-                var transfer = await transfers.ReadAsync(
-                    http.Request,
-                    copySource,
-                    sourceRange: null,
-                    allowSourceCustomerProvidedKey: true,
-                    allowFileRequestIntent: true,
-                    5_000L * 1024 * 1024,
-                    sourceLengthConflict: true,
-                    async source => await service.PutBlockBlobAsync(
-                        request.Account,
-                        containerName,
-                        blobName,
-                        source.Content,
-                        ReadUrlWriteOptions(http.Request, source, copySourceTags, current, urlExpiry),
-                        current?.Lease ?? LeaseRecord.Available,
-                        current?.GenerationId,
-                        current?.Revision,
-                        cancellationToken).ConfigureAwait(false),
-                    cancellationToken,
-                    copySourceTags).ConfigureAwait(false);
-                var uploaded = transfer.Value;
-                AzureResponseWriter.AddBlobWriteHeaders(http.Response, uploaded);
-                AddRequestServerEncryptedHeader(http.Response);
-                AddEncryptionResponseHeaders(http.Response, EncryptionOf(uploaded));
-                AddFullBlobChecksumHeaders(http.Response, transfer.Checksums);
-                http.Response.StatusCode = StatusCodes.Status201Created;
+                await PutBlobFromUrlAsync(
+                    http, request, service, containerName, blobName, current, copySource, requestedType,
+                    requiresSync, requiresSyncValue, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             var publicSource = SanitizeCopySource(copySource);
             if (requiresSync)
             {
-                RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
-                RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
-                ValidateSynchronousCopyEncryption(http.Request);
-                ValidateDestinationBlobType(current, BlobKind.BlockBlob);
-                RequireZeroContentLength(http.Request);
-                if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
-                    throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
-                if (http.Request.Headers.ContainsKey("x-ms-copy-source-blob-properties"))
-                {
-                    throw AzureStorageException.InvalidHeader(
-                        "x-ms-copy-source-blob-properties",
-                        ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
-                }
-                var copySourceTags = ReadCopySourceTags(http.Request);
-                BlobRecord synchronousCopy;
-                UrlTransferClient.ValidateFileRequestIntent(http.Request, copySource, allowed: true);
-                var synchronousInternalSource = ResolveInternalCopySource(http.Request, request, copySource);
-                if (synchronousInternalSource is not null)
-                {
-                    var source = await ResolveCopySourceAsync(
-                        http,
-                        request,
-                        service,
-                        synchronousInternalSource,
-                        cancellationToken,
-                        requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request)).ConfigureAwait(false);
-                    EvaluateCopySourceConditions(http.Request, source);
-                    ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
-                    source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
-                    synchronousCopy = await service.CopyBlockBlobFromBlobAsync(
-                        request.Account,
-                        containerName,
-                        blobName,
-                        source,
-                        ReadCopyWriteOptions(
-                            http.Request,
-                            source,
-                            current,
-                            copySourceTags,
-                            synchronous: true),
-                        publicSource,
-                        current?.Lease ?? LeaseRecord.Available,
-                        current?.GenerationId,
-                        current?.Revision,
-                        cancellationToken).ConfigureAwait(false);
-                }
-                else
-                {
-                    var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
-                    var transfer = await transfers.ReadAsync(
-                        http.Request,
-                        copySource,
-                        sourceRange: null,
-                        allowSourceCustomerProvidedKey: false,
-                        allowFileRequestIntent: true,
-                        256L * 1024 * 1024,
-                        sourceLengthConflict: true,
-                        async source =>
-                        {
-                            if (source.Kind is not null && source.Kind != BlobKind.BlockBlob)
-                            {
-                                throw new AzureStorageException(
-                                    StatusCodes.Status409Conflict,
-                                    "InvalidSourceBlobType",
-                                    "The source blob type is invalid for this operation.");
-                            }
-                            return await service.CopyBlockBlobFromStreamAsync(
-                                request.Account,
-                                containerName,
-                                blobName,
-                                source.Content,
-                                source.ContentLength!.Value,
-                                source.CommittedBlocks,
-                                ReadUrlCopyWriteOptions(
-                                    http.Request,
-                                    source,
-                                    copySourceTags,
-                                    current,
-                                    synchronous: true),
-                                publicSource,
-                                current?.Lease ?? LeaseRecord.Available,
-                                current?.GenerationId,
-                                current?.Revision,
-                                cancellationToken).ConfigureAwait(false);
-                        },
-                        cancellationToken,
-                        copySourceTags,
-                        preserveSourceShape: true).ConfigureAwait(false);
-                    synchronousCopy = transfer.Value;
-                }
-                AzureResponseWriter.AddBlobCopyHeaders(http.Response, synchronousCopy, includeVersion: false);
-                AddRequestServerEncryptedHeader(http.Response);
-                AddEncryptionResponseHeaders(http.Response, EncryptionOf(synchronousCopy));
-                http.Response.StatusCode = StatusCodes.Status202Accepted;
+                await CopyBlobFromUrlSynchronouslyAsync(
+                    http, request, service, containerName, blobName, current, copySource,
+                    publicSource, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
-            if (http.Request.Headers.ContainsKey("x-ms-copy-source-tag-option"))
+            await BeginCopyBlobAsync(
+                http, request, service, containerName, blobName, current, copySource,
+                publicSource, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        await CreateBlobFromRequestAsync(
+            http, request, service, containerName, blobName, current, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BlobRecord?> ValidatePutBlobDestinationAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        CancellationToken cancellationToken)
+    {
+        var current = await TryGetCurrentBlobAsync(
+            service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
+        ValidateBlobTypeVersion(request, current?.Kind);
+        RequireAny(request, current is null ? 'c' : 'w', 'w');
+        await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
+        EvaluateWriteConditions(http.Request, current);
+        if (current is not null ||
+            http.Request.Headers.ContainsKey("x-ms-lease-id") &&
+            IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
+        {
+            EnsureLease(http.Request, current?.Lease ?? LeaseRecord.Available, "blob");
+        }
+        EnsureNoPendingCopyDestination(current);
+        return current;
+    }
+
+    private static async Task HandleLegacyCopyBlobAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        CancellationToken cancellationToken)
+    {
+        RejectExpiryHeaders(http.Request);
+        if (request.Authorization.Kind != StorageAuthorizationKind.SharedKey)
+            throw AzureStorageException.AuthorizationFailure();
+        RequireZeroContentLength(http.Request);
+        EnsureDestinationCanBeOverwritten(current);
+        var legacySourceReference = ResolveLegacyCopySource(http.Request, request, copySource);
+        if (legacySourceReference.Snapshot is not null)
+            RequireBlobSnapshots(request, service, legacySourceReference.Account);
+        var legacySource = await service.GetBlobAsync(
+            legacySourceReference.Account,
+            legacySourceReference.Container,
+            legacySourceReference.Blob,
+            versionId: null,
+            legacySourceReference.Snapshot,
+            includeDeleted: false,
+            cancellationToken).ConfigureAwait(false);
+        ValidateBlobTypeVersion(request, legacySource.Kind);
+        ValidateOptionalLease(http.Request, legacySource.Lease, "blob", "x-ms-source-lease-id");
+        EvaluateCopySourceConditions(http.Request, legacySource);
+        ValidateCopySourceTier(http.Request, legacySource, allowArchivedSource: false);
+        ValidateDestinationBlobType(current, legacySource.Kind);
+        var legacyCopy = await service.CopyBlobFromBlobSynchronouslyAsync(
+            request.Account,
+            containerName,
+            blobName,
+            legacySource,
+            ReadCopyWriteOptions(http.Request, legacySource, current, synchronous: true),
+            current?.Lease ?? LeaseRecord.Available,
+            current?.GenerationId,
+            current?.Revision,
+            cancellationToken).ConfigureAwait(false);
+        AzureResponseWriter.AddBlobWriteHeaders(http.Response, legacyCopy);
+        http.Response.StatusCode = StatusCodes.Status201Created;
+    }
+
+    private static async Task CopyBlobFromUrlSynchronouslyAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
+        RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
+        RequireFeatureVersion(request, new DateOnly(2018, 3, 28), "Copy Blob From URL");
+        ValidateSynchronousCopyEncryption(http.Request);
+        ValidateDestinationBlobType(current, BlobKind.BlockBlob);
+        RequireZeroContentLength(http.Request);
+        if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
+            throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
+        if (http.Request.Headers.ContainsKey("x-ms-copy-source-blob-properties"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-copy-source-blob-properties",
+                ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
+        }
+        var copySourceTags = ReadCopySourceTags(http.Request);
+        BlobRecord synchronousCopy;
+        UrlTransferClient.ValidateFileRequestIntent(http.Request, copySource, allowed: true);
+        var synchronousInternalSource = ResolveInternalCopySource(http.Request, request, copySource);
+        if (synchronousInternalSource is not null)
+        {
+            synchronousCopy = await CopyBlockBlobFromInternalSourceAsync(
+                http, request, service, containerName, blobName, current, synchronousInternalSource,
+                publicSource, copySourceTags, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            synchronousCopy = await CopyBlockBlobFromExternalSourceAsync(
+                http, request, service, containerName, blobName, current, copySource,
+                publicSource, copySourceTags, cancellationToken).ConfigureAwait(false);
+        }
+        AzureResponseWriter.AddBlobCopyHeaders(http.Response, synchronousCopy, includeVersion: false);
+        AddRequestServerEncryptedHeader(http.Response);
+        AddEncryptionResponseHeaders(http.Response, EncryptionOf(synchronousCopy));
+        http.Response.StatusCode = StatusCodes.Status202Accepted;
+    }
+
+    private static async Task BeginCopyBlobAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
+        if (http.Request.Headers.ContainsKey("x-ms-copy-source-tag-option"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-copy-source-tag-option",
+                ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-tag-option"));
+        }
+        if (http.Request.Headers.ContainsKey("x-ms-copy-source-blob-properties"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-copy-source-blob-properties",
+                ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
+        }
+        ValidateAsynchronousCopyEncryption(http.Request);
+        RejectUnsupportedHeader(http.Request, "x-ms-file-request-intent");
+        _ = ReadRehydratePriority(http.Request);
+        EnsureAsynchronousCopyDestinationLease(http.Request, current);
+        RequireZeroContentLength(http.Request);
+        BlobRecord copied;
+        var internalSource = ResolveInternalCopySource(http.Request, request, copySource);
+        if (internalSource is not null)
+        {
+            copied = await BeginCopyFromInternalSourceAsync(
+                http, request, service, containerName, blobName, current, internalSource,
+                publicSource, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            copied = await BeginCopyFromExternalSourceAsync(
+                http, request, service, containerName, blobName, current, copySource,
+                publicSource, cancellationToken).ConfigureAwait(false);
+        }
+        AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: true);
+        http.Response.StatusCode = StatusCodes.Status202Accepted;
+    }
+
+    private static async Task PutBlobFromUrlAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string requestedType,
+        bool requiresSync,
+        string? requiresSyncValue,
+        CancellationToken cancellationToken)
+    {
+        RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
+        if (!string.Equals(requestedType, "BlockBlob", StringComparison.Ordinal))
+            throw AzureStorageException.InvalidHeader("x-ms-blob-type", requestedType);
+        if (requiresSync)
+            throw AzureStorageException.InvalidHeader("x-ms-requires-sync", requiresSyncValue);
+        RequireFeatureVersion(request, new DateOnly(2020, 4, 8), "Put Blob From URL");
+        if (http.Request.Headers.ContainsKey("x-ms-seal-blob"))
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-seal-blob",
+                ProtocolParsing.First(http.Request.Headers, "x-ms-seal-blob"));
+        }
+        RequireZeroContentLength(http.Request);
+        if (ProtocolParsing.First(http.Request.Headers, "x-ms-source-range") is { } sourceRange)
+            throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
+        var urlExpiry = ReadWriteExpiry(http.Request, service, request.Account, fallback: null);
+        var copySourceTags = ReadCopySourceTags(http.Request);
+        var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+        var transfer = await transfers.ReadAsync(
+            http.Request,
+            copySource,
+            sourceRange: null,
+            allowSourceCustomerProvidedKey: true,
+            allowFileRequestIntent: true,
+            5_000L * 1024 * 1024,
+            sourceLengthConflict: true,
+            async source => await service.PutBlockBlobAsync(
+                request.Account,
+                containerName,
+                blobName,
+                source.Content,
+                ReadUrlWriteOptions(http.Request, source, copySourceTags, current, urlExpiry),
+                current?.Lease ?? LeaseRecord.Available,
+                current?.GenerationId,
+                current?.Revision,
+                cancellationToken).ConfigureAwait(false),
+            cancellationToken,
+            copySourceTags).ConfigureAwait(false);
+        var uploaded = transfer.Value;
+        AzureResponseWriter.AddBlobWriteHeaders(http.Response, uploaded);
+        AddRequestServerEncryptedHeader(http.Response);
+        AddEncryptionResponseHeaders(http.Response, EncryptionOf(uploaded));
+        AddFullBlobChecksumHeaders(http.Response, transfer.Checksums);
+        http.Response.StatusCode = StatusCodes.Status201Created;
+    }
+
+    private static async Task<BlobRecord> CopyBlockBlobFromInternalSourceAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        ResolvedInternalCopySource internalSource,
+        string publicSource,
+        bool copySourceTags,
+        CancellationToken cancellationToken)
+    {
+        var source = await ResolveCopySourceAsync(
+            http,
+            request,
+            service,
+            internalSource,
+            cancellationToken,
+            requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request)).ConfigureAwait(false);
+        EvaluateCopySourceConditions(http.Request, source);
+        ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
+        source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
+        return await service.CopyBlockBlobFromBlobAsync(
+            request.Account,
+            containerName,
+            blobName,
+            source,
+            ReadCopyWriteOptions(
+                http.Request,
+                source,
+                current,
+                copySourceTags,
+                synchronous: true),
+            publicSource,
+            current?.Lease ?? LeaseRecord.Available,
+            current?.GenerationId,
+            current?.Revision,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BlobRecord> CopyBlockBlobFromExternalSourceAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string publicSource,
+        bool copySourceTags,
+        CancellationToken cancellationToken)
+    {
+        var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+        var transfer = await transfers.ReadAsync(
+            http.Request,
+            copySource,
+            sourceRange: null,
+            allowSourceCustomerProvidedKey: false,
+            allowFileRequestIntent: true,
+            256L * 1024 * 1024,
+            sourceLengthConflict: true,
+            async source =>
             {
-                throw AzureStorageException.InvalidHeader(
-                    "x-ms-copy-source-tag-option",
-                    ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-tag-option"));
-            }
-            if (http.Request.Headers.ContainsKey("x-ms-copy-source-blob-properties"))
-            {
-                throw AzureStorageException.InvalidHeader(
-                    "x-ms-copy-source-blob-properties",
-                    ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source-blob-properties"));
-            }
-            ValidateAsynchronousCopyEncryption(http.Request);
-            RejectUnsupportedHeader(http.Request, "x-ms-file-request-intent");
-            _ = ReadRehydratePriority(http.Request);
-            EnsureAsynchronousCopyDestinationLease(http.Request, current);
-            RequireZeroContentLength(http.Request);
-            BlobRecord copied;
-            var internalSource = ResolveInternalCopySource(http.Request, request, copySource);
-            if (internalSource is not null)
-            {
-                var source = await ResolveCopySourceAsync(
-                    http,
-                    request,
-                    service,
-                    internalSource,
-                    cancellationToken,
-                    requireTagsPermission: HasSourceTagCondition(http.Request)).ConfigureAwait(false);
-                EvaluateCopySourceConditions(http.Request, source);
-                ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
-                ValidateDestinationBlobType(current, source.Kind);
-                source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
-                copied = await service.BeginCopyFromBlobAsync(
+                if (source.Kind is not null && source.Kind != BlobKind.BlockBlob)
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status409Conflict,
+                        "InvalidSourceBlobType",
+                        "The source blob type is invalid for this operation.");
+                }
+                return await service.CopyBlockBlobFromStreamAsync(
                     request.Account,
                     containerName,
                     blobName,
-                    source,
-                    ReadCopySealDestination(http.Request, source.Kind, source.IsSealed),
-                    ReadCopyWriteOptions(http.Request, source, current),
+                    source.Content,
+                    source.ContentLength!.Value,
+                    source.CommittedBlocks,
+                    ReadUrlCopyWriteOptions(
+                        http.Request,
+                        source,
+                        copySourceTags,
+                        current,
+                        synchronous: true),
                     publicSource,
                     current?.Lease ?? LeaseRecord.Available,
                     current?.GenerationId,
                     current?.Revision,
                     cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
-                var transfer = await transfers.ReadAsync(
-                    http.Request,
-                    copySource,
-                    sourceRange: null,
-                    allowSourceCustomerProvidedKey: false,
-                    allowFileRequestIntent: false,
-                    long.MaxValue,
-                    sourceLengthConflict: false,
-                    async source =>
-                    {
-                        var sourceKind = source.Kind ?? BlobKind.BlockBlob;
-                        ValidateBlobTypeVersion(request, sourceKind);
-                        ValidateCopySourceTier(http.Request, source.AccessTier, allowArchivedSource: true);
-                        ValidateDestinationBlobType(current, sourceKind);
-                        return await service.BeginCopyFromStreamAsync(
-                            request.Account,
-                            containerName,
-                            blobName,
-                            source.Content,
-                            source.ContentLength!.Value,
-                            sourceKind,
-                            string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal),
-                            source.SequenceNumber,
-                            ReadCopySealDestination(http.Request, sourceKind, source.IsSealed),
-                            source.AppendBlockCount,
-                            source.CommittedBlocks,
-                            source.PageRanges,
-                            ReadUrlCopyWriteOptions(
-                                http.Request,
-                                source,
-                                copySourceTags: false,
-                                current,
-                                synchronous: false),
-                            publicSource,
-                            current?.Lease ?? LeaseRecord.Available,
-                            current?.GenerationId,
-                            current?.Revision,
-                            cancellationToken).ConfigureAwait(false);
-                    },
-                    cancellationToken,
-                    preserveSourceShape: true).ConfigureAwait(false);
-                copied = transfer.Value;
-            }
-            AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: true);
-            http.Response.StatusCode = StatusCodes.Status202Accepted;
-            return;
-        }
+            },
+            cancellationToken,
+            copySourceTags,
+            preserveSourceShape: true).ConfigureAwait(false);
+        return transfer.Value;
+    }
 
+    private static async Task<BlobRecord> BeginCopyFromInternalSourceAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        ResolvedInternalCopySource internalSource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
+        var source = await ResolveCopySourceAsync(
+            http,
+            request,
+            service,
+            internalSource,
+            cancellationToken,
+            requireTagsPermission: HasSourceTagCondition(http.Request)).ConfigureAwait(false);
+        EvaluateCopySourceConditions(http.Request, source);
+        ValidateCopySourceTier(http.Request, source, allowArchivedSource: true);
+        ValidateDestinationBlobType(current, source.Kind);
+        source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
+        return await service.BeginCopyFromBlobAsync(
+            request.Account,
+            containerName,
+            blobName,
+            source,
+            ReadCopySealDestination(http.Request, source.Kind, source.IsSealed),
+            ReadCopyWriteOptions(http.Request, source, current),
+            publicSource,
+            current?.Lease ?? LeaseRecord.Available,
+            current?.GenerationId,
+            current?.Revision,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BlobRecord> BeginCopyFromExternalSourceAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
+        var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+        var transfer = await transfers.ReadAsync(
+            http.Request,
+            copySource,
+            sourceRange: null,
+            allowSourceCustomerProvidedKey: false,
+            allowFileRequestIntent: false,
+            long.MaxValue,
+            sourceLengthConflict: false,
+            async source =>
+            {
+                var sourceKind = source.Kind ?? BlobKind.BlockBlob;
+                ValidateBlobTypeVersion(request, sourceKind);
+                ValidateCopySourceTier(http.Request, source.AccessTier, allowArchivedSource: true);
+                ValidateDestinationBlobType(current, sourceKind);
+                return await service.BeginCopyFromStreamAsync(
+                    request.Account,
+                    containerName,
+                    blobName,
+                    source.Content,
+                    source.ContentLength!.Value,
+                    sourceKind,
+                    string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal),
+                    source.SequenceNumber,
+                    ReadCopySealDestination(http.Request, sourceKind, source.IsSealed),
+                    source.AppendBlockCount,
+                    source.CommittedBlocks,
+                    source.PageRanges,
+                    ReadUrlCopyWriteOptions(
+                        http.Request,
+                        source,
+                        copySourceTags: false,
+                        current,
+                        synchronous: false),
+                    publicSource,
+                    current?.Lease ?? LeaseRecord.Available,
+                    current?.GenerationId,
+                    current?.Revision,
+                    cancellationToken).ConfigureAwait(false);
+            },
+            cancellationToken,
+            preserveSourceShape: true).ConfigureAwait(false);
+        return transfer.Value;
+    }
+
+    private static async Task CreateBlobFromRequestAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        CancellationToken cancellationToken)
+    {
         RejectUnsupportedHeader(http.Request, "x-ms-rehydrate-priority");
         EnsureDestinationCanBeOverwritten(current);
         var type = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type")
@@ -2497,67 +2650,16 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         switch (requestedKind)
         {
             case BlobKind.BlockBlob:
-                created = null!;
-                var persistedMd5 = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-content-md5");
-                checksums = await WithIntegrityValidationAsync(http.Request, async body =>
-                    created = await service.PutBlockBlobAsync(
-                        request.Account,
-                        containerName,
-                        blobName,
-                        body,
-                        ReadWriteOptions(
-                            http.Request,
-                            current,
-                            generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)),
-                            encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
-                            expiresAt: expiresAt),
-                        current?.Lease ?? LeaseRecord.Available,
-                        current?.GenerationId,
-                        current?.Revision,
-                        cancellationToken).ConfigureAwait(false),
-                    maximumBodyBytes: GetMaximumPutBlobBytes(request),
-                    expectedMd5HeaderName: persistedMd5 is null
-                        ? "Content-MD5"
-                        : "x-ms-blob-content-md5").ConfigureAwait(false);
+                (created, checksums) = await CreateBlockBlobFromRequestAsync(
+                    http, request, service, containerName, blobName, current, expiresAt, cancellationToken).ConfigureAwait(false);
                 break;
             case BlobKind.AppendBlob:
-                RequireAppendBlobVersion(request);
-                RequireZeroContentLength(http.Request);
-                created = await service.CreateAppendBlobAsync(
-                    request.Account,
-                    containerName,
-                    blobName,
-                    ReadWriteOptions(
-                        http.Request,
-                        current,
-                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
-                        expiresAt: expiresAt),
-                    current?.Lease ?? LeaseRecord.Available,
-                    current?.GenerationId,
-                    current?.Revision,
-                    cancellationToken).ConfigureAwait(false);
+                created = await CreateAppendBlobFromRequestAsync(
+                    http, request, service, containerName, blobName, current, expiresAt, cancellationToken).ConfigureAwait(false);
                 break;
             case BlobKind.PageBlob:
-                RequirePageBlobVersion(request);
-                RequireFlatNamespace(service, request.Account);
-                RequireZeroContentLength(http.Request);
-                var length = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-content-length", required: true);
-                var sequence = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number", defaultValue: 0);
-                created = await service.CreatePageBlobAsync(
-                    request.Account,
-                    containerName,
-                    blobName,
-                    length,
-                    ReadWriteOptions(
-                        http.Request,
-                        current,
-                        encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
-                        expiresAt: expiresAt),
-                    sequence,
-                    current?.Lease ?? LeaseRecord.Available,
-                    current?.GenerationId,
-                    current?.Revision,
-                    cancellationToken).ConfigureAwait(false);
+                created = await CreatePageBlobFromRequestAsync(
+                    http, request, service, containerName, blobName, current, expiresAt, cancellationToken).ConfigureAwait(false);
                 break;
             default:
                 throw AzureStorageException.InvalidHeader("x-ms-blob-type", type);
@@ -2569,6 +2671,100 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         AddRequestServerEncryptedHeader(http.Response);
         AddEncryptionResponseHeaders(http.Response, EncryptionOf(created));
         http.Response.StatusCode = StatusCodes.Status201Created;
+    }
+
+    private static async Task<(BlobRecord Blob, TransactionalChecksums Checksums)> CreateBlockBlobFromRequestAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        DateTimeOffset? expiresAt,
+        CancellationToken cancellationToken)
+    {
+        BlobRecord created = null!;
+        var persistedMd5 = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-content-md5");
+        var checksums = await WithIntegrityValidationAsync(http.Request, async body =>
+            created = await service.PutBlockBlobAsync(
+                request.Account,
+                containerName,
+                blobName,
+                body,
+                ReadWriteOptions(
+                    http.Request,
+                    current,
+                    generateContentMd5: IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12)),
+                    encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                    expiresAt: expiresAt),
+                current?.Lease ?? LeaseRecord.Available,
+                current?.GenerationId,
+                current?.Revision,
+                cancellationToken).ConfigureAwait(false),
+            maximumBodyBytes: GetMaximumPutBlobBytes(request),
+            expectedMd5HeaderName: persistedMd5 is null
+                ? "Content-MD5"
+                : "x-ms-blob-content-md5").ConfigureAwait(false);
+        return (created, checksums);
+    }
+
+    private static async Task<BlobRecord> CreateAppendBlobFromRequestAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        DateTimeOffset? expiresAt,
+        CancellationToken cancellationToken)
+    {
+        RequireAppendBlobVersion(request);
+        RequireZeroContentLength(http.Request);
+        return await service.CreateAppendBlobAsync(
+            request.Account,
+            containerName,
+            blobName,
+            ReadWriteOptions(
+                http.Request,
+                current,
+                encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                expiresAt: expiresAt),
+            current?.Lease ?? LeaseRecord.Available,
+            current?.GenerationId,
+            current?.Revision,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BlobRecord> CreatePageBlobFromRequestAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        DateTimeOffset? expiresAt,
+        CancellationToken cancellationToken)
+    {
+        RequirePageBlobVersion(request);
+        RequireFlatNamespace(service, request.Account);
+        RequireZeroContentLength(http.Request);
+        var length = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-content-length", required: true);
+        var sequence = ProtocolParsing.ParseLongHeader(http.Request.Headers, "x-ms-blob-sequence-number", defaultValue: 0);
+        return await service.CreatePageBlobAsync(
+            request.Account,
+            containerName,
+            blobName,
+            length,
+            ReadWriteOptions(
+                http.Request,
+                current,
+                encryptionContext: ReadEncryptionContext(http.Request, service, request.Account),
+                expiresAt: expiresAt),
+            sequence,
+            current?.Lease ?? LeaseRecord.Available,
+            current?.GenerationId,
+            current?.Revision,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task WriteBlobAsync(
