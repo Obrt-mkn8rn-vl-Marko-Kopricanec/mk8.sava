@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using Azure;
 using Azure.Core.Pipeline;
 using Azure.Storage;
@@ -166,6 +167,36 @@ public sealed class AzuriteDifferentialTests
         var expected = await ExerciseServiceCorsAsync(azurite, azuriteTransport).ConfigureAwait(false);
         var actual = await ExerciseServiceCorsAsync(local, localTransport).ConfigureAwait(false);
         Assert.Equal(expected, actual);
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task SameAccountCopyMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseCopyAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseCopyAsync(localContainer).ConfigureAwait(false);
+            // Azurite uses the generic error; the published Blob error catalog names the source-specific one.
+            Assert.Equal("ConditionNotMet", expected.StaleSourceCode);
+            Assert.Equal("SourceConditionNotMet", actual.StaleSourceCode);
+            Assert.Equal(expected with { StaleSourceCode = actual.StaleSourceCode }, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
     }
 
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
@@ -383,9 +414,16 @@ public sealed class AzuriteDifferentialTests
         var read = await service.GetPropertiesAsync().ConfigureAwait(false);
         var rule = Assert.Single(read.Value.Cors);
         var preflight = await ExerciseCorsPreflightAsync(transport, service.Uri).ConfigureAwait(false);
+        var deniedOrigin = await GetPreflightStatusAsync(
+            transport, service.Uri, "https://denied.example.test", "GET").ConfigureAwait(false);
+        var missingMethod = await GetPreflightStatusAsync(
+            transport, service.Uri, "https://client.example.test", method: null).ConfigureAwait(false);
+        Assert.Equal(403, deniedOrigin);
+        Assert.Equal(400, missingMethod);
         return new ServiceCorsObservation(initial.GetRawResponse().Status, written.Status,
             read.GetRawResponse().Status, rule.AllowedOrigins, rule.AllowedMethods,
-            rule.AllowedHeaders, rule.ExposedHeaders, rule.MaxAgeInSeconds, preflight);
+            rule.AllowedHeaders, rule.ExposedHeaders, rule.MaxAgeInSeconds,
+            preflight, deniedOrigin, missingMethod);
     }
 
     private static async Task<CorsPreflightObservation> ExerciseCorsPreflightAsync(
@@ -402,6 +440,49 @@ public sealed class AzuriteDifferentialTests
             string.Join(',', response.Headers.GetValues("Access-Control-Allow-Origin")),
             string.Join(',', response.Headers.GetValues("Access-Control-Allow-Methods")),
             string.Join(',', response.Headers.GetValues("Access-Control-Max-Age")));
+    }
+
+    private static async Task<int> GetPreflightStatusAsync(
+        HttpClient transport,
+        Uri serviceUri,
+        string origin,
+        string? method)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Options, new Uri(serviceUri, "?comp=list"));
+        request.Headers.TryAddWithoutValidation("Origin", origin);
+        if (method is not null)
+            request.Headers.TryAddWithoutValidation("Access-Control-Request-Method", method);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        return (int)response.StatusCode;
+    }
+
+    private static async Task<CopyObservation> ExerciseCopyAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var source = container.GetBlobClient("source.bin");
+        var bytes = new byte[8192];
+        DeterministicTestBytes.Fill(0xA20C, bytes);
+        await source.UploadAsync(BinaryData.FromBytes(bytes)).ConfigureAwait(false);
+        var stale = (await source.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag;
+        await source.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "changed"
+        }).ConfigureAwait(false);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobClient("rejected.bin").StartCopyFromUriAsync(source.Uri,
+                new BlobCopyFromUriOptions
+                {
+                    SourceConditions = new BlobRequestConditions { IfMatch = stale }
+                })).ConfigureAwait(false);
+        var destination = container.GetBlobClient("copy.bin");
+        var copy = await destination.StartCopyFromUriAsync(source.Uri).ConfigureAwait(false);
+        await copy.WaitForCompletionAsync().ConfigureAwait(false);
+        var properties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var actual = (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray();
+        Assert.Equal(bytes, actual);
+        return new CopyObservation(
+            rejected.Status, rejected.ErrorCode, copy.GetRawResponse().Status, properties.CopyStatus.ToString(),
+            properties.ContentLength, Convert.ToHexString(SHA256.HashData(actual)));
     }
 
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
@@ -466,7 +547,12 @@ public sealed class AzuriteDifferentialTests
     private sealed record ServiceCorsObservation(
         int InitialStatus, int SetStatus, int GetStatus,
         string AllowedOrigins, string AllowedMethods, string AllowedHeaders,
-        string ExposedHeaders, int MaxAgeInSeconds, CorsPreflightObservation Preflight);
+        string ExposedHeaders, int MaxAgeInSeconds, CorsPreflightObservation Preflight,
+        int DeniedOriginStatus, int MissingMethodStatus);
 
     private sealed record CorsPreflightObservation(int Status, string AllowedOrigin, string AllowedMethods, string MaxAge);
+
+    private sealed record CopyObservation(
+        int StaleSourceStatus, string? StaleSourceCode, int StartStatus,
+        string CopyStatus, long Length, string ContentSha256);
 }
