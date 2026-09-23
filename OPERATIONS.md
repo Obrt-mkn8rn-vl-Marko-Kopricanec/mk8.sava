@@ -80,18 +80,23 @@ DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run-enospc.sh
 ```
 
 It mounts a private 32 MiB tmpfs beneath a freshly created temporary directory,
-fills it until the kernel returns `ENOSPC`, and runs five independent boundaries:
+fills it until the kernel returns `ENOSPC`, and runs six independent boundaries:
 a 512 KiB standalone upload with only 256 KiB free, metadata-only container
 creation with 128 KiB free, a blob metadata update with 256 KiB free, a packed
-upload with 8 KiB free, and pack compaction with 4 KiB free. The tests confirm
+upload with 8 KiB free, pack compaction with 4 KiB free, and a blob-publication
+transaction where a fault hook fills the tmpfs after staging but immediately
+before the SQLite commit. The tests confirm
 an earlier acknowledged object remains exact, failed logical publication is
 absent after restart, partial/unreachable extents can be reclaimed or discarded,
 and retry succeeds. The pack test also records that staging completed and pack
 append began before the kernel failure. The compaction test checks that a
 failed replacement leaves the old indexed pack authoritative across restart,
-then succeeds after capacity is restored. The mount is private to the harness
-process and is unmounted on exit. This does not cover every SQLite commit,
-compaction commit, filesystem, Windows, or power-loss boundary.
+then succeeds after capacity is restored. The publication-commit case checks
+that staged chunks remain unreachable, the earlier blob survives, garbage
+collection reclaims the orphan after restart, and retry publishes exact bytes.
+The mount is private to the harness process and is unmounted on exit. This
+does not cover every SQLite commit, compaction commit, filesystem, Windows, or
+power-loss boundary.
 
 ## SDK substitution checks
 
