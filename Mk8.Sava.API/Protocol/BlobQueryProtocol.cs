@@ -598,58 +598,7 @@ internal static class BlobQueryProtocol
     {
         try
         {
-            var type = field.ClrType;
-            if (type == typeof(ReadOnlyMemory<char>))
-            {
-                var values = new string?[rowCount];
-                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
-                return values;
-            }
-            if (type == typeof(ReadOnlyMemory<byte>))
-            {
-                var values = new byte[]?[rowCount];
-                await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
-                return values.Select(value => value is null ? null : Convert.ToBase64String(value)).ToArray();
-            }
-            if (type == typeof(bool))
-                return await ReadParquetValueColumnAsync<bool>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(byte))
-                return await ReadParquetValueColumnAsync<byte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(sbyte))
-                return await ReadParquetValueColumnAsync<sbyte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(short))
-                return await ReadParquetValueColumnAsync<short>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(ushort))
-                return await ReadParquetValueColumnAsync<ushort>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(int))
-                return await ReadParquetValueColumnAsync<int>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(uint))
-                return await ReadParquetValueColumnAsync<uint>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(long))
-                return await ReadParquetValueColumnAsync<long>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(ulong))
-                return await ReadParquetValueColumnAsync<ulong>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(float))
-                return await ReadParquetValueColumnAsync<float>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(double))
-                return await ReadParquetValueColumnAsync<double>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(decimal))
-                return await ReadParquetValueColumnAsync<decimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(BigDecimal))
-                return await ReadParquetValueColumnAsync<BigDecimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(System.Numerics.BigInteger))
-                return await ReadParquetValueColumnAsync<BigInteger>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(DateTime))
-                return await ReadParquetValueColumnAsync<DateTime>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(DateOnly))
-                return await ReadParquetValueColumnAsync<DateOnly>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-            if (type == typeof(Guid))
-                return await ReadParquetValueColumnAsync<Guid>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
-
-            throw new BlobQueryDataException(
-                "UnsupportedParquetType",
-                $"Parquet field '{field.Name}' uses an unsupported data type.",
-                0);
+            return await ReadParquetColumnCoreAsync(group, field, rowCount, cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -663,6 +612,79 @@ internal static class BlobQueryProtocol
         {
             throw InvalidParquetFile();
         }
+    }
+
+    private static async Task<object?[]> ReadParquetColumnCoreAsync(
+        ParquetRowGroupReader group,
+        Parquet.Schema.DataField field,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
+        var type = field.ClrType;
+        if (type == typeof(ReadOnlyMemory<char>))
+        {
+            var values = new string?[rowCount];
+            await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
+            return values;
+        }
+        if (type == typeof(ReadOnlyMemory<byte>))
+        {
+            var values = new byte[]?[rowCount];
+            await group.ReadAsync(field, values.AsMemory(), cancellationToken: cancellationToken).ConfigureAwait(false);
+            return values.Select(value => value is null ? null : Convert.ToBase64String(value)).ToArray();
+        }
+        var integral = await ReadParquetIntegralColumnAsync(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (integral is not null)
+            return integral;
+        if (type == typeof(ulong))
+            return await ReadParquetValueColumnAsync<ulong>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(float))
+            return await ReadParquetValueColumnAsync<float>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(double))
+            return await ReadParquetValueColumnAsync<double>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(decimal))
+            return await ReadParquetValueColumnAsync<decimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(BigDecimal))
+            return await ReadParquetValueColumnAsync<BigDecimal>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(System.Numerics.BigInteger))
+            return await ReadParquetValueColumnAsync<BigInteger>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(DateTime))
+            return await ReadParquetValueColumnAsync<DateTime>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(DateOnly))
+            return await ReadParquetValueColumnAsync<DateOnly>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(Guid))
+            return await ReadParquetValueColumnAsync<Guid>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+
+        throw new BlobQueryDataException(
+            "UnsupportedParquetType",
+            $"Parquet field '{field.Name}' uses an unsupported data type.",
+            0);
+    }
+
+    private static async Task<object?[]?> ReadParquetIntegralColumnAsync(
+        ParquetRowGroupReader group,
+        Parquet.Schema.DataField field,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
+        var type = field.ClrType;
+        if (type == typeof(bool))
+            return await ReadParquetValueColumnAsync<bool>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(byte))
+            return await ReadParquetValueColumnAsync<byte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(sbyte))
+            return await ReadParquetValueColumnAsync<sbyte>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(short))
+            return await ReadParquetValueColumnAsync<short>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(ushort))
+            return await ReadParquetValueColumnAsync<ushort>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(int))
+            return await ReadParquetValueColumnAsync<int>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(uint))
+            return await ReadParquetValueColumnAsync<uint>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        if (type == typeof(long))
+            return await ReadParquetValueColumnAsync<long>(group, field, rowCount, cancellationToken).ConfigureAwait(false);
+        return null;
     }
 
     private static async Task<object?[]> ReadParquetValueColumnAsync<T>(

@@ -25,32 +25,11 @@ internal static class StructuredBodyDecoder
         if (expectedContentLength > maximumContentLength)
             throw new RequestBodyTooLargeException(maximumContentLength);
 
-        var header = new byte[HeaderLength];
-        await ReadExactlyAsync(source, header, cancellationToken).ConfigureAwait(false);
-        if (header[0] != 1)
-            throw InvalidBody();
-
-        var messageLength = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(1, sizeof(ulong)));
-        var flags = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(9, sizeof(ushort)));
-        var segmentCount = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(11, sizeof(ushort)));
-        if (messageLength != (ulong)encodedLength || flags != IncludeCrc64 || segmentCount == 0)
-            throw InvalidBody();
-
-        ulong calculatedLength;
-        try
-        {
-            calculatedLength = checked(
-                (ulong)HeaderLength +
-                (ulong)expectedContentLength +
-                (ulong)segmentCount * (SegmentHeaderLength + ChecksumLength) +
-                ChecksumLength);
-        }
-        catch (OverflowException)
-        {
-            throw InvalidBody();
-        }
-        if (calculatedLength != messageLength)
-            throw InvalidBody();
+        var segmentCount = await ReadHeaderAsync(
+            source,
+            encodedLength,
+            expectedContentLength,
+            cancellationToken).ConfigureAwait(false);
 
         var messageCrc64 = new StorageCrc64();
         var segmentHeader = new byte[SegmentHeaderLength];
@@ -96,6 +75,41 @@ internal static class StructuredBodyDecoder
             throw Crc64Mismatch();
         if (decodedLength != expectedContentLength)
             throw InvalidBody();
+    }
+
+    private static async Task<ushort> ReadHeaderAsync(
+        Stream source,
+        long encodedLength,
+        long expectedContentLength,
+        CancellationToken cancellationToken)
+    {
+        var header = new byte[HeaderLength];
+        await ReadExactlyAsync(source, header, cancellationToken).ConfigureAwait(false);
+        if (header[0] != 1)
+            throw InvalidBody();
+
+        var messageLength = BinaryPrimitives.ReadUInt64LittleEndian(header.AsSpan(1, sizeof(ulong)));
+        var flags = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(9, sizeof(ushort)));
+        var segmentCount = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(11, sizeof(ushort)));
+        if (messageLength != (ulong)encodedLength || flags != IncludeCrc64 || segmentCount == 0)
+            throw InvalidBody();
+
+        ulong calculatedLength;
+        try
+        {
+            calculatedLength = checked(
+                (ulong)HeaderLength +
+                (ulong)expectedContentLength +
+                (ulong)segmentCount * (SegmentHeaderLength + ChecksumLength) +
+                ChecksumLength);
+        }
+        catch (OverflowException)
+        {
+            throw InvalidBody();
+        }
+        if (calculatedLength != messageLength)
+            throw InvalidBody();
+        return segmentCount;
     }
 
     private static async Task ReadExactlyAsync(
