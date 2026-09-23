@@ -138,6 +138,9 @@ block-blob upload, properties, metadata, full and ranged downloads,
 conditional writes, listing, deletion, and missing-resource errors. Separate
 scenarios compare staged-block commit/order and block lists, snapshots,
 lease-enforced metadata writes, tags, append blobs, and page ranges/clears. The
+container scenario compares metadata, public-access policy, and lease-enforced
+deletion; it enables public access only in its disposable mk8.sava fixture to
+match Azurite's test account, leaving the service's secure default unchanged. The
 script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

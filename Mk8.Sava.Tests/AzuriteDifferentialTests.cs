@@ -90,6 +90,36 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task ContainerMetadataPolicyAndLeaseOperationsMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:AllowAnonymousPublicAccess"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseContainerAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseContainerAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -233,6 +263,31 @@ public sealed class AzuriteDifferentialTests
             remaining);
     }
 
+    private static async Task<ContainerObservation> ExerciseContainerAsync(BlobContainerClient container)
+    {
+        var created = await container.CreateAsync(
+            PublicAccessType.None,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "initial" })
+            .ConfigureAwait(false);
+        var initial = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["phase"];
+        var metadataWrite = await container.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "updated" })
+            .ConfigureAwait(false);
+        var updated = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["phase"];
+        var policyWrite = await container.SetAccessPolicyAsync(PublicAccessType.Blob).ConfigureAwait(false);
+        var policy = (await container.GetAccessPolicyAsync().ConfigureAwait(false)).Value.BlobPublicAccess;
+        var lease = container.GetBlobLeaseClient();
+        await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => container.DeleteAsync())
+            .ConfigureAwait(false);
+        await lease.ReleaseAsync().ConfigureAwait(false);
+        var deleted = await container.DeleteAsync().ConfigureAwait(false);
+        return new ContainerObservation(
+            created.GetRawResponse().Status, initial, metadataWrite.GetRawResponse().Status,
+            updated, policyWrite.GetRawResponse().Status, policy.ToString(),
+            rejected.Status, rejected.ErrorCode, deleted.Status);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -278,4 +333,15 @@ public sealed class AzuriteDifferentialTests
         long? PageRangeLength,
         string PageContent,
         int RemainingRanges);
+
+    private sealed record ContainerObservation(
+        int CreateStatus,
+        string InitialMetadata,
+        int SetMetadataStatus,
+        string UpdatedMetadata,
+        int SetPolicyStatus,
+        string PublicAccess,
+        int MissingLeaseStatus,
+        string? MissingLeaseCode,
+        int DeleteStatus);
 }
