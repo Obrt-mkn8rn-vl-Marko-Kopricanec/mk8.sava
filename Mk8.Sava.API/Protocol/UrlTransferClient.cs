@@ -194,33 +194,13 @@ internal sealed class UrlTransferClient(
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
             await using (temporary.ConfigureAwait(false))
             {
-                using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-                var crc64 = new StorageCrc64();
-                var buffer = new byte[128 * 1024];
-                long length = 0;
-                while (true)
-                {
-                    var read = await source.Content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                    if (read == 0)
-                        break;
-                    length = checked(length + read);
-                    if (length > maximumBytes)
-                        throw new RequestBodyTooLargeException(maximumBytes);
-                    md5.AppendData(buffer, 0, read);
-                    crc64.Append(buffer.AsSpan(0, read));
-                    await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-                }
-
-                var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
-                var actual = expectedMd5Text is null ? checksums.Crc64 : checksums.Md5;
-                if (!CryptographicOperations.FixedTimeEquals(expected, actual))
-                {
-                    throw new AzureStorageException(
-                        StatusCodes.Status400BadRequest,
-                        expectedMd5Text is null ? "Crc64Mismatch" : "Md5Mismatch",
-                        "The checksum specified for the source did not match its content.");
-                }
-
+                var (checksums, length) = await CopyAndVerifySourceAsync(
+                    source.Content,
+                    temporary,
+                    maximumBytes,
+                    expectedMd5Text is null,
+                    expected,
+                    cancellationToken).ConfigureAwait(false);
                 temporary.Position = 0;
                 var value = await consume(source with { Content = temporary, ContentLength = length }).ConfigureAwait(false);
                 return new UrlTransferResult<TResult>(value, checksums);
@@ -231,6 +211,43 @@ internal sealed class UrlTransferClient(
             if (File.Exists(temporaryPath))
                 File.Delete(temporaryPath);
         }
+    }
+
+    private static async Task<(TransactionalChecksums Checksums, long Length)> CopyAndVerifySourceAsync(
+        Stream source,
+        Stream temporary,
+        long maximumBytes,
+        bool verifyCrc64,
+        byte[] expected,
+        CancellationToken cancellationToken)
+    {
+        using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+        var crc64 = new StorageCrc64();
+        var buffer = new byte[128 * 1024];
+        long length = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+                break;
+            length = checked(length + read);
+            if (length > maximumBytes)
+                throw new RequestBodyTooLargeException(maximumBytes);
+            md5.AppendData(buffer, 0, read);
+            crc64.Append(buffer.AsSpan(0, read));
+            await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+        }
+
+        var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
+        var actual = verifyCrc64 ? checksums.Crc64 : checksums.Md5;
+        if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                verifyCrc64 ? "Crc64Mismatch" : "Md5Mismatch",
+                "The checksum specified for the source did not match its content.");
+        }
+        return (checksums, length);
     }
 
     internal static void ValidateFileRequestIntent(
@@ -401,6 +418,12 @@ internal sealed class UrlTransferClient(
         if (!string.Equals(algorithm, "AES256", StringComparison.Ordinal))
             throw AzureStorageException.InvalidHeader("x-ms-source-encryption-algorithm", algorithm);
 
+        ValidateSourceCustomerProvidedKey(encodedKey, encodedHash);
+        return new SourceCustomerProvidedKey(encodedKey, encodedHash, "AES256");
+    }
+
+    private static void ValidateSourceCustomerProvidedKey(string encodedKey, string encodedHash)
+    {
         byte[] key;
         byte[] suppliedHash;
         try
@@ -434,7 +457,6 @@ internal sealed class UrlTransferClient(
         {
             CryptographicOperations.ZeroMemory(key);
         }
-        return new SourceCustomerProvidedKey(encodedKey, encodedHash, "AES256");
     }
 
     private static BlobHttpProperties ReadHttpProperties(HttpResponseMessage response) => new()
@@ -538,8 +560,8 @@ internal sealed class UrlTransferClient(
             case BlobKind.AppendBlob:
                 return new UrlSourceShape(
                     0,
-                    ReadBooleanHeader("x-ms-blob-sealed", defaultValue: false),
-                    ReadIntegerHeader("x-ms-blob-committed-block-count"),
+                    ReadBooleanHeader(sourceResponse, "x-ms-blob-sealed", defaultValue: false),
+                    ReadIntegerHeader(sourceResponse, "x-ms-blob-committed-block-count"),
                     [],
                     []);
             case BlobKind.PageBlob:
@@ -553,7 +575,7 @@ internal sealed class UrlTransferClient(
                         contentLength,
                         cancellationToken).ConfigureAwait(false);
                     return new UrlSourceShape(
-                        ReadLongHeader("x-ms-blob-sequence-number"),
+                        ReadLongHeader(sourceResponse, "x-ms-blob-sequence-number"),
                         false,
                         0,
                         [],
@@ -562,42 +584,42 @@ internal sealed class UrlTransferClient(
             default:
                 return UrlSourceShape.Empty;
         }
+    }
 
-        bool ReadBooleanHeader(string name, bool defaultValue)
-        {
-            var value = CurrentResponseHeader(name);
-            if (value is null)
-                return defaultValue;
-            return bool.TryParse(value, out var parsed)
-                ? parsed
-                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
-        }
+    private static bool ReadBooleanHeader(HttpResponseMessage response, string name, bool defaultValue)
+    {
+        var value = CurrentResponseHeader(response, name);
+        if (value is null)
+            return defaultValue;
+        return bool.TryParse(value, out var parsed)
+            ? parsed
+            : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+    }
 
-        int ReadIntegerHeader(string name)
-        {
-            var value = CurrentResponseHeader(name);
-            return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
-                ? parsed
-                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
-        }
+    private static int ReadIntegerHeader(HttpResponseMessage response, string name)
+    {
+        var value = CurrentResponseHeader(response, name);
+        return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
+            ? parsed
+            : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+    }
 
-        long ReadLongHeader(string name)
-        {
-            var value = CurrentResponseHeader(name);
-            return long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
-                ? parsed
-                : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
-        }
+    private static long ReadLongHeader(HttpResponseMessage response, string name)
+    {
+        var value = CurrentResponseHeader(response, name);
+        return long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0
+            ? parsed
+            : throw CannotVerifyCopySource($"The source returned an invalid {name} header.");
+    }
 
-        string? CurrentResponseHeader(string name)
+    private static string? CurrentResponseHeader(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out var values) ||
+            response.Content.Headers.TryGetValues(name, out values))
         {
-            if (sourceResponse.Headers.TryGetValues(name, out var values) ||
-                sourceResponse.Content.Headers.TryGetValues(name, out values))
-            {
-                return values.SingleOrDefault();
-            }
-            return null;
+            return values.SingleOrDefault();
         }
+        return null;
     }
 
     private async Task<IReadOnlyList<CopySourceBlock>> ReadCommittedBlocksAsync(
