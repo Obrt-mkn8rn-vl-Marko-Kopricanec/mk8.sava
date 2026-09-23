@@ -2407,6 +2407,192 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalAclListsOnlyAnAuthorizedDirectoryWithSdkPaging()
+    {
+        const string readerObjectId = "bb709241-d428-4339-8609-635fdf5fd9ac";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-list-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("visible/one.txt").UploadAsync(BinaryData.FromString("one"));
+        await container.GetBlobClient("visible/two.txt").UploadAsync(BinaryData.FromString("two"));
+        await container.GetBlobClient("hidden/secret.txt").UploadAsync(BinaryData.FromString("secret"));
+
+        var rootAcl = $"user::rwx,user:{readerObjectId}:r-x,group::r-x,mask::r-x,other::---";
+        var visibleAcl = rootAcl;
+        var hiddenAcl = $"user::rwx,user:{readerObjectId}:--x,group::r-x,mask::r-x,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = rootAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "visible",
+                AccessAcl = visibleAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "hidden",
+                AccessAcl = hiddenAcl
+            });
+
+        var reader = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId))
+            .GetBlobContainerClient(container.Name);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var rootNames = new List<string>();
+        var rootListing = reader.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions { Delimiter = "/" });
+        await foreach (var page in rootListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token))
+        {
+            Assert.Single(page.Values);
+            rootNames.Add(page.Values[0].Prefix);
+            Assert.True(rootNames.Count <= 3,
+                $"Root directory listing did not advance: {string.Join(',', rootNames)}; marker={page.ContinuationToken}");
+        }
+        Assert.Equal(["hidden/", "visible/"], rootNames);
+
+        var visibleNames = new List<string>();
+        var visibleListing = reader.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+        {
+            Delimiter = "/",
+            Prefix = "visible/"
+        });
+        await foreach (var page in visibleListing.AsPages(pageSizeHint: 1).WithCancellation(timeout.Token))
+        {
+            Assert.Single(page.Values);
+            visibleNames.Add(page.Values[0].Blob.Name);
+            Assert.True(visibleNames.Count <= 3, "Nested directory listing did not advance its continuation.");
+        }
+        Assert.Equal(["visible/one.txt", "visible/two.txt"], visibleNames);
+
+        var hidden = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            var hiddenListing = reader.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+            {
+                Delimiter = "/",
+                Prefix = "hidden/"
+            });
+            await foreach (var _ in hiddenListing)
+            {
+            }
+        });
+        Assert.Equal(StatusCodes.Status403Forbidden, hidden.Status);
+
+        var recursive = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            await foreach (var _ in reader.GetBlobsAsync())
+            {
+            }
+        });
+        Assert.Equal(StatusCodes.Status403Forbidden, recursive.Status);
+    }
+
+    [Fact]
+    public async Task HierarchicalDirectoryListHonorsSignedSuoidAndListPermission()
+    {
+        const string readerObjectId = "024e3416-6d43-4310-a404-b2e26705ba06";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "rl",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
+        });
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-list-suoid-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("visible/item.txt").UploadAsync(BinaryData.FromString("item"));
+        var accessAcl = $"user::rwx,user:{readerObjectId}:r-x,group::r-x,mask::r-x,other::---";
+        await ApplyAclManifestAsync(application,
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = string.Empty,
+                AccessAcl = accessAcl
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = "visible",
+                AccessAcl = accessAcl
+            });
+
+        var delegator = CreateBearerClient(application, CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId));
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+        var signedStart = startsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var signedExpiry = expiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        const string signedVersion = "2023-11-03";
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}";
+        var stringToSign = string.Join('\n',
+            "l", signedStart, signedExpiry, canonicalResource,
+            key.SignedObjectId, key.SignedTenantId, keyStart, keyExpiry,
+            key.SignedService, key.SignedVersion,
+            string.Empty, readerObjectId, string.Empty, string.Empty,
+            "https,http", signedVersion, "c",
+            string.Empty, string.Empty, string.Empty, string.Empty,
+            string.Empty, string.Empty, string.Empty);
+        var signature = Convert.ToBase64String(HMACSHA256.HashData(
+            Convert.FromBase64String(key.Value), Encoding.UTF8.GetBytes(stringToSign)));
+        var sas =
+            $"sp=l&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
+            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
+            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
+            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
+            $"&suoid={readerObjectId}&spr=https%2Chttp&sv={signedVersion}&sr=c" +
+            $"&sig={Uri.EscapeDataString(signature)}";
+        var endpoint = $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}";
+        using var transport = new HttpClient(application.Server.CreateHandler());
+
+        using (var root = await transport.GetAsync(
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&{sas}"))
+        {
+            Assert.Equal(HttpStatusCode.OK, root.StatusCode);
+            Assert.Contains("<Name>visible/</Name>", await root.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        }
+        using (var nested = await transport.GetAsync(
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&prefix=visible%2F&{sas}"))
+        {
+            Assert.Equal(HttpStatusCode.OK, nested.StatusCode);
+            Assert.Contains("<Name>visible/item.txt</Name>", await nested.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        }
+        using (var unsupported = await transport.GetAsync(
+                   $"{endpoint}?restype=container&comp=list&{sas}"))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, unsupported.StatusCode);
+            Assert.Equal("AuthorizationFailure", unsupported.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var tampered = await transport.GetAsync(
+                   $"{endpoint}?restype=container&comp=list&delimiter=%2F&" +
+                   sas.Replace(readerObjectId, Guid.NewGuid().ToString(), StringComparison.Ordinal)))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, tampered.StatusCode);
+            Assert.Equal("AuthenticationFailed", tampered.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    [Fact]
     public async Task HierarchicalAclOperatorCommandAppliesManifestAcrossProcessRestart()
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-acl-command-{Guid.NewGuid():N}");

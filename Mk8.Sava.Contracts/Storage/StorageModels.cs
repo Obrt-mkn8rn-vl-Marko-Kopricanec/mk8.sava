@@ -263,7 +263,7 @@ internal sealed record BlobListEntry(BlobRecord? Blob, string? Prefix, string? U
 {
     public bool IsUncommitted => UncommittedBlobName is not null;
 
-    public string Name => Blob?.Name ?? Prefix ?? UncommittedBlobName!;
+    public string Name => Prefix ?? Blob?.Name ?? UncommittedBlobName!;
 
     public BlobListCursor Cursor
     {
