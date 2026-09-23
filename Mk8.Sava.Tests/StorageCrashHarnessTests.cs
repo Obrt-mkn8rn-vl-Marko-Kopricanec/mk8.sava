@@ -90,8 +90,8 @@ public sealed class StorageCrashHarnessTests
                     await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29)));
                     await discarded.DeleteAsync();
                     faultInjector.ArmTermination(
-                        scenario == "pack-metadata-precommit"
-                            ? StorageFaultPoint.BeforePackMetadataCommit
+string.Equals(scenario, "pack-metadata-precommit"
+, StringComparison.Ordinal) ? StorageFaultPoint.BeforePackMetadataCommit
                             : StorageFaultPoint.AfterPackMetadataCommit);
                     await application.Services
                         .GetRequiredService<BlobService>()
@@ -133,7 +133,7 @@ public sealed class StorageCrashHarnessTests
                 .GetBlobContainerClient(ContainerName)
                 .GetBlobClient(BlobName);
 
-            if (scenario == "pack-record-append")
+            if (string.Equals(scenario, "pack-record-append", StringComparison.Ordinal))
             {
                 Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
                 var interrupted = CreateClient(application)
@@ -157,7 +157,7 @@ public sealed class StorageCrashHarnessTests
                 return;
             }
 
-            if (scenario == "metadata-postcommit")
+            if (string.Equals(scenario, "metadata-postcommit", StringComparison.Ordinal))
             {
                 var recovered = await blob.DownloadContentAsync();
                 Assert.Equal(CreateContent(), recovered.Value.Content.ToArray());

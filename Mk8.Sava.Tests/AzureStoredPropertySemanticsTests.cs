@@ -921,12 +921,12 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
                 "/page" => BlobResponse(PagePayload, "PageBlob", request),
                 _ => new HttpResponseMessage(HttpStatusCode.NotFound) { RequestMessage = request }
             };
-            if (path == "/append")
+            if (string.Equals(path, "/append", StringComparison.Ordinal))
             {
                 response.Headers.TryAddWithoutValidation("x-ms-blob-committed-block-count", "2");
                 response.Headers.TryAddWithoutValidation("x-ms-blob-sealed", "true");
             }
-            if (path == "/page")
+            if (string.Equals(path, "/page", StringComparison.Ordinal))
                 response.Headers.TryAddWithoutValidation("x-ms-blob-sequence-number", "42");
             response.Headers.TryAddWithoutValidation("x-ms-meta-shape", path?.TrimStart('/'));
             return Task.FromResult(response);

@@ -392,7 +392,7 @@ public sealed class StorageEnospcHarnessTests
         var fullPath = Path.GetFullPath(dataPath);
         var mountRoot = Path.GetDirectoryName(fullPath)
                         ?? throw new InvalidOperationException("The ENOSPC data path has no mount root.");
-        if (Path.GetFileName(fullPath) != "data" ||
+        if (!string.Equals(Path.GetFileName(fullPath), "data", StringComparison.Ordinal) ||
             !Path.GetFileName(mountRoot).StartsWith("mk8-sava-enospc-", StringComparison.Ordinal))
         {
             throw new InvalidOperationException("The ENOSPC test requires an isolated mk8-sava-enospc-* mount.");
