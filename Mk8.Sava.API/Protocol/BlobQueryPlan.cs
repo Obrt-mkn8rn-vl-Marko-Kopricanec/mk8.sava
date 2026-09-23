@@ -1235,84 +1235,7 @@ internal sealed class BlobQueryPlan
             switch (token.Kind)
             {
                 case QueryTokenKind.Identifier:
-                    if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(null));
-                    if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(true));
-                    if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
-                        return new QueryOperand(null, new QueryCell(false));
-                    if (!token.Quoted &&
-                        string.Equals(token.Text, "sys", StringComparison.OrdinalIgnoreCase) &&
-                        IsSysSplitStart())
-                    {
-                        _position += 3;
-                        var sizeToken = Expect(QueryTokenKind.Number, "Sys.Split size");
-                        if (!long.TryParse(sizeToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var size) ||
-                            size < 10L * 1024 * 1024)
-                        {
-                            throw InvalidQuery(
-                                sizeToken.Position,
-                                "The Sys.Split size must be an integer of at least 10485760 bytes.");
-                        }
-                        ExpectSymbol(")");
-                        return new QuerySplitExpression(size);
-                    }
-                    if (!token.Quoted &&
-                        string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) &&
-                        MatchSymbol("("))
-                    {
-                        var operand = ParseExpression();
-                        ExpectKeyword("AS");
-                        var type = ParseValueType(Expect(QueryTokenKind.Identifier, "CAST type"));
-                        ExpectSymbol(")");
-                        return new QueryCastExpression(operand, type);
-                    }
-                    if (!token.Quoted && MatchSymbol("("))
-                    {
-                        var function = token.Text.ToUpperInvariant();
-                        if (function is "COUNT" or "AVG" or "MIN" or "MAX" or "SUM")
-                            return ParseAggregateExpression(token, function);
-                        var arguments = function switch
-                        {
-                            "DATE_ADD" or "DATE_DIFF" => ParseDateFunctionArguments(),
-                            "EXTRACT" => ParseExtractArguments(),
-                            "TRIM" => ParseTrimArguments(),
-                            _ => ParseFunctionArguments()
-                        };
-                        ValidateFunction(token, arguments.Count);
-                        return new QueryFunctionExpression(function, arguments);
-                    }
-                    var path = new List<QueryFieldSegment>
-                    {
-                        new(token.Text, null, token.Quoted)
-                    };
-                    while (true)
-                    {
-                        if (MatchSymbol("."))
-                        {
-                            var fieldToken = Expect(QueryTokenKind.Identifier, "field name");
-                            path.Add(new QueryFieldSegment(fieldToken.Text, null, fieldToken.Quoted));
-                            continue;
-                        }
-                        if (MatchSymbol("["))
-                        {
-                            var indexToken = Expect(QueryTokenKind.Number, "array index");
-                            if (!int.TryParse(indexToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var arrayIndex))
-                                throw InvalidQuery(indexToken.Position, "A JSON array index must be a non-negative integer.");
-                            ExpectSymbol("]");
-                            path.Add(new QueryFieldSegment(null, arrayIndex, false));
-                            continue;
-                        }
-                        break;
-                    }
-                    if (path.Count > 1 &&
-                        (string.Equals(path[0].Name, "BlobStorage", StringComparison.OrdinalIgnoreCase) ||
-                         _sourceAlias is not null &&
-                         string.Equals(path[0].Name, _sourceAlias, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        path.RemoveAt(0);
-                    }
-                    return new QueryOperand(path, null);
+                    return ParseIdentifier(token);
                 case QueryTokenKind.String:
                     return new QueryOperand(null, new QueryCell(token.Text));
                 case QueryTokenKind.Number:
@@ -1328,6 +1251,93 @@ internal sealed class BlobQueryPlan
                 default:
                     throw InvalidQuery(token.Position, $"Expected an expression, found '{token.Text}'.");
             }
+        }
+
+        private QueryExpression ParseIdentifier(QueryToken token)
+        {
+            if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
+                return new QueryOperand(null, new QueryCell(null));
+            if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
+                return new QueryOperand(null, new QueryCell(true));
+            if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
+                return new QueryOperand(null, new QueryCell(false));
+            if (!token.Quoted &&
+                string.Equals(token.Text, "sys", StringComparison.OrdinalIgnoreCase) &&
+                IsSysSplitStart())
+            {
+                _position += 3;
+                var sizeToken = Expect(QueryTokenKind.Number, "Sys.Split size");
+                if (!long.TryParse(sizeToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var size) ||
+                    size < 10L * 1024 * 1024)
+                {
+                    throw InvalidQuery(
+                        sizeToken.Position,
+                        "The Sys.Split size must be an integer of at least 10485760 bytes.");
+                }
+                ExpectSymbol(")");
+                return new QuerySplitExpression(size);
+            }
+            if (!token.Quoted &&
+                string.Equals(token.Text, "CAST", StringComparison.OrdinalIgnoreCase) &&
+                MatchSymbol("("))
+            {
+                var operand = ParseExpression();
+                ExpectKeyword("AS");
+                var type = ParseValueType(Expect(QueryTokenKind.Identifier, "CAST type"));
+                ExpectSymbol(")");
+                return new QueryCastExpression(operand, type);
+            }
+            if (!token.Quoted && MatchSymbol("("))
+            {
+                var function = token.Text.ToUpperInvariant();
+                if (function is "COUNT" or "AVG" or "MIN" or "MAX" or "SUM")
+                    return ParseAggregateExpression(token, function);
+                var arguments = function switch
+                {
+                    "DATE_ADD" or "DATE_DIFF" => ParseDateFunctionArguments(),
+                    "EXTRACT" => ParseExtractArguments(),
+                    "TRIM" => ParseTrimArguments(),
+                    _ => ParseFunctionArguments()
+                };
+                ValidateFunction(token, arguments.Count);
+                return new QueryFunctionExpression(function, arguments);
+            }
+            return ParseFieldPath(token);
+        }
+
+        private QueryOperand ParseFieldPath(QueryToken token)
+        {
+            var path = new List<QueryFieldSegment>
+            {
+                new(token.Text, null, token.Quoted)
+            };
+            while (true)
+            {
+                if (MatchSymbol("."))
+                {
+                    var fieldToken = Expect(QueryTokenKind.Identifier, "field name");
+                    path.Add(new QueryFieldSegment(fieldToken.Text, null, fieldToken.Quoted));
+                    continue;
+                }
+                if (MatchSymbol("["))
+                {
+                    var indexToken = Expect(QueryTokenKind.Number, "array index");
+                    if (!int.TryParse(indexToken.Text, NumberStyles.None, CultureInfo.InvariantCulture, out var arrayIndex))
+                        throw InvalidQuery(indexToken.Position, "A JSON array index must be a non-negative integer.");
+                    ExpectSymbol("]");
+                    path.Add(new QueryFieldSegment(null, arrayIndex, false));
+                    continue;
+                }
+                break;
+            }
+            if (path.Count > 1 &&
+                (string.Equals(path[0].Name, "BlobStorage", StringComparison.OrdinalIgnoreCase) ||
+                 _sourceAlias is not null &&
+                 string.Equals(path[0].Name, _sourceAlias, StringComparison.OrdinalIgnoreCase)))
+            {
+                path.RemoveAt(0);
+            }
+            return new QueryOperand(path, null);
         }
 
         private QueryAggregateExpression ParseAggregateExpression(QueryToken token, string function)
@@ -1585,34 +1595,7 @@ string.Equals(_tokens[_position + 2].Text, "(", StringComparison.Ordinal);
                 var character = expression[index];
                 if (character == '\'' || character == '"')
                 {
-                    var delimiter = character;
-                    index++;
-                    var value = new StringBuilder();
-                    var closed = false;
-                    while (index < expression.Length)
-                    {
-                        character = expression[index++];
-                        if (character != delimiter)
-                        {
-                            value.Append(character);
-                            continue;
-                        }
-                        if (index < expression.Length && expression[index] == delimiter)
-                        {
-                            value.Append(delimiter);
-                            index++;
-                            continue;
-                        }
-                        closed = true;
-                        break;
-                    }
-                    if (!closed)
-                        throw InvalidQuery(start, "A quoted value is not terminated.");
-                    tokens.Add(new QueryToken(
-                        delimiter == '\'' ? QueryTokenKind.String : QueryTokenKind.Identifier,
-                        value.ToString(),
-                        start,
-                        Quoted: delimiter == '"'));
+                    tokens.Add(ReadQuotedToken(expression, ref index, start, character));
                     continue;
                 }
 
@@ -1627,27 +1610,7 @@ string.Equals(_tokens[_position + 2].Text, "(", StringComparison.Ordinal);
 
                 if (char.IsDigit(character))
                 {
-                    index++;
-                    while (index < expression.Length && char.IsDigit(expression[index]))
-                        index++;
-                    if (index < expression.Length && expression[index] == '.')
-                    {
-                        index++;
-                        while (index < expression.Length && char.IsDigit(expression[index]))
-                            index++;
-                    }
-                    if (index < expression.Length && expression[index] is 'e' or 'E')
-                    {
-                        index++;
-                        if (index < expression.Length && expression[index] is '+' or '-')
-                            index++;
-                        var exponentStart = index;
-                        while (index < expression.Length && char.IsDigit(expression[index]))
-                            index++;
-                        if (index == exponentStart)
-                            throw InvalidQuery(start, "A numeric exponent requires at least one digit.");
-                    }
-                    tokens.Add(new QueryToken(QueryTokenKind.Number, expression[start..index], start));
+                    tokens.Add(ReadNumberToken(expression, ref index, start));
                     continue;
                 }
 
@@ -1667,6 +1630,62 @@ string.Equals(_tokens[_position + 2].Text, "(", StringComparison.Ordinal);
             }
             tokens.Add(new QueryToken(QueryTokenKind.End, string.Empty, expression.Length));
             return tokens;
+        }
+
+        private static QueryToken ReadQuotedToken(string expression, ref int index, int start, char delimiter)
+        {
+            index++;
+            var value = new StringBuilder();
+            var closed = false;
+            while (index < expression.Length)
+            {
+                var character = expression[index++];
+                if (character != delimiter)
+                {
+                    value.Append(character);
+                    continue;
+                }
+                if (index < expression.Length && expression[index] == delimiter)
+                {
+                    value.Append(delimiter);
+                    index++;
+                    continue;
+                }
+                closed = true;
+                break;
+            }
+            if (!closed)
+                throw InvalidQuery(start, "A quoted value is not terminated.");
+            return new QueryToken(
+                delimiter == '\'' ? QueryTokenKind.String : QueryTokenKind.Identifier,
+                value.ToString(),
+                start,
+                Quoted: delimiter == '"');
+        }
+
+        private static QueryToken ReadNumberToken(string expression, ref int index, int start)
+        {
+            index++;
+            while (index < expression.Length && char.IsDigit(expression[index]))
+                index++;
+            if (index < expression.Length && expression[index] == '.')
+            {
+                index++;
+                while (index < expression.Length && char.IsDigit(expression[index]))
+                    index++;
+            }
+            if (index < expression.Length && expression[index] is 'e' or 'E')
+            {
+                index++;
+                if (index < expression.Length && expression[index] is '+' or '-')
+                    index++;
+                var exponentStart = index;
+                while (index < expression.Length && char.IsDigit(expression[index]))
+                    index++;
+                if (index == exponentStart)
+                    throw InvalidQuery(start, "A numeric exponent requires at least one digit.");
+            }
+            return new QueryToken(QueryTokenKind.Number, expression[start..index], start);
         }
 
         private static AzureStorageException InvalidQuery(int position, string detail) => new(
