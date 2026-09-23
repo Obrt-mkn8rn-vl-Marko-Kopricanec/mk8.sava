@@ -104,6 +104,10 @@ try
     await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
     await app.Services.GetRequiredService<StorageDataKeyContinuity>().EnsureAsync(CancellationToken.None);
     await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync();
+    var prunedChunkDirectories = app.Services.GetRequiredService<StoragePaths>()
+        .PruneLegacyEmptyChunkDirectories();
+    if (prunedChunkDirectories > 0)
+        app.Logger.LogInformation("Pruned {DirectoryCount} legacy empty chunk directories.", prunedChunkDirectories);
 }
 catch
 {
