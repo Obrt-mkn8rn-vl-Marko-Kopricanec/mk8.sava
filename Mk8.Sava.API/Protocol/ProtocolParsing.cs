@@ -233,34 +233,38 @@ string.Equals(reader.LocalName, "BlockList", StringComparison.Ordinal))
             if (reader.NodeType != XmlNodeType.Element || reader.Depth != rootDepth + 1)
                 throw InvalidBlockListXml();
 
-            var mode = reader.LocalName switch
-            {
-                "Latest" => BlockListMode.Latest,
-                "Committed" => BlockListMode.Committed,
-                "Uncommitted" => BlockListMode.Uncommitted,
-                _ => throw InvalidBlockListXml()
-            };
-            if (blocks.Count == BlobServiceLimits.MaximumCommittedBlockCount)
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status409Conflict,
-                    "BlockCountExceedsLimit",
-                    "The block list may not contain more than 50,000 blocks.");
-            }
-
-            string blockId;
-            try
-            {
-                blockId = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
-            }
-            catch (InvalidOperationException)
-            {
-                throw InvalidBlockListXml();
-            }
-            blocks.Add(new BlockListEntry(blockId, mode));
+            blocks.Add(await ReadBlockListEntryAsync(reader, blocks.Count).ConfigureAwait(false));
         }
 
         throw InvalidBlockListXml();
+    }
+
+    private static async Task<BlockListEntry> ReadBlockListEntryAsync(XmlReader reader, int blockCount)
+    {
+        var mode = reader.LocalName switch
+        {
+            "Latest" => BlockListMode.Latest,
+            "Committed" => BlockListMode.Committed,
+            "Uncommitted" => BlockListMode.Uncommitted,
+            _ => throw InvalidBlockListXml()
+        };
+        if (blockCount == BlobServiceLimits.MaximumCommittedBlockCount)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "BlockCountExceedsLimit",
+                "The block list may not contain more than 50,000 blocks.");
+        }
+
+        try
+        {
+            var blockId = await reader.ReadElementContentAsStringAsync().ConfigureAwait(false);
+            return new BlockListEntry(blockId, mode);
+        }
+        catch (InvalidOperationException)
+        {
+            throw InvalidBlockListXml();
+        }
     }
 
     public static async Task<Dictionary<string, StoredAccessPolicy>> ReadAclAsync(Stream body, CancellationToken cancellationToken)

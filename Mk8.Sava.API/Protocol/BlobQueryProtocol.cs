@@ -551,28 +551,42 @@ internal static class BlobQueryProtocol
             var names = fields.Select(field => field.Name).ToArray();
             for (var groupIndex = 0; groupIndex < reader.RowGroupCount; groupIndex++)
             {
-                using var group = reader.OpenRowGroupReader(groupIndex);
-                if (group.RowCount > int.MaxValue)
-                    throw InvalidParquetFile("A Parquet row group contains too many rows.");
-                var rowCount = checked((int)group.RowCount);
-                var columns = new object?[fields.Length][];
-                for (var column = 0; column < fields.Length; column++)
+                await foreach (var row in ReadParquetGroupAsync(reader, fields, names, groupIndex, cancellationToken)
+                                   .ConfigureAwait(false))
                 {
-                    columns[column] = await ReadParquetColumnAsync(
-                        group,
-                        fields[column],
-                        rowCount,
-                        cancellationToken).ConfigureAwait(false);
-                }
-
-                for (var row = 0; row < rowCount; row++)
-                {
-                    var cells = new QueryCell[fields.Length];
-                    for (var column = 0; column < fields.Length; column++)
-                        cells[column] = new QueryCell(columns[column][row]);
-                    yield return new QueryRow(names, cells);
+                    yield return row;
                 }
             }
+        }
+    }
+
+    private static async IAsyncEnumerable<QueryRow> ReadParquetGroupAsync(
+        ParquetReader reader,
+        Parquet.Schema.DataField[] fields,
+        string[] names,
+        int groupIndex,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        using var group = reader.OpenRowGroupReader(groupIndex);
+        if (group.RowCount > int.MaxValue)
+            throw InvalidParquetFile("A Parquet row group contains too many rows.");
+        var rowCount = checked((int)group.RowCount);
+        var columns = new object?[fields.Length][];
+        for (var column = 0; column < fields.Length; column++)
+        {
+            columns[column] = await ReadParquetColumnAsync(
+                group,
+                fields[column],
+                rowCount,
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        for (var row = 0; row < rowCount; row++)
+        {
+            var cells = new QueryCell[fields.Length];
+            for (var column = 0; column < fields.Length; column++)
+                cells[column] = new QueryCell(columns[column][row]);
+            yield return new QueryRow(names, cells);
         }
     }
 

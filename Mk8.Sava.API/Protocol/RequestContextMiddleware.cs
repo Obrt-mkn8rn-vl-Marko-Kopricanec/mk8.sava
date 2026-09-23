@@ -83,22 +83,11 @@ internal sealed class RequestContextMiddleware(
             : remaining.Length > 1
                 ? string.Join('/', remaining.Skip(1))
                 : null;
-        var restype = context.Request.Query["restype"].ToString();
-        var resourceKind = staticWebsite
-            ? StorageResourceKind.StaticWebsite
-            : container is null
-            ? StorageResourceKind.Service
-            : blob is not null
-                ? StorageResourceKind.Blob
-                : string.Equals(restype, "container", StringComparison.OrdinalIgnoreCase)
-                    ? StorageResourceKind.Container
-                    : StorageResourceKind.Blob;
-
-        var canonicalPath = "/" + account;
-        if (container is not null)
-            canonicalPath += "/" + container;
-        if (blob is not null)
-            canonicalPath += "/" + blob;
+        var resourceKind = ResolveResourceKind(
+            staticWebsite,
+            container,
+            blob,
+            context.Request.Query["restype"].ToString());
 
         var (serviceVersion, versionSource) = await ResolveServiceVersionAsync(
             context.Request,
@@ -113,11 +102,36 @@ internal sealed class RequestContextMiddleware(
             Snapshot = NullIfEmpty(context.Request.Query["snapshot"].ToString()),
             VersionId = NullIfEmpty(context.Request.Query["versionid"].ToString()),
             ResourceKind = resourceKind,
-            CanonicalResourcePath = canonicalPath,
+            CanonicalResourcePath = BuildCanonicalPath(account, container, blob),
             ServiceVersion = serviceVersion,
             Authorization = StorageAuthorization.Anonymous
         };
         return new ParsedRequest(request, versionSource);
+    }
+
+    private static StorageResourceKind ResolveResourceKind(
+        bool staticWebsite,
+        string? container,
+        string? blob,
+        string restype) =>
+        staticWebsite
+            ? StorageResourceKind.StaticWebsite
+            : container is null
+                ? StorageResourceKind.Service
+                : blob is not null
+                    ? StorageResourceKind.Blob
+                    : string.Equals(restype, "container", StringComparison.OrdinalIgnoreCase)
+                        ? StorageResourceKind.Container
+                        : StorageResourceKind.Blob;
+
+    private static string BuildCanonicalPath(string account, string? container, string? blob)
+    {
+        var path = "/" + account;
+        if (container is not null)
+            path += "/" + container;
+        if (blob is not null)
+            path += "/" + blob;
+        return path;
     }
 
     private string? ResolveHostAccount(string host)
