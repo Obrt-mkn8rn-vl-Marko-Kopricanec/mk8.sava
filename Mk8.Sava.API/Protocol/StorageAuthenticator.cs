@@ -358,6 +358,7 @@ public sealed class StorageAuthenticator(
         var signingKey = encodedKey;
         var isCrossTenantUserBoundSas = false;
         string? delegatedCreatorObjectId = null;
+        string? aclObjectId = null;
         if (isAccountSas)
         {
             if (!string.IsNullOrEmpty(query["si"].ToString()))
@@ -470,9 +471,8 @@ public sealed class StorageAuthenticator(
                 throw AzureStorageException.AuthorizationFailure();
             if (hasUnauthorizedObjectId)
             {
-                // suoid requires a POSIX ACL decision for the impersonated
-                // user in addition to the signer's ownership action.
-                throw AzureStorageException.AuthorizationFailure();
+                aclObjectId = unauthorizedObjectId;
+                delegatedCreatorObjectId = unauthorizedObjectId;
             }
             if (hasAuthorizedObjectId)
                 delegatedCreatorObjectId = authorizedObjectId;
@@ -662,6 +662,16 @@ public sealed class StorageAuthenticator(
         ApplyUserBoundSasPolicy(
             request,
             isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
+        if (aclObjectId is not null)
+        {
+            await HierarchicalAclAuthorization.EnsureReadAsync(
+                metadata,
+                context.Request,
+                request,
+                aclObjectId,
+                permissions,
+                cancellationToken);
+        }
 
         return new StorageAuthorization(
             StorageAuthorizationKind.Sas,

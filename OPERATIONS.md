@@ -176,9 +176,14 @@ User-delegation `scid` is signature-validated from version `2020-02-10`.
 when the delegation-key owner has the explicit
 `Sava:BearerAuthentication:Principals:<object-id>:CanManageOwnership` grant;
 it attributes new file ownership to the signed authorized object ID without
-an additional POSIX ACL check. `suoid` still fails closed because it requires
-a POSIX ACL decision for the impersonated user; a signed object identifier or
-ownership grant alone is insufficient.
+an additional POSIX ACL check. A signed `suoid` currently supports only Get
+Blob and Get Blob Properties for an existing file (or a missing target beneath
+traversable parents): the impersonated object ID must be the owning user of the
+container root and every parent directory with execute permission, and of the
+file with read permission. The delegation-key owner still needs the explicit
+ownership grant and the token still needs `r`; signing or changing the object
+ID cannot bypass the ACL check. Other `suoid` operations and group/named-user
+ACL grants remain fail-closed pending the full POSIX authorization model.
 From version `2025-07-05`, `sduoid` binds use to the matching bearer object and
 tenant without treating that identity proof as an additional RBAC grant. From
 version `2026-04-06`, `srh` and `srq` bind request headers and query values,
