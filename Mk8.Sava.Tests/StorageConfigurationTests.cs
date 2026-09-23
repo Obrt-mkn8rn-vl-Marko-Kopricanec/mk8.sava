@@ -104,4 +104,32 @@ public sealed class StorageConfigurationTests
 
         Assert.Empty(options.Validate(new ValidationContext(options)));
     }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public void HnsRejectsUnsupportedVersioningAndChangeFeedCapabilities(
+        bool versioningEnabled, bool changeFeedEnabled)
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
+            },
+            AccountCapabilities = new Dictionary<string, StorageAccountCapabilities>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = new()
+                {
+                    HierarchicalNamespaceEnabled = true,
+                    VersioningEnabled = versioningEnabled,
+                    ChangeFeedEnabled = changeFeedEnabled
+                }
+            }
+        };
+
+        Assert.Contains(options.Validate(new ValidationContext(options)), error =>
+            error.MemberNames.Contains(nameof(SavaOptions.AccountCapabilities), StringComparer.Ordinal) &&
+            error.ErrorMessage!.Contains("hierarchical namespace", StringComparison.Ordinal));
+    }
 }

@@ -488,6 +488,10 @@ Requests carrying the blob's `x-ms-encryption-key` headers are rejected there
 on writes and reads, before a new blob can be published. Encryption scopes
 remain supported on HNS accounts;
 flat-namespace customer-provided-key behavior is unchanged.
+The same feature table marks blob versioning and change feed unsupported on
+HNS accounts. Startup configuration rejects either capability when
+`HierarchicalNamespaceEnabled` is true; it must not advertise a setting whose
+Blob behavior is suppressed by the account mode.
 
 `LastAccessTimeTrackingEnabled` emulates Azure's account-level last-access-time
 policy. Data writes update the persisted access time immediately. The first data
