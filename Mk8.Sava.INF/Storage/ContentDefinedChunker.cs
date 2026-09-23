@@ -31,7 +31,7 @@ internal sealed class ContentDefinedChunker
 
         while (true)
         {
-            var read = await source.ReadAsync(buffer, cancellationToken);
+            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 break;
 
