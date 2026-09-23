@@ -276,15 +276,19 @@ To rotate an existing account that used this default, first configure
 `DataEncryptionKeys:<account>` to the *current* `Accounts:<account>` value and
 verify a representative full read and a backup. Only then replace the Shared
 Key credential while retaining the same data key. Never replace or remove a
-data key while chunks in its domain are reachable: old content would become
-unreadable. Backups fingerprint the effective data key and reject restore with
-the wrong key. The live root records the effective key fingerprint for each
-account or cross-account sharing domain with reachable chunks and rejects a
-mismatch at startup, before accepting requests. On the first start after an
-older metadata schema, it verifies one encrypted chunk per distinct domain
-before recording the fingerprints. This migration check is not a full
-integrity scan, and online data-key rotation is still outstanding. Preserve
-data keys separately from backups.
+data key while chunks in its domain are reachable or physically reusable:
+old content would become unreadable, and an orphaned chunk could obstruct a
+later upload of identical bytes. Backups fingerprint the effective data key and
+reject restore with the wrong key. The live root records the effective key
+fingerprint for each account or cross-account sharing domain with reachable or
+physically reusable chunks and rejects a mismatch at startup, before accepting
+requests. Startup also inventories standalone chunks and registered pack
+locators, so crash-abandoned but unreferenced extents keep their key requirement
+until garbage collection removes them. On the first start after an older
+metadata schema, it verifies one encrypted chunk per distinct domain before
+recording the fingerprints. This migration check is not a full integrity scan,
+and online data-key rotation is still outstanding. Preserve data keys
+separately from backups.
 
 `AllowSharedKeyAccessForServices:Blob:Enabled` mirrors Azure's Blob-specific
 management setting. When set to `false`, it denies Blob Shared Key, Shared Key

@@ -11,6 +11,96 @@ namespace Mk8.Sava.Tests;
 
 public sealed class StorageKeyRotationTests
 {
+    [Fact]
+    public async Task StartupRejectsChangedDataKeyWhileCrashOrphanExtentStillExists()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-orphan-key-{Guid.NewGuid():N}");
+        var containerName = $"orphan-key-{Guid.NewGuid():N}";
+        var content = RandomNumberGenerator.GetBytes(64 * 1024);
+        var rotatedDataKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        try
+        {
+            var injector = new SingleMetadataCommitFaultInjector();
+            await using (var first = new SavaWebApplicationFactory(
+                             dataPath,
+                             injector,
+                             analyticsSink: null,
+                             configurationOverrides: new Dictionary<string, string?>
+                             {
+                                 ["Sava:EnableSmallChunkPacking"] = "false",
+                                 ["Sava:MaintenanceScanInterval"] = "01:00:00"
+                             },
+                             deleteDataPath: false,
+                             disableMaintenance: true))
+            {
+                await first.InitializeAsync();
+                var container = CreateClient(first, SavaWebApplicationFactory.AccountKey)
+                    .GetBlobContainerClient(containerName);
+                await container.CreateAsync();
+                injector.Arm();
+                var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                    container.GetBlobClient("payload.bin").UploadAsync(BinaryData.FromBytes(content)));
+                Assert.Equal(500, rejected.Status);
+                Assert.False((await container.GetBlobClient("payload.bin").ExistsAsync()).Value);
+                Assert.Empty((await first.Services.GetRequiredService<MetadataStore>()
+                    .GetStorageInventoryAsync(CancellationToken.None)).ReachableChunkIds);
+                Assert.NotEmpty(Directory.EnumerateFiles(
+                    Path.Combine(dataPath, "chunks"),
+                    "*.chunk",
+                    SearchOption.AllDirectories));
+            }
+
+            await using (var wrong = new SavaWebApplicationFactory(
+                             dataPath,
+                             new Dictionary<string, string?>
+                             {
+                                 [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] =
+                                     rotatedDataKey
+                             },
+                             deleteDataPath: false))
+            {
+                var failure = await Assert.ThrowsAsync<InvalidDataException>(wrong.InitializeAsync);
+                Assert.Contains("data encryption key continuity", failure.Message, StringComparison.Ordinal);
+            }
+
+            await using (var cleanup = new SavaWebApplicationFactory(
+                             dataPath,
+                             new NullStorageFaultInjector(),
+                             analyticsSink: null,
+                             configurationOverrides: null,
+                             deleteDataPath: false,
+                             disableMaintenance: true))
+            {
+                await cleanup.InitializeAsync();
+                var service = cleanup.Services.GetRequiredService<BlobService>();
+                Assert.True(await service.CollectGarbageAsync(CancellationToken.None) > 0);
+                Assert.Empty(Directory.EnumerateFiles(
+                    Path.Combine(dataPath, "chunks"),
+                    "*.chunk",
+                    SearchOption.AllDirectories));
+            }
+
+            await using var rotated = new SavaWebApplicationFactory(
+                dataPath,
+                new Dictionary<string, string?>
+                {
+                    [$"Sava:DataEncryptionKeys:{SavaWebApplicationFactory.AccountName}"] = rotatedDataKey
+                },
+                deleteDataPath: true);
+            await rotated.InitializeAsync();
+            var blob = CreateClient(rotated, SavaWebApplicationFactory.AccountKey)
+                .GetBlobContainerClient(containerName)
+                .GetBlobClient("payload.bin");
+            await blob.UploadAsync(BinaryData.FromBytes(content));
+            Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+        }
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -182,5 +272,18 @@ public sealed class StorageKeyRotationTests
                 }),
                 Retry = { MaxRetries = 0 }
             });
+    }
+
+    private sealed class SingleMetadataCommitFaultInjector : IStorageFaultInjector
+    {
+        private int _armed;
+
+        public void Arm() => Interlocked.Exchange(ref _armed, 1);
+
+        public void Inject(StorageFaultPoint point)
+        {
+            if (point == StorageFaultPoint.BeforeBlobMetadataCommit && Interlocked.Exchange(ref _armed, 0) == 1)
+                throw new IOException("Injected metadata commit failure after chunk publication.");
+        }
     }
 }
