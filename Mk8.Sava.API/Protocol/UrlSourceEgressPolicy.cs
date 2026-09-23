@@ -50,7 +50,7 @@ internal sealed class UrlSourceEgressPolicy(SavaOptions options)
         var endpoint = context.DnsEndPoint;
         var addresses = IPAddress.TryParse(endpoint.Host, out var literal)
             ? [literal]
-            : await Dns.GetHostAddressesAsync(endpoint.Host, cancellationToken);
+            : await Dns.GetHostAddressesAsync(endpoint.Host, cancellationToken).ConfigureAwait(false);
         var permitted = addresses.Where(address => Allows(endpoint.Host, address)).ToArray();
         if (permitted.Length == 0)
             throw new IOException("The copy source resolves only to blocked private or non-routable addresses.");
@@ -62,7 +62,7 @@ internal sealed class UrlSourceEgressPolicy(SavaOptions options)
             var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
-                await socket.ConnectAsync(address, endpoint.Port, cancellationToken);
+                await socket.ConnectAsync(address, endpoint.Port, cancellationToken).ConfigureAwait(false);
                 return new NetworkStream(socket, ownsSocket: true);
             }
             catch (Exception exception) when (exception is SocketException or IOException)

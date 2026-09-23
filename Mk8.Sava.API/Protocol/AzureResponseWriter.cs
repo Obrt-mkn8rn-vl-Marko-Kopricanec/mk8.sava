@@ -18,7 +18,7 @@ public sealed partial class AzureResponseWriter
     {
         if (!bool.TryParse(context.Request.Headers["x-ms-upn"], out var projectUpn) ||
             !projectUpn ||
-            objectId == "$superuser")
+string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             return objectId;
 
         var principals = context.RequestServices
@@ -43,7 +43,7 @@ public sealed partial class AzureResponseWriter
         }
 
         context.Response.ContentType = "application/xml";
-        await context.Response.WriteAsync(builder.ToString(), cancellationToken);
+        await context.Response.WriteAsync(builder.ToString(), cancellationToken).ConfigureAwait(false);
     }
 
     internal Task WriteContainersAsync(
@@ -459,7 +459,7 @@ public sealed partial class AzureResponseWriter
                 }
                 if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
                     writer.WriteElementString("IncrementalCopy", "true");
-                if (blob.Copy?.Status == "success" && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+                if (string.Equals(blob.Copy?.Status, "success", StringComparison.Ordinal) && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
                     WriteOptional(writer, "DestinationSnapshot", blob.CopyDestinationSnapshot);
                 writer.WriteEndElement();
                 if (includes.Contains("metadata"))
@@ -908,7 +908,7 @@ public sealed partial class AzureResponseWriter
         }
         if (blob.IsIncrementalCopy && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
             response.Headers["x-ms-incremental-copy"] = "true";
-        if (blob.Copy?.Status == "success" && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
+        if (string.Equals(blob.Copy?.Status, "success", StringComparison.Ordinal) && IsServiceVersionAtLeast(request, new DateOnly(2016, 5, 31)))
             SetOptional(response.Headers, "x-ms-copy-destination-snapshot", blob.CopyDestinationSnapshot);
     }
 

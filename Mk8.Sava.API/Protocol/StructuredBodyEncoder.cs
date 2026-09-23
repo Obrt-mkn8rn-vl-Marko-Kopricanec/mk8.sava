@@ -33,7 +33,7 @@ internal static class StructuredBodyEncoder
         BinaryPrimitives.WriteUInt64LittleEndian(header.AsSpan(1), (ulong)encodedLength);
         BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(9), IncludeCrc64);
         BinaryPrimitives.WriteUInt16LittleEndian(header.AsSpan(11), segmentCount);
-        await destination.WriteAsync(header, cancellationToken);
+        await destination.WriteAsync(header, cancellationToken).ConfigureAwait(false);
 
         var messageCrc64 = new StorageCrc64();
         var segmentHeader = new byte[SegmentHeaderLength];
@@ -43,7 +43,7 @@ internal static class StructuredBodyEncoder
             var currentLength = Math.Min(segmentLength, contentLength - offset);
             BinaryPrimitives.WriteUInt16LittleEndian(segmentHeader, (ushort)index);
             BinaryPrimitives.WriteUInt64LittleEndian(segmentHeader.AsSpan(sizeof(ushort)), (ulong)currentLength);
-            await destination.WriteAsync(segmentHeader, cancellationToken);
+            await destination.WriteAsync(segmentHeader, cancellationToken).ConfigureAwait(false);
 
             var segmentCrc64 = new StorageCrc64();
             var hashingDestination = new Crc64WriteStream(
@@ -52,17 +52,17 @@ internal static class StructuredBodyEncoder
                 messageCrc64,
                 currentLength);
             if (currentLength > 0)
-                await writeRange(offset, currentLength, hashingDestination, cancellationToken);
+                await writeRange(offset, currentLength, hashingDestination, cancellationToken).ConfigureAwait(false);
             if (hashingDestination.BytesWritten != currentLength)
                 throw new InvalidDataException("The structured response producer wrote an unexpected number of bytes.");
 
-            await destination.WriteAsync(segmentCrc64.GetHash(), cancellationToken);
+            await destination.WriteAsync(segmentCrc64.GetHash(), cancellationToken).ConfigureAwait(false);
             offset = checked(offset + currentLength);
         }
 
         if (offset != contentLength)
             throw new InvalidDataException("The structured response producer did not write the complete content.");
-        await destination.WriteAsync(messageCrc64.GetHash(), cancellationToken);
+        await destination.WriteAsync(messageCrc64.GetHash(), cancellationToken).ConfigureAwait(false);
     }
 
     private static (long SegmentLength, ushort SegmentCount) GetSegmentation(long contentLength)
@@ -133,7 +133,7 @@ internal static class StructuredBodyEncoder
             ValidateLength(buffer.Length);
             segmentCrc64.Append(buffer.Span);
             messageCrc64.Append(buffer.Span);
-            await destination.WriteAsync(buffer, cancellationToken);
+            await destination.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
             BytesWritten += buffer.Length;
         }
 
@@ -146,7 +146,7 @@ internal static class StructuredBodyEncoder
             int offset,
             int count,
             CancellationToken cancellationToken) =>
-            await WriteAsync(buffer.AsMemory(offset, count), cancellationToken);
+            await WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
 
         private void ValidateLength(int count)
         {

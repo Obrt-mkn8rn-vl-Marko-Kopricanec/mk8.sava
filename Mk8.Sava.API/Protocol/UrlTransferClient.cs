@@ -74,7 +74,7 @@ internal sealed class UrlTransferClient(
 
         var sourceTags = copySourceTags
             ? await ReadSourceTagsAsync(destinationRequest, sourceUri, cancellationToken)
-            : new Dictionary<string, string>(StringComparer.Ordinal);
+.ConfigureAwait(false) : new Dictionary<string, string>(StringComparer.Ordinal);
 
         using var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         AddSourceAuthenticationHeaders(destinationRequest, sourceRequest);
@@ -96,7 +96,7 @@ internal sealed class UrlTransferClient(
             response = await client.SendAsync(
                 sourceRequest,
                 HttpCompletionOption.ResponseHeadersRead,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
         catch (HttpRequestException)
         {
@@ -118,7 +118,7 @@ internal sealed class UrlTransferClient(
                 throw await CreateSourceFailureAsync(
                     destinationRequest,
                     response,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
             if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
             {
@@ -155,9 +155,11 @@ internal sealed class UrlTransferClient(
                     etag,
                     contentLength.Value,
                     cancellationToken)
-                : UrlSourceShape.Empty;
-            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken);
-            var sourceInfo = new UrlSource(
+.ConfigureAwait(false) : UrlSourceShape.Empty;
+            var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using (source.ConfigureAwait(false))
+            {
+                var sourceInfo = new UrlSource(
                 new LengthLimitedReadStream(source, effectiveMaximumBytes),
                 contentLength,
                 ReadHttpProperties(response),
@@ -171,12 +173,13 @@ internal sealed class UrlTransferClient(
                 sourceShape.AppendBlockCount,
                 sourceShape.CommittedBlocks,
                 sourceShape.PageRanges);
-            return await ConsumeWithChecksumValidationAsync(
-                destinationRequest,
-                sourceInfo,
-                effectiveMaximumBytes,
-                consume,
-                cancellationToken);
+                return await ConsumeWithChecksumValidationAsync(
+                    destinationRequest,
+                    sourceInfo,
+                    effectiveMaximumBytes,
+                    consume,
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 
@@ -199,7 +202,7 @@ internal sealed class UrlTransferClient(
         if (expectedMd5Text is null && expectedCrc64Text is null)
         {
             using var hashingSource = new TransactionalChecksumReadStream(source.Content);
-            var value = await consume(source with { Content = hashingSource });
+            var value = await consume(source with { Content = hashingSource }).ConfigureAwait(false);
             return new UrlTransferResult<TResult>(value, hashingSource.Complete());
         }
 
@@ -208,43 +211,46 @@ internal sealed class UrlTransferClient(
         var temporaryPath = Path.Combine(paths.Staging, $"url-source-{Guid.NewGuid():N}.tmp");
         try
         {
-            await using var temporary = new FileStream(
+            var temporary = new FileStream(
                 temporaryPath,
                 FileMode.CreateNew,
                 FileAccess.ReadWrite,
                 FileShare.None,
                 128 * 1024,
                 FileOptions.Asynchronous | FileOptions.SequentialScan);
-            using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
-            var crc64 = new StorageCrc64();
-            var buffer = new byte[128 * 1024];
-            long length = 0;
-            while (true)
+            await using (temporary.ConfigureAwait(false))
             {
-                var read = await source.Content.ReadAsync(buffer, cancellationToken);
-                if (read == 0)
-                    break;
-                length = checked(length + read);
-                if (length > maximumBytes)
-                    throw new RequestBodyTooLargeException(maximumBytes);
-                md5.AppendData(buffer, 0, read);
-                crc64.Append(buffer.AsSpan(0, read));
-                await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-            }
+                using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
+                var crc64 = new StorageCrc64();
+                var buffer = new byte[128 * 1024];
+                long length = 0;
+                while (true)
+                {
+                    var read = await source.Content.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                        break;
+                    length = checked(length + read);
+                    if (length > maximumBytes)
+                        throw new RequestBodyTooLargeException(maximumBytes);
+                    md5.AppendData(buffer, 0, read);
+                    crc64.Append(buffer.AsSpan(0, read));
+                    await temporary.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                }
 
-            var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
-            var actual = expectedMd5Text is null ? checksums.Crc64 : checksums.Md5;
-            if (!CryptographicOperations.FixedTimeEquals(expected, actual))
-            {
-                throw new AzureStorageException(
-                    StatusCodes.Status400BadRequest,
-                    expectedMd5Text is null ? "Crc64Mismatch" : "Md5Mismatch",
-                    "The checksum specified for the source did not match its content.");
-            }
+                var checksums = new TransactionalChecksums(md5.GetHashAndReset(), crc64.GetHash());
+                var actual = expectedMd5Text is null ? checksums.Crc64 : checksums.Md5;
+                if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status400BadRequest,
+                        expectedMd5Text is null ? "Crc64Mismatch" : "Md5Mismatch",
+                        "The checksum specified for the source did not match its content.");
+                }
 
-            temporary.Position = 0;
-            var value = await consume(source with { Content = temporary, ContentLength = length });
-            return new UrlTransferResult<TResult>(value, checksums);
+                temporary.Position = 0;
+                var value = await consume(source with { Content = temporary, ContentLength = length }).ConfigureAwait(false);
+                return new UrlTransferResult<TResult>(value, checksums);
+            }
         }
         finally
         {
@@ -501,7 +507,7 @@ internal sealed class UrlTransferClient(
         HttpResponseMessage response;
         try
         {
-            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         }
         catch (HttpRequestException)
         {
@@ -515,9 +521,12 @@ internal sealed class UrlTransferClient(
         using (response)
         {
             if (!response.IsSuccessStatusCode)
-                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken);
-            await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
-            return await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken);
+                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken).ConfigureAwait(false);
+            var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using (body.ConfigureAwait(false))
+            {
+                return await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 
@@ -538,7 +547,7 @@ internal sealed class UrlTransferClient(
                         destinationRequest,
                         sourceUri,
                         etag,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                     long blockLength;
                     try
                     {
@@ -568,7 +577,7 @@ internal sealed class UrlTransferClient(
                         sourceUri,
                         etag,
                         contentLength,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                     return new UrlSourceShape(
                         ReadLongHeader("x-ms-blob-sequence-number"),
                         false,
@@ -630,18 +639,18 @@ internal sealed class UrlTransferClient(
                 new KeyValuePair<string, string?>("comp", "blocklist"),
                 new KeyValuePair<string, string?>("blocklisttype", "committed")),
             etag,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var committed = document.Descendants()
-            .FirstOrDefault(element => element.Name.LocalName == "CommittedBlocks");
+            .FirstOrDefault(element => string.Equals(element.Name.LocalName, "CommittedBlocks", StringComparison.Ordinal));
         if (committed is null)
             throw CannotVerifyCopySource("The source did not return a committed block list.");
 
         var blocks = new List<CopySourceBlock>();
         int? blockIdLength = null;
-        foreach (var block in committed.Elements().Where(element => element.Name.LocalName == "Block"))
+        foreach (var block in committed.Elements().Where(element => string.Equals(element.Name.LocalName, "Block", StringComparison.Ordinal)))
         {
-            var name = block.Elements().FirstOrDefault(element => element.Name.LocalName == "Name")?.Value;
-            var sizeText = block.Elements().FirstOrDefault(element => element.Name.LocalName == "Size")?.Value;
+            var name = block.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "Name", StringComparison.Ordinal))?.Value;
+            var sizeText = block.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "Size", StringComparison.Ordinal))?.Value;
             if (string.IsNullOrEmpty(name) ||
                 !long.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out var size) ||
                 size < 0)
@@ -690,11 +699,11 @@ internal sealed class UrlTransferClient(
                 destinationRequest,
                 BuildComponentUri(sourceUri, parameters.ToArray()),
                 etag,
-                cancellationToken);
-            foreach (var range in document.Descendants().Where(element => element.Name.LocalName == "PageRange"))
+                cancellationToken).ConfigureAwait(false);
+            foreach (var range in document.Descendants().Where(element => string.Equals(element.Name.LocalName, "PageRange", StringComparison.Ordinal)))
             {
-                var startText = range.Elements().FirstOrDefault(element => element.Name.LocalName == "Start")?.Value;
-                var endText = range.Elements().FirstOrDefault(element => element.Name.LocalName == "End")?.Value;
+                var startText = range.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "Start", StringComparison.Ordinal))?.Value;
+                var endText = range.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "End", StringComparison.Ordinal))?.Value;
                 if (!long.TryParse(startText, NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
                     !long.TryParse(endText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
                     start < 0 || end < start || end == long.MaxValue ||
@@ -705,7 +714,7 @@ internal sealed class UrlTransferClient(
                 ranges.Add(new PageRange(start, end));
             }
             marker = document.Descendants()
-                .FirstOrDefault(element => element.Name.LocalName == "NextMarker")
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "NextMarker", StringComparison.Ordinal))
                 ?.Value;
             if (!string.IsNullOrEmpty(marker) && !markers.Add(marker))
                 throw CannotVerifyCopySource("The source page range continuation marker repeated.");
@@ -730,7 +739,7 @@ internal sealed class UrlTransferClient(
         HttpResponseMessage response;
         try
         {
-            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         }
         catch (HttpRequestException)
         {
@@ -744,17 +753,20 @@ internal sealed class UrlTransferClient(
         using (response)
         {
             if (!response.IsSuccessStatusCode)
-                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken);
+                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken).ConfigureAwait(false);
             try
             {
-                await using var body = await response.Content.ReadAsStreamAsync(cancellationToken);
-                using var reader = XmlReader.Create(body, new XmlReaderSettings
+                var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+                await using (body.ConfigureAwait(false))
                 {
-                    Async = true,
-                    DtdProcessing = DtdProcessing.Prohibit,
-                    MaxCharactersInDocument = 32L * 1024 * 1024
-                });
-                return await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken);
+                    using var reader = XmlReader.Create(body, new XmlReaderSettings
+                    {
+                        Async = true,
+                        DtdProcessing = DtdProcessing.Prohibit,
+                        MaxCharactersInDocument = 32L * 1024 * 1024
+                    });
+                    return await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (Exception exception) when (exception is XmlException or InvalidOperationException)
             {
@@ -835,7 +847,7 @@ internal sealed class UrlTransferClient(
         var sourceErrorCode = response.Headers.TryGetValues("x-ms-error-code", out var errorCodes)
             ? errorCodes.FirstOrDefault()
             : null;
-        var sourceError = await ReadSourceErrorAsync(response.Content, cancellationToken);
+        var sourceError = await ReadSourceErrorAsync(response.Content, cancellationToken).ConfigureAwait(false);
         sourceErrorCode ??= sourceError.Code;
         var sourceErrorMessage = sourceError.Message;
         var message = sourceErrorMessage ??
@@ -874,33 +886,36 @@ internal sealed class UrlTransferClient(
         const int maximumErrorBodyBytes = 64 * 1024;
         try
         {
-            await using var source = await content.ReadAsStreamAsync(cancellationToken);
-            using var buffer = new MemoryStream();
-            var bytes = new byte[4096];
-            while (buffer.Length <= maximumErrorBodyBytes)
+            var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using (source.ConfigureAwait(false))
             {
-                var read = await source.ReadAsync(bytes, cancellationToken);
-                if (read == 0)
-                    break;
-                await buffer.WriteAsync(bytes.AsMemory(0, read), cancellationToken);
-            }
-            if (buffer.Length == 0 || buffer.Length > maximumErrorBodyBytes)
-                return (null, null);
+                using var buffer = new MemoryStream();
+                var bytes = new byte[4096];
+                while (buffer.Length <= maximumErrorBodyBytes)
+                {
+                    var read = await source.ReadAsync(bytes, cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                        break;
+                    await buffer.WriteAsync(bytes.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                }
+                if (buffer.Length == 0 || buffer.Length > maximumErrorBodyBytes)
+                    return (null, null);
 
-            buffer.Position = 0;
-            using var reader = XmlReader.Create(buffer, new XmlReaderSettings
-            {
-                DtdProcessing = DtdProcessing.Prohibit,
-                MaxCharactersInDocument = maximumErrorBodyBytes
-            });
-            var document = XDocument.Load(reader, LoadOptions.None);
-            var code = document.Descendants()
-                .FirstOrDefault(element => element.Name.LocalName == "Code")
-                ?.Value;
-            var message = document.Descendants()
-                .FirstOrDefault(element => element.Name.LocalName == "Message")
-                ?.Value;
-            return (code, message);
+                buffer.Position = 0;
+                using var reader = XmlReader.Create(buffer, new XmlReaderSettings
+                {
+                    DtdProcessing = DtdProcessing.Prohibit,
+                    MaxCharactersInDocument = maximumErrorBodyBytes
+                });
+                var document = XDocument.Load(reader, LoadOptions.None);
+                var code = document.Descendants()
+                    .FirstOrDefault(element => string.Equals(element.Name.LocalName, "Code", StringComparison.Ordinal))
+                    ?.Value;
+                var message = document.Descendants()
+                    .FirstOrDefault(element => string.Equals(element.Name.LocalName, "Message", StringComparison.Ordinal))
+                    ?.Value;
+                return (code, message);
+            }
         }
         catch (Exception exception) when (exception is XmlException or InvalidOperationException or IOException)
         {
@@ -954,7 +969,7 @@ internal sealed class UrlTransferClient(
         {
             if (buffer.IsEmpty)
                 return 0;
-            var read = await inner.ReadAsync(Limit(buffer), cancellationToken);
+            var read = await inner.ReadAsync(Limit(buffer), cancellationToken).ConfigureAwait(false);
             Record(read);
             return read;
         }

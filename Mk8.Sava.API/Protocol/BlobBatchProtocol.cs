@@ -56,12 +56,12 @@ internal static class BlobBatchProtocol
         var consumed = 0;
         while (consumed < body.Length)
         {
-            var read = await request.Body.ReadAsync(body.AsMemory(consumed), cancellationToken);
+            var read = await request.Body.ReadAsync(body.AsMemory(consumed), cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 throw InvalidBatch("The blob batch payload ended before Content-Length bytes were received.");
             consumed += read;
         }
-        if (await request.Body.ReadAsync(new byte[1], cancellationToken) != 0)
+        if (await request.Body.ReadAsync(new byte[1], cancellationToken).ConfigureAwait(false) != 0)
             throw BatchTooLarge();
 
         var payload = Encoding.Latin1.GetString(body);
@@ -169,24 +169,24 @@ internal static class BlobBatchProtocol
 
         foreach (var subresponse in subresponses)
         {
-            await WriteLatin1Async(response.Body, $"--{boundary}\r\n", cancellationToken);
-            await WriteLatin1Async(response.Body, "Content-Type: application/http\r\n", cancellationToken);
+            await WriteLatin1Async(response.Body, $"--{boundary}\r\n", cancellationToken).ConfigureAwait(false);
+            await WriteLatin1Async(response.Body, "Content-Type: application/http\r\n", cancellationToken).ConfigureAwait(false);
             if (subresponse.ContentId is not null)
-                await WriteLatin1Async(response.Body, $"Content-ID: {subresponse.ContentId}\r\n", cancellationToken);
+                await WriteLatin1Async(response.Body, $"Content-ID: {subresponse.ContentId}\r\n", cancellationToken).ConfigureAwait(false);
             await WriteLatin1Async(
                 response.Body,
                 $"\r\nHTTP/1.1 {subresponse.StatusCode} {ReasonPhrases.GetReasonPhrase(subresponse.StatusCode)}\r\n",
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             foreach (var header in subresponse.Headers)
-                await WriteLatin1Async(response.Body, $"{header.Key}: {header.Value}\r\n", cancellationToken);
+                await WriteLatin1Async(response.Body, $"{header.Key}: {header.Value}\r\n", cancellationToken).ConfigureAwait(false);
             if (subresponse.Body.Length > 0 && !subresponse.Headers.ContainsKey("Content-Length"))
-                await WriteLatin1Async(response.Body, $"Content-Length: {subresponse.Body.Length}\r\n", cancellationToken);
-            await WriteLatin1Async(response.Body, "\r\n", cancellationToken);
+                await WriteLatin1Async(response.Body, $"Content-Length: {subresponse.Body.Length}\r\n", cancellationToken).ConfigureAwait(false);
+            await WriteLatin1Async(response.Body, "\r\n", cancellationToken).ConfigureAwait(false);
             if (subresponse.Body.Length > 0)
-                await response.Body.WriteAsync(subresponse.Body, cancellationToken);
-            await WriteLatin1Async(response.Body, "\r\n", cancellationToken);
+                await response.Body.WriteAsync(subresponse.Body, cancellationToken).ConfigureAwait(false);
+            await WriteLatin1Async(response.Body, "\r\n", cancellationToken).ConfigureAwait(false);
         }
-        await WriteLatin1Async(response.Body, $"--{boundary}--\r\n", cancellationToken);
+        await WriteLatin1Async(response.Body, $"--{boundary}--\r\n", cancellationToken).ConfigureAwait(false);
     }
 
     private static Dictionary<string, StringValues> ReadHeaders(BatchLineReader reader)

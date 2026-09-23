@@ -89,7 +89,7 @@ if (operatorCommand is { Name: "restore" })
         operatorCommand.Value.Path,
         target,
         options,
-        CancellationToken.None);
+        CancellationToken.None).ConfigureAwait(false);
     Console.WriteLine(
         $"Restored {restored.BlobRecordCount} blob records and {restored.ChunkCount} chunks into '{target}'.");
     return;
@@ -101,7 +101,7 @@ if (operatorCommand is { Name: "validate" })
     var validated = await StorageBackupService.ValidateBackupAsync(
         operatorCommand.Value.Path,
         options,
-        CancellationToken.None);
+        CancellationToken.None).ConfigureAwait(false);
     Console.WriteLine(
         $"Validated backup '{validated.BackupPath}' with {validated.BlobRecordCount} blob records and {validated.ChunkCount} chunks.");
     return;
@@ -109,9 +109,9 @@ if (operatorCommand is { Name: "validate" })
 
 try
 {
-    await app.Services.GetRequiredService<MetadataStore>().InitializeAsync();
-    await app.Services.GetRequiredService<StorageDataKeyContinuity>().EnsureAsync(CancellationToken.None);
-    await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync();
+    await app.Services.GetRequiredService<MetadataStore>().InitializeAsync().ConfigureAwait(false);
+    await app.Services.GetRequiredService<StorageDataKeyContinuity>().EnsureAsync(CancellationToken.None).ConfigureAwait(false);
+    await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync().ConfigureAwait(false);
     var prunedChunkDirectories = app.Services.GetRequiredService<StoragePaths>()
         .PruneLegacyEmptyChunkDirectories();
     if (prunedChunkDirectories > 0)
@@ -119,7 +119,7 @@ try
 }
 catch
 {
-    await app.DisposeAsync();
+    await app.DisposeAsync().ConfigureAwait(false);
     throw;
 }
 
@@ -127,7 +127,7 @@ if (operatorCommand is { Name: "create" })
 {
     var created = await app.Services.GetRequiredService<StorageBackupService>().CreateAsync(
         operatorCommand.Value.Path,
-        CancellationToken.None);
+        CancellationToken.None).ConfigureAwait(false);
     Console.WriteLine(
         $"Created backup '{created.BackupPath}' with {created.BlobRecordCount} blob records and {created.ChunkCount} chunks.");
     return;
@@ -137,7 +137,7 @@ if (operatorCommand is { Name: "acl-apply" })
 {
     var applied = await app.Services.GetRequiredService<BlobService>().ApplyHierarchicalAclManifestAsync(
         operatorCommand.Value.Path,
-        CancellationToken.None);
+        CancellationToken.None).ConfigureAwait(false);
     Console.WriteLine($"Applied HNS access ACLs to {applied} existing targets.");
     return;
 }
@@ -151,7 +151,7 @@ app.MapGet("/health/ready", async (
     IStorageTelemetry telemetry,
     CancellationToken cancellationToken) =>
 {
-    var metadataReady = await store.IsReadyAsync(cancellationToken);
+    var metadataReady = await store.IsReadyAsync(cancellationToken).ConfigureAwait(false);
     var integrity = telemetry.Integrity;
     var ready = metadataReady && integrity.Healthy;
     return Results.Json(
@@ -176,7 +176,7 @@ app.MapGet("/metrics", (IStorageTelemetry telemetry) =>
     Results.Text(telemetry.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
-await app.RunAsync();
+await app.RunAsync().ConfigureAwait(false);
 
 static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
 {
