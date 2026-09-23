@@ -307,6 +307,98 @@ public sealed class StorageEnospcHarnessTests
     }
 
     [Fact]
+    public async Task ExhaustedFilesystemAtBlobPublicationCommitKeepsEarlierBlob()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "publication-data");
+        var fillerPath = Path.Combine(mountRoot, "publication-filler.bin");
+        var stableBytes = RandomNumberGenerator.GetBytes(32 * 1024);
+        var attemptedBytes = RandomNumberGenerator.GetBytes(96 * 1024);
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:EnableSmallChunkPacking"] = "false"
+        };
+
+        await AssertPublicationCommitRejectedAsync(
+            dataPath, fillerPath, stableBytes, attemptedBytes, configuration).ConfigureAwait(true);
+        await AssertPublicationCommitRecoversAsync(
+            dataPath, stableBytes, attemptedBytes, configuration).ConfigureAwait(true);
+    }
+
+    private static async Task AssertPublicationCommitRejectedAsync(
+        string dataPath,
+        string fillerPath,
+        byte[] stableBytes,
+        byte[] attemptedBytes,
+        Dictionary<string, string?> configuration)
+    {
+        var injector = new EnospcAtCommitFaultInjector(fillerPath);
+        var first = CreateHarness(dataPath, configuration, injector);
+        try
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(first).GetBlobContainerClient("enospc-publication");
+            await container.CreateAsync().ConfigureAwait(false);
+            var stable = container.GetBlobClient("stable.bin");
+            var attempted = container.GetBlobClient("attempted.bin");
+            await stable.UploadAsync(BinaryData.FromBytes(stableBytes)).ConfigureAwait(false);
+            var priorChunkCount = CountStandaloneChunks(dataPath);
+            injector.Arm();
+
+            try
+            {
+                var failure = await Assert.ThrowsAsync<RequestFailedException>(() =>
+                    attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes))).ConfigureAwait(false);
+                Assert.Equal(500, failure.Status);
+                Assert.True(injector.Filled);
+                Assert.True(CountStandaloneChunks(dataPath) > priorChunkCount);
+            }
+            finally
+            {
+                if (File.Exists(fillerPath))
+                    File.Delete(fillerPath);
+            }
+            Assert.False((await attempted.ExistsAsync().ConfigureAwait(false)).Value);
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await first.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertPublicationCommitRecoversAsync(
+        string dataPath,
+        byte[] stableBytes,
+        byte[] attemptedBytes,
+        Dictionary<string, string?> configuration)
+    {
+        var restarted = CreateHarness(dataPath, configuration);
+        try
+        {
+            await restarted.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(restarted).GetBlobContainerClient("enospc-publication");
+            Assert.Equal(stableBytes, (await container.GetBlobClient("stable.bin")
+                .DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            var attempted = container.GetBlobClient("attempted.bin");
+            Assert.False((await attempted.ExistsAsync().ConfigureAwait(false)).Value);
+            Assert.True(await restarted.Services.GetRequiredService<BlobService>()
+                .CollectGarbageAsync(CancellationToken.None).ConfigureAwait(false) > 0);
+            await attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes)).ConfigureAwait(false);
+            Assert.Equal(attemptedBytes, (await attempted.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await restarted.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    [Fact]
     public async Task ExhaustedFilesystemDuringPackAppendPreservesIndexedRecords()
     {
         var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
@@ -627,6 +719,25 @@ public sealed class StorageEnospcHarnessTests
                 Interlocked.Exchange(ref _stagingCompleted, 1);
             if (point == StorageFaultPoint.DuringPackRecordAppend)
                 Interlocked.Exchange(ref _packAppendStarted, 1);
+        }
+    }
+
+    private sealed class EnospcAtCommitFaultInjector(string fillerPath) : IStorageFaultInjector
+    {
+        private int _armed;
+        private int _filled;
+
+        public bool Filled => Volatile.Read(ref _filled) != 0;
+
+        public void Arm() => Interlocked.Exchange(ref _armed, 1);
+
+        public void Inject(StorageFaultPoint point)
+        {
+            if (point != StorageFaultPoint.BeforeBlobMetadataCommit ||
+                Interlocked.Exchange(ref _armed, 0) != 1)
+                return;
+            FillUntilNoSpace(fillerPath, releaseBytes: 0);
+            Interlocked.Exchange(ref _filled, 1);
         }
     }
 }
