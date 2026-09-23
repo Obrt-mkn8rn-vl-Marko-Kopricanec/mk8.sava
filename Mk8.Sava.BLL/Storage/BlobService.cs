@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -18,8 +19,13 @@ public sealed class BlobService(
     StorageAnalyticsService analytics,
     IStorageTelemetry telemetry,
     IStorageFaultInjector faultInjector,
-    IOptions<SavaOptions> configuredOptions)
+    IOptions<SavaOptions> configuredOptions) : IDisposable
 {
+    private static readonly JsonSerializerOptions AclManifestJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+    };
+
     private readonly SavaOptions _options = configuredOptions.Value;
     private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private readonly SemaphoreSlim _hierarchicalDirectoryGate = new(1, 1);
@@ -39,6 +45,13 @@ public sealed class BlobService(
     private StoragePhysicalUsage? _lastPhysicalUsage;
     private long _lastPhysicalScanTicks;
     private long _lastPhysicalScanUnixSeconds;
+
+    public void Dispose()
+    {
+        _maintenanceGate.Dispose();
+        _hierarchicalDirectoryGate.Dispose();
+        GC.SuppressFinalize(this);
+    }
 
     public bool AllowsAnonymousPublicAccess(string account) =>
         _options.AccountCapabilities.TryGetValue(account, out var capabilities)
@@ -81,20 +94,20 @@ public sealed class BlobService(
                 account => account,
                 IsHierarchicalNamespaceEnabled,
                 StringComparer.Ordinal),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
         foreach (var (account, capabilities) in _options.AccountCapabilities)
         {
             if (!capabilities.VersioningEnabled)
                 continue;
 
-            var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+            var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
             if (!properties.VersioningEnabled)
             {
                 await metadata.PutServicePropertiesAsync(
                     account,
                     properties with { VersioningEnabled = true },
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -105,32 +118,32 @@ public sealed class BlobService(
     {
         const int maximumBytes = 4 * 1024 * 1024;
         var fullPath = Path.GetFullPath(manifestPath);
-        await using var file = new FileStream(
+        var file = new FileStream(
             fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.Asynchronous);
+        await using var fileDisposal = file.ConfigureAwait(false);
         if (file.Length > maximumBytes)
             throw new InvalidDataException("The HNS ACL manifest exceeds the 4 MiB limit.");
         var json = new byte[maximumBytes + 1];
         var length = 0;
         while (length < json.Length)
         {
-            var read = await file.ReadAsync(json.AsMemory(length), cancellationToken);
+            var read = await file.ReadAsync(json.AsMemory(length), cancellationToken).ConfigureAwait(false);
             if (read == 0)
                 break;
             length += read;
         }
         if (length > maximumBytes)
             throw new InvalidDataException("The HNS ACL manifest exceeds the 4 MiB limit.");
-        var manifest = JsonSerializer.Deserialize<HierarchicalAclManifest>(json.AsSpan(0, length),
-            new JsonSerializerOptions(JsonSerializerDefaults.Web)
-            {
-                UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
-            }) ?? throw new InvalidDataException("The HNS ACL manifest is empty.");
+        var manifest = JsonSerializer.Deserialize<HierarchicalAclManifest>(
+            json.AsSpan(0, length), AclManifestJsonOptions)
+            ?? throw new InvalidDataException("The HNS ACL manifest is empty.");
         if (manifest.SchemaVersion != 1 || manifest.Entries is not { Count: >= 1 and <= 4096 })
             throw new InvalidDataException("The HNS ACL manifest has an unsupported schema or entry count.");
 
         var targets = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var entry in manifest.Entries)
+        for (var entryIndex = 0; entryIndex < manifest.Entries.Count; entryIndex++)
         {
+            var entry = manifest.Entries[entryIndex];
             if (entry is null ||
                 string.IsNullOrEmpty(entry.Account) ||
                 string.IsNullOrEmpty(entry.Container) ||
@@ -139,9 +152,9 @@ public sealed class BlobService(
                 entry.AccessAcl.Length > 4096 ||
                 entry.Path.Length > 1024 ||
                 entry.Path.Any(char.IsControl) ||
-                !entry.Path.Equals(string.Empty, StringComparison.Ordinal) &&
-                (entry.Path.StartsWith("/", StringComparison.Ordinal) ||
-                 entry.Path.EndsWith("/", StringComparison.Ordinal)) ||
+                !string.IsNullOrEmpty(entry.Path) &&
+                (entry.Path.StartsWith('/') ||
+                 entry.Path.EndsWith('/')) ||
                 !_options.Accounts.ContainsKey(entry.Account) ||
                 !IsHierarchicalNamespaceEnabled(entry.Account))
             {
@@ -152,7 +165,7 @@ public sealed class BlobService(
                 throw new InvalidDataException("The HNS ACL manifest contains a duplicate target.");
         }
 
-        await metadata.ApplyHierarchicalAclEntriesAsync(manifest.Entries, cancellationToken);
+        await metadata.ApplyHierarchicalAclEntriesAsync(manifest.Entries, cancellationToken).ConfigureAwait(false);
         return manifest.Entries.Count;
     }
 
@@ -161,13 +174,13 @@ public sealed class BlobService(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        var containers = await metadata.ListContainersAsync(account, includeDeleted, cancellationToken);
+        var containers = await metadata.ListContainersAsync(account, includeDeleted, cancellationToken).ConfigureAwait(false);
         containers = containers
-            .Where(container => container.Name != StorageAnalyticsService.LogsContainerName)
+            .Where(container => !string.Equals(container.Name, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal))
             .ToArray();
         if (!includeDeleted || !containers.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue))
             return containers.Select(EffectiveContainer).ToArray();
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         return containers.Select(container => container.DeletedAt.HasValue && !container.DeleteRetentionUntil.HasValue
             ? EffectiveContainer(container with
             {
@@ -192,11 +205,11 @@ public sealed class BlobService(
             prefix,
             marker,
             maximum,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var needsRetention = includeDeleted && page.Items.Any(item =>
             item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue);
         var properties = needsRetention
-            ? await metadata.GetServicePropertiesAsync(account, cancellationToken)
+            ? await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false)
             : null;
         return page with
         {
@@ -215,13 +228,14 @@ public sealed class BlobService(
     public async Task<ContainerRecord> CreateContainerAsync(
         string account,
         string name,
-        Dictionary<string, string> userMetadata,
+        IReadOnlyDictionary<string, string> userMetadata,
         string? publicAccess,
         string? defaultEncryptionScope,
         bool preventEncryptionScopeOverride,
         CancellationToken cancellationToken,
         string? creatorObjectId = null)
     {
+        ArgumentNullException.ThrowIfNull(name);
         ValidateContainerName(name);
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
@@ -246,9 +260,9 @@ public sealed class BlobService(
                 IsImmutableStorageWithVersioningEnabled(account, name)
         };
 
-        if (!await metadata.TryCreateContainerAsync(container, cancellationToken))
+        if (!await metadata.TryCreateContainerAsync(container, cancellationToken).ConfigureAwait(false))
         {
-            var existing = await metadata.GetContainerAsync(account, name, includeDeleted: true, cancellationToken);
+            var existing = await metadata.GetContainerAsync(account, name, includeDeleted: true, cancellationToken).ConfigureAwait(false);
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
                 existing?.DeletedAt is null ? "ContainerAlreadyExists" : "ContainerBeingDeleted",
@@ -266,16 +280,17 @@ public sealed class BlobService(
         bool includeDeleted,
         CancellationToken cancellationToken)
     {
-        var container = await metadata.GetContainerAsync(account, name, includeDeleted, cancellationToken)
+        var container = await metadata.GetContainerAsync(account, name, includeDeleted, cancellationToken).ConfigureAwait(false)
                         ?? throw AzureStorageException.ContainerNotFound();
         return EffectiveContainer(container);
     }
 
     public async Task<ContainerRecord> SetContainerMetadataAsync(
         ContainerRecord current,
-        Dictionary<string, string> userMetadata,
+        IReadOnlyDictionary<string, string> userMetadata,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         var updated = current with
         {
             Metadata = userMetadata,
@@ -283,16 +298,17 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
-        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
     public async Task<ContainerRecord> SetContainerAclAsync(
         ContainerRecord current,
         string? publicAccess,
-        Dictionary<string, StoredAccessPolicy> policies,
+        IReadOnlyDictionary<string, StoredAccessPolicy> policies,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
             throw AzureStorageException.InvalidHeader("x-ms-blob-public-access", publicAccess);
         EnsurePublicAccessAllowed(current.Account, publicAccess);
@@ -304,13 +320,14 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
-        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
     public async Task DeleteContainerAsync(ContainerRecord current, CancellationToken cancellationToken)
     {
-        if (current.Name == StorageAnalyticsService.LogsContainerName)
+        ArgumentNullException.ThrowIfNull(current);
+        if (string.Equals(current.Name, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal))
         {
             throw new AzureStorageException(
                 StatusCodes.Status403Forbidden,
@@ -325,7 +342,7 @@ public sealed class BlobService(
                 "The requested operation is not allowed because the container has immutable storage with versioning enabled.");
         }
         EnsureContainerMutable(current);
-        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
         if (properties.ContainerSoftDeleteEnabled)
         {
             var deletedAt = metadata.GetUtcNow();
@@ -338,11 +355,11 @@ public sealed class BlobService(
                 ETag = MetadataStore.NewETag(),
                 LastModified = deletedAt
             };
-            await metadata.PutContainerAsync(deleted, current.Revision, cancellationToken);
+            await metadata.PutContainerAsync(deleted, current.Revision, cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            await metadata.DeleteContainerPermanentlyAsync(current.Account, current.Name, current.Revision, cancellationToken);
+            await metadata.DeleteContainerPermanentlyAsync(current.Account, current.Name, current.Revision, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -353,11 +370,12 @@ public sealed class BlobService(
         string deletedVersion,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(destinationName);
         ValidateContainerName(destinationName);
-        var current = await GetContainerAsync(account, sourceName, includeDeleted: true, cancellationToken);
+        var current = await GetContainerAsync(account, sourceName, includeDeleted: true, cancellationToken).ConfigureAwait(false);
         if (current.DeletedAt is null || !string.Equals(current.DeletedVersion, deletedVersion, StringComparison.Ordinal))
             throw AzureStorageException.ContainerNotFound();
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         var retentionUntil = current.DeleteRetentionUntil ??
                              current.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays);
         if (retentionUntil <= metadata.GetUtcNow())
@@ -375,7 +393,7 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
-        if (!await metadata.TryRestoreContainerAsync(sourceName, restored, current.Revision, cancellationToken))
+        if (!await metadata.TryRestoreContainerAsync(sourceName, restored, current.Revision, cancellationToken).ConfigureAwait(false))
         {
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
@@ -392,10 +410,12 @@ public sealed class BlobService(
         string? sourceLeaseId,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(sourceName);
+        ArgumentNullException.ThrowIfNull(destinationName);
         ValidateContainerName(sourceName);
         ValidateContainerName(destinationName);
-        var current = await GetContainerAsync(account, sourceName, includeDeleted: false, cancellationToken);
-        if (current.Name == StorageAnalyticsService.LogsContainerName)
+        var current = await GetContainerAsync(account, sourceName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        if (string.Equals(current.Name, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal))
             throw AzureStorageException.ContainerNotFound();
         EnsureContainerMutable(current);
         leases.EnsureWriteAccess(
@@ -415,13 +435,13 @@ public sealed class BlobService(
                 sourceName,
                 renamed,
                 current.Revision,
-                cancellationToken))
+                cancellationToken).ConfigureAwait(false))
         {
             var existing = await metadata.GetContainerAsync(
                 account,
                 destinationName,
                 includeDeleted: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
                 existing?.DeletedAt is null ? "ContainerAlreadyExists" : "ContainerBeingDeleted",
@@ -441,6 +461,7 @@ public sealed class BlobService(
         bool updateProperties,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         var updated = current with
         {
             Lease = lease,
@@ -448,7 +469,7 @@ public sealed class BlobService(
             ETag = updateProperties ? MetadataStore.NewETag() : current.ETag,
             LastModified = updateProperties ? metadata.GetUtcNow() : current.LastModified
         };
-        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutContainerAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -462,17 +483,17 @@ public sealed class BlobService(
     {
         if (includeSnapshots && !SupportsBlobSnapshots(account))
             throw AzureStorageException.BlobOperationNotSupported();
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
-        var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken).ConfigureAwait(false);
+        var blobs = await metadata.ListBlobsAsync(account, container, includeVersions, includeSnapshots, includeDeleted, cancellationToken).ConfigureAwait(false);
         var effective = new List<BlobRecord>(blobs.Count);
         var properties = includeDeleted && blobs.Any(item => item.DeletedAt.HasValue && !item.DeleteRetentionUntil.HasValue)
-            ? await metadata.GetServicePropertiesAsync(account, cancellationToken)
+            ? await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false)
             : null;
         foreach (var blob in blobs)
         {
-            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
-            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
+            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken).ConfigureAwait(false);
+            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken).ConfigureAwait(false);
             effective.Add(properties is not null && rehydrated.DeletedAt.HasValue && !rehydrated.DeleteRetentionUntil.HasValue
                 ? EffectiveBlob(rehydrated with
                 {
@@ -501,8 +522,8 @@ public sealed class BlobService(
     {
         if (includeSnapshots && !SupportsBlobSnapshots(account))
             throw AzureStorageException.BlobOperationNotSupported();
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken).ConfigureAwait(false);
         var page = await metadata.ListBlobsPageAsync(
             account,
             container,
@@ -519,12 +540,12 @@ public sealed class BlobService(
             marker.Cursor,
             marker.LegacyOffset,
             maximum,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         ServiceProperties? properties = null;
         if (includeDeleted && page.Items.Any(item =>
                 item.Blob is { DeletedAt: not null, DeleteRetentionUntil: null }))
         {
-            properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+            properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         }
 
         var effective = new List<BlobListEntry>(page.Items.Count);
@@ -536,8 +557,8 @@ public sealed class BlobService(
                 continue;
             }
 
-            var copy = await CompleteCopyIfDueAsync(item.Blob, cancellationToken);
-            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken);
+            var copy = await CompleteCopyIfDueAsync(item.Blob, cancellationToken).ConfigureAwait(false);
+            var rehydrated = await CompleteRehydrationIfDueAsync(copy, cancellationToken).ConfigureAwait(false);
             var blob = properties is not null && rehydrated.DeletedAt.HasValue &&
                        !rehydrated.DeleteRetentionUntil.HasValue
                 ? EffectiveBlob(rehydrated with
@@ -563,12 +584,12 @@ public sealed class BlobService(
             filter,
             cursor,
             maximum,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var effective = new List<BlobRecord>(page.Items.Count);
         foreach (var blob in page.Items)
         {
-            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken);
-            effective.Add(EffectiveBlob(await CompleteRehydrationIfDueAsync(copy, cancellationToken)));
+            var copy = await CompleteCopyIfDueAsync(blob, cancellationToken).ConfigureAwait(false);
+            effective.Add(EffectiveBlob(await CompleteRehydrationIfDueAsync(copy, cancellationToken).ConfigureAwait(false)));
         }
         return new TaggedBlobPage(effective, page.HasMore);
     }
@@ -587,12 +608,12 @@ public sealed class BlobService(
             throw AzureStorageException.BlobOperationNotSupported();
         if (versionId is not null && IsHierarchicalNamespaceEnabled(account))
             throw AzureStorageException.BlobNotFound();
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken);
-        var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken)
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        await EnsureHierarchicalDirectoryIndexAsync(account, container, cancellationToken).ConfigureAwait(false);
+        var blob = await metadata.GetBlobAsync(account, container, name, versionId, snapshot, includeDeleted, cancellationToken).ConfigureAwait(false)
                    ?? throw AzureStorageException.BlobNotFound();
-        blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
-        return EffectiveBlob(await CompleteRehydrationIfDueAsync(blob, cancellationToken));
+        blob = await CompleteCopyIfDueAsync(blob, cancellationToken).ConfigureAwait(false);
+        return EffectiveBlob(await CompleteRehydrationIfDueAsync(blob, cancellationToken).ConfigureAwait(false));
     }
 
     public async Task<BlobRecord> RecordDataAccessAsync(
@@ -622,7 +643,7 @@ public sealed class BlobService(
             };
             try
             {
-                await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+                await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
                 return updated;
             }
             catch (StorageConcurrencyException)
@@ -634,7 +655,7 @@ public sealed class BlobService(
                               current.VersionId,
                               current.Snapshot,
                               includeDeleted: false,
-                              cancellationToken)
+                              cancellationToken).ConfigureAwait(false)
                           ?? throw AzureStorageException.BlobNotFound();
             }
         }
@@ -651,11 +672,12 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
         ValidateBlobName(name);
         ValidateEncryptionContext(account, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
-        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
         if (options.GenerateContentMd5 && options.Http.ContentMd5 is null)
         {
             options = options with
@@ -673,7 +695,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> CreateAppendBlobAsync(
@@ -686,9 +708,10 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
         ValidateBlobName(name);
         ValidateEncryptionContext(account, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now) with
         {
@@ -699,7 +722,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> CreatePageBlobAsync(
@@ -714,6 +737,7 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
         EnsureBlobKindSupported(account, BlobKind.PageBlob);
         ValidateBlobName(name);
         ValidateEncryptionContext(account, options);
@@ -724,7 +748,7 @@ public sealed class BlobService(
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
         if (sequenceNumber < 0)
             throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.ToString(CultureInfo.InvariantCulture));
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with
         {
@@ -736,7 +760,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobEncryption> StageBlockAsync(
@@ -750,8 +774,8 @@ public sealed class BlobService(
     {
         ValidateBlobName(name);
         var blockIdLength = ValidateBlockId(blockId);
-        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         encryption = ApplyContainerEncryptionPolicy(containerRecord, encryption, current);
         if (current is not null)
             EnsureNoPendingCopy(current);
@@ -759,17 +783,20 @@ public sealed class BlobService(
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current is not null && !chunks.IsInDomain(account, encryption, current.Content))
             throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
-        var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
+        var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken).ConfigureAwait(false);
         if (staged.Count >= BlobServiceLimits.MaximumUncommittedBlockCount &&
             staged.All(item => !string.Equals(item.BlockId, blockId, StringComparison.Ordinal)))
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The uncommitted block count exceeds the maximum permitted value.");
-        var existingId = staged.Select(item => item.BlockId).FirstOrDefault()
-                         ?? current?.CommittedBlocks.FirstOrDefault()?.Id;
+        string? existingId = null;
+        if (staged.Count > 0)
+            existingId = staged[0].BlockId;
+        else if (current?.CommittedBlocks.Count > 0)
+            existingId = current.CommittedBlocks[0].Id;
         if (existingId is not null && ValidateBlockId(existingId) != blockIdLength)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidBlobOrBlock", "All block IDs for a blob must have the same length.");
         if (staged.Any(item => !chunks.IsInDomain(account, encryption, item.Content)))
             throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
-        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+        using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
         await metadata.PutStagedBlockAsync(new StagedBlockRecord
         {
             Account = account,
@@ -778,7 +805,7 @@ public sealed class BlobService(
             BlockId = blockId,
             Content = content.Manifest,
             CreatedAt = metadata.GetUtcNow()
-        }, cancellationToken);
+        }, cancellationToken).ConfigureAwait(false);
         if (current is not null)
         {
             var written = PrepareBlobWrite(current);
@@ -789,7 +816,7 @@ public sealed class BlobService(
                     await metadata.PutBlobRecordAsync(
                         written with { Revision = MetadataStore.NewRevision() },
                         current.Revision,
-                        cancellationToken);
+                        cancellationToken).ConfigureAwait(false);
                 }
                 catch (StorageConcurrencyException)
                 {
@@ -810,18 +837,20 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(blockList);
         if (blockList.Count > BlobServiceLimits.MaximumCommittedBlockCount)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "BlockCountExceedsLimit", "The block list may not contain more than 50,000 blocks.");
 
         ValidateEncryptionContext(account, options);
-        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken);
+        var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         options = await ApplyContainerEncryptionPolicyAsync(
             account,
             container,
             options,
             cancellationToken,
-            current);
-        var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken);
+            current).ConfigureAwait(false);
+        var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
         var stagedById = staged.ToDictionary(item => item.BlockId, StringComparer.Ordinal);
         var committedById = current?.CommittedBlocks
@@ -855,7 +884,7 @@ public sealed class BlobService(
             selected.Add(new CommittedBlockRecord(blockId, resolved));
         }
 
-        var content = await chunks.ComposeAsync(account, encryption, selected.Select(item => item.Content).ToArray(), cancellationToken);
+        var content = await chunks.ComposeAsync(account, encryption, selected.Select(item => item.Content).ToArray(), cancellationToken).ConfigureAwait(false);
         using var contentPin = chunks.Pin(content);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.BlockBlob, content, options, now) with
@@ -869,7 +898,7 @@ public sealed class BlobService(
             expectedRevision,
             staged,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> AppendBlockAsync(
@@ -880,7 +909,8 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
-        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken);
+        ArgumentNullException.ThrowIfNull(current);
+        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         encryption = ApplyContainerEncryptionPolicy(container, encryption, current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
@@ -896,7 +926,7 @@ public sealed class BlobService(
 
         if (!chunks.IsInDomain(current.Account, encryption, current.Content))
             throw AzureStorageException.BlobUsesCustomerSpecifiedEncryption();
-        using var appended = await chunks.StorePinnedAsync(current.Account, encryption, source, cancellationToken);
+        using var appended = await chunks.StorePinnedAsync(current.Account, encryption, source, cancellationToken).ConfigureAwait(false);
         if (appended.Manifest.Length > 100L * 1024 * 1024)
             throw new AzureStorageException(StatusCodes.Status413PayloadTooLarge, "RequestBodyTooLarge", "An append block cannot exceed 100 MiB.");
         if (expectedMaximumSize.HasValue && current.Content.Length + appended.Manifest.Length > expectedMaximumSize.Value)
@@ -906,7 +936,7 @@ public sealed class BlobService(
                 "MaxBlobSizeConditionNotMet",
                 "The max blob size condition specified was not met.");
         }
-        var content = await chunks.ComposeAsync(current.Account, encryption, [current.Content, appended.Manifest], cancellationToken);
+        var content = await chunks.ComposeAsync(current.Account, encryption, [current.Content, appended.Manifest], cancellationToken).ConfigureAwait(false);
         using var contentPin = chunks.Pin(content);
         var now = metadata.GetUtcNow();
         var updated = current with
@@ -922,7 +952,7 @@ public sealed class BlobService(
             AppendBlockCount = checked(current.AppendBlockCount + 1),
             Copy = null
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -935,8 +965,9 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureFlatNamespace(current.Account);
-        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken);
+        var container = await GetContainerAsync(current.Account, current.Container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         encryption = ApplyContainerEncryptionPolicy(container, encryption, current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
@@ -961,7 +992,7 @@ public sealed class BlobService(
                 end - start + 1,
                 source,
                 clear,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
         catch (EndOfStreamException)
         {
@@ -981,7 +1012,7 @@ public sealed class BlobService(
                     ? now
                     : current.LastAccessedAt
             };
-            await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+            await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
             return updated;
         }
     }
@@ -994,6 +1025,8 @@ public sealed class BlobService(
         long end,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(previous);
+        ArgumentNullException.ThrowIfNull(current);
         if (current.Kind != BlobKind.PageBlob || previous.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.CreatedAt != previous.CreatedAt ||
@@ -1020,19 +1053,19 @@ public sealed class BlobService(
 
         while (cursor < rangeEndExclusive)
         {
-            while (currentIndex < currentRanges.Count && currentRanges[currentIndex].End < cursor)
+            while (currentIndex < currentRanges.Length && currentRanges[currentIndex].End < cursor)
                 currentIndex++;
-            while (previousIndex < previousRanges.Count && previousRanges[previousIndex].End < cursor)
+            while (previousIndex < previousRanges.Length && previousRanges[previousIndex].End < cursor)
                 previousIndex++;
 
-            var currentAllocated = currentIndex < currentRanges.Count && currentRanges[currentIndex].Start <= cursor;
-            var previousAllocated = previousIndex < previousRanges.Count && previousRanges[previousIndex].Start <= cursor;
+            var currentAllocated = currentIndex < currentRanges.Length && currentRanges[currentIndex].Start <= cursor;
+            var previousAllocated = previousIndex < previousRanges.Length && previousRanges[previousIndex].Start <= cursor;
             var currentBoundary = currentAllocated
                 ? checked(currentRanges[currentIndex].End + 1)
-                : currentIndex < currentRanges.Count ? currentRanges[currentIndex].Start : rangeEndExclusive;
+                : currentIndex < currentRanges.Length ? currentRanges[currentIndex].Start : rangeEndExclusive;
             var previousBoundary = previousAllocated
                 ? checked(previousRanges[previousIndex].End + 1)
-                : previousIndex < previousRanges.Count ? previousRanges[previousIndex].Start : rangeEndExclusive;
+                : previousIndex < previousRanges.Length ? previousRanges[previousIndex].Start : rangeEndExclusive;
             var boundary = Math.Min(rangeEndExclusive, Math.Min(currentBoundary, previousBoundary));
 
             if (currentAllocated && !previousAllocated)
@@ -1052,7 +1085,7 @@ public sealed class BlobService(
                     cursor,
                     boundary,
                     changed,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
 
             cursor = boundary;
@@ -1069,6 +1102,7 @@ public sealed class BlobService(
         Stream destination,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(blob);
         EnsureNoPendingCopy(blob);
         if (string.Equals(blob.AccessTier, "Archive", StringComparison.Ordinal))
         {
@@ -1077,14 +1111,15 @@ public sealed class BlobService(
                 "BlobArchived",
                 "This operation is not permitted on an archived blob.");
         }
-        await chunks.WriteRangeAsync(blob.Content, encryption, offset, length, destination, cancellationToken);
+        await chunks.WriteRangeAsync(blob.Content, encryption, offset, length, destination, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> SetBlobMetadataAsync(
         BlobRecord current,
-        Dictionary<string, string> userMetadata,
+        IReadOnlyDictionary<string, string> userMetadata,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -1096,7 +1131,7 @@ public sealed class BlobService(
             LastModified = metadata.GetUtcNow(),
             Copy = null
         };
-        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
         if (properties.VersioningEnabled && !IsHierarchicalNamespaceEnabled(current.Account))
         {
             return await metadata.PublishBlobAsync(
@@ -1109,24 +1144,26 @@ public sealed class BlobService(
                 current.GenerationId,
                 current.Revision,
                 hierarchicalNamespace: false,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
     public async Task<BlobRecord> SetBlobTagsAsync(
         BlobRecord current,
-        Dictionary<string, string> tags,
+        IReadOnlyDictionary<string, string> tags,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(tags);
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
         if (tags.Count > 10)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
         var updated = current with { Tags = tags, Copy = null, Revision = MetadataStore.NewRevision() };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1139,6 +1176,7 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -1149,7 +1187,7 @@ public sealed class BlobService(
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The sequence number is only valid for page blobs.");
             if (sequenceNumber < 0)
                 throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.Value.ToString(CultureInfo.InvariantCulture));
-            nextSequence = sequenceAction?.ToLowerInvariant() switch
+            nextSequence = (sequenceAction is null ? null : ProtocolLowercase(sequenceAction)) switch
             {
                 "max" when sequenceNumber.HasValue => Math.Max(nextSequence, sequenceNumber.Value),
                 "increment" => checked(nextSequence + 1),
@@ -1166,7 +1204,7 @@ public sealed class BlobService(
             const long maximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
             if (current.Kind != BlobKind.PageBlob || resizeTo < 0 || resizeTo > maximumPageBlobBytes || resizeTo % 512 != 0)
                 throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", resizeTo.Value.ToString(CultureInfo.InvariantCulture));
-            resized = await chunks.ResizeSparsePinnedAsync(current.Account, encryption, current.Content, resizeTo.Value, cancellationToken);
+            resized = await chunks.ResizeSparsePinnedAsync(current.Account, encryption, current.Content, resizeTo.Value, cancellationToken).ConfigureAwait(false);
             content = resized.Manifest;
         }
 
@@ -1192,7 +1230,7 @@ public sealed class BlobService(
         };
         try
         {
-            await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+            await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
             return updated;
         }
         finally
@@ -1206,6 +1244,7 @@ public sealed class BlobService(
         long? expectedPosition,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
@@ -1221,7 +1260,7 @@ public sealed class BlobService(
             LastModified = metadata.GetUtcNow(),
             Copy = null
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1233,6 +1272,8 @@ public sealed class BlobService(
         bool supportsCustomerProvidedKey,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(tier);
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         if (current.Kind != BlobKind.BlockBlob)
@@ -1249,12 +1290,12 @@ public sealed class BlobService(
         var now = metadata.GetUtcNow();
         BlobRecord updated;
         var pending = false;
-        if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal) && tier != "Archive")
+        if (string.Equals(current.AccessTier, "Archive", StringComparison.Ordinal) && !string.Equals(tier, "Archive", StringComparison.Ordinal))
         {
             if (!current.IsCurrent || current.Snapshot is not null)
                 throw new AzureStorageException(StatusCodes.Status409Conflict, "BlobArchived", "This operation is not permitted on an archived blob.");
 
-            var requestedStatus = $"rehydrate-pending-to-{tier.ToLowerInvariant()}";
+            var requestedStatus = $"rehydrate-pending-to-{ProtocolLowercase(tier)}";
             if (current.ArchiveStatus is not null && !string.Equals(current.ArchiveStatus, requestedStatus, StringComparison.Ordinal))
             {
                 throw new AzureStorageException(
@@ -1266,11 +1307,11 @@ public sealed class BlobService(
             var priority = current.RehydratePriority switch
             {
                 "High" => "High",
-                "Standard" when allowRehydratePriorityUpdate && rehydratePriority == "High" => "High",
+                "Standard" when allowRehydratePriorityUpdate && string.Equals(rehydratePriority, "High", StringComparison.Ordinal) => "High",
                 "Standard" => "Standard",
                 _ => rehydratePriority ?? "Standard"
             };
-            var delay = priority == "High" ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
+            var delay = string.Equals(priority, "High", StringComparison.Ordinal) ? _options.HighPriorityRehydrationDelay : _options.StandardRehydrationDelay;
             var completion = now.Add(delay);
             if (current.RehydrateCompleteAt.HasValue && current.RehydrateCompleteAt.Value < completion)
             {
@@ -1298,8 +1339,8 @@ public sealed class BlobService(
             {
                 AccessTier = tier,
                 AccessTierInferred = false,
-                SmartAccessTier = tier == "Smart" ? "Hot" : null,
-                SmartTierLastAccessedAt = tier == "Smart" ? now : null,
+                SmartAccessTier = string.Equals(tier, "Smart", StringComparison.Ordinal) ? "Hot" : null,
+                SmartTierLastAccessedAt = string.Equals(tier, "Smart", StringComparison.Ordinal) ? now : null,
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
@@ -1307,12 +1348,13 @@ public sealed class BlobService(
                 AccessTierChangedAt = now
             };
         }
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return new BlobTierUpdate(updated, pending);
     }
 
     public async Task<BlobRecord> SetExpiryAsync(BlobRecord current, DateTimeOffset? expiresAt, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         if (!IsHierarchicalNamespaceEnabled(current.Account) || current.IsDirectory)
             throw AzureStorageException.BlobOperationNotSupported();
         EnsureNoPendingCopy(current);
@@ -1328,7 +1370,7 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1338,7 +1380,8 @@ public sealed class BlobService(
         bool locked,
         CancellationToken cancellationToken)
     {
-        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
+        ArgumentNullException.ThrowIfNull(current);
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken).ConfigureAwait(false);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         if (expiresOn <= metadata.GetUtcNow())
@@ -1356,7 +1399,7 @@ public sealed class BlobService(
             Copy = null,
             Revision = MetadataStore.NewRevision()
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1364,7 +1407,8 @@ public sealed class BlobService(
         BlobRecord current,
         CancellationToken cancellationToken)
     {
-        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
+        ArgumentNullException.ThrowIfNull(current);
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken).ConfigureAwait(false);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         if (current.ImmutabilityLocked)
@@ -1376,7 +1420,7 @@ public sealed class BlobService(
             Copy = null,
             Revision = MetadataStore.NewRevision()
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1385,7 +1429,8 @@ public sealed class BlobService(
         bool hasLegalHold,
         CancellationToken cancellationToken)
     {
-        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken);
+        ArgumentNullException.ThrowIfNull(current);
+        await EnsureVersionLevelImmutabilityEnabledAsync(current, cancellationToken).ConfigureAwait(false);
         EnsureNoPendingCopy(current);
         current = PrepareBlobWrite(current);
         var updated = current with
@@ -1394,7 +1439,7 @@ public sealed class BlobService(
             Copy = null,
             Revision = MetadataStore.NewRevision()
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -1403,21 +1448,23 @@ public sealed class BlobService(
         LeaseRecord lease,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         var updated = current with
         {
             Lease = lease,
             Revision = MetadataStore.NewRevision()
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
     public Task<BlobRecord> CreateSnapshotAsync(
         BlobRecord current,
-        Dictionary<string, string>? snapshotMetadata,
+        IReadOnlyDictionary<string, string>? snapshotMetadata,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         if (!SupportsBlobSnapshots(current.Account) || current.IsDirectory)
             throw AzureStorageException.BlobOperationNotSupported();
@@ -1442,6 +1489,7 @@ public sealed class BlobService(
         BlobDeleteSnapshotsOption deleteSnapshots,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         if ((current.Snapshot is not null || deleteSnapshots != BlobDeleteSnapshotsOption.Unspecified) &&
@@ -1454,7 +1502,7 @@ public sealed class BlobService(
                 current.Account,
                 current.Container,
                 current.Name,
-                cancellationToken))
+                cancellationToken).ConfigureAwait(false))
         {
             throw AzureStorageException.DirectoryIsNotEmpty();
         }
@@ -1463,8 +1511,8 @@ public sealed class BlobService(
             current.Container,
             current.Name,
             includeDeleted: true,
-            cancellationToken);
-        var relatedSnapshots = records.Where(item => item.Name == current.Name && item.Snapshot is not null && !item.IsDeleted).ToArray();
+            cancellationToken).ConfigureAwait(false);
+        var relatedSnapshots = records.Where(item => string.Equals(item.Name, current.Name, StringComparison.Ordinal) && item.Snapshot is not null && !item.IsDeleted).ToArray();
         if (!hasExplicitSnapshotOrVersion &&
             relatedSnapshots.Length > 0 &&
             deleteSnapshots == BlobDeleteSnapshotsOption.Unspecified)
@@ -1485,18 +1533,19 @@ public sealed class BlobService(
                 targets.AddRange(relatedSnapshots);
         }
 
-        foreach (var target in targets)
-            EnsureBlobMutable(target);
+        for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
+            EnsureBlobMutable(targets[targetIndex]);
 
-        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
         var hierarchicalNamespace = IsHierarchicalNamespaceEnabled(current.Account);
         var deletionIds = records
             .Where(item => item.DeletionId.HasValue)
             .Select(item => item.DeletionId!.Value)
             .ToHashSet();
         var mutations = new List<BlobRecordMutation>(targets.Count);
-        foreach (var target in targets)
+        for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
         {
+            var target = targets[targetIndex];
             BlobRecord? replacement;
             if (!hasExplicitSnapshotOrVersion &&
                 target.IsCurrent &&
@@ -1550,7 +1599,7 @@ public sealed class BlobService(
         await metadata.ApplyBlobRecordMutationsAsync(
             mutations,
             cancellationToken,
-            clearStagedBlocksForCurrentBlobs: true);
+            clearStagedBlocksForCurrentBlobs: true).ConfigureAwait(false);
     }
 
     public async Task PermanentlyDeleteBlobAsync(
@@ -1558,7 +1607,8 @@ public sealed class BlobService(
         bool hasExplicitSnapshotOrVersion,
         CancellationToken cancellationToken)
     {
-        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken);
+        ArgumentNullException.ThrowIfNull(current);
+        var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
         if (!properties.BlobPermanentDeleteEnabled || !properties.BlobSoftDeleteEnabled)
         {
             throw new AzureStorageException(
@@ -1583,7 +1633,7 @@ public sealed class BlobService(
 
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
-        if (!await metadata.DeleteBlobRecordAsync(current.GenerationId, current.Revision, cancellationToken))
+        if (!await metadata.DeleteBlobRecordAsync(current.GenerationId, current.Revision, cancellationToken).ConfigureAwait(false))
             throw AzureStorageException.BlobNotFound();
     }
 
@@ -1594,12 +1644,12 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        var records = await metadata.ListBlobFamilyAsync(account, container, name, includeDeleted: true, cancellationToken);
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        var records = await metadata.ListBlobFamilyAsync(account, container, name, includeDeleted: true, cancellationToken).ConfigureAwait(false);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var mutations = new List<BlobRecordMutation>();
-        foreach (var record in records.Where(item => item.Name == name && item.IsDeleted))
+        foreach (var record in records.Where(item => string.Equals(item.Name, name, StringComparison.Ordinal) && item.IsDeleted))
         {
             if (record.DeletedAt is null)
                 continue;
@@ -1617,7 +1667,7 @@ public sealed class BlobService(
         }
         if (mutations.Count == 0)
             throw AzureStorageException.BlobNotFound();
-        await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken);
+        await metadata.ApplyBlobRecordMutationsAsync(mutations, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task UndeleteHierarchicalBlobAsync(
@@ -1630,14 +1680,14 @@ public sealed class BlobService(
     {
         ValidateBlobName(sourceName);
         ValidateBlobName(destinationName);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         var records = await metadata.ListBlobFamilyAsync(
             account,
             container,
             sourceName,
             includeDeleted: true,
-            cancellationToken);
-        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        var properties = await metadata.GetServicePropertiesAsync(account, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var source = records.FirstOrDefault(item =>
             item.IsDeleted &&
@@ -1656,10 +1706,12 @@ public sealed class BlobService(
             DeleteRetentionUntil = null,
             Revision = MetadataStore.NewRevision()
         };
-        if (!await metadata.TryRestoreDeletedBlobAsync(restored, source.Revision, cancellationToken))
+        if (!await metadata.TryRestoreDeletedBlobAsync(restored, source.Revision, cancellationToken).ConfigureAwait(false))
             throw AzureStorageException.PathAlreadyExists();
     }
 
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
     public async Task<BlobRecord> BeginCopyFromBlobAsync(
         string account,
         string container,
@@ -1673,15 +1725,18 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(options);
         var sourceIsArchived = string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal);
         ValidateCopyRehydrationOptions(source.Kind, sourceIsArchived, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
             EncryptionOf(options),
             preserveCommittedBlocks: true,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         return await BeginCopyAsync(
             account,
             container,
@@ -1699,9 +1754,11 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
     public async Task<BlobRecord> CopyBlockBlobFromBlobAsync(
         string account,
         string container,
@@ -1714,6 +1771,9 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(source);
         if (source.Kind != BlobKind.BlockBlob)
         {
             throw new AzureStorageException(
@@ -1721,13 +1781,13 @@ public sealed class BlobService(
                 "InvalidSourceBlobType",
                 "The source blob type is invalid for this operation.");
         }
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
             EncryptionOf(options),
             preserveCommittedBlocks: true,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         return await PublishSynchronousBlockCopyAsync(
             account,
             container,
@@ -1739,7 +1799,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> CopyBlobFromBlobSynchronouslyAsync(
@@ -1753,16 +1813,18 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(source);
         EnsureBlobKindSupported(account, source.Kind);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
             EncryptionOf(options),
             preserveCommittedBlocks: true,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, source.Kind, prepared.Content, options, now) with
         {
@@ -1778,9 +1840,11 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
     public async Task<BlobRecord> CopyBlockBlobFromStreamAsync(
         string account,
         string container,
@@ -1795,14 +1859,17 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(sourceBlocks);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         using var content = await StoreRemoteBlockBlobAsync(
             account,
             source,
             contentLength,
             sourceBlocks,
             EncryptionOf(options),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         return await PublishSynchronousBlockCopyAsync(
             account,
             container,
@@ -1814,7 +1881,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<BlobRecord> PublishSynchronousBlockCopyAsync(
@@ -1851,9 +1918,11 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
     public async Task<BlobRecord> BeginIncrementalCopyAsync(
         string account,
         string container,
@@ -1864,6 +1933,9 @@ public sealed class BlobService(
         BlobRecord? current,
         CancellationToken cancellationToken)
     {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(source);
         EnsureFlatNamespace(account);
         ValidateBlobName(name);
         options = await ApplyContainerEncryptionPolicyAsync(
@@ -1871,7 +1943,7 @@ public sealed class BlobService(
             container,
             options,
             cancellationToken,
-            current);
+            current).ConfigureAwait(false);
         if (source.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidSourceBlobType", "The source blob type is invalid for incremental copy.");
         if (source.Snapshot is null)
@@ -1916,7 +1988,7 @@ public sealed class BlobService(
             source,
             encryption,
             preserveCommittedBlocks: false,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var copyId = Guid.NewGuid().ToString();
         var pending = (current ?? NewBlob(
@@ -1960,11 +2032,13 @@ public sealed class BlobService(
                 null,
                 null,
                 IsHierarchicalNamespaceEnabled(account),
-                cancellationToken);
-        await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken);
+                cancellationToken).ConfigureAwait(false);
+        await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken).ConfigureAwait(false);
         return pending;
     }
 
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
     public async Task<BlobRecord> BeginCopyFromStreamAsync(
         string account,
         string container,
@@ -1985,8 +2059,11 @@ public sealed class BlobService(
         string? expectedRevision,
         CancellationToken cancellationToken)
     {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(sourceBlocks);
         ValidateCopyRehydrationOptions(sourceKind, sourceIsArchived, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken);
+        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
         if (sourceKind == BlobKind.BlockBlob)
         {
@@ -1996,7 +2073,7 @@ public sealed class BlobService(
                 contentLength,
                 sourceBlocks,
                 encryption,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             return await BeginCopyAsync(
                 account,
                 container,
@@ -2014,9 +2091,9 @@ public sealed class BlobService(
                 destinationLease,
                 expectedGeneration,
                 expectedRevision,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
         }
-        using var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
+        using var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
         if (stored.Manifest.Length != contentLength)
             throw CannotVerifyCopySource("The copy source length did not match its Content-Length value.");
         return await BeginCopyAsync(
@@ -2036,7 +2113,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<BlobRecord> BeginCopyAsync(
@@ -2061,7 +2138,7 @@ public sealed class BlobService(
         EnsureBlobKindSupported(account, sourceKind);
         ValidateCopyRehydrationOptions(sourceKind, sourceIsArchived, options);
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
         if (!chunks.IsInDomain(account, encryption, sourceContent))
             throw UnsupportedEncryptionTransition();
@@ -2073,8 +2150,8 @@ public sealed class BlobService(
             ? options.RehydratePriority ?? "Standard"
             : null;
         var rehydrateCompleteAt = sourceIsArchived
-            ? now.Add(rehydratePriority == "High"
-                ? _options.HighPriorityRehydrationDelay
+            ? now.Add(string.Equals(rehydratePriority, "High"
+, StringComparison.Ordinal) ? _options.HighPriorityRehydrationDelay
                 : _options.StandardRehydrationDelay)
             : (DateTimeOffset?)null;
         if (rehydrateCompleteAt < copyReadyAt)
@@ -2098,7 +2175,7 @@ public sealed class BlobService(
             AccessTier = sourceIsArchived ? "Archive" : options.AccessTier ?? "Hot",
             AccessTierInferred = sourceIsArchived ? false : options.AccessTierInferred ?? options.AccessTier is null,
             ArchiveStatus = sourceIsArchived
-                ? $"rehydrate-pending-to-{options.AccessTier!.ToLowerInvariant()}"
+                ? $"rehydrate-pending-to-{ProtocolLowercase(options.AccessTier!)}"
                 : null,
             RehydratePriority = rehydratePriority,
             RehydrateCompleteAt = rehydrateCompleteAt,
@@ -2118,7 +2195,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             IsHierarchicalNamespaceEnabled(account),
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static void ValidateCopyRehydrationOptions(
@@ -2144,7 +2221,7 @@ public sealed class BlobService(
     private static async Task EnsureSourceExhaustedAsync(Stream source, CancellationToken cancellationToken)
     {
         var probe = new byte[1];
-        if (await source.ReadAsync(probe, cancellationToken) != 0)
+        if (await source.ReadAsync(probe, cancellationToken).ConfigureAwait(false) != 0)
             throw CannotVerifyCopySource("The copy source contained more data than its committed block list.");
     }
 
@@ -2156,16 +2233,16 @@ public sealed class BlobService(
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
-        var leases = new List<IDisposable>();
+        var contentLeases = new List<IDisposable>();
         try
         {
             if (sourceBlocks.Count == 0)
             {
-                var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken);
-                leases.Add(stored);
+                var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
+                contentLeases.Add(stored);
                 if (stored.Manifest.Length != contentLength)
                     throw CannotVerifyCopySource("The copy source length did not match its Content-Length value.");
-                return new PreparedCopyContent(stored.Manifest, [], leases);
+                return new PreparedCopyContent(stored.Manifest, [], contentLeases);
             }
 
             var copiedBlocks = new List<CommittedBlockRecord>(sourceBlocks.Count);
@@ -2175,29 +2252,29 @@ public sealed class BlobService(
                 StoredContent storedBlock;
                 try
                 {
-                    storedBlock = await chunks.StorePinnedAsync(account, encryption, blockSource, cancellationToken);
+                    storedBlock = await chunks.StorePinnedAsync(account, encryption, blockSource, cancellationToken).ConfigureAwait(false);
                 }
                 catch (EndOfStreamException)
                 {
                     throw CannotVerifyCopySource("The copy source ended before its committed block did.");
                 }
-                leases.Add(storedBlock);
+                contentLeases.Add(storedBlock);
                 copiedBlocks.Add(new CommittedBlockRecord(sourceBlock.Id, storedBlock.Manifest));
             }
-            await EnsureSourceExhaustedAsync(source, cancellationToken);
+            await EnsureSourceExhaustedAsync(source, cancellationToken).ConfigureAwait(false);
             var content = await chunks.ComposeAsync(
                 account,
                 encryption,
                 copiedBlocks.Select(block => block.Content).ToArray(),
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (content.Length != contentLength)
                 throw CannotVerifyCopySource("The copy source length did not match its committed block list.");
-            return new PreparedCopyContent(content, copiedBlocks, leases);
+            return new PreparedCopyContent(content, copiedBlocks, contentLeases);
         }
         catch
         {
-            foreach (var lease in leases)
-                lease.Dispose();
+            for (var leaseIndex = 0; leaseIndex < contentLeases.Count; leaseIndex++)
+                contentLeases[leaseIndex].Dispose();
             throw;
         }
     }
@@ -2240,7 +2317,7 @@ public sealed class BlobService(
                 return 0;
             var read = await inner.ReadAsync(
                 buffer[..(int)Math.Min(buffer.Length, _remaining)],
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             Record(read);
             return read;
         }
@@ -2288,7 +2365,7 @@ public sealed class BlobService(
         if (source.CustomerProvidedKeySha256 is not null)
             throw UnsupportedEncryptionTransition();
 
-        var leases = new List<IDisposable>();
+        var contentLeases = new List<IDisposable>();
         try
         {
             if (preserveCommittedBlocks && source.CommittedBlocks.Count > 0)
@@ -2301,16 +2378,16 @@ public sealed class BlobService(
                         EncryptionOf(source),
                         destinationEncryption,
                         block.Content,
-                        cancellationToken);
-                    leases.Add(copied);
+                        cancellationToken).ConfigureAwait(false);
+                    contentLeases.Add(copied);
                     copiedBlocks.Add(new CommittedBlockRecord(block.Id, copied.Manifest));
                 }
                 var content = await chunks.ComposeAsync(
                     destinationAccount,
                     destinationEncryption,
                     copiedBlocks.Select(block => block.Content).ToArray(),
-                    cancellationToken);
-                return new PreparedCopyContent(content, copiedBlocks, leases);
+                    cancellationToken).ConfigureAwait(false);
+                return new PreparedCopyContent(content, copiedBlocks, contentLeases);
             }
 
             var copiedContent = await chunks.CopyToDomainPinnedAsync(
@@ -2318,14 +2395,14 @@ public sealed class BlobService(
                 EncryptionOf(source),
                 destinationEncryption,
                 source.Content,
-                cancellationToken);
-            leases.Add(copiedContent);
-            return new PreparedCopyContent(copiedContent.Manifest, [], leases);
+                cancellationToken).ConfigureAwait(false);
+            contentLeases.Add(copiedContent);
+            return new PreparedCopyContent(copiedContent.Manifest, [], contentLeases);
         }
         catch
         {
-            foreach (var lease in leases)
-                lease.Dispose();
+            for (var leaseIndex = 0; leaseIndex < contentLeases.Count; leaseIndex++)
+                contentLeases[leaseIndex].Dispose();
             throw;
         }
     }
@@ -2350,8 +2427,9 @@ public sealed class BlobService(
         string copyId,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(current);
         current = PrepareBlobWrite(current);
-        if (current.Copy is null || current.Copy.Status != "pending" || current.PendingCopyContent is null)
+        if (current.Copy is null || !string.Equals(current.Copy.Status, "pending", StringComparison.Ordinal) || current.PendingCopyContent is null)
         {
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,
@@ -2398,7 +2476,7 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             LastModified = now
         };
-        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -2416,8 +2494,8 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
-        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
-        if (!await metadata.DeleteStagedBlocksAsync(account, container, name, cancellationToken))
+        _ = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        if (!await metadata.DeleteStagedBlocksAsync(account, container, name, cancellationToken).ConfigureAwait(false))
             throw AzureStorageException.BlobNotFound();
     }
 
@@ -2429,6 +2507,7 @@ public sealed class BlobService(
         ServiceProperties properties,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(properties);
         if (!properties.VersioningEnabled &&
             _options.ObjectReplicationPolicies.Any(policy =>
                 string.Equals(policy.SourceAccount, account, StringComparison.Ordinal) ||
@@ -2439,14 +2518,14 @@ public sealed class BlobService(
                 "BlobOperationNotSupported",
                 "Blob versioning cannot be disabled while an object replication policy is active.");
         }
-        await analytics.EnsureContainerAsync(account, cancellationToken);
+        await analytics.EnsureContainerAsync(account, cancellationToken).ConfigureAwait(false);
         if (properties.StaticWebsite.Enabled)
         {
             var websiteContainer = await metadata.GetContainerAsync(
                 account,
                 "$web",
                 includeDeleted: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (websiteContainer?.DeletedAt is not null)
             {
                 throw new AzureStorageException(
@@ -2463,18 +2542,18 @@ public sealed class BlobService(
                     publicAccess: null,
                     defaultEncryptionScope: null,
                     preventEncryptionScopeOverride: false,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }
         }
-        await metadata.PutServicePropertiesAsync(account, properties, cancellationToken);
+        await metadata.PutServicePropertiesAsync(account, properties, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<StorageMaintenanceResult> RunMaintenanceAsync(CancellationToken cancellationToken)
     {
-        await _maintenanceGate.WaitAsync(cancellationToken);
+        await _maintenanceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await RunMaintenanceCoreAsync(cancellationToken);
+            return await RunMaintenanceCoreAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2499,43 +2578,43 @@ public sealed class BlobService(
         var blobPage = await metadata.ListBlobMaintenancePageAsync(
             _blobMaintenanceCursor,
             _options.BlobRecordsPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         foreach (var candidate in blobPage.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
                 var blob = candidate;
-                if (blob.Container == StorageAnalyticsService.LogsContainerName)
+                if (string.Equals(blob.Container, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal))
                 {
                     if (!serviceProperties.TryGetValue(blob.Account, out var analyticsProperties))
                     {
-                        analyticsProperties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken);
+                        analyticsProperties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken).ConfigureAwait(false);
                         serviceProperties.Add(blob.Account, analyticsProperties);
                     }
                     if (analyticsProperties.Logging.RetentionPolicy is { Enabled: true, Days: { } retentionDays } &&
                         blob.CreatedAt.AddDays(retentionDays) <= now &&
-                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken).ConfigureAwait(false))
                     {
                         continue;
                     }
                 }
-                if (blob.Copy?.Status == "pending" && blob.PendingCopyContent is not null)
+                if (string.Equals(blob.Copy?.Status, "pending", StringComparison.Ordinal) && blob.PendingCopyContent is not null)
                 {
                     var pendingCopy = blob;
-                    blob = await CompleteCopyIfDueAsync(blob, cancellationToken);
-                    if (pendingCopy.Copy.Status == "pending" && blob.Copy?.Status == "success")
+                    blob = await CompleteCopyIfDueAsync(blob, cancellationToken).ConfigureAwait(false);
+                    if (string.Equals(pendingCopy.Copy?.Status, "pending", StringComparison.Ordinal) && string.Equals(blob.Copy?.Status, "success", StringComparison.Ordinal))
                         completedCopies++;
                 }
                 if (blob.RehydrateCompleteAt <= now)
                 {
-                    var rehydrated = await CompleteRehydrationIfDueAsync(blob, cancellationToken);
+                    var rehydrated = await CompleteRehydrationIfDueAsync(blob, cancellationToken).ConfigureAwait(false);
                     if (rehydrated.RehydrateCompleteAt is null && blob.RehydrateCompleteAt is not null)
                         completedRehydrations++;
                     blob = rehydrated;
                 }
 
-                var smartTiered = await TransitionSmartTierIfDueAsync(blob, now, cancellationToken);
+                var smartTiered = await TransitionSmartTierIfDueAsync(blob, now, cancellationToken).ConfigureAwait(false);
                 if (!string.Equals(smartTiered.SmartAccessTier, blob.SmartAccessTier, StringComparison.Ordinal))
                     completedSmartTierTransitions++;
                 blob = smartTiered;
@@ -2547,13 +2626,13 @@ public sealed class BlobService(
                     {
                         if (!serviceProperties.TryGetValue(blob.Account, out var properties))
                         {
-                            properties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken);
+                            properties = await metadata.GetServicePropertiesAsync(blob.Account, cancellationToken).ConfigureAwait(false);
                             serviceProperties.Add(blob.Account, properties);
                         }
                         retentionUntil = blob.DeletedAt.Value.AddDays(properties.BlobSoftDeleteRetentionDays);
                     }
                     if (retentionUntil <= now &&
-                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                        await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken).ConfigureAwait(false))
                     {
                         purgedBlobs++;
                     }
@@ -2565,13 +2644,13 @@ public sealed class BlobService(
                     blob.ExpiresAt <= now &&
                     !blob.HasLegalHold &&
                     (!blob.ImmutabilityUntil.HasValue || blob.ImmutabilityUntil <= now) &&
-                    await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken))
+                    await metadata.DeleteBlobRecordAsync(blob.GenerationId, blob.Revision, cancellationToken).ConfigureAwait(false))
                 {
                     expiredBlobs++;
                     continue;
                 }
 
-                var replication = await ReplicateObjectIfConfiguredAsync(blob, now, cancellationToken);
+                var replication = await ReplicateObjectIfConfiguredAsync(blob, now, cancellationToken).ConfigureAwait(false);
                 completedObjectReplications += replication.Completed;
                 failedObjectReplications += replication.Failed;
             }
@@ -2587,20 +2666,20 @@ public sealed class BlobService(
         var replicationStatePage = await metadata.ListObjectReplicationStatesPageAsync(
             _objectReplicationStateCursor,
             _options.BlobRecordsPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         foreach (var state in replicationStatePage.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!IsConfiguredObjectReplicationState(state))
             {
-                _ = await metadata.ForgetObjectReplicationStateAsync(state, cancellationToken);
+                _ = await metadata.ForgetObjectReplicationStateAsync(state, cancellationToken).ConfigureAwait(false);
                 continue;
             }
-            if (await metadata.GetBlobByGenerationAsync(state.SourceGenerationId, cancellationToken) is not null)
+            if (await metadata.GetBlobByGenerationAsync(state.SourceGenerationId, cancellationToken).ConfigureAwait(false) is not null)
                 continue;
             try
             {
-                if (await metadata.RemoveObjectReplicaForMissingSourceAsync(state, cancellationToken))
+                if (await metadata.RemoveObjectReplicaForMissingSourceAsync(state, cancellationToken).ConfigureAwait(false))
                     removedObjectReplicas++;
             }
             catch (StorageConcurrencyException)
@@ -2622,7 +2701,7 @@ public sealed class BlobService(
         var containerPage = await metadata.ListContainerMaintenancePageAsync(
             _containerMaintenanceCursor,
             _options.ContainerRecordsPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         foreach (var container in containerPage.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -2633,7 +2712,7 @@ public sealed class BlobService(
             {
                 if (!serviceProperties.TryGetValue(container.Account, out var properties))
                 {
-                    properties = await metadata.GetServicePropertiesAsync(container.Account, cancellationToken);
+                    properties = await metadata.GetServicePropertiesAsync(container.Account, cancellationToken).ConfigureAwait(false);
                     serviceProperties.Add(container.Account, properties);
                 }
                 retentionUntil = container.DeletedAt.Value.AddDays(properties.ContainerSoftDeleteRetentionDays);
@@ -2646,7 +2725,7 @@ public sealed class BlobService(
                         container.Account,
                         container.Name,
                         container.Revision,
-                        cancellationToken))
+                        cancellationToken).ConfigureAwait(false))
                 {
                     purgedContainers++;
                 }
@@ -2663,23 +2742,23 @@ public sealed class BlobService(
         var expiredBlocks = await metadata.DeleteStagedBlocksOlderThanAsync(
             now.Subtract(_options.UncommittedBlockRetention),
             _options.UncommittedBlocksPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var reclaimedStagingFiles = chunks.DeleteAbandonedStagingFiles(
             now.Subtract(_options.AbandonedStagingRetention),
             _options.MaximumStagingFilesPerMaintenancePass);
-        var reclaimedChunks = await CollectGarbageBatchAsync(cancellationToken);
+        var reclaimedChunks = await CollectGarbageBatchAsync(cancellationToken).ConfigureAwait(false);
         _ = await metadata.SealChunkPacksOlderThanAsync(
             now.Subtract(_options.ChunkPackSealAge),
             _options.ChunkPacksPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         var orphanedPacks = await chunks.ReclaimOrphanedPacksAsync(
             now.Subtract(_options.ChunkPackSealAge),
             _options.ChunkPacksPerMaintenancePass,
-            cancellationToken);
-        var packCompaction = await CompactChunkPacksAsync(cancellationToken);
-        var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken);
-        await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken);
-        var recompression = await RecompressColdChunksAsync(now, cancellationToken);
+            cancellationToken).ConfigureAwait(false);
+        var packCompaction = await CompactChunkPacksAsync(cancellationToken).ConfigureAwait(false);
+        var summary = await metadata.GetStorageInventorySummaryAsync(cancellationToken).ConfigureAwait(false);
+        await ScanIntegrityAsync(summary.ReachableChunkCount, cancellationToken).ConfigureAwait(false);
+        var recompression = await RecompressColdChunksAsync(now, cancellationToken).ConfigureAwait(false);
         if (chunks.IsPhysicalUsageScanInProgress ||
             _lastPhysicalUsage is null ||
             Stopwatch.GetElapsedTime(_lastPhysicalScanTicks) >= _options.PhysicalUsageScanInterval)
@@ -2735,7 +2814,7 @@ public sealed class BlobService(
         if (candidate.Kind != BlobKind.BlockBlob ||
             candidate.Snapshot is not null ||
             candidate.IsDeleted ||
-            candidate.Copy?.Status == "pending")
+string.Equals(candidate.Copy?.Status, "pending", StringComparison.Ordinal))
         {
             return default;
         }
@@ -2761,10 +2840,10 @@ public sealed class BlobService(
             var fingerprint = ObjectReplicationFingerprint(source);
             var statusKey = $"{policy.PolicyId}_{rule.RuleId}";
             var stateKey = new ObjectReplicationStateKey(policy.PolicyId, rule.RuleId, source.GenerationId);
-            var existingState = await metadata.GetObjectReplicationStateAsync(stateKey, cancellationToken);
+            var existingState = await metadata.GetObjectReplicationStateAsync(stateKey, cancellationToken).ConfigureAwait(false);
             if (existingState is not null && !ObjectReplicationStateMatches(policy, rule, source, existingState))
             {
-                _ = await metadata.ForgetObjectReplicationStateAsync(existingState, cancellationToken);
+                _ = await metadata.ForgetObjectReplicationStateAsync(existingState, cancellationToken).ConfigureAwait(false);
                 existingState = null;
             }
             var sourceCannotReplicate = source.CustomerProvidedKeySha256 is not null ||
@@ -2800,7 +2879,7 @@ public sealed class BlobService(
                     throw AzureStorageException.BlobOperationNotSupported();
 
                 var mappedDestination = existingState?.DestinationGenerationId is { } destinationGeneration
-                    ? await metadata.GetBlobByGenerationAsync(destinationGeneration, cancellationToken)
+                    ? await metadata.GetBlobByGenerationAsync(destinationGeneration, cancellationToken).ConfigureAwait(false)
                     : null;
                 var currentDestination = await metadata.GetBlobAsync(
                     policy.DestinationAccount,
@@ -2809,7 +2888,7 @@ public sealed class BlobService(
                     versionId: null,
                     snapshot: null,
                     includeDeleted: false,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 if (IsArchivedObjectReplicationTarget(mappedDestination) ||
                     IsArchivedObjectReplicationTarget(currentDestination))
                 {
@@ -2825,13 +2904,13 @@ public sealed class BlobService(
                         rule.ReplicateBlobTags
                             ? new Dictionary<string, string>(source.Tags, StringComparer.Ordinal)
                             : new Dictionary<string, string>(StringComparer.Ordinal)),
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 using var prepared = await PrepareCopyContentAsync(
                     policy.DestinationAccount,
                     source,
                     EncryptionOf(options),
                     preserveCommittedBlocks: true,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 var proposedDestination = NewBlob(
                     policy.DestinationAccount,
                     rule.DestinationContainer,
@@ -2849,7 +2928,7 @@ public sealed class BlobService(
                     proposedDestination,
                     proposedState,
                     statusKey,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 completed++;
             }
             catch (StorageConcurrencyException)
@@ -2862,13 +2941,13 @@ public sealed class BlobService(
                         source,
                         proposedState,
                         statusKey,
-                        cancellationToken))
+                        cancellationToken).ConfigureAwait(false))
                 {
                     failed++;
                 }
             }
 
-            source = await metadata.GetBlobByGenerationAsync(source.GenerationId, cancellationToken)
+            source = await metadata.GetBlobByGenerationAsync(source.GenerationId, cancellationToken).ConfigureAwait(false)
                      ?? source;
         }
 
@@ -2902,10 +2981,10 @@ public sealed class BlobService(
 
     public async Task<int> CollectGarbageAsync(CancellationToken cancellationToken)
     {
-        await _maintenanceGate.WaitAsync(cancellationToken);
+        await _maintenanceGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await CollectGarbageBatchAsync(cancellationToken);
+            return await CollectGarbageBatchAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -2919,14 +2998,14 @@ public sealed class BlobService(
         var page = await chunks.EnumerateChunkIdsPageAsync(
             _garbageCollectionCursor,
             _options.GarbageCollectionChunksPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         if (page.Items.Count == 0)
         {
             _garbageCollectionCursor = null;
             return 0;
         }
 
-        var firstReachabilitySnapshot = await metadata.FindReachableChunkIdsAsync(page.Items, cancellationToken);
+        var firstReachabilitySnapshot = await metadata.FindReachableChunkIdsAsync(page.Items, cancellationToken).ConfigureAwait(false);
         var reservations = new List<ChunkStore.ChunkMutationReservation>();
         var deleted = 0;
         try
@@ -2943,14 +3022,15 @@ public sealed class BlobService(
 
             var confirmedReachability = await metadata.FindReachableChunkIdsAsync(
                 reservations.Select(reservation => reservation.Id).ToArray(),
-                cancellationToken);
-            foreach (var reservation in reservations)
+                cancellationToken).ConfigureAwait(false);
+            for (var reservationIndex = 0; reservationIndex < reservations.Count; reservationIndex++)
             {
+                var reservation = reservations[reservationIndex];
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!confirmedReachability.Contains(reservation.Id))
                 {
                     faultInjector.Inject(StorageFaultPoint.BeforeGarbageCollectionDelete);
-                    if (await reservation.TryDeleteAsync(cancellationToken))
+                    if (await reservation.TryDeleteAsync(cancellationToken).ConfigureAwait(false))
                         deleted++;
                 }
             }
@@ -2959,8 +3039,8 @@ public sealed class BlobService(
         }
         finally
         {
-            foreach (var reservation in reservations)
-                reservation.Dispose();
+            for (var reservationIndex = 0; reservationIndex < reservations.Count; reservationIndex++)
+                reservations[reservationIndex].Dispose();
         }
     }
 
@@ -2974,7 +3054,7 @@ public sealed class BlobService(
             _integrityCursor,
             _options.IntegrityScanChunksPerMaintenancePass,
             excludeCustomerProvidedKeyDomains: false,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         if (page.Items.Count == 0)
         {
             telemetry.RecordIntegrity(new StorageIntegritySnapshot(
@@ -2993,7 +3073,7 @@ public sealed class BlobService(
         foreach (var id in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var status = await chunks.VerifyChunkAsync(id, cancellationToken);
+            var status = await chunks.VerifyChunkAsync(id, cancellationToken).ConfigureAwait(false);
             _integrityChecked++;
             switch (status)
             {
@@ -3010,7 +3090,7 @@ public sealed class BlobService(
                     _integrityCorrupt++;
                     break;
                 default:
-                    throw new ArgumentOutOfRangeException(nameof(status));
+                    throw new InvalidDataException($"Unexpected chunk integrity status: {status}.");
             }
         }
 
@@ -3035,7 +3115,7 @@ public sealed class BlobService(
         var page = await metadata.ListSealedChunkPacksAsync(
             _packCompactionCursor,
             _options.ChunkPacksPerMaintenancePass,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         if (page.Items.Count == 0)
         {
             _packCompactionCursor = null;
@@ -3049,7 +3129,7 @@ public sealed class BlobService(
         foreach (var pack in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = await chunks.TryCompactPackAsync(pack, cancellationToken);
+            var result = await chunks.TryCompactPackAsync(pack, cancellationToken).ConfigureAwait(false);
             examined += result.ExaminedPacks;
             compacted += result.CompactedPacks;
             reclaimedRecords += result.ReclaimedRecords;
@@ -3077,7 +3157,7 @@ public sealed class BlobService(
             _recompressionCursor,
             _options.BackgroundCompressionChunksPerMaintenancePass,
             excludeCustomerProvidedKeyDomains: true,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         if (page.Items.Count == 0)
         {
             _recompressionCursor = null;
@@ -3090,7 +3170,7 @@ public sealed class BlobService(
         foreach (var id in page.Items)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var result = await chunks.TryRecompressChunkAsync(id, now, cancellationToken);
+            var result = await chunks.TryRecompressChunkAsync(id, now, cancellationToken).ConfigureAwait(false);
             examined += result.ExaminedChunks;
             recompressed += result.RecompressedChunks;
             bytesSaved = checked(bytesSaved + result.BytesSaved);
@@ -3104,20 +3184,21 @@ public sealed class BlobService(
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
-        if (blob.Copy?.Status != "pending" ||
+        var copy = blob.Copy;
+        if (copy is null || !string.Equals(copy.Status, "pending", StringComparison.Ordinal) ||
             blob.PendingCopyContent is null)
         {
             return blob;
         }
 
         var now = metadata.GetUtcNow();
-        if (blob.Copy.ExpiresAt <= now &&
-            (!blob.Copy.ReadyAt.HasValue || blob.Copy.ReadyAt > blob.Copy.ExpiresAt))
+        if (copy.ExpiresAt <= now &&
+            (!copy.ReadyAt.HasValue || copy.ReadyAt > copy.ExpiresAt))
         {
             var failedTier = RehydrationTargetTier(blob.ArchiveStatus) ?? blob.AccessTier;
             var failed = blob with
             {
-                Content = blob.Copy.IsIncremental
+                Content = copy.IsIncremental
                     ? blob.Content
                     : chunks.Empty(blob.Account, EncryptionOf(blob)),
                 PendingCopyContent = null,
@@ -3125,15 +3206,15 @@ public sealed class BlobService(
                 PendingCopyAppendBlockCount = null,
                 PendingCopyIsSealed = null,
                 PendingCopyPageRanges = null,
-                CommittedBlocks = blob.Copy.IsIncremental ? blob.CommittedBlocks : [],
-                PageRanges = blob.Copy.IsIncremental ? blob.PageRanges : [],
-                AppendBlockCount = blob.Copy.IsIncremental ? blob.AppendBlockCount : 0,
-                IsSealed = blob.Copy.IsIncremental && blob.IsSealed,
+                CommittedBlocks = copy.IsIncremental ? blob.CommittedBlocks : [],
+                PageRanges = copy.IsIncremental ? blob.PageRanges : [],
+                AppendBlockCount = copy.IsIncremental ? blob.AppendBlockCount : 0,
+                IsSealed = copy.IsIncremental && blob.IsSealed,
                 AccessTier = failedTier,
                 ArchiveStatus = null,
                 RehydratePriority = null,
                 RehydrateCompleteAt = null,
-                Copy = blob.Copy with
+                Copy = copy with
                 {
                     Status = "failed",
                     BytesCopied = 0,
@@ -3148,7 +3229,7 @@ public sealed class BlobService(
             };
             try
             {
-                await metadata.PutBlobRecordAsync(failed, blob.Revision, cancellationToken);
+                await metadata.PutBlobRecordAsync(failed, blob.Revision, cancellationToken).ConfigureAwait(false);
                 return failed;
             }
             catch (StorageConcurrencyException)
@@ -3160,12 +3241,12 @@ public sealed class BlobService(
                            blob.VersionId,
                            blob.Snapshot,
                            includeDeleted: false,
-                           cancellationToken)
+                           cancellationToken).ConfigureAwait(false)
                        ?? throw AzureStorageException.BlobNotFound();
             }
         }
 
-        if (!blob.Copy.ReadyAt.HasValue || blob.Copy.ReadyAt.Value > now)
+        if (!copy.ReadyAt.HasValue || copy.ReadyAt.Value > now)
             return blob;
 
         using var contentPin = chunks.Pin(blob.PendingCopyContent);
@@ -3182,13 +3263,13 @@ public sealed class BlobService(
             PendingCopyIsSealed = null,
             PageRanges = blob.PendingCopyPageRanges ?? blob.PageRanges,
             PendingCopyPageRanges = null,
-            IncrementalCopySourceSnapshot = blob.Copy.IsIncremental
-                ? blob.Copy.SourceSnapshot
+            IncrementalCopySourceSnapshot = copy.IsIncremental
+                ? copy.SourceSnapshot
                 : blob.IncrementalCopySourceSnapshot,
-            Copy = blob.Copy with
+            Copy = copy with
             {
                 Status = "success",
-                BytesCopied = blob.Copy.TotalBytes,
+                BytesCopied = copy.TotalBytes,
                 CompletedAt = now,
                 ReadyAt = null,
                 ExpiresAt = null
@@ -3202,9 +3283,9 @@ public sealed class BlobService(
         };
         try
         {
-            if (blob.Copy.IsIncremental)
-                return await metadata.CompleteIncrementalCopyAsync(updated, blob.Revision, now, cancellationToken);
-            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+            if (copy.IsIncremental)
+                return await metadata.CompleteIncrementalCopyAsync(updated, blob.Revision, now, cancellationToken).ConfigureAwait(false);
+            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken).ConfigureAwait(false);
             return updated;
         }
         catch (StorageConcurrencyException)
@@ -3216,7 +3297,7 @@ public sealed class BlobService(
                        blob.VersionId,
                        blob.Snapshot,
                        includeDeleted: false,
-                       cancellationToken)
+                       cancellationToken).ConfigureAwait(false)
                    ?? throw AzureStorageException.BlobNotFound();
         }
     }
@@ -3225,7 +3306,7 @@ public sealed class BlobService(
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
-        if (blob.Copy?.Status == "pending" ||
+        if (string.Equals(blob.Copy?.Status, "pending", StringComparison.Ordinal) ||
             blob.ArchiveStatus is null ||
             !blob.RehydrateCompleteAt.HasValue ||
             blob.RehydrateCompleteAt.Value > metadata.GetUtcNow())
@@ -3242,8 +3323,8 @@ public sealed class BlobService(
         var updated = blob with
         {
             AccessTier = targetTier,
-            SmartAccessTier = targetTier == "Smart" ? "Hot" : null,
-            SmartTierLastAccessedAt = targetTier == "Smart" ? now : null,
+            SmartAccessTier = string.Equals(targetTier, "Smart", StringComparison.Ordinal) ? "Hot" : null,
+            SmartTierLastAccessedAt = string.Equals(targetTier, "Smart", StringComparison.Ordinal) ? now : null,
             AccessTierChangedAt = now,
             ArchiveStatus = null,
             RehydratePriority = null,
@@ -3252,7 +3333,7 @@ public sealed class BlobService(
         };
         try
         {
-            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+            await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken).ConfigureAwait(false);
             return updated;
         }
         catch (StorageConcurrencyException)
@@ -3264,7 +3345,7 @@ public sealed class BlobService(
                        blob.VersionId,
                        blob.Snapshot,
                        includeDeleted: false,
-                       cancellationToken)
+                       cancellationToken).ConfigureAwait(false)
                    ?? throw AzureStorageException.BlobNotFound();
         }
     }
@@ -3312,7 +3393,7 @@ public sealed class BlobService(
             SmartTierLastAccessedAt = lastAccessedAt,
             AccessTierChangedAt = now
         };
-        await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken);
+        await metadata.PutBlobRecordAsync(updated, blob.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }
 
@@ -3370,7 +3451,7 @@ public sealed class BlobService(
             AccessTier = options.AccessTier ?? "Hot",
             AccessTierInferred = kind == BlobKind.BlockBlob &&
                                  (options.AccessTierInferred ?? options.AccessTier is null),
-            SmartAccessTier = options.AccessTier == "Smart" ? "Hot" : null,
+            SmartAccessTier = string.Equals(options.AccessTier, "Smart", StringComparison.Ordinal) ? "Hot" : null,
             LastAccessedAt = IsLastAccessTimeTrackingEnabled(account) ? now : null,
             AccessTierChangedAt = options.AccessTierSpecified ? now : null,
             ImmutabilityUntil = options.ImmutabilityUntil,
@@ -3382,7 +3463,7 @@ public sealed class BlobService(
                 : options.EncryptionContext,
             ExpiresAt = options.ExpiresAt,
             CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256,
-            SmartTierLastAccessedAt = options.AccessTier == "Smart" ? now : null
+            SmartTierLastAccessedAt = string.Equals(options.AccessTier, "Smart", StringComparison.Ordinal) ? now : null
         };
     }
 
@@ -3405,7 +3486,7 @@ public sealed class BlobService(
         CancellationToken cancellationToken,
         BlobRecord? current = null)
     {
-        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken);
+        var containerRecord = await GetContainerAsync(account, container, includeDeleted: false, cancellationToken).ConfigureAwait(false);
         if (options.ImmutabilityUntil.HasValue || options.ImmutabilityLocked || options.HasLegalHold)
             EnsureVersionLevelImmutabilityEnabled(containerRecord);
         var resolved = ApplyContainerEncryptionPolicy(containerRecord, EncryptionOf(options), current);
@@ -3551,8 +3632,8 @@ public sealed class BlobService(
             var length = checked((int)Math.Min(comparisonBatchBytes, endExclusive - cursor));
             using var currentBytes = new MemoryStream(length);
             using var previousBytes = new MemoryStream(length);
-            await chunks.WriteRangeAsync(current.Content, encryption, cursor, length, currentBytes, cancellationToken);
-            await chunks.WriteRangeAsync(previous.Content, encryption, cursor, length, previousBytes, cancellationToken);
+            await chunks.WriteRangeAsync(current.Content, encryption, cursor, length, currentBytes, cancellationToken).ConfigureAwait(false);
+            await chunks.WriteRangeAsync(previous.Content, encryption, cursor, length, previousBytes, cancellationToken).ConfigureAwait(false);
 
             var currentSpan = currentBytes.GetBuffer().AsSpan(0, length);
             var previousSpan = previousBytes.GetBuffer().AsSpan(0, length);
@@ -3565,7 +3646,7 @@ public sealed class BlobService(
         }
     }
 
-    private static IReadOnlyList<PageRange> ClipPageRanges(
+    private static PageRange[] ClipPageRanges(
         IReadOnlyList<PageRange> ranges,
         long start,
         long end)
@@ -3655,6 +3736,15 @@ public sealed class BlobService(
     private BlobRecord PrepareBlobWrite(BlobRecord blob) =>
         blob with { Lease = leases.ResetAfterBlobWrite(blob.Lease) };
 
+    private static string ProtocolLowercase(string value)
+    {
+        // Azure's sequence actions and rehydration status tokens are lowercase wire values.
+#pragma warning disable CA1308
+        return value.ToLowerInvariant();
+#pragma warning restore CA1308
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private readonly record struct ObjectReplicationPassResult(int Completed, int Failed);
 
     private async Task EnsureHierarchicalDirectoryIndexAsync(
@@ -3668,12 +3758,12 @@ public sealed class BlobService(
         if (_indexedHierarchicalContainers.ContainsKey(key))
             return;
 
-        await _hierarchicalDirectoryGate.WaitAsync(cancellationToken);
+        await _hierarchicalDirectoryGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (_indexedHierarchicalContainers.ContainsKey(key))
                 return;
-            await metadata.EnsureHierarchicalDirectoriesAsync(account, container, cancellationToken);
+            await metadata.EnsureHierarchicalDirectoriesAsync(account, container, cancellationToken).ConfigureAwait(false);
             _indexedHierarchicalContainers.TryAdd(key, 0);
         }
         finally
@@ -3743,7 +3833,7 @@ public sealed class BlobService(
             blob.Account,
             blob.Container,
             includeDeleted: false,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
         EnsureVersionLevelImmutabilityEnabled(container);
     }
 
@@ -3768,7 +3858,7 @@ public sealed class BlobService(
 
     private static void EnsureNoPendingCopy(BlobRecord blob)
     {
-        if (blob.Copy?.Status == "pending")
+        if (string.Equals(blob.Copy?.Status, "pending", StringComparison.Ordinal))
         {
             throw new AzureStorageException(
                 StatusCodes.Status409Conflict,

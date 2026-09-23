@@ -3,21 +3,11 @@ using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
 
-public enum LeaseAction
-{
-    Acquire,
-    Renew,
-    Change,
-    Release,
-    Break
-}
-
-public readonly record struct LeaseTransition(LeaseRecord Lease, int? RemainingSeconds);
-
 public sealed class LeaseService(TimeProvider timeProvider)
 {
     public LeaseRecord GetEffective(LeaseRecord lease)
     {
+        ArgumentNullException.ThrowIfNull(lease);
         var now = timeProvider.GetUtcNow();
         if (lease.State == LeaseState.Breaking && lease.BreakEndsAt <= now)
         {
@@ -47,6 +37,7 @@ public sealed class LeaseService(TimeProvider timeProvider)
 
     public LeaseRecord ResetAfterBlobWrite(LeaseRecord lease)
     {
+        ArgumentNullException.ThrowIfNull(lease);
         var effective = GetEffective(lease);
         return effective.State is LeaseState.Available or LeaseState.Expired or LeaseState.Broken
             ? LeaseRecord.Available
@@ -59,6 +50,7 @@ public sealed class LeaseService(TimeProvider timeProvider)
         string resource,
         string headerName = "x-ms-lease-id")
     {
+        ArgumentNullException.ThrowIfNull(lease);
         var effective = GetEffective(lease);
         var supplied = ParseOptionalId(suppliedId, headerName);
         if (effective.State is LeaseState.Leased or LeaseState.Breaking)
@@ -80,6 +72,7 @@ public sealed class LeaseService(TimeProvider timeProvider)
         string resource,
         string headerName = "x-ms-lease-id")
     {
+        ArgumentNullException.ThrowIfNull(lease);
         if (suppliedId is null)
             return;
 
@@ -100,6 +93,7 @@ public sealed class LeaseService(TimeProvider timeProvider)
         string? proposedId,
         bool useLegacySemantics = false)
     {
+        ArgumentNullException.ThrowIfNull(lease);
         var current = GetEffective(lease);
         return action switch
         {
