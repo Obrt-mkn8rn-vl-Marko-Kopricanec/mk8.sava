@@ -522,6 +522,114 @@ public sealed class StorageEnospcHarnessTests
             dataPath, liveBytes, seed, configuration).ConfigureAwait(true);
     }
 
+    [Fact]
+    public async Task ExhaustedFilesystemAtPackCompactionCommitKeepsOldPackAuthoritative()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "compaction-commit-data");
+        var fillerPath = Path.Combine(mountRoot, "compaction-commit-filler.bin");
+        var liveBytes = RandomNumberGenerator.GetBytes(4096);
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
+            ["Sava:ChunkPackMaximumRecords"] = "2",
+            ["Sava:ChunkPackCompactionMinimumSavingsBytes"] = "1",
+            ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
+        };
+
+        var identity = await AssertPackCompactionCommitRejectedAsync(
+            dataPath, fillerPath, liveBytes, configuration).ConfigureAwait(true);
+        await AssertPackCompactionCommitRecoversAsync(
+            dataPath, liveBytes, identity, configuration).ConfigureAwait(true);
+    }
+
+    private static async Task<CompactionIdentity> AssertPackCompactionCommitRejectedAsync(
+        string dataPath,
+        string fillerPath,
+        byte[] liveBytes,
+        Dictionary<string, string?> configuration)
+    {
+        var injector = new EnospcAtCommitFaultInjector(fillerPath, StorageFaultPoint.BeforePackMetadataCommit);
+        var first = CreateHarness(dataPath, configuration, injector);
+        try
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            var seed = await SeedCompactionAsync(first, dataPath, liveBytes).ConfigureAwait(false);
+            var metadata = first.Services.GetRequiredService<MetadataStore>();
+            var chunks = first.Services.GetRequiredService<ChunkStore>();
+            injector.Arm();
+            try
+            {
+                var failure = await Assert.ThrowsAnyAsync<Exception>(() =>
+                    chunks.TryCompactPackAsync(seed.Pack, CancellationToken.None)).ConfigureAwait(false);
+                Assert.True(injector.Filled);
+                if (failure is Microsoft.Data.Sqlite.SqliteException sqlite)
+                    Assert.Equal(13, sqlite.SqliteErrorCode);
+                else
+                    Assert.Contains("No space left on device", Assert.IsType<IOException>(failure).Message,
+                        StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                if (File.Exists(fillerPath))
+                    File.Delete(fillerPath);
+            }
+
+            Assert.True(Directory.EnumerateFiles(Path.Combine(dataPath, "packs"), "*.pack",
+                SearchOption.AllDirectories).Count() >= 2);
+            Assert.Equal(seed.OldPackLength, new FileInfo(seed.PackPath).Length);
+            Assert.Equal(seed.Identity.PackId,
+                (await metadata.GetPackedChunkLocationAsync(seed.Identity.ChunkId, CancellationToken.None)
+                    .ConfigureAwait(false))?.PackId);
+            Assert.Equal(liveBytes, (await seed.Live.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            return seed.Identity;
+        }
+        finally
+        {
+            await first.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertPackCompactionCommitRecoversAsync(
+        string dataPath,
+        byte[] liveBytes,
+        CompactionIdentity identity,
+        Dictionary<string, string?> configuration)
+    {
+        var restarted = CreateHarness(dataPath, configuration);
+        try
+        {
+            await restarted.InitializeAsync().ConfigureAwait(false);
+            var metadata = restarted.Services.GetRequiredService<MetadataStore>();
+            var chunks = restarted.Services.GetRequiredService<ChunkStore>();
+            var live = CreateClient(restarted)
+                .GetBlobContainerClient("enospc-compaction")
+                .GetBlobClient("live.bin");
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            Assert.Equal(identity.PackId,
+                (await metadata.GetPackedChunkLocationAsync(identity.ChunkId, CancellationToken.None)
+                    .ConfigureAwait(false))?.PackId);
+            var reclaimed = await chunks.ReclaimOrphanedPacksAsync(
+                DateTimeOffset.UtcNow.AddMinutes(1), 16, CancellationToken.None).ConfigureAwait(false);
+            Assert.Equal(1, reclaimed.ReclaimedPacks);
+            var oldPack = Assert.Single((await metadata.ListSealedChunkPacksAsync(
+                after: null, maximum: 16, CancellationToken.None).ConfigureAwait(false)).Items);
+            Assert.Equal(identity.PackId, oldPack.PackId);
+            Assert.Equal(1, (await chunks.TryCompactPackAsync(oldPack, CancellationToken.None)
+                .ConfigureAwait(false)).CompactedPacks);
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await restarted.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     private static async Task<CompactionIdentity> AssertPackCompactionRejectedAsync(
         string dataPath,
         string fillerPath,
@@ -722,7 +830,9 @@ public sealed class StorageEnospcHarnessTests
         }
     }
 
-    private sealed class EnospcAtCommitFaultInjector(string fillerPath) : IStorageFaultInjector
+    private sealed class EnospcAtCommitFaultInjector(
+        string fillerPath,
+        StorageFaultPoint targetPoint = StorageFaultPoint.BeforeBlobMetadataCommit) : IStorageFaultInjector
     {
         private int _armed;
         private int _filled;
@@ -733,7 +843,7 @@ public sealed class StorageEnospcHarnessTests
 
         public void Inject(StorageFaultPoint point)
         {
-            if (point != StorageFaultPoint.BeforeBlobMetadataCommit ||
+            if (point != targetPoint ||
                 Interlocked.Exchange(ref _armed, 0) != 1)
                 return;
             FillUntilNoSpace(fillerPath, releaseBytes: 0);
