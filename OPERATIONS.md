@@ -148,7 +148,9 @@ through the SDK, an allowed preflight, a denied origin, and a malformed
 preflight. A same-account copy scenario compares source conditions, completion,
 and exact downloaded bytes. A blob-list scenario compares filtered metadata,
 one-item pages and continuations, and delimiter-based hierarchy prefixes with
-an out-of-prefix blob. Azurite returns the generic `ConditionNotMet` for
+an out-of-prefix blob. A stored-access-policy scenario compares a read-only
+service SAS, denied overwrite, and revocation after policy removal. Azurite
+returns the generic `ConditionNotMet` for
 a stale copy-source ETag; mk8.sava retains the published Blob-specific
 `SourceConditionNotMet` code, and the test records this emulator divergence.
 The script configures Azurite with the test account key used by mk8.sava and

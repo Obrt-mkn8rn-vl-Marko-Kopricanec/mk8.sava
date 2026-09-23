@@ -5,6 +5,7 @@ using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
+using Azure.Storage.Sas;
 
 namespace Mk8.Sava.Tests;
 
@@ -217,6 +218,45 @@ public sealed class AzuriteDifferentialTests
         {
             var expected = await ExerciseBlobListingAsync(azuriteContainer).ConfigureAwait(false);
             var actual = await ExerciseBlobListingAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task StoredAccessPolicySasReadAndWriteDenialMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseStoredPolicySasAsync(
+                azuriteContainer, uri => new BlobClient(uri, CreateOptions())).ConfigureAwait(false);
+            var actual = await ExerciseStoredPolicySasAsync(localContainer, uri =>
+            {
+                var options = CreateOptions();
+                options.Transport = new HttpClientTransport(application.Server.CreateHandler());
+                return new BlobClient(uri, options);
+            }).ConfigureAwait(false);
+            Assert.Equal("reader", expected.Identifier);
+            Assert.Equal("r", expected.Permissions);
+            Assert.Equal("policy payload", expected.ReadBytes);
+            Assert.Equal("policy payload", expected.RetainedBytes);
+            Assert.Equal(403, expected.DeniedWriteStatus);
+            Assert.Equal(403, expected.RevokedReadStatus);
             Assert.Equal(expected, actual);
         }
         finally
@@ -559,6 +599,46 @@ public sealed class AzuriteDifferentialTests
             string.Join('|', hierarchyPages), hierarchyContinuations);
     }
 
+    private static async Task<StoredPolicySasObservation> ExerciseStoredPolicySasAsync(
+        BlobContainerClient container, Func<Uri, BlobClient> createSasClient)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("policy.txt");
+        await blob.UploadAsync(BinaryData.FromString("policy payload")).ConfigureAwait(false);
+        await container.SetAccessPolicyAsync(PublicAccessType.None,
+            [new BlobSignedIdentifier
+            {
+                Id = "reader",
+                AccessPolicy = new BlobAccessPolicy
+                {
+                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+                    ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+                    Permissions = "r"
+                }
+            }]).ConfigureAwait(false);
+        var policy = Assert.Single((await container.GetAccessPolicyAsync().ConfigureAwait(false)).Value.SignedIdentifiers);
+        var sas = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
+            Resource = "b",
+            Identifier = "reader",
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        var client = createSasClient(blob.GenerateSasUri(sas));
+        var read = await client.DownloadContentAsync().ConfigureAwait(false);
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            client.UploadAsync(BinaryData.FromString("blocked"), overwrite: true)).ConfigureAwait(false);
+        var retained = await blob.DownloadContentAsync().ConfigureAwait(false);
+        await container.SetAccessPolicyAsync(PublicAccessType.None, []).ConfigureAwait(false);
+        var revoked = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            client.DownloadContentAsync()).ConfigureAwait(false);
+        return new StoredPolicySasObservation(
+            policy.Id, policy.AccessPolicy.Permissions,
+            read.Value.Content.ToString(), denied.Status, denied.ErrorCode,
+            retained.Value.Content.ToString(), revoked.Status, revoked.ErrorCode);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -633,4 +713,9 @@ public sealed class AzuriteDifferentialTests
     private sealed record BlobListingObservation(
         string FlatPages, int FlatContinuations,
         string HierarchyPages, int HierarchyContinuations);
+
+    private sealed record StoredPolicySasObservation(
+        string Identifier, string Permissions, string ReadBytes,
+        int DeniedWriteStatus, string? DeniedWriteCode, string RetainedBytes,
+        int RevokedReadStatus, string? RevokedReadCode);
 }
