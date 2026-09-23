@@ -150,6 +150,24 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task ServiceCorsPropertiesMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        using var azuriteTransport = new HttpClient();
+        using var localTransport = new HttpClient(application.Server.CreateHandler());
+        var expected = await ExerciseServiceCorsAsync(azurite, azuriteTransport).ConfigureAwait(false);
+        var actual = await ExerciseServiceCorsAsync(local, localTransport).ConfigureAwait(false);
+        Assert.Equal(expected, actual);
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -346,6 +364,46 @@ public sealed class AzuriteDifferentialTests
         return new ContainerListingObservation(string.Join('|', pages), continuationCount);
     }
 
+    private static async Task<ServiceCorsObservation> ExerciseServiceCorsAsync(
+        BlobServiceClient service,
+        HttpClient transport)
+    {
+        var initial = await service.GetPropertiesAsync().ConfigureAwait(false);
+        var properties = initial.Value;
+        properties.Cors.Clear();
+        properties.Cors.Add(new BlobCorsRule
+        {
+            AllowedOrigins = "https://client.example.test",
+            AllowedMethods = "GET,HEAD",
+            AllowedHeaders = "x-ms-meta-*",
+            ExposedHeaders = "x-ms-request-id",
+            MaxAgeInSeconds = 321
+        });
+        var written = await service.SetPropertiesAsync(properties).ConfigureAwait(false);
+        var read = await service.GetPropertiesAsync().ConfigureAwait(false);
+        var rule = Assert.Single(read.Value.Cors);
+        var preflight = await ExerciseCorsPreflightAsync(transport, service.Uri).ConfigureAwait(false);
+        return new ServiceCorsObservation(initial.GetRawResponse().Status, written.Status,
+            read.GetRawResponse().Status, rule.AllowedOrigins, rule.AllowedMethods,
+            rule.AllowedHeaders, rule.ExposedHeaders, rule.MaxAgeInSeconds, preflight);
+    }
+
+    private static async Task<CorsPreflightObservation> ExerciseCorsPreflightAsync(
+        HttpClient transport,
+        Uri serviceUri)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Options, new Uri(serviceUri, "?comp=list"));
+        request.Headers.TryAddWithoutValidation("Origin", "https://client.example.test");
+        request.Headers.TryAddWithoutValidation("Access-Control-Request-Method", "GET");
+        request.Headers.TryAddWithoutValidation("Access-Control-Request-Headers", "x-ms-meta-test");
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        return new CorsPreflightObservation(
+            (int)response.StatusCode,
+            string.Join(',', response.Headers.GetValues("Access-Control-Allow-Origin")),
+            string.Join(',', response.Headers.GetValues("Access-Control-Allow-Methods")),
+            string.Join(',', response.Headers.GetValues("Access-Control-Max-Age")));
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -404,4 +462,11 @@ public sealed class AzuriteDifferentialTests
         int DeleteStatus);
 
     private sealed record ContainerListingObservation(string Pages, int ContinuationCount);
+
+    private sealed record ServiceCorsObservation(
+        int InitialStatus, int SetStatus, int GetStatus,
+        string AllowedOrigins, string AllowedMethods, string AllowedHeaders,
+        string ExposedHeaders, int MaxAgeInSeconds, CorsPreflightObservation Preflight);
+
+    private sealed record CorsPreflightObservation(int Status, string AllowedOrigin, string AllowedMethods, string MaxAge);
 }
