@@ -11105,9 +11105,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var metadata = application.Services.GetRequiredService<MetadataStore>();
         var chunkStore = application.Services.GetRequiredService<ChunkStore>();
 
+        await AssertPinnedChunksSurviveMaintenanceAsync(
+            container, containerName, blobService, chunkStore).ConfigureAwait(true);
+        await AssertBlobExpiryMaintenanceAsync(container, containerName, blobService).ConfigureAwait(true);
+        await AssertStaleBlocksExpireAsync(
+            application, container, containerName, blobService, metadata).ConfigureAwait(true);
+    }
+
+    private static async Task AssertPinnedChunksSurviveMaintenanceAsync(
+        BlobContainerClient container, string containerName, BlobService blobService, ChunkStore chunkStore)
+    {
         var protectedBlob = container.GetBlobClient("active-reader.bin");
         var protectedBytes = RandomNumberGenerator.GetBytes(48 * 1024);
-        await protectedBlob.UploadAsync(BinaryData.FromBytes(protectedBytes));
+        await protectedBlob.UploadAsync(BinaryData.FromBytes(protectedBytes)).ConfigureAwait(false);
         var protectedRecord = await blobService.GetBlobAsync(
             SavaWebApplicationFactory.AccountName,
             containerName,
@@ -11115,7 +11125,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             versionId: null,
             snapshot: null,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         var protectedChunkIds = protectedRecord.Content.Chunks
             .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
             .Select(chunk => chunk.Id)
@@ -11123,18 +11133,24 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         using (chunkStore.Pin(protectedRecord.Content))
         {
-            await protectedBlob.DeleteAsync();
-            await blobService.RunMaintenanceAsync(CancellationToken.None);
+            await protectedBlob.DeleteAsync().ConfigureAwait(false);
+            await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
             foreach (var chunkId in protectedChunkIds)
-                Assert.Equal(ChunkIntegrityStatus.Verified, await chunkStore.VerifyChunkAsync(chunkId, CancellationToken.None));
+                Assert.Equal(ChunkIntegrityStatus.Verified,
+                    await chunkStore.VerifyChunkAsync(chunkId, CancellationToken.None).ConfigureAwait(false));
         }
 
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
         foreach (var chunkId in protectedChunkIds)
-            Assert.Equal(ChunkIntegrityStatus.Missing, await chunkStore.VerifyChunkAsync(chunkId, CancellationToken.None));
+            Assert.Equal(ChunkIntegrityStatus.Missing,
+                await chunkStore.VerifyChunkAsync(chunkId, CancellationToken.None).ConfigureAwait(false));
+    }
 
+    private static async Task AssertBlobExpiryMaintenanceAsync(
+        BlobContainerClient container, string containerName, BlobService blobService)
+    {
         var expiring = container.GetBlobClient("expiring.bin");
-        await expiring.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(20 * 1024)));
+        await expiring.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(20 * 1024))).ConfigureAwait(false);
         var expiringRecord = await blobService.GetBlobAsync(
             SavaWebApplicationFactory.AccountName,
             containerName,
@@ -11142,33 +11158,38 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             versionId: null,
             snapshot: null,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         await blobService.SetExpiryAsync(
             expiringRecord,
             DateTimeOffset.UtcNow.AddMilliseconds(100),
-            CancellationToken.None);
-        await Task.Delay(150);
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
-        Assert.False((await expiring.ExistsAsync()).Value);
+            CancellationToken.None).ConfigureAwait(false);
+        await Task.Delay(150).ConfigureAwait(false);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.False((await expiring.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertStaleBlocksExpireAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, string containerName,
+        BlobService blobService, MetadataStore metadata)
+    {
         var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
         var blockId = Convert.ToBase64String("stale-block-0001"u8);
-        await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(32 * 1024)));
+        await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(32 * 1024))).ConfigureAwait(false);
         var staged = Assert.Single(await blobService.ListStagedBlocksAsync(
             SavaWebApplicationFactory.AccountName,
             containerName,
             uncommitted.Name,
-            CancellationToken.None));
+            CancellationToken.None).ConfigureAwait(false));
         await metadata.PutStagedBlockAsync(
             staged with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) },
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
 
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
         Assert.Empty(await blobService.ListStagedBlocksAsync(
             SavaWebApplicationFactory.AccountName,
             containerName,
             uncommitted.Name,
-            CancellationToken.None));
+            CancellationToken.None).ConfigureAwait(false));
         Assert.All(
             staged.Content.Chunks.Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal)),
             chunk => Assert.False(File.Exists(ChunkPath(application.DataPath, chunk.Id))));
@@ -11921,69 +11942,68 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         try
         {
-            var enabled = (await client.GetPropertiesAsync()).Value;
-            enabled.DeleteRetentionPolicy.Enabled = true;
-            enabled.DeleteRetentionPolicy.Days = 1;
-            await client.SetPropertiesAsync(enabled);
-            await blob.DeleteAsync();
-
-            var deleted = await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                containerName,
-                blob.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.NotNull(deleted?.DeleteRetentionUntil);
-            Assert.InRange(
-                deleted!.DeleteRetentionUntil!.Value - deleted.DeletedAt!.Value,
-                TimeSpan.FromHours(23.9),
-                TimeSpan.FromHours(24.1));
-
-            var disabled = (await client.GetPropertiesAsync()).Value;
-            disabled.DeleteRetentionPolicy.Enabled = false;
-            await client.SetPropertiesAsync(disabled);
-            await blob.UndeleteAsync();
-            Assert.True((await blob.ExistsAsync()).Value);
-
-            enabled = (await client.GetPropertiesAsync()).Value;
-            enabled.DeleteRetentionPolicy.Enabled = true;
-            enabled.DeleteRetentionPolicy.Days = 1;
-            await client.SetPropertiesAsync(enabled);
-            await blob.DeleteAsync();
-            deleted = await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                containerName,
-                blob.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.NotNull(deleted);
-            await metadata.PutBlobRecordAsync(
-                deleted! with
-                {
-                    Revision = MetadataStore.NewRevision(),
-                    DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
-                },
-                deleted.Revision,
-                CancellationToken.None);
-
-            await blobService.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Null(await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                containerName,
-                blob.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: true,
-                CancellationToken.None));
+            await AssertRetentionSurvivesPolicyChangeAsync(client, blob, metadata, containerName);
+            await AssertExpiredSoftDeleteIsPurgedAsync(client, blob, blobService, metadata, containerName);
         }
         finally
         {
             await client.SetPropertiesAsync(original);
         }
+    }
+
+    private static async Task AssertRetentionSurvivesPolicyChangeAsync(
+        BlobServiceClient client, BlobClient blob, MetadataStore metadata, string containerName)
+    {
+        var enabled = (await client.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        enabled.DeleteRetentionPolicy.Enabled = true;
+        enabled.DeleteRetentionPolicy.Days = 1;
+        await client.SetPropertiesAsync(enabled).ConfigureAwait(false);
+        await blob.DeleteAsync().ConfigureAwait(false);
+
+        var deleted = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, containerName, blob.Name,
+            versionId: null, snapshot: null, includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.NotNull(deleted?.DeleteRetentionUntil);
+        Assert.InRange(
+            deleted!.DeleteRetentionUntil!.Value - deleted.DeletedAt!.Value,
+            TimeSpan.FromHours(23.9), TimeSpan.FromHours(24.1));
+
+        var disabled = (await client.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        disabled.DeleteRetentionPolicy.Enabled = false;
+        await client.SetPropertiesAsync(disabled).ConfigureAwait(false);
+        await blob.UndeleteAsync().ConfigureAwait(false);
+        Assert.True((await blob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
+
+    private static async Task AssertExpiredSoftDeleteIsPurgedAsync(
+        BlobServiceClient client, BlobClient blob, BlobService blobService,
+        MetadataStore metadata, string containerName)
+    {
+        var enabled = (await client.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        enabled.DeleteRetentionPolicy.Enabled = true;
+        enabled.DeleteRetentionPolicy.Days = 1;
+        await client.SetPropertiesAsync(enabled).ConfigureAwait(false);
+        await blob.DeleteAsync().ConfigureAwait(false);
+        var deleted = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, containerName, blob.Name,
+            versionId: null, snapshot: null, includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.NotNull(deleted);
+        await metadata.PutBlobRecordAsync(
+            deleted! with
+            {
+                Revision = MetadataStore.NewRevision(),
+                DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
+            },
+            deleted.Revision,
+            CancellationToken.None).ConfigureAwait(false);
+
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Null(await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, containerName, blob.Name,
+            versionId: null, snapshot: null, includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false));
     }
 
     [Fact]
@@ -13748,48 +13768,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
     [Fact]
     public async Task QueryBlobContentsReadsParquetRowGroupsThroughTheOfficialSdk()
     {
-        var id = new Parquet.Schema.DataField<int>("id");
-        var name = new Parquet.Schema.DataField<string>("name");
-        var enabled = new Parquet.Schema.DataField<bool>("enabled");
-        var score = new Parquet.Schema.DataField<double>("score");
-        var observed = new Parquet.Schema.DataField<DateTime>("observed");
-        var maybe = new Parquet.Schema.DataField<int?>("maybe");
-        var schema = new Parquet.Schema.ParquetSchema(id, name, enabled, score, observed, maybe);
-
-        using var content = new MemoryStream();
-        {
-            var writer = (await Parquet.ParquetWriter.CreateAsync(schema, content));
-            await using (writer.ConfigureAwait(false))
-            {
-                using (var group = writer.CreateRowGroup())
-                {
-                    await group.WriteAsync<int>(id, FirstParquetIds.AsMemory());
-                    await group.WriteAsync(name, FirstParquetNames);
-                    await group.WriteAsync<bool>(enabled, FirstParquetEnabled.AsMemory());
-                    await group.WriteAsync<double>(score, FirstParquetScores.AsMemory());
-                    await group.WriteAsync<DateTime>(
-                        observed,
-                        FirstParquetObserved.AsMemory());
-                    await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory());
-                    group.CompleteValidate();
-                }
-
-                using (var group = writer.CreateRowGroup())
-                {
-                    await group.WriteAsync<int>(id, SecondParquetIds.AsMemory());
-                    await group.WriteAsync(name, SecondParquetNames);
-                    await group.WriteAsync<bool>(enabled, SecondParquetEnabled.AsMemory());
-                    await group.WriteAsync<double>(score, SecondParquetScores.AsMemory());
-                    await group.WriteAsync<DateTime>(
-                        observed,
-                        SecondParquetObserved.AsMemory());
-                    await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory());
-                    group.CompleteValidate();
-                }
-            }
-        }
-        content.Position = 0;
-
+        using var content = new MemoryStream(await CreateParquetQueryFixtureAsync());
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"parquet-query-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -13807,7 +13786,56 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         using var resultReader = new StreamReader(response.Value.Content);
         var result = await resultReader.ReadToEndAsync();
         var lines = result.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        AssertParquetQueryRows(lines);
+    }
 
+    private static async Task<byte[]> CreateParquetQueryFixtureAsync()
+    {
+        var id = new Parquet.Schema.DataField<int>("id");
+        var name = new Parquet.Schema.DataField<string>("name");
+        var enabled = new Parquet.Schema.DataField<bool>("enabled");
+        var score = new Parquet.Schema.DataField<double>("score");
+        var observed = new Parquet.Schema.DataField<DateTime>("observed");
+        var maybe = new Parquet.Schema.DataField<int?>("maybe");
+        var schema = new Parquet.Schema.ParquetSchema(id, name, enabled, score, observed, maybe);
+
+        using var content = new MemoryStream();
+        {
+            var writer = await Parquet.ParquetWriter.CreateAsync(schema, content).ConfigureAwait(false);
+            await using (writer.ConfigureAwait(false))
+            {
+                using (var group = writer.CreateRowGroup())
+                {
+                    await group.WriteAsync<int>(id, FirstParquetIds.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync(name, FirstParquetNames).ConfigureAwait(false);
+                    await group.WriteAsync<bool>(enabled, FirstParquetEnabled.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<double>(score, FirstParquetScores.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<DateTime>(
+                        observed,
+                        FirstParquetObserved.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory()).ConfigureAwait(false);
+                    group.CompleteValidate();
+                }
+
+                using (var group = writer.CreateRowGroup())
+                {
+                    await group.WriteAsync<int>(id, SecondParquetIds.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync(name, SecondParquetNames).ConfigureAwait(false);
+                    await group.WriteAsync<bool>(enabled, SecondParquetEnabled.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<double>(score, SecondParquetScores.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<DateTime>(
+                        observed,
+                        SecondParquetObserved.AsMemory()).ConfigureAwait(false);
+                    await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory()).ConfigureAwait(false);
+                    group.CompleteValidate();
+                }
+            }
+        }
+        return content.ToArray();
+    }
+
+    private static void AssertParquetQueryRows(string[] lines)
+    {
         Assert.Equal(2, lines.Length);
         using var second = JsonDocument.Parse(lines[0]);
         Assert.Equal(2, second.RootElement.GetProperty("id").GetInt64());
