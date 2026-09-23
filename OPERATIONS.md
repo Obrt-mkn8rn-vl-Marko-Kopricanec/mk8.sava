@@ -177,6 +177,12 @@ A separate local Get Blob contract test exercises both transactional MD5 and
 CRC64 at the inclusive 4 MiB range limit, rejects a 4 MiB + 1 byte range and
 checksum-without-range with 400, and verifies that `x-ms-range` takes precedence
 over a simultaneous `Range` header.
+An eleventh scenario compares blob lease acquire, renew, ID change, stale-ID
+renewal failure, release, immediate break, and reacquisition through the SDK.
+It asserts the [published lease success statuses](https://learn.microsoft.com/en-us/rest/api/storageservices/lease-blob),
+immediate-break time, and unchanged ETag/last-modified values, as well as
+Azurite/mk8.sava observation equality. This is a single lifecycle path, not a
+complete lease-state/version matrix.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
@@ -748,7 +754,9 @@ an empty root. A full inventory still adds I/O on large roots, but it no longer
 monopolizes one maintenance pass. Like any live filesystem walk, it is a sampled
 inventory, not an atomic filesystem snapshot. A controlled local scale test
 uses 50,000 chunk files across 50 shards while 512 staging files are created,
-flushed, and deleted concurrently. It requires at most 110 inventory passes,
+flushed, and deleted concurrently. The scale-test collection runs without
+other xUnit tests in parallel so unrelated test activity does not enter its
+wall-clock budget. It requires at most 110 inventory passes,
 at most 500 ms per 1024-step pass, and a staging-mutation p99 below 250 ms.
 These are regression budgets for the local test filesystem, not measured
 production-client latency or a deployment-filesystem guarantee.
