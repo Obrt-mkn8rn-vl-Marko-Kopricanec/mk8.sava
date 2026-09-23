@@ -4,6 +4,67 @@ namespace Mk8.Sava.Protocol;
 
 internal static class HierarchicalAclAuthorization
 {
+    internal static char? GetParentMutationPermission(HttpRequest http, StorageRequestContext request)
+    {
+        if (request.ResourceKind != StorageResourceKind.Blob ||
+            request.Container is null ||
+            request.Blob is null ||
+            http.Query["comp"].ToString().Length > 0 ||
+            http.Query.ContainsKey("snapshot") ||
+            http.Query.ContainsKey("versionid") ||
+            http.Query.ContainsKey("deletetype"))
+            return null;
+
+        if (HttpMethods.IsPut(http.Method))
+            return 'w';
+        return HttpMethods.IsDelete(http.Method) ? 'd' : null;
+    }
+
+    internal static async Task EnsureParentMutationAsync(
+        MetadataStore metadata,
+        HttpRequest http,
+        StorageRequestContext request,
+        string objectId,
+        IReadOnlySet<string> groups,
+        string signedPermissions,
+        CancellationToken cancellationToken)
+    {
+        var permission = GetParentMutationPermission(http, request);
+        if (permission is null || !signedPermissions.Contains(permission.Value, StringComparison.Ordinal))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var root = await metadata.GetContainerAsync(
+            request.Account, request.Container!, includeDeleted: false, cancellationToken);
+        if (root is null ||
+            !PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'x'))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var name = request.Blob!;
+        var lastSeparator = name.LastIndexOf('/');
+        if (lastSeparator == 0)
+            throw AzureStorageException.AuthorizationFailure();
+        if (lastSeparator < 0)
+        {
+            if (!PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'w'))
+                throw AzureStorageException.AuthorizationFailure();
+            return;
+        }
+
+        var separator = name.IndexOf('/', StringComparison.Ordinal);
+        while (separator > 0)
+        {
+            var parent = await metadata.GetBlobAsync(
+                request.Account, request.Container!, name[..separator],
+                versionId: null, snapshot: null, includeDeleted: false, cancellationToken);
+            if (parent is null || !parent.IsDirectory ||
+                !PosixAccessControl.Allows(parent.Acl, parent.Owner, parent.Group, objectId, groups, 'x') ||
+                separator == lastSeparator &&
+                !PosixAccessControl.Allows(parent.Acl, parent.Owner, parent.Group, objectId, groups, 'w'))
+                throw AzureStorageException.AuthorizationFailure();
+            separator = name.IndexOf('/', separator + 1);
+        }
+    }
+
     internal static bool IsDirectoryListOperation(HttpRequest http, StorageRequestContext request)
     {
         if (request.ResourceKind != StorageResourceKind.Container ||

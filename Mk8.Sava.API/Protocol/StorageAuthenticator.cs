@@ -37,7 +37,10 @@ public sealed record StorageAuthorization(
     string? AclAuthorizedGenerationId = null,
     bool AclListChecked = false,
     string? AclListObjectId = null,
-    IReadOnlySet<string>? AclListGroups = null)
+    IReadOnlySet<string>? AclListGroups = null,
+    bool AclMutationChecked = false,
+    string? AclMutationObjectId = null,
+    IReadOnlySet<string>? AclMutationGroups = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
@@ -302,6 +305,36 @@ public sealed class StorageAuthenticator(
             }
         }
 
+        var aclMutationChecked = false;
+        IReadOnlySet<string>? aclMutationGroups = null;
+        var parentMutationPermission = HierarchicalAclAuthorization.GetParentMutationPermission(
+            context.Request, request);
+        if (requireDataAuthorization &&
+            parentMutationPermission is { } mutationPermission &&
+            !granted.Contains(mutationPermission) &&
+            objectId is not null &&
+            Guid.TryParse(objectId, out _) &&
+            IsHierarchicalNamespaceEnabled(request.Account))
+        {
+            try
+            {
+                var groups = principal.FindAll("groups")
+                    .Select(claim => claim.Value)
+                    .Where(value => Guid.TryParse(value, out _))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+                    metadata, context.Request, request, objectId, groups,
+                    mutationPermission.ToString(), context.RequestAborted);
+                aclMutationGroups = groups;
+                aclMutationChecked = true;
+                granted.Add(mutationPermission);
+            }
+            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            {
+                // An ACL cannot grant this mutation; retain only the configured RBAC grants.
+            }
+        }
+
         if (requireDataAuthorization && granted.Count == 0)
             throw AzureStorageException.AuthorizationFailure();
         var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
@@ -320,7 +353,10 @@ public sealed class StorageAuthenticator(
             AclAuthorizedGenerationId: aclAuthorizedGenerationId,
             AclListChecked: aclListChecked,
             AclListObjectId: aclListChecked ? objectId : null,
-            AclListGroups: aclListGroups);
+            AclListGroups: aclListGroups,
+            AclMutationChecked: aclMutationChecked,
+            AclMutationObjectId: aclMutationChecked ? objectId : null,
+            AclMutationGroups: aclMutationGroups);
     }
 
     private StorageAuthorization AuthenticateSharedKey(
@@ -736,9 +772,17 @@ public sealed class StorageAuthenticator(
             isUserDelegationSas && !string.IsNullOrEmpty(query["sduoid"].ToString()));
         string? aclAuthorizedGenerationId = null;
         var aclListChecked = false;
+        var aclMutationChecked = false;
         if (aclObjectId is not null)
         {
-            if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
+            if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
+            {
+                await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+                    metadata, context.Request, request, aclObjectId, NoGroups,
+                    permissions, cancellationToken);
+                aclMutationChecked = true;
+            }
+            else if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
             {
                 await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
                     metadata, context.Request, request, aclObjectId, NoGroups,
@@ -768,11 +812,14 @@ public sealed class StorageAuthenticator(
             signedResource,
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
             DelegatedObjectId: delegatedCreatorObjectId,
-            AclReadChecked: aclObjectId is not null && !aclListChecked,
+            AclReadChecked: aclObjectId is not null && !aclListChecked && !aclMutationChecked,
             AclAuthorizedGenerationId: aclAuthorizedGenerationId,
             AclListChecked: aclListChecked,
             AclListObjectId: aclListChecked ? aclObjectId : null,
-            AclListGroups: aclListChecked ? NoGroups : null);
+            AclListGroups: aclListChecked ? NoGroups : null,
+            AclMutationChecked: aclMutationChecked,
+            AclMutationObjectId: aclMutationChecked ? aclObjectId : null,
+            AclMutationGroups: aclMutationChecked ? NoGroups : null);
     }
 
     private static string BuildSharedKeyString(

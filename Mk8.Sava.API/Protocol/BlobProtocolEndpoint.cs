@@ -1418,6 +1418,7 @@ public static class BlobProtocolEndpoint
         {
             Require(request, 'd');
             EvaluateWriteConditions(http.Request, null);
+            await RecheckParentMutationAclAsync(http, request, cancellationToken);
             await service.DeleteUncommittedBlobAsync(request.Account, containerName, blobName, cancellationToken);
             http.Response.StatusCode = StatusCodes.Status202Accepted;
             return;
@@ -1840,6 +1841,7 @@ public static class BlobProtocolEndpoint
                 http.Request,
                 blob.AccessTierChangedAt);
             EnsureLease(http.Request, blob.Lease, "blob");
+            await RecheckParentMutationAclAsync(http, request, cancellationToken);
             if (permanentDelete)
             {
                 await service.PermanentlyDeleteBlobAsync(
@@ -1877,6 +1879,7 @@ public static class BlobProtocolEndpoint
         var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken);
         ValidateBlobTypeVersion(request, current?.Kind);
         RequireAny(request, current is null ? 'c' : 'w', 'w');
+        await RecheckParentMutationAclAsync(http, request, cancellationToken);
         EvaluateWriteConditions(http.Request, current);
         if (current is not null ||
             http.Request.Headers.ContainsKey("x-ms-lease-id") &&
@@ -3133,6 +3136,24 @@ public static class BlobProtocolEndpoint
                 throw AzureStorageException.InvalidQuery(queryName);
             http.Response.Headers[headerName] = value;
         }
+    }
+
+    private static Task RecheckParentMutationAclAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        CancellationToken cancellationToken)
+    {
+        if (!request.Authorization.AclMutationChecked)
+            return Task.CompletedTask;
+
+        return HierarchicalAclAuthorization.EnsureParentMutationAsync(
+            http.RequestServices.GetRequiredService<MetadataStore>(),
+            http.Request,
+            request,
+            request.Authorization.AclMutationObjectId!,
+            request.Authorization.AclMutationGroups!,
+            request.Authorization.Permissions,
+            cancellationToken);
     }
 
     private static async Task AuthorizeBlobReadAsync(
