@@ -67,8 +67,7 @@ internal static class StructuredBodyEncoder
 
     private static (long SegmentLength, ushort SegmentCount) GetSegmentation(long contentLength)
     {
-        if (contentLength < 0)
-            throw new ArgumentOutOfRangeException(nameof(contentLength));
+        ArgumentOutOfRangeException.ThrowIfNegative(contentLength);
         if (contentLength == 0)
             return (DefaultSegmentLength, 1);
 

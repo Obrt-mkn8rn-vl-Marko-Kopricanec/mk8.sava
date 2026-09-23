@@ -6,7 +6,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
 
-internal sealed partial class AzureResponseWriter
+internal static partial class AzureResponseWriter
 {
     internal const string ArrowStreamContentType = "application/vnd.apache.arrow.stream";
 

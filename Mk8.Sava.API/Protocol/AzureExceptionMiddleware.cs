@@ -65,6 +65,7 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
                 "InvalidXmlDocument",
                 "The specified XML is not syntactically valid.")).ConfigureAwait(false);
         }
+#pragma warning disable CA1031 // The outer HTTP boundary must translate unexpected failures to Azure's InternalError response.
         catch (Exception exception)
         {
             logger.LogError(exception, "Storage operation failed for request {RequestId}.", GetRequestId(context));
@@ -73,6 +74,7 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
                 "InternalError",
                 "The server encountered an internal error. Please retry the request.")).ConfigureAwait(false);
         }
+#pragma warning restore CA1031
     }
 
     private static async Task WriteErrorAsync(HttpContext context, AzureStorageException exception)

@@ -44,11 +44,11 @@ internal sealed class StorageAuthenticator(
                 request,
                 requireDataAuthorization: !hasSas).ConfigureAwait(false);
             return hasSas
-                ? await AuthenticateSasAsync(context, request, cancellationToken, bearer)
+                ? await AuthenticateSasAsync(context, request, bearer, cancellationToken)
 .ConfigureAwait(false) : bearer;
         }
         if (context.Request.Query.ContainsKey("sig"))
-            return await AuthenticateSasAsync(context, request, cancellationToken, null).ConfigureAwait(false);
+            return await AuthenticateSasAsync(context, request, null, cancellationToken).ConfigureAwait(false);
         return StorageAuthorization.Anonymous;
     }
 
@@ -368,8 +368,8 @@ internal sealed class StorageAuthenticator(
     private async Task<StorageAuthorization> AuthenticateSasAsync(
         HttpContext context,
         StorageRequestContext request,
-        CancellationToken cancellationToken,
-        StorageAuthorization? bearer)
+        StorageAuthorization? bearer,
+        CancellationToken cancellationToken)
     {
         var query = context.Request.Query;
         var version = query["sv"].ToString();

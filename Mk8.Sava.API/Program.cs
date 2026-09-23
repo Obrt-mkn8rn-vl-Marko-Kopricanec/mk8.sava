@@ -60,7 +60,6 @@ builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddSingleton<StorageDataKeyContinuity>();
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
-builder.Services.AddSingleton<AzureResponseWriter>();
 builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
     .RemoveAllLoggers()
     .ConfigurePrimaryHttpMessageHandler(services =>
