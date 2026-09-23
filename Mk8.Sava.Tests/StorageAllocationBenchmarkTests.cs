@@ -3,6 +3,7 @@ using System.Globalization;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Mk8.Sava.Storage;
 using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
@@ -54,13 +55,53 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             await container.CreateAsync();
 
             long logicalBytes = 0;
-            output.WriteLine("workload,logical_bytes,sava_allocated_bytes,raw_allocated_bytes,metadata_allocated_bytes,chunks_allocated_bytes,packs_allocated_bytes,staging_allocated_bytes,upload_ms,read_ms,process_cpu_ms,working_set_bytes");
+            output.WriteLine("workload,logical_bytes,sava_allocated_bytes,raw_allocated_bytes,metadata_allocated_bytes,chunks_allocated_bytes,packs_allocated_bytes,staging_allocated_bytes,upload_ms,read_ms,process_cpu_ms,working_set_bytes,sampled_peak_staging_temp_allocated_bytes,sampled_peak_working_set_bytes");
 
             async Task RecordAsync(string workload, Func<Task<(double UploadMs, double ReadMs)>> operation)
             {
                 var cpuBefore = Process.GetCurrentProcess().TotalProcessorTime;
-                var timing = await operation();
+                var stagingPath = Path.Combine(application.DataPath, "staging");
+                var stagingBaseline = StorageAllocationMeter.MeasureRoot(stagingPath);
+                long? peakTemporaryAllocation = stagingBaseline.HasValue ? 0 : null;
+                long peakWorkingSet = 0;
+                using var samplingCancellation = new CancellationTokenSource();
+                var sampler = Task.Run(async () =>
+                {
+                    using var sampledProcess = Process.GetCurrentProcess();
+                    while (!samplingCancellation.IsCancellationRequested)
+                    {
+                        var allocated = StorageAllocationMeter.MeasureRoot(stagingPath);
+                        if (allocated is { } measured && stagingBaseline is { } baseline)
+                        {
+                            peakTemporaryAllocation = Math.Max(
+                                peakTemporaryAllocation!.Value,
+                                Math.Max(0, measured - baseline));
+                        }
+                        sampledProcess.Refresh();
+                        peakWorkingSet = Math.Max(peakWorkingSet, sampledProcess.WorkingSet64);
+                        try
+                        {
+                            await Task.Delay(TimeSpan.FromMilliseconds(10), samplingCancellation.Token);
+                        }
+                        catch (OperationCanceledException) when (samplingCancellation.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                    }
+                });
+                (double UploadMs, double ReadMs) timing;
+                try
+                {
+                    timing = await operation();
+                }
+                finally
+                {
+                    samplingCancellation.Cancel();
+                    await sampler;
+                }
                 var process = Process.GetCurrentProcess();
+                peakWorkingSet = Math.Max(peakWorkingSet, process.WorkingSet64);
+                Assert.True(peakWorkingSet > 0);
                 output.WriteLine(string.Join(',',
                     workload,
                     logicalBytes.ToString(CultureInfo.InvariantCulture),
@@ -79,7 +120,9 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     timing.UploadMs.ToString("F3", CultureInfo.InvariantCulture),
                     timing.ReadMs.ToString("F3", CultureInfo.InvariantCulture),
                     (process.TotalProcessorTime - cpuBefore).TotalMilliseconds.ToString("F3", CultureInfo.InvariantCulture),
-                    process.WorkingSet64.ToString(CultureInfo.InvariantCulture)));
+                    process.WorkingSet64.ToString(CultureInfo.InvariantCulture),
+                    peakTemporaryAllocation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable",
+                    peakWorkingSet.ToString(CultureInfo.InvariantCulture)));
             }
 
             async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
