@@ -668,6 +668,12 @@ Boolean and the header is rejected for flat-namespace accounts. Configure
 user whose object ID should be projected when `x-ms-upn=true`; unknown object
 IDs and `$superuser` remain unchanged. The mapping is evaluated when a response
 is written, so changing a configured name does not rewrite stored paths.
+For HNS List Blobs, a file in an intermediate component of `prefix` is a path
+conflict, not an empty successful enumeration. The flat namespace still permits
+independent blobs named `file` and `file/child`. This follows the published
+[List Blobs prefix rule](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs#uri-parameters);
+the exact Azure error-code parity for that HNS edge is not yet established by
+the documentation.
 
 Blob expiry is likewise confined to HNS files. Set Blob Expiry is available
 from service version 2020-02-10 and rejects directories. Put Blob, Put Block
