@@ -10,11 +10,12 @@ public sealed class MetadataStore(
     IStorageFaultInjector faultInjector,
     TimeProvider? timeProvider = null)
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
     private const int ChunkIndexSchemaVersion = 2;
     private const int TagIndexSchemaVersion = 3;
     private const int PackIndexSchemaVersion = 4;
     private const int ObjectReplicationSchemaVersion = 5;
+    private const int DataKeyContinuitySchemaVersion = 6;
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
@@ -141,6 +142,11 @@ public sealed class MetadataStore(
                     fingerprint TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS account_namespace_modes (
+                    account TEXT PRIMARY KEY,
+                    hierarchical_namespace_enabled INTEGER NOT NULL CHECK (hierarchical_namespace_enabled IN (0, 1))
+                );
+
                 CREATE TABLE IF NOT EXISTS chunk_packs (
                     pack_id TEXT PRIMARY KEY,
                     domain TEXT NOT NULL,
@@ -193,7 +199,8 @@ public sealed class MetadataStore(
                 await MigrateVersion2ToVersion3Async(connection, cancellationToken);
                 schemaVersion = TagIndexSchemaVersion;
             }
-            if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion or ObjectReplicationSchemaVersion)
+            if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion or
+                ObjectReplicationSchemaVersion or DataKeyContinuitySchemaVersion)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken);
@@ -269,6 +276,57 @@ public sealed class MetadataStore(
                 delete.CommandText = "DELETE FROM data_encryption_keys WHERE key_id = $key;";
                 delete.Parameters.AddWithValue("$key", keyId);
                 await delete.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeGate.Release();
+        }
+    }
+
+    public async Task EnsureAccountNamespaceModesAsync(
+        IReadOnlyDictionary<string, bool> expected,
+        CancellationToken cancellationToken)
+    {
+        await _writeGate.WaitAsync(cancellationToken);
+        try
+        {
+            await using var connection = await OpenAsync(cancellationToken);
+            await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var recorded = new Dictionary<string, bool>(StringComparer.Ordinal);
+            await using (var read = connection.CreateCommand())
+            {
+                read.Transaction = transaction;
+                read.CommandText = "SELECT account, hierarchical_namespace_enabled FROM account_namespace_modes;";
+                await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                    recorded.Add(reader.GetString(0), reader.GetInt32(1) == 1);
+            }
+
+            foreach (var (account, enabled) in expected)
+            {
+                if (recorded.TryGetValue(account, out var previous))
+                {
+                    if (previous != enabled)
+                    {
+                        throw new InvalidDataException(
+                            $"The configured hierarchical namespace mode for account '{account}' differs from its recorded mode. " +
+                            "Changing account namespace mode requires an explicit offline migration.");
+                    }
+                    continue;
+                }
+
+                await using var insert = connection.CreateCommand();
+                insert.Transaction = transaction;
+                insert.CommandText = """
+                    INSERT INTO account_namespace_modes(account, hierarchical_namespace_enabled)
+                    VALUES ($account, $enabled);
+                    """;
+                insert.Parameters.AddWithValue("$account", account);
+                insert.Parameters.AddWithValue("$enabled", enabled ? 1 : 0);
+                await insert.ExecuteNonQueryAsync(cancellationToken);
             }
 
             await transaction.CommitAsync(cancellationToken);

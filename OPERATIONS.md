@@ -245,6 +245,13 @@ reports the setting through Get Account Information and applies the correspondin
 Blob API restrictions and hierarchical listing/property shape. The separate Data
 Lake `dfs` protocol is outside this service's endpoint boundary.
 
+The configured hierarchical-namespace mode is recorded in the metadata database
+for each account on startup. A later restart with the opposite mode fails before
+serving requests; changing it requires a separately designed offline migration,
+not a configuration flip. Existing schema-6 roots did not record this mode, so
+their first schema-7 startup binds the then-configured value. Operators upgrading
+such roots must preserve the mode used before that first startup.
+
 Configured account names follow Azure's 3–24-character lowercase ASCII letter
 or digit rule. Startup rejects other names, including path separators, rather
 than allowing an account identity to alter the chunk-storage path layout.
