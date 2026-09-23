@@ -72,6 +72,22 @@ terminates the worker without unwinding it, and validates recovery in a new test
 host before deleting that exact temporary root. Core dumps are disabled for the
 intentional terminations.
 
+On Linux hosts that permit unprivileged user and mount namespaces, run the
+separate real-ENOSPC lane:
+
+```bash
+DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run-enospc.sh
+```
+
+It mounts a private 16 MiB tmpfs beneath a freshly created temporary directory,
+fills it until the kernel returns `ENOSPC`, then leaves only 256 KiB free for a
+512 KiB random upload. The test confirms partial physical chunks were written
+but no logical blob was published, an earlier acknowledged blob remains exact,
+orphan chunks are reclaimed after capacity is restored and the host restarts,
+and retry succeeds. The mount is private to the harness process and is unmounted
+on exit. This covers an actual capacity failure during upload, not every SQLite
+commit, pack-compaction, filesystem, Windows, or power-loss boundary.
+
 ## SDK substitution checks
 
 The normal .NET integration suite uses the official Azure Storage client.
