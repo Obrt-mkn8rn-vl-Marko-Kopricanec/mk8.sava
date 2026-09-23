@@ -758,13 +758,10 @@ internal static class BlobQueryProtocol
         var escape = Encoding.UTF8.GetBytes(format.Escape.ToString());
         var doubledQuoteEscaping = format.Quote == format.Escape;
         using var reader = new BlobQueryByteReader(input);
-        var recordBytes = 0L;
+        var recordBytes = await ReadSplitPreambleAsync(reader, cancellationToken).ConfigureAwait(false);
         var batchBytes = 0L;
         var inQuotes = false;
         var atFieldStart = true;
-
-        if (await reader.TryConsumeAsync(Utf8Preamble, cancellationToken).ConfigureAwait(false))
-            recordBytes += Utf8Preamble.Length;
 
         while (await reader.HasDataAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -813,6 +810,13 @@ internal static class BlobQueryProtocol
         if (batchBytes > 0)
             yield return new QuerySelection([outputName], [new QueryCell(batchBytes)]);
     }
+
+    private static async Task<long> ReadSplitPreambleAsync(
+        BlobQueryByteReader reader,
+        CancellationToken cancellationToken) =>
+        await reader.TryConsumeAsync(Utf8Preamble, cancellationToken).ConfigureAwait(false)
+            ? Utf8Preamble.Length
+            : 0;
 
     private static async Task<(long RecordBytes, bool InQuotes)> ConsumeQuotedSplitInputAsync(
         BlobQueryByteReader reader,
