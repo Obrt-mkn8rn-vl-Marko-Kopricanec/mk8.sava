@@ -58,10 +58,10 @@ public sealed class StorageRootLeaseTests
                     await using (holder.ConfigureAwait(false))
                     {
                         await holder.InitializeAsync();
-                        File.WriteAllText(Path.Combine(dataPath, "holder-ready"), string.Empty);
+                        await File.WriteAllTextAsync(Path.Combine(dataPath, "holder-ready"), string.Empty).ConfigureAwait(true);
                         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
                         while (!File.Exists(Path.Combine(dataPath, "release-holder")))
-                            await Task.Delay(50, timeout.Token);
+                            await Task.Delay(50, timeout.Token).ConfigureAwait(true);
                     }
                 }
                 break;
@@ -69,7 +69,7 @@ public sealed class StorageRootLeaseTests
                 {
                     var contender = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
                     await using (contender.ConfigureAwait(false))
-                        await Assert.ThrowsAsync<IOException>(contender.InitializeAsync);
+                        await Assert.ThrowsAsync<IOException>(contender.InitializeAsync).ConfigureAwait(true);
                 }
                 break;
             default:

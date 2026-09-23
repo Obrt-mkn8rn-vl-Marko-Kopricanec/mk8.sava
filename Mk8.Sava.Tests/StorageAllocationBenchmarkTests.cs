@@ -97,7 +97,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 }
                 finally
                 {
-                    samplingCancellation.Cancel();
+                    await samplingCancellation.CancelAsync().ConfigureAwait(false);
                     await sampler.ConfigureAwait(false);
                 }
                 var process = Process.GetCurrentProcess();

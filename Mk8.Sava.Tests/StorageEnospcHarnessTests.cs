@@ -232,16 +232,16 @@ public sealed class StorageEnospcHarnessTests
             Assert.Equal(500, failure.Status);
             Assert.True(recorder.StagingCompleted);
             Assert.True(recorder.PackAppendStarted);
-            Assert.Equal(1, metadata.CountPackedChunks());
-            Assert.Equal(priorIndexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None));
+            Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
+            Assert.Equal(priorIndexedLength, await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None).ConfigureAwait(true));
             File.Delete(fillerPath);
 
-            Assert.False((await attempted.ExistsAsync()).Value);
-            Assert.Equal(stableBytes, (await stable.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.False((await attempted.ExistsAsync().ConfigureAwait(true)).Value);
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
         }
         finally
         {
-            await first.DisposeAsync();
+            await first.DisposeAsync().ConfigureAwait(true);
         }
 
         var restarted = new SavaWebApplicationFactory(
@@ -253,21 +253,21 @@ public sealed class StorageEnospcHarnessTests
             disableMaintenance: true);
         try
         {
-            await restarted.InitializeAsync();
+            await restarted.InitializeAsync().ConfigureAwait(true);
             var container = CreateClient(restarted).GetBlobContainerClient("enospc-pack");
             Assert.Equal(stableBytes,
-                (await container.GetBlobClient("stable.bin").DownloadContentAsync()).Value.Content.ToArray());
+                (await container.GetBlobClient("stable.bin").DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
             var attempted = container.GetBlobClient("interrupted.bin");
-            await attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes));
-            Assert.Equal(attemptedBytes, (await attempted.DownloadContentAsync()).Value.Content.ToArray());
+            await attempted.UploadAsync(BinaryData.FromBytes(attemptedBytes)).ConfigureAwait(true);
+            Assert.Equal(attemptedBytes, (await attempted.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
             var metadata = restarted.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(2, metadata.CountPackedChunks());
+            Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
             var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
-            Assert.Equal(await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None), new FileInfo(packPath).Length);
+            Assert.Equal(await metadata.GetPackIndexedLengthAsync(packId, CancellationToken.None).ConfigureAwait(true), new FileInfo(packPath).Length);
         }
         finally
         {
-            await restarted.DisposeAsync();
+            await restarted.DisposeAsync().ConfigureAwait(true);
         }
     }
 
