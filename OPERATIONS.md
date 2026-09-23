@@ -746,7 +746,13 @@ accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
 valid measurement and distinguishes an unmeasured or unsupported host from
 an empty root. A full inventory still adds I/O on large roots, but it no longer
 monopolizes one maintenance pass. Like any live filesystem walk, it is a sampled
-inventory rather than an atomic snapshot of concurrent writes.
+inventory, not an atomic filesystem snapshot. A controlled local scale test
+uses 50,000 chunk files across 50 shards while 512 staging files are created,
+flushed, and deleted concurrently. It requires at most 110 inventory passes,
+at most 500 ms per 1024-step pass, and a staging-mutation p99 below 250 ms.
+These are regression budgets for the local test filesystem, not measured
+production-client latency or a deployment-filesystem guarantee.
+
 The serialized chunk and pack inventory also skips linked files and directories,
 so an external or cyclic link cannot inflate or trap its maintenance scan.
 
