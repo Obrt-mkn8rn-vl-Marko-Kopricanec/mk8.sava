@@ -15,7 +15,7 @@ public sealed class AzureRehydrationPriorityTests
     public async Task ArchivedCopyPublishesArchiveStateAndSupportsPriorityUpgrade()
     {
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 12, 0, 0, TimeSpan.Zero));
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             clock,
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
@@ -24,6 +24,7 @@ public sealed class AzureRehydrationPriorityTests
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:01",
                 ["Sava:MaintenanceScanInterval"] = "1.00:00:00"
             });
+        await using var applicationDisposal1 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient($"copy-rehydrate-{Guid.NewGuid():N}");
@@ -95,7 +96,7 @@ public sealed class AzureRehydrationPriorityTests
     public async Task Pre20200612SetTierCannotUpgradeAnExistingPriority()
     {
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 22, 13, 0, 0, TimeSpan.Zero));
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             clock,
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
@@ -103,6 +104,7 @@ public sealed class AzureRehydrationPriorityTests
                 ["Sava:HighPriorityRehydrationDelay"] = "00:00:01",
                 ["Sava:MaintenanceScanInterval"] = "1.00:00:00"
             });
+        await using var applicationDisposal2 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient($"tier-version-{Guid.NewGuid():N}");
@@ -137,7 +139,8 @@ public sealed class AzureRehydrationPriorityTests
     [Fact]
     public async Task RehydratePriorityIsRejectedOutsideSupportedOperationsAndVersions()
     {
-        await using var application = new SavaWebApplicationFactory();
+        var application = new SavaWebApplicationFactory();
+        await using var applicationDisposal3 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient($"priority-headers-{Guid.NewGuid():N}");

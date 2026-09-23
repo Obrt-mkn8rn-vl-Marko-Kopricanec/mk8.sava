@@ -15,18 +15,24 @@ public sealed class StorageRootLeaseTests
     public async Task OnlyOneServiceCanOpenADataRootAtATime()
     {
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-root-lease-{Guid.NewGuid():N}");
-        await using (var first = new SavaWebApplicationFactory(dataPath, deleteDataPath: false))
         {
-            await first.InitializeAsync();
-            Assert.True(File.Exists(Path.Combine(dataPath, ".mk8-sava.lock")));
+            var first = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+            await using (first.ConfigureAwait(false))
+            {
+                await first.InitializeAsync();
+                Assert.True(File.Exists(Path.Combine(dataPath, ".mk8-sava.lock")));
 
-            var environment = first.Services.GetRequiredService<IHostEnvironment>();
-            var options = first.Services.GetRequiredService<IOptions<SavaOptions>>();
-            Assert.Throws<IOException>(() => new StoragePaths(environment, options));
+                var environment = first.Services.GetRequiredService<IHostEnvironment>();
+                var options = first.Services.GetRequiredService<IOptions<SavaOptions>>();
+                Assert.Throws<IOException>(() => new StoragePaths(environment, options));
+            }
         }
 
-        await using (var reopened = new SavaWebApplicationFactory(dataPath, deleteDataPath: true))
-            await reopened.InitializeAsync();
+        {
+            var reopened = new SavaWebApplicationFactory(dataPath, deleteDataPath: true);
+            await using (reopened.ConfigureAwait(false))
+                await reopened.InitializeAsync();
+        }
     }
 
     [Fact]
@@ -47,18 +53,24 @@ public sealed class StorageRootLeaseTests
         switch (Environment.GetEnvironmentVariable(WorkerRoleVariable))
         {
             case "holder":
-                await using (var holder = new SavaWebApplicationFactory(dataPath, deleteDataPath: true))
                 {
-                    await holder.InitializeAsync();
-                    File.WriteAllText(Path.Combine(dataPath, "holder-ready"), string.Empty);
-                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-                    while (!File.Exists(Path.Combine(dataPath, "release-holder")))
-                        await Task.Delay(50, timeout.Token);
+                    var holder = new SavaWebApplicationFactory(dataPath, deleteDataPath: true);
+                    await using (holder.ConfigureAwait(false))
+                    {
+                        await holder.InitializeAsync();
+                        File.WriteAllText(Path.Combine(dataPath, "holder-ready"), string.Empty);
+                        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                        while (!File.Exists(Path.Combine(dataPath, "release-holder")))
+                            await Task.Delay(50, timeout.Token);
+                    }
                 }
                 break;
             case "contender":
-                await using (var contender = new SavaWebApplicationFactory(dataPath, deleteDataPath: false))
-                    await Assert.ThrowsAsync<IOException>(contender.InitializeAsync);
+                {
+                    var contender = new SavaWebApplicationFactory(dataPath, deleteDataPath: false);
+                    await using (contender.ConfigureAwait(false))
+                        await Assert.ThrowsAsync<IOException>(contender.InitializeAsync);
+                }
                 break;
             default:
                 throw new InvalidOperationException("The root-lease harness role is invalid.");

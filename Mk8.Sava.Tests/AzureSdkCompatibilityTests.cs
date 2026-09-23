@@ -411,7 +411,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             using var getResponse = await transport.GetAsync(uri).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, getResponse.StatusCode);
-            Assert.Equal(value, await getResponse.Content.ReadAsStringAsync());
+            Assert.Equal(value, await getResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
 
         await PutAndReadDirectAsync("/a", "/a", "leading separator");
@@ -571,12 +571,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 DataSource = Path.Combine(application.DataPath, "metadata.db"),
                 ForeignKeys = true
             }.ToString();
-            await using (var connection = new SqliteConnection(directConnectionString))
             {
-                await connection.OpenAsync();
-                await using var corruptIndex = connection.CreateCommand();
-                corruptIndex.CommandText = "DELETE FROM blob_tags WHERE tag_key = 'project';";
-                Assert.True(await corruptIndex.ExecuteNonQueryAsync() > 0);
+                var connection = new SqliteConnection(directConnectionString);
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var corruptIndex = connection.CreateCommand();
+                    corruptIndex.CommandText = "DELETE FROM blob_tags WHERE tag_key = 'project';";
+                    Assert.True(await corruptIndex.ExecuteNonQueryAsync() > 0);
+                }
             }
             var backup = application.Services.GetRequiredService<StorageBackupService>();
             var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
@@ -1019,7 +1022,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 HttpCompletionOption.ResponseHeadersRead);
             Assert.Equal(HttpStatusCode.OK, arrowResponse.StatusCode);
             Assert.Equal(AzureResponseWriter.ArrowStreamContentType, arrowResponse.Content.Headers.ContentType?.MediaType);
-            await using var responseStream = await arrowResponse.Content.ReadAsStreamAsync();
+            var responseStream = (await arrowResponse.Content.ReadAsStreamAsync());
+            await using var responseStreamDisposal1 = responseStream.ConfigureAwait(false);
             using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(responseStream);
             Assert.Equal("2", reader.Schema.Metadata["NumberOfRecords"]);
             Assert.False(string.IsNullOrEmpty(reader.Schema.Metadata["NextMarker"]));
@@ -1367,11 +1371,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceAccountsExposePosixPropertiesAndRejectUnsupportedBlobApis()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal2 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -1483,11 +1488,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceSoftDeleteUsesDeletionIdsAndRestoresASelectedGeneration()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal3 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -1616,11 +1622,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespacePersistsDirectoriesAndListsTheirAzureProperties()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal4 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -1644,7 +1651,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
 
         var recursive = await ListAsync("include=permissions");
@@ -1753,68 +1760,74 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         try
         {
-            await using (var application = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
             {
-                await application.InitializeAsync();
-                var bearer = CreateBearerClient(
-                    application,
-                    CreateJwt(SavaWebApplicationFactory.AccountKey, creatorId, SavaWebApplicationFactory.TenantId));
-                var created = bearer.GetBlobContainerClient(containerName);
-                await created.CreateAsync();
-                await created.GetBlobClient("parent/child.txt").UploadAsync(BinaryData.FromString("original"));
-
-                var shared = CreateClient(application).GetBlobContainerClient(containerName);
-                await shared.GetBlobClient("parent/child.txt")
-                    .UploadAsync(BinaryData.FromString("replacement"), overwrite: true);
-
-                var delegator = CreateBearerClient(
-                    application,
-                    CreateJwt(
-                        SavaWebApplicationFactory.AccountKey,
-                        delegatedCreatorId,
-                        SavaWebApplicationFactory.TenantId));
-                var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
-                var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
-                var key = await delegator.GetUserDelegationKeyAsync(
-                    new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
-                var sasBuilder = new BlobSasBuilder
+                var application = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+                await using (application.ConfigureAwait(false))
                 {
-                    BlobContainerName = containerName,
-                    BlobName = "parent/delegated.txt",
-                    Resource = "b",
-                    StartsOn = startsOn,
-                    ExpiresOn = expiresOn,
-                    Protocol = SasProtocol.HttpsAndHttp
-                };
-                sasBuilder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
-                var sas = sasBuilder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
-                var delegated = CreateBlobClient(
-                    application,
-                    new Uri(
-                        $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
-                        $"{containerName}/parent/delegated.txt?{sas}"));
-                await delegated.UploadAsync(BinaryData.FromString("delegated"));
+                    await application.InitializeAsync();
+                    var bearer = CreateBearerClient(
+                        application,
+                        CreateJwt(SavaWebApplicationFactory.AccountKey, creatorId, SavaWebApplicationFactory.TenantId));
+                    var created = bearer.GetBlobContainerClient(containerName);
+                    await created.CreateAsync();
+                    await created.GetBlobClient("parent/child.txt").UploadAsync(BinaryData.FromString("original"));
 
-                sasBuilder.BlobName = "parent/impersonated.txt";
-                sasBuilder.PreauthorizedAgentObjectId = impersonatedCreatorId;
-                var impersonationSas = sasBuilder.ToSasQueryParameters(
-                    key.Value,
-                    SavaWebApplicationFactory.AccountName);
-                var impersonated = CreateBlobClient(
-                    application,
-                    new Uri(
-                        $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
-                        $"{containerName}/parent/impersonated.txt?{impersonationSas}"));
-                await impersonated.UploadAsync(BinaryData.FromString("impersonated"));
-                await AssertHierarchicalOwnershipAsync(application, shared);
+                    var shared = CreateClient(application).GetBlobContainerClient(containerName);
+                    await shared.GetBlobClient("parent/child.txt")
+                        .UploadAsync(BinaryData.FromString("replacement"), overwrite: true);
+
+                    var delegator = CreateBearerClient(
+                        application,
+                        CreateJwt(
+                            SavaWebApplicationFactory.AccountKey,
+                            delegatedCreatorId,
+                            SavaWebApplicationFactory.TenantId));
+                    var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+                    var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+                    var key = await delegator.GetUserDelegationKeyAsync(
+                        new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
+                    var sasBuilder = new BlobSasBuilder
+                    {
+                        BlobContainerName = containerName,
+                        BlobName = "parent/delegated.txt",
+                        Resource = "b",
+                        StartsOn = startsOn,
+                        ExpiresOn = expiresOn,
+                        Protocol = SasProtocol.HttpsAndHttp
+                    };
+                    sasBuilder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+                    var sas = sasBuilder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
+                    var delegated = CreateBlobClient(
+                        application,
+                        new Uri(
+                            $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                            $"{containerName}/parent/delegated.txt?{sas}"));
+                    await delegated.UploadAsync(BinaryData.FromString("delegated"));
+
+                    sasBuilder.BlobName = "parent/impersonated.txt";
+                    sasBuilder.PreauthorizedAgentObjectId = impersonatedCreatorId;
+                    var impersonationSas = sasBuilder.ToSasQueryParameters(
+                        key.Value,
+                        SavaWebApplicationFactory.AccountName);
+                    var impersonated = CreateBlobClient(
+                        application,
+                        new Uri(
+                            $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                            $"{containerName}/parent/impersonated.txt?{impersonationSas}"));
+                    await impersonated.UploadAsync(BinaryData.FromString("impersonated"));
+                    await AssertHierarchicalOwnershipAsync(application, shared);
+                }
             }
 
-            await using (var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
             {
-                await restarted.InitializeAsync();
-                await AssertHierarchicalOwnershipAsync(
-                    restarted,
-                    CreateClient(restarted).GetBlobContainerClient(containerName));
+                var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+                await using (restarted.ConfigureAwait(false))
+                {
+                    await restarted.InitializeAsync();
+                    await AssertHierarchicalOwnershipAsync(
+                        restarted,
+                        CreateClient(restarted).GetBlobContainerClient(containerName));
+                }
             }
         }
         finally
@@ -1855,7 +1868,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
             var directory = Assert.Single(document.Descendants("BlobPrefix"));
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Owner")?.Value);
             Assert.Equal(creatorId, directory.Element("Properties")?.Element("Group")?.Value);
@@ -1877,7 +1890,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             projectedListRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
             using var projectedListResponse = await transport.SendAsync(projectedListRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, projectedListResponse.StatusCode);
-            var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync());
+            var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
             var projectedDirectory = Assert.Single(projectedList.Descendants("BlobPrefix"));
             Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Owner")?.Value);
             Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Group")?.Value);
@@ -1890,7 +1903,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             recursiveRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
             using var recursiveResponse = await transport.SendAsync(recursiveRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, recursiveResponse.StatusCode);
-            var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync());
+            var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
             var delegatedEntry = recursive.Descendants("Blob").Single(element =>
                 element.Element("Name")?.Value == "parent/delegated.txt");
             Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
@@ -1903,7 +1916,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     {
         const string ownerObjectId = "11e1e2fd-3f95-4e15-b855-c83472392325";
         const string foreignObjectId = "68679a90-477a-4584-94d1-c520340668b1";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Accounts:0"] =
@@ -1912,6 +1925,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:CanGenerateUserDelegationKey"] = "true",
             [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:CanManageOwnership"] = "true"
         });
+        await using var applicationDisposal5 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var bearer = CreateBearerClient(
             application,
@@ -2115,7 +2129,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         const string ownerObjectId = "475a2329-f852-4d23-acba-b11dde00ff74";
         const string readerObjectId = "3a90b230-d1cf-4691-9b1e-916d0a5d850c";
         const string strangerObjectId = "45064256-b8fb-45c6-89a7-589030389341";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Accounts:0"] =
@@ -2125,6 +2139,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
             [$"Sava:BearerAuthentication:Principals:{readerObjectId}:Permissions"] = "r"
         });
+        await using var applicationDisposal6 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var owner = CreateBearerClient(
             application,
@@ -2189,10 +2204,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         const string namedObjectId = "4d7ec17e-ae95-4bc6-84e0-b95c5ee4c15b";
         const string groupMemberObjectId = "bd107df5-cd2e-437c-b3ca-5c99f4602ed5";
         const string groupId = "a91490fb-9d7f-4c82-abba-114cc59a3de9";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal7 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-named-acl-{Guid.NewGuid():N}");
@@ -2295,10 +2311,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalAclManifestRollsBackEveryTargetWhenOneDoesNotExist()
     {
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal8 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-acl-atomic-{Guid.NewGuid():N}");
@@ -2358,10 +2375,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task HierarchicalDefaultAclPropagatesOnlyToNewDescendants()
     {
         const string readerObjectId = "e4508a61-2d86-42c7-8b51-3da9d71126b6";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal9 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-default-acl-{Guid.NewGuid():N}");
@@ -2424,10 +2442,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task HierarchicalAclListsOnlyAnAuthorizedDirectoryWithSdkPaging()
     {
         const string readerObjectId = "bb709241-d428-4339-8609-635fdf5fd9ac";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal10 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-list-acl-{Guid.NewGuid():N}");
@@ -2517,12 +2536,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task HierarchicalDirectoryListHonorsSignedSuoidAndListPermission()
     {
         const string readerObjectId = "024e3416-6d43-4310-a404-b2e26705ba06";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "rl",
             [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
         });
+        await using var applicationDisposal11 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-list-suoid-{Guid.NewGuid():N}");
@@ -2610,10 +2630,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task HierarchicalAclAuthorizesPutAndDeleteFromTheParentDirectory()
     {
         const string writerObjectId = "97f5af62-55de-46b3-86b5-151988d1ae11";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal12 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-write-acl-{Guid.NewGuid():N}");
@@ -2685,10 +2706,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task HierarchicalAclRequiresFileReadAndWriteForAppendBlock()
     {
         const string appenderObjectId = "321c78dd-64e5-439f-bf30-748d84eea652";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
         });
+        await using var applicationDisposal13 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"hns-append-acl-{Guid.NewGuid():N}");
@@ -2773,10 +2795,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         const string accessAcl = "user::rwx,group::r-x,other::r-x";
         try
         {
-            await using (var initial = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false))
             {
-                await initial.InitializeAsync();
-                await CreateClient(initial).GetBlobContainerClient(containerName).CreateAsync();
+                var initial = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false);
+                await using (initial.ConfigureAwait(false))
+                {
+                    await initial.InitializeAsync();
+                    await CreateClient(initial).GetBlobContainerClient(containerName).CreateAsync();
+                }
             }
 
             var manifest = new HierarchicalAclManifest
@@ -2814,13 +2839,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var error = process.StandardError.ReadToEndAsync();
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
             await process.WaitForExitAsync(timeout.Token);
-            Assert.True(process.ExitCode == 0, await error);
-            Assert.Contains("Applied HNS access ACLs to 1 existing targets.", await output, StringComparison.Ordinal);
+            Assert.True(process.ExitCode == 0, await error.ConfigureAwait(true));
+            Assert.Contains("Applied HNS access ACLs to 1 existing targets.", await output.ConfigureAwait(true), StringComparison.Ordinal);
 
-            await using var reopened = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false);
+            var reopened = new SavaWebApplicationFactory(dataPath, settings, deleteDataPath: false);
+            await using var reopenedDisposal14 = reopened.ConfigureAwait(false);
             await reopened.InitializeAsync();
             var root = await reopened.Services.GetRequiredService<MetadataStore>().GetContainerAsync(
-                SavaWebApplicationFactory.AccountName, containerName, includeDeleted: false, CancellationToken.None);
+                SavaWebApplicationFactory.AccountName, containerName, includeDeleted: false, CancellationToken.None).ConfigureAwait(true);
             Assert.NotNull(root);
             Assert.Equal(accessAcl, root.AccessAcl);
         }
@@ -2835,11 +2861,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceBlobIndexTagsRequireTheExplicitPreviewCapability()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal15 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -2891,12 +2918,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceBlobIndexTagPreviewMatchesTheBlobApiFromVersion20241104()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true",
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceBlobIndexTagsEnabled"] = "true"
             });
+        await using var applicationDisposal16 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -2948,11 +2976,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceBlobSnapshotsRequireTheExplicitPreviewCapability()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal17 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -2985,12 +3014,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceBlobSnapshotPreviewPreservesSnapshotsWithoutCreatingVersions()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true",
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceBlobSnapshotsEnabled"] = "true"
             });
+        await using var applicationDisposal18 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -3060,11 +3090,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceNeverExposesBlobVersions()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal19 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -3120,11 +3151,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceEncryptionContextHonorsBlobRestWriteAndReadContracts()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal20 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -3174,7 +3206,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
             using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
 
         const string context = "tenant=alpha;key=v1";
@@ -3278,7 +3310,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
         }
 
-        await using var flatApplication = new SavaWebApplicationFactory();
+        var flatApplication = new SavaWebApplicationFactory();
+        await using var flatApplicationDisposal21 = flatApplication.ConfigureAwait(false);
         var flatService = CreateClient(flatApplication);
         var flatContainer = flatService.GetBlobContainerClient($"flat-encryption-context-{Guid.NewGuid():N}");
         await flatContainer.CreateAsync();
@@ -3294,11 +3327,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceUpnProjectionValidatesItsDocumentedRequestShape()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal22 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -3374,7 +3408,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(invalid, "x-ms-error-code"));
         }
 
-        await using var flatApplication = new SavaWebApplicationFactory();
+        var flatApplication = new SavaWebApplicationFactory();
+        await using var flatApplicationDisposal23 = flatApplication.ConfigureAwait(false);
         var flatService = CreateClient(flatApplication);
         var flatContainer = flatService.GetBlobContainerClient($"flat-upn-{Guid.NewGuid():N}");
         await flatContainer.CreateAsync();
@@ -3395,11 +3430,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HierarchicalNamespaceBlobExpiryMatchesAzureOperationContracts()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal24 = application.ConfigureAwait(false);
         var service = CreateClient(
             application,
             SavaWebApplicationFactory.SecondAccountName,
@@ -3471,12 +3507,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    "2021-08-06",
                    "RelativeToNow",
                    "600000",
-                   "must not publish"u8.ToArray()))
+                   "must not publish"u8.ToArray()).ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal("FeatureVersionMismatch", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.False((await oldVersion.ExistsAsync()).Value);
+        Assert.False((await oldVersion.ExistsAsync().ConfigureAwait(true)).Value);
 
         var invalidCreationOption = container.GetBlobClient("relative-to-creation.bin");
         using (var response = await PutBlobAsync(
@@ -3485,12 +3521,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    "2023-08-03",
                    "RelativeToCreation",
                    "600000",
-                   "must not publish"u8.ToArray()))
+                   "must not publish"u8.ToArray()).ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.False((await invalidCreationOption.ExistsAsync()).Value);
+        Assert.False((await invalidCreationOption.ExistsAsync().ConfigureAwait(true)).Value);
 
         var absoluteExpiry = DateTimeOffset.UtcNow.AddMinutes(20);
         absoluteExpiry = new DateTimeOffset(
@@ -3508,11 +3544,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    "2023-08-03",
                    "Absolute",
                    absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
-                   "direct expiry"u8.ToArray()))
+                   "direct expiry"u8.ToArray()).ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
-        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name)).ExpiresAt);
+        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
 
         async Task<HttpResponseMessage> GetPropertiesAsync(string version)
         {
@@ -3523,12 +3559,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             return await transport.SendAsync(request).ConfigureAwait(false);
         }
 
-        using (var legacyProperties = await GetPropertiesAsync("2019-12-12"))
+        using (var legacyProperties = await GetPropertiesAsync("2019-12-12").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.OK, legacyProperties.StatusCode);
             Assert.False(legacyProperties.Headers.Contains("x-ms-expiry-time"));
         }
-        using (var properties = await GetPropertiesAsync("2020-02-10"))
+        using (var properties = await GetPropertiesAsync("2020-02-10").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.OK, properties.StatusCode);
             Assert.Equal(
@@ -3542,7 +3578,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var request = new HttpRequestMessage(HttpMethod.Get, listUri))
         {
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(true);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
             var listed = document.Descendants("Blob").Single(element =>
@@ -3556,43 +3592,43 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    direct,
                    "2020-02-10",
                    "Absolute",
-                   DateTimeOffset.UtcNow.AddMinutes(30).ToString("O", CultureInfo.InvariantCulture)))
+                   DateTimeOffset.UtcNow.AddMinutes(30).ToString("O", CultureInfo.InvariantCulture)).ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(malformed, "x-ms-error-code"));
         }
-        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name)).ExpiresAt);
+        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
 
-        var beforeRelative = await GetRecordAsync(direct.Name);
+        var beforeRelative = await GetRecordAsync(direct.Name).ConfigureAwait(true);
         using (var response = await SetExpiryAsync(
                    direct,
                    "2020-02-10",
                    "rElAtIvEtOcReAtIoN",
-                   "1800000"))
+                   "1800000").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.True(response.Headers.Contains("ETag"));
             Assert.NotNull(response.Content.Headers.LastModified);
         }
-        Assert.Equal(beforeRelative.CreatedAt.AddMinutes(30), (await GetRecordAsync(direct.Name)).ExpiresAt);
+        Assert.Equal(beforeRelative.CreatedAt.AddMinutes(30), (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
 
-        using (var invalidNever = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", "1"))
+        using (var invalidNever = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", "1").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.BadRequest, invalidNever.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(invalidNever, "x-ms-error-code"));
         }
-        using (var cleared = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", expiryTime: null))
+        using (var cleared = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", expiryTime: null).ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.OK, cleared.StatusCode);
         }
-        Assert.Null((await GetRecordAsync(direct.Name)).ExpiresAt);
+        Assert.Null((await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
 
-        await container.GetBlobClient("folder/child.bin").UploadAsync(BinaryData.FromString("child"));
+        await container.GetBlobClient("folder/child.bin").UploadAsync(BinaryData.FromString("child")).ConfigureAwait(true);
         using (var directory = await SetExpiryAsync(
                    container.GetBlobClient("folder"),
                    "2020-02-10",
                    "RelativeToNow",
-                   "600000"))
+                   "600000").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.Conflict, directory.StatusCode);
             Assert.Equal("BlobOperationNotSupported", GetResponseHeader(directory, "x-ms-error-code"));
@@ -3600,7 +3636,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         var block = container.GetBlockBlobClient("blocks.bin");
         var blockId = Convert.ToBase64String("expiry-block-0001"u8);
-        await block.StageBlockAsync(blockId, BinaryData.FromString("block expiry").ToStream());
+        await block.StageBlockAsync(blockId, BinaryData.FromString("block expiry").ToStream()).ConfigureAwait(true);
         var blockExpiry = absoluteExpiry.AddMinutes(10);
         async Task<HttpResponseMessage> CommitBlocksAsync(bool includeExpiry)
         {
@@ -3627,15 +3663,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             return await transport.SendAsync(request).ConfigureAwait(false);
         }
 
-        using (var committed = await CommitBlocksAsync(includeExpiry: true))
+        using (var committed = await CommitBlocksAsync(includeExpiry: true).ConfigureAwait(true))
             Assert.Equal(HttpStatusCode.Created, committed.StatusCode);
-        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name)).ExpiresAt);
-        using (var recommitted = await CommitBlocksAsync(includeExpiry: false))
+        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name).ConfigureAwait(true)).ExpiresAt);
+        using (var recommitted = await CommitBlocksAsync(includeExpiry: false).ConfigureAwait(true))
             Assert.Equal(HttpStatusCode.Created, recommitted.StatusCode);
-        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name)).ExpiresAt);
+        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name).ConfigureAwait(true)).ExpiresAt);
 
         var urlBytes = "put blob from url expiry"u8.ToArray();
-        await using (var source = await LoopbackSource.StartAsync(urlBytes))
+        var source = await LoopbackSource.StartAsync(urlBytes).ConfigureAwait(true);
+        await using (source.ConfigureAwait(false))
         {
             var destination = container.GetBlockBlobClient("from-url.bin");
             var request = new HttpRequestMessage(
@@ -3651,10 +3688,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "1200000");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(true);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            Assert.Equal(urlBytes, (await destination.DownloadContentAsync()).Value.Content.ToArray());
-            Assert.NotNull((await GetRecordAsync(destination.Name)).ExpiresAt);
+            Assert.Equal(urlBytes, (await destination.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+            Assert.NotNull((await GetRecordAsync(destination.Name).ConfigureAwait(true)).ExpiresAt);
         }
 
         var copyTarget = container.GetBlobClient("copy-rejects-expiry.bin");
@@ -3671,59 +3708,62 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-copy-source", "https://source.invalid/blob");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(true);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
         }
 
-        await using var flatApplication = new SavaWebApplicationFactory();
-        var flatService = CreateClient(flatApplication);
-        var flatContainer = flatService.GetBlobContainerClient($"flat-expiry-{Guid.NewGuid():N}");
-        await flatContainer.CreateAsync();
-        var flat = flatContainer.GetBlobClient("flat.bin");
-        using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
-        using (var response = await PutBlobAsync(
-                   flatTransport,
-                   flat,
-                   "2023-08-03",
-                   "RelativeToNow",
-                   "600000",
-                   "flat"u8.ToArray()))
+        var flatApplication = new SavaWebApplicationFactory();
+        await using (flatApplication.ConfigureAwait(false))
         {
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
-        }
-        Assert.False((await flat.ExistsAsync()).Value);
-        await flat.UploadAsync(BinaryData.FromString("flat"));
-        var flatRecord = await flatApplication.Services.GetRequiredService<BlobService>().GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            flatContainer.Name,
-            flat.Name,
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        var flatBusinessFailure = await Assert.ThrowsAsync<AzureStorageException>(() =>
-            flatApplication.Services.GetRequiredService<BlobService>().SetExpiryAsync(
-                flatRecord,
-                DateTimeOffset.UtcNow.AddMinutes(10),
-                CancellationToken.None));
-        Assert.Equal("BlobOperationNotSupported", flatBusinessFailure.ErrorCode);
+            var flatService = CreateClient(flatApplication);
+            var flatContainer = flatService.GetBlobContainerClient($"flat-expiry-{Guid.NewGuid():N}");
+            await flatContainer.CreateAsync().ConfigureAwait(true);
+            var flat = flatContainer.GetBlobClient("flat.bin");
+            using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
+            using (var response = await PutBlobAsync(
+                       flatTransport,
+                       flat,
+                       "2023-08-03",
+                       "RelativeToNow",
+                       "600000",
+                       "flat"u8.ToArray()).ConfigureAwait(true))
+            {
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+                Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
+            }
+            Assert.False((await flat.ExistsAsync().ConfigureAwait(true)).Value);
+            await flat.UploadAsync(BinaryData.FromString("flat")).ConfigureAwait(true);
+            var flatRecord = await flatApplication.Services.GetRequiredService<BlobService>().GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                flatContainer.Name,
+                flat.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                CancellationToken.None).ConfigureAwait(true);
+            var flatBusinessFailure = await Assert.ThrowsAsync<AzureStorageException>(() =>
+                flatApplication.Services.GetRequiredService<BlobService>().SetExpiryAsync(
+                    flatRecord,
+                    DateTimeOffset.UtcNow.AddMinutes(10),
+                    CancellationToken.None)).ConfigureAwait(true);
+            Assert.Equal("BlobOperationNotSupported", flatBusinessFailure.ErrorCode);
 
-        var flatExpiryUri = AppendQuery(
-            flat.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-            "comp=expiry");
-        using (var request = new HttpRequestMessage(HttpMethod.Put, flatExpiryUri)
-        {
-            Content = new ByteArrayContent([])
-        })
-        {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
-            using var response = await flatTransport.SendAsync(request);
-            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("BlobOperationNotSupported", GetResponseHeader(response, "x-ms-error-code"));
+            var flatExpiryUri = AppendQuery(
+                flat.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "comp=expiry");
+            using (var request = new HttpRequestMessage(HttpMethod.Put, flatExpiryUri)
+            {
+                Content = new ByteArrayContent([])
+            })
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+                request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
+                request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
+                using var response = await flatTransport.SendAsync(request).ConfigureAwait(true);
+                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+                Assert.Equal("BlobOperationNotSupported", GetResponseHeader(response, "x-ms-error-code"));
+            }
         }
     }
 
@@ -4002,7 +4042,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task StorageAnalyticsLoggingMaterializesProtectedAzureFormatSystemBlobs()
     {
-        await using var application = new SavaWebApplicationFactory();
+        var application = new SavaWebApplicationFactory();
+        await using var applicationDisposal25 = application.ConfigureAwait(false);
         var service = CreateClient(application);
         var configured = (await service.GetPropertiesAsync()).Value;
         configured.Logging = new BlobAnalyticsLogging
@@ -4104,9 +4145,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task StorageAnalyticsRetentionPurgesExpiredLogBlobsWhenLoggingIsDisabledForReads()
     {
         var clock = new AdjustableTimeProvider(new DateTimeOffset(2026, 9, 20, 8, 30, 0, TimeSpan.Zero));
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             clock,
             new Dictionary<string, string?>(StringComparer.Ordinal));
+        await using var applicationDisposal26 = application.ConfigureAwait(false);
         var service = CreateClient(application);
         var configured = (await service.GetPropertiesAsync()).Value;
         configured.Logging = new BlobAnalyticsLogging
@@ -5765,18 +5807,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 DataSource = Path.Combine(application.DataPath, "metadata.db"),
                 ForeignKeys = true
             }.ToString();
-            await using (var connection = new SqliteConnection(directConnectionString))
             {
-                await connection.OpenAsync();
-                await using var corrupt = connection.CreateCommand();
-                corrupt.CommandText = """
-                    UPDATE blobs SET data = 'not-json'
-                    WHERE account = $account AND container = $container AND name = $name;
-                    """;
-                corrupt.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
-                corrupt.Parameters.AddWithValue("$container", container.Name);
-                corrupt.Parameters.AddWithValue("$name", unrelated.Name);
-                Assert.Equal(1, await corrupt.ExecuteNonQueryAsync());
+                var connection = new SqliteConnection(directConnectionString);
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var corrupt = connection.CreateCommand();
+                    corrupt.CommandText = """
+                        UPDATE blobs SET data = 'not-json'
+                        WHERE account = $account AND container = $container AND name = $name;
+                        """;
+                    corrupt.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
+                    corrupt.Parameters.AddWithValue("$container", container.Name);
+                    corrupt.Parameters.AddWithValue("$name", unrelated.Name);
+                    Assert.Equal(1, await corrupt.ExecuteNonQueryAsync());
+                }
             }
 
             await deleted.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
@@ -5787,18 +5832,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 includeDeleted: true,
                 CancellationToken.None));
 
-            await using (var connection = new SqliteConnection(directConnectionString))
             {
-                await connection.OpenAsync();
-                await using var removeCorruptRecord = connection.CreateCommand();
-                removeCorruptRecord.CommandText = """
-                    DELETE FROM blobs
-                    WHERE account = $account AND container = $container AND name = $name;
-                    """;
-                removeCorruptRecord.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
-                removeCorruptRecord.Parameters.AddWithValue("$container", container.Name);
-                removeCorruptRecord.Parameters.AddWithValue("$name", unrelated.Name);
-                Assert.Equal(1, await removeCorruptRecord.ExecuteNonQueryAsync());
+                var connection = new SqliteConnection(directConnectionString);
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var removeCorruptRecord = connection.CreateCommand();
+                    removeCorruptRecord.CommandText = """
+                        DELETE FROM blobs
+                        WHERE account = $account AND container = $container AND name = $name;
+                        """;
+                    removeCorruptRecord.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
+                    removeCorruptRecord.Parameters.AddWithValue("$container", container.Name);
+                    removeCorruptRecord.Parameters.AddWithValue("$name", unrelated.Name);
+                    Assert.Equal(1, await removeCorruptRecord.ExecuteNonQueryAsync());
+                }
             }
 
             var atomic = container.GetBlobClient("atomic-family");
@@ -6805,21 +6853,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             return await client.SendAsync(request).ConfigureAwait(false);
         }
 
-        await SetPolicyAsync(permission);
-        using (var legacy = await GetAclAsync("2014-02-14"))
+        await SetPolicyAsync(permission).ConfigureAwait(true);
+        using (var legacy = await GetAclAsync("2014-02-14").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.Conflict, legacy.StatusCode);
             Assert.Equal("FeatureVersionMismatch", GetResponseHeader(legacy, "x-ms-error-code"));
         }
-        using (var modern = await GetAclAsync("2015-04-05"))
+        using (var modern = await GetAclAsync("2015-04-05").ConfigureAwait(true))
         {
             Assert.Equal(HttpStatusCode.OK, modern.StatusCode);
             Assert.Contains($"<Permission>{permission}</Permission>",
                 await modern.Content.ReadAsStringAsync(), StringComparison.Ordinal);
         }
 
-        await SetPolicyAsync("r");
-        using var legacyReadOnly = await GetAclAsync("2014-02-14");
+        await SetPolicyAsync("r").ConfigureAwait(true);
+        using var legacyReadOnly = await GetAclAsync("2014-02-14").ConfigureAwait(true);
         Assert.Equal(HttpStatusCode.OK, legacyReadOnly.StatusCode);
     }
 
@@ -6831,7 +6879,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         bool accountSharedKeyEnabled,
         bool? blobSharedKeyEnabled)
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowSharedKeyAccess"] =
@@ -6841,6 +6889,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] =
                     "racwdxytlfmeiopk"
             });
+        await using var applicationDisposal27 = application.ConfigureAwait(false);
         var token = CreateJwt(
             SavaWebApplicationFactory.AccountKey,
             SavaWebApplicationFactory.DelegatorObjectId,
@@ -6928,11 +6977,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task HttpsOnlyAccountRejectsInsecureBlobRequestsBeforeAuthorization()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:EnableHttpsTrafficOnly"] = "true"
             });
+        await using var applicationDisposal28 = application.ConfigureAwait(false);
         var secureService = CreateEncryptedClient(application, null, null);
         var container = secureService.GetBlobContainerClient($"https-only-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -6984,11 +7034,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task DirectoryServiceAndUserDelegationSasAreBoundToAnHnsPrefix()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal29 = application.ConfigureAwait(false);
         var owner = CreateClient(application);
         var container = owner.GetBlobContainerClient($"directory-sas-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -7630,27 +7681,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task UserBoundSasAccountPolicyLogsOrBlocksUnboundTokens()
     {
-        await using (var logApplication = new SavaWebApplicationFactory(
+        {
+            var logApplication = new SavaWebApplicationFactory(
                          new Dictionary<string, string?>(StringComparer.Ordinal)
                          {
                              [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
                                  "true"
-                         }))
-        {
-            var owner = CreateClient(logApplication);
-            var container = owner.GetBlobContainerClient($"user-bound-log-{Guid.NewGuid():N}");
-            await container.CreateAsync();
-            var blob = container.GetBlobClient("allowed.txt");
-            await blob.UploadAsync(BinaryData.FromString("log-only policy"));
-            var unboundServiceSas = CreateBlobClient(
-                logApplication,
-                HttpsSasUri(blob, BlobSasPermissions.Read));
-            Assert.Equal(
-                "log-only policy",
-                (await unboundServiceSas.DownloadContentAsync()).Value.Content.ToString());
+                         });
+            await using (logApplication.ConfigureAwait(false))
+            {
+                var owner = CreateClient(logApplication);
+                var container = owner.GetBlobContainerClient($"user-bound-log-{Guid.NewGuid():N}");
+                await container.CreateAsync();
+                var blob = container.GetBlobClient("allowed.txt");
+                await blob.UploadAsync(BinaryData.FromString("log-only policy"));
+                var unboundServiceSas = CreateBlobClient(
+                    logApplication,
+                    HttpsSasUri(blob, BlobSasPermissions.Read));
+                Assert.Equal(
+                    "log-only policy",
+                    (await unboundServiceSas.DownloadContentAsync()).Value.Content.ToString());
+            }
         }
 
-        await using var blockApplication = new SavaWebApplicationFactory(
+        var blockApplication = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
@@ -7658,6 +7712,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSasAction"] =
                     "Block"
             });
+        await using var blockApplicationDisposal30 = blockApplication.ConfigureAwait(false);
         var blockOwner = CreateClient(blockApplication);
         var blockContainer = blockOwner.GetBlobContainerClient($"user-bound-block-{Guid.NewGuid():N}");
         await blockContainer.CreateAsync();
@@ -7738,27 +7793,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task SasExpirationPolicyLogsOrBlocksEveryAdHocSasType()
     {
-        await using (var logApplication = new SavaWebApplicationFactory(
+        {
+            var logApplication = new SavaWebApplicationFactory(
                          new Dictionary<string, string?>(StringComparer.Ordinal)
                          {
                              [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationPeriod"] =
                                  "00:05:00"
-                         }))
-        {
-            var owner = CreateClient(logApplication);
-            var container = owner.GetBlobContainerClient($"sas-expiry-log-{Guid.NewGuid():N}");
-            await container.CreateAsync();
-            var blob = container.GetBlobClient("allowed.txt");
-            await blob.UploadAsync(BinaryData.FromString("log-only expiration policy"));
-            var loggedMissingStart = CreateBlobClient(
-                logApplication,
-                HttpsSasUri(blob, BlobSasPermissions.Read));
-            Assert.Equal(
-                "log-only expiration policy",
-                (await loggedMissingStart.DownloadContentAsync()).Value.Content.ToString());
+                         });
+            await using (logApplication.ConfigureAwait(false))
+            {
+                var owner = CreateClient(logApplication);
+                var container = owner.GetBlobContainerClient($"sas-expiry-log-{Guid.NewGuid():N}");
+                await container.CreateAsync();
+                var blob = container.GetBlobClient("allowed.txt");
+                await blob.UploadAsync(BinaryData.FromString("log-only expiration policy"));
+                var loggedMissingStart = CreateBlobClient(
+                    logApplication,
+                    HttpsSasUri(blob, BlobSasPermissions.Read));
+                Assert.Equal(
+                    "log-only expiration policy",
+                    (await loggedMissingStart.DownloadContentAsync()).Value.Content.ToString());
+            }
         }
 
-        await using var blockApplication = new SavaWebApplicationFactory(
+        var blockApplication = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationPeriod"] =
@@ -7766,6 +7824,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:SasExpirationAction"] =
                     "Block"
             });
+        await using var blockApplicationDisposal31 = blockApplication.ConfigureAwait(false);
         var ownerClient = CreateClient(blockApplication);
         var blockContainer = ownerClient.GetBlobContainerClient($"sas-expiry-block-{Guid.NewGuid():N}");
         await blockContainer.CreateAsync();
@@ -8466,13 +8525,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     {
         var allowedContainerName = $"copy-bearer-allowed-{Guid.NewGuid():N}";
         var privateContainerName = $"copy-bearer-private-{Guid.NewGuid():N}";
-        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             ["Sava:BearerAuthentication:Principals:copy-agent:Permissions"] = "rcw",
             ["Sava:BearerAuthentication:Principals:copy-agent:Accounts:0"] =
                 SavaWebApplicationFactory.AccountName,
             ["Sava:BearerAuthentication:Principals:copy-agent:Containers:0"] = allowedContainerName
         });
+        await using var applicationDisposal32 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var owner = CreateClient(application);
         var allowed = owner.GetBlobContainerClient(allowedContainerName);
@@ -8694,12 +8754,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 deniedCrossTenant.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        await using var crossTenantApplication = new SavaWebApplicationFactory(
+        var crossTenantApplication = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowCrossTenantDelegationSas"] =
                     "true"
             });
+        await using var crossTenantApplicationDisposal33 = crossTenantApplication.ConfigureAwait(false);
         using var crossTenantTransport = new HttpClient(crossTenantApplication.Server.CreateHandler());
         using (var accepted = await SendAsync(
                    crossTenantTransport,
@@ -8719,7 +8780,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task UrlTransfersSupportBlockAppendPageAndWholeBlobOperations()
     {
         var sourceBytes = Enumerable.Range(0, 16 * 1024).Select(index => (byte)(index % 251)).ToArray();
-        await using var source = await LoopbackSource.StartAsync(sourceBytes);
+        var source = (await LoopbackSource.StartAsync(sourceBytes));
+        await using var sourceDisposal34 = source.ConfigureAwait(false);
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"url-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -8807,8 +8869,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task UrlTransferRejectsRedirectWithoutContactingRedirectTarget()
     {
-        await using var source = await LoopbackSource.StartAsync("redirect target content"u8.ToArray());
-        await using var application = new SavaWebApplicationFactory();
+        var source = (await LoopbackSource.StartAsync("redirect target content"u8.ToArray()));
+        await using var sourceDisposal35 = source.ConfigureAwait(false);
+        var application = new SavaWebApplicationFactory();
+        await using var applicationDisposal36 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"url-redirect-{Guid.NewGuid():N}");
@@ -8827,8 +8891,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task UrlTransferRequiresExplicitTrustForPrivateResolvedSource()
     {
-        await using var source = await LoopbackSource.StartAsync("trusted loopback"u8.ToArray());
-        await using var application = new SavaWebApplicationFactory();
+        var source = (await LoopbackSource.StartAsync("trusted loopback"u8.ToArray()));
+        await using var sourceDisposal37 = source.ConfigureAwait(false);
+        var application = new SavaWebApplicationFactory();
+        await using var applicationDisposal38 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var container = CreateClient(application)
             .GetBlobContainerClient($"url-egress-{Guid.NewGuid():N}");
@@ -9035,7 +9101,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task UrlSourceConditionsAndFailuresKeepAzureErrorSemantics()
     {
         var sourceBytes = Enumerable.Range(0, 2048).Select(index => (byte)(index % 241)).ToArray();
-        await using var source = await LoopbackSource.StartAsync(sourceBytes);
+        var source = (await LoopbackSource.StartAsync(sourceBytes));
+        await using var sourceDisposal39 = source.ConfigureAwait(false);
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"url-errors-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -9355,7 +9422,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(412, failed.Status);
         Assert.Equal("SequenceNumberConditionNotMet", failed.ErrorCode);
 
-        var diff = (await page.GetPageRangesDiffAsync(previousSnapshot: snapshot)).Value;
+        var diff = (await page.GetPageRangesDiffAsync(previousSnapshot: snapshot).ConfigureAwait(true)).Value;
         Assert.Collection(
             diff.PageRanges,
             range =>
@@ -9503,12 +9570,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task ImmutabilityPoliciesAndLegalHoldsArePersistedAndEnforced()
     {
         var containerName = $"worm-{Guid.NewGuid():N}";
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningContainers:0"] = containerName
             });
+        await using var applicationDisposal40 = application.ConfigureAwait(false);
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
@@ -9571,12 +9639,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task ImmutableStorageWithVersioningCapabilityMatchesContainerAndPolicySemantics()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningEnabled"] = "true"
             });
+        await using var applicationDisposal41 = application.ConfigureAwait(false);
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient($"version-worm-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -9984,7 +10053,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 arrowRequest.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
                 using var response = await transport.SendAsync(arrowRequest);
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                await using var stream = await response.Content.ReadAsStreamAsync();
+                var stream = (await response.Content.ReadAsStreamAsync());
+                await using var streamDisposal42 = stream.ConfigureAwait(false);
                 using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(stream);
                 using var batch = await reader.ReadNextRecordBatchAsync();
                 Assert.NotNull(batch);
@@ -10025,7 +10095,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task AsynchronousCopiesCompleteDurablyAndCanBeAborted()
     {
         var remoteBytes = Enumerable.Range(0, 48 * 1024).Select(index => (byte)(index % 241)).ToArray();
-        await using var remote = await LoopbackSource.StartAsync(remoteBytes);
+        var remote = (await LoopbackSource.StartAsync(remoteBytes));
+        await using var remoteDisposal43 = remote.ConfigureAwait(false);
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"copy-{Guid.NewGuid():N}");
         await container.CreateAsync();
@@ -10718,11 +10789,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     [Fact]
     public async Task MaintenanceExpiresUncommittedBlocksAndNeverReclaimsPinnedContent()
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
             });
+        await using var applicationDisposal44 = application.ConfigureAwait(false);
         var client = CreateClient(application);
         var containerName = $"maintenance-{Guid.NewGuid():N}";
         var container = client.GetBlobContainerClient(containerName);
@@ -10812,22 +10884,25 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await File.WriteAllBytesAsync(freshPath, "fresh"u8.ToArray());
         File.SetLastWriteTimeUtc(abandonedPath, DateTime.UtcNow.AddDays(-2));
 
-        await using (var active = new FileStream(
+        {
+            var active = new FileStream(
                          activePath,
                          FileMode.CreateNew,
                          FileAccess.ReadWrite,
                          FileShare.None,
                          bufferSize: 4096,
-                         FileOptions.Asynchronous))
-        {
-            await active.WriteAsync("active"u8.ToArray());
-            await active.FlushAsync();
-            File.SetLastWriteTimeUtc(activePath, DateTime.UtcNow.AddDays(-2));
+                         FileOptions.Asynchronous);
+            await using (active.ConfigureAwait(false))
+            {
+                await active.WriteAsync("active"u8.ToArray());
+                await active.FlushAsync();
+                File.SetLastWriteTimeUtc(activePath, DateTime.UtcNow.AddDays(-2));
 
-            await blobService.RunMaintenanceAsync(CancellationToken.None);
-            Assert.False(File.Exists(abandonedPath));
-            Assert.True(File.Exists(activePath));
-            Assert.True(File.Exists(freshPath));
+                await blobService.RunMaintenanceAsync(CancellationToken.None);
+                Assert.False(File.Exists(abandonedPath));
+                Assert.True(File.Exists(activePath));
+                Assert.True(File.Exists(freshPath));
+            }
         }
 
         await blobService.RunMaintenanceAsync(CancellationToken.None);
@@ -10850,20 +10925,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             CancellationToken.None);
         var chunk = record.Content.Chunks.First(item => !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
         var chunkPath = ChunkPath(factory.DataPath, chunk.Id);
-        await using (var file = new FileStream(
+        {
+            var file = new FileStream(
                          chunkPath,
                          FileMode.Open,
                          FileAccess.ReadWrite,
                          FileShare.None,
                          bufferSize: 4096,
-                         FileOptions.Asynchronous))
-        {
-            file.Position = file.Length - 1;
-            var value = file.ReadByte();
-            Assert.NotEqual(-1, value);
-            file.Position--;
-            file.WriteByte((byte)(value ^ 0xff));
-            file.Flush(flushToDisk: true);
+                         FileOptions.Asynchronous);
+            await using (file.ConfigureAwait(false))
+            {
+                file.Position = file.Length - 1;
+                var value = file.ReadByte();
+                Assert.NotEqual(-1, value);
+                file.Position--;
+                file.WriteByte((byte)(value ^ 0xff));
+                file.Flush(flushToDisk: true);
+            }
         }
 
         await blobService.RunMaintenanceAsync(CancellationToken.None);
@@ -11061,30 +11139,36 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
             Assert.Single(EnumerateChunkFiles(backupPath));
             Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
-            await using (var connection = new SqliteConnection(
-                             $"Data Source={Path.Combine(backupPath, "metadata.db")}"))
             {
-                await connection.OpenAsync();
-                await using var command = connection.CreateCommand();
-                command.CommandText =
-                    "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
-                Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                var connection = new SqliteConnection(
+                             $"Data Source={Path.Combine(backupPath, "metadata.db")}");
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var command = connection.CreateCommand();
+                    command.CommandText =
+                        "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
+                    Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                }
             }
 
             var packPath = Assert.Single(EnumeratePackFiles(dataPath)).FullName;
-            await using (var corrupt = new FileStream(
+            {
+                var corrupt = new FileStream(
                              packPath,
                              FileMode.Open,
                              FileAccess.ReadWrite,
                              FileShare.None,
                              4096,
-                             FileOptions.Asynchronous))
-            {
-                var value = corrupt.ReadByte();
-                Assert.NotEqual(-1, value);
-                corrupt.Position = 0;
-                corrupt.WriteByte((byte)(value ^ 0xff));
-                corrupt.Flush(flushToDisk: true);
+                             FileOptions.Asynchronous);
+                await using (corrupt.ConfigureAwait(false))
+                {
+                    var value = corrupt.ReadByte();
+                    Assert.NotEqual(-1, value);
+                    corrupt.Position = 0;
+                    corrupt.WriteByte((byte)(value ^ 0xff));
+                    corrupt.Flush(flushToDisk: true);
+                }
             }
             var record = await blobs.GetBlobAsync(
                 SavaWebApplicationFactory.AccountName,
@@ -11370,20 +11454,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Path.Combine(backupPath, "chunks"),
                 "*.chunk",
                 SearchOption.AllDirectories).First();
-            await using (var corrupt = new FileStream(
+            {
+                var corrupt = new FileStream(
                              backedUpChunk,
                              FileMode.Open,
                              FileAccess.ReadWrite,
                              FileShare.None,
                              4096,
-                             FileOptions.Asynchronous))
-            {
-                corrupt.Position = corrupt.Length - 1;
-                var value = corrupt.ReadByte();
-                Assert.NotEqual(-1, value);
-                corrupt.Position--;
-                corrupt.WriteByte((byte)(value ^ 0xff));
-                corrupt.Flush(flushToDisk: true);
+                             FileOptions.Asynchronous);
+                await using (corrupt.ConfigureAwait(false))
+                {
+                    corrupt.Position = corrupt.Length - 1;
+                    var value = corrupt.ReadByte();
+                    Assert.NotEqual(-1, value);
+                    corrupt.Position--;
+                    corrupt.WriteByte((byte)(value ^ 0xff));
+                    corrupt.Flush(flushToDisk: true);
+                }
             }
             await Assert.ThrowsAsync<InvalidDataException>(() =>
                 backup.ValidateAsync(backupPath, CancellationToken.None));
@@ -11442,24 +11529,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(Convert.ToBase64String("migrated-block"u8), staged.Name);
             Assert.Equal(512, staged.SizeLong);
 
-            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
             {
-                await connection.OpenAsync();
-                await using var version = connection.CreateCommand();
-                version.CommandText = "PRAGMA user_version;";
-                Assert.Equal(
-                    MetadataStore.CurrentSchemaVersion,
-                    Convert.ToInt32(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
-                await using var references = connection.CreateCommand();
-                references.CommandText = """
-                    SELECT
-                        (SELECT COUNT(*) FROM blob_chunk_references) +
-                        (SELECT COUNT(*) FROM staged_block_chunk_references);
-                    """;
-                Assert.Equal(2L, Convert.ToInt64(await references.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
-                await using var tags = connection.CreateCommand();
-                tags.CommandText = "SELECT COUNT(*) FROM blob_tags;";
-                Assert.Equal(1L, Convert.ToInt64(await tags.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var version = connection.CreateCommand();
+                    version.CommandText = "PRAGMA user_version;";
+                    Assert.Equal(
+                        MetadataStore.CurrentSchemaVersion,
+                        Convert.ToInt32(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                    await using var references = connection.CreateCommand();
+                    references.CommandText = """
+                        SELECT
+                            (SELECT COUNT(*) FROM blob_chunk_references) +
+                            (SELECT COUNT(*) FROM staged_block_chunk_references);
+                        """;
+                    Assert.Equal(2L, Convert.ToInt64(await references.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                    await using var tags = connection.CreateCommand();
+                    tags.CommandText = "SELECT COUNT(*) FROM blob_tags;";
+                    Assert.Equal(1L, Convert.ToInt64(await tags.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+                }
             }
 
             var backup = application.Services.GetRequiredService<StorageBackupService>();
@@ -11468,15 +11558,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(1, created.StagedBlockCount);
             Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
 
-            await using (var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}"))
             {
-                await connection.OpenAsync();
-                await using var corruptIndex = connection.CreateCommand();
-                corruptIndex.CommandText = """
-                    DELETE FROM blob_chunk_references;
-                    DELETE FROM staged_block_chunk_references;
-                    """;
-                await corruptIndex.ExecuteNonQueryAsync();
+                var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+                await using (connection.ConfigureAwait(false))
+                {
+                    await connection.OpenAsync();
+                    await using var corruptIndex = connection.CreateCommand();
+                    corruptIndex.CommandText = """
+                        DELETE FROM blob_chunk_references;
+                        DELETE FROM staged_block_chunk_references;
+                        """;
+                    await corruptIndex.ExecuteNonQueryAsync();
+                }
             }
             var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
                 backup.CreateAsync(rejectedBackupPath, CancellationToken.None));
@@ -11745,12 +11838,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         finally
         {
             await stop.CancelAsync();
-            await sweeper;
+            await sweeper.ConfigureAwait(true);
         }
 
         foreach (var index in Enumerable.Range(0, 16))
         {
-            var downloaded = await container.GetBlobClient($"published-{index:D2}.bin").DownloadContentAsync();
+            var downloaded = await container.GetBlobClient($"published-{index:D2}.bin").DownloadContentAsync().ConfigureAwait(true);
             Assert.Equal(content, downloaded.Value.Content.ToArray());
         }
     }
@@ -12461,12 +12554,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task VersionedBlobFeaturesRejectBeforeMutationAndHideNewerResponseFields()
     {
         var containerName = $"feature-versions-{Guid.NewGuid():N}";
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:ImmutableStorageWithVersioningContainers:0"] = containerName
             });
+        await using var applicationDisposal45 = application.ConfigureAwait(false);
         var service = CreateClient(application);
         var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
@@ -12803,41 +12897,44 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-public-policy-{Guid.NewGuid():N}");
         var containerName = $"public-policy-{Guid.NewGuid():N}";
         const string blobName = "content.txt";
-        await using (var initial = new SavaWebApplicationFactory(
+        {
+            var initial = new SavaWebApplicationFactory(
                          dataPath,
                          new Dictionary<string, string?>(StringComparer.Ordinal) { ["Sava:AllowAnonymousPublicAccess"] = "true" },
-                         deleteDataPath: false))
-        {
-            await initial.InitializeAsync();
-            foreach (var (account, key) in new[]
+                         deleteDataPath: false);
+            await using (initial.ConfigureAwait(false))
             {
-                (SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
-                (SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey)
-            })
-            {
-                var client = CreateClient(initial, account, key);
-                var container = client.GetBlobContainerClient(containerName);
-                await container.CreateAsync(
-                    account == SavaWebApplicationFactory.AccountName
-                        ? PublicAccessType.Blob
-                        : PublicAccessType.BlobContainer);
-                await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account));
-            }
+                await initial.InitializeAsync();
+                foreach (var (account, key) in new[]
+                {
+                    (SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+                    (SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey)
+                })
+                {
+                    var client = CreateClient(initial, account, key);
+                    var container = client.GetBlobContainerClient(containerName);
+                    await container.CreateAsync(
+                        account == SavaWebApplicationFactory.AccountName
+                            ? PublicAccessType.Blob
+                            : PublicAccessType.BlobContainer);
+                    await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account));
+                }
 
-            var secondAccount = CreateClient(
-                initial,
-                SavaWebApplicationFactory.SecondAccountName,
-                SavaWebApplicationFactory.SecondAccountKey);
-            var properties = (await secondAccount.GetPropertiesAsync()).Value;
-            properties.StaticWebsite.Enabled = true;
-            properties.StaticWebsite.IndexDocument = "index.html";
-            await secondAccount.SetPropertiesAsync(properties);
-            await secondAccount.GetBlobContainerClient("$web")
-                .GetBlobClient("index.html")
-                .UploadAsync(BinaryData.FromString("website remains public"));
+                var secondAccount = CreateClient(
+                    initial,
+                    SavaWebApplicationFactory.SecondAccountName,
+                    SavaWebApplicationFactory.SecondAccountKey);
+                var properties = (await secondAccount.GetPropertiesAsync()).Value;
+                properties.StaticWebsite.Enabled = true;
+                properties.StaticWebsite.IndexDocument = "index.html";
+                await secondAccount.SetPropertiesAsync(properties);
+                await secondAccount.GetBlobContainerClient("$web")
+                    .GetBlobClient("index.html")
+                    .UploadAsync(BinaryData.FromString("website remains public"));
+            }
         }
 
-        await using var restarted = new SavaWebApplicationFactory(
+        var restarted = new SavaWebApplicationFactory(
             dataPath,
             new Dictionary<string, string?>(StringComparer.Ordinal)
             {
@@ -12846,6 +12943,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:AllowBlobPublicAccess"] = "false"
             },
             deleteDataPath: true);
+        await using var restartedDisposal46 = restarted.ConfigureAwait(false);
         await restarted.InitializeAsync();
         using var anonymous = new HttpClient(restarted.Server.CreateHandler());
         using (var allowed = await anonymous.GetAsync(
@@ -13348,36 +13446,39 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var schema = new Parquet.Schema.ParquetSchema(id, name, enabled, score, observed, maybe);
 
         using var content = new MemoryStream();
-        await using (var writer = await Parquet.ParquetWriter.CreateAsync(schema, content))
         {
-            using (var group = writer.CreateRowGroup())
+            var writer = (await Parquet.ParquetWriter.CreateAsync(schema, content));
+            await using (writer.ConfigureAwait(false))
             {
-                await group.WriteAsync<int>(id, new[] { 1, 2 }.AsMemory());
-                await group.WriteAsync(name, new string?[] { "one", "two" });
-                await group.WriteAsync<bool>(enabled, new[] { true, false }.AsMemory());
-                await group.WriteAsync<double>(score, new[] { 1.25D, 2.5D }.AsMemory());
-                await group.WriteAsync<DateTime>(
-                    observed,
-                    new[]
-                    {
-                        new DateTime(2026, 9, 20, 10, 15, 0, DateTimeKind.Utc),
-                        new DateTime(2026, 9, 21, 11, 30, 0, DateTimeKind.Utc)
-                    }.AsMemory());
-                await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory());
-                group.CompleteValidate();
-            }
+                using (var group = writer.CreateRowGroup())
+                {
+                    await group.WriteAsync<int>(id, new[] { 1, 2 }.AsMemory());
+                    await group.WriteAsync(name, new string?[] { "one", "two" });
+                    await group.WriteAsync<bool>(enabled, new[] { true, false }.AsMemory());
+                    await group.WriteAsync<double>(score, new[] { 1.25D, 2.5D }.AsMemory());
+                    await group.WriteAsync<DateTime>(
+                        observed,
+                        new[]
+                        {
+                            new DateTime(2026, 9, 20, 10, 15, 0, DateTimeKind.Utc),
+                            new DateTime(2026, 9, 21, 11, 30, 0, DateTimeKind.Utc)
+                        }.AsMemory());
+                    await group.WriteAsync<int>(maybe, new int?[] { null, 20 }.AsMemory());
+                    group.CompleteValidate();
+                }
 
-            using (var group = writer.CreateRowGroup())
-            {
-                await group.WriteAsync<int>(id, new[] { 3 }.AsMemory());
-                await group.WriteAsync(name, new string?[] { "three" });
-                await group.WriteAsync<bool>(enabled, new[] { true }.AsMemory());
-                await group.WriteAsync<double>(score, new[] { 3.75D }.AsMemory());
-                await group.WriteAsync<DateTime>(
-                    observed,
-                    new[] { new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc) }.AsMemory());
-                await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory());
-                group.CompleteValidate();
+                using (var group = writer.CreateRowGroup())
+                {
+                    await group.WriteAsync<int>(id, new[] { 3 }.AsMemory());
+                    await group.WriteAsync(name, new string?[] { "three" });
+                    await group.WriteAsync<bool>(enabled, new[] { true }.AsMemory());
+                    await group.WriteAsync<double>(score, new[] { 3.75D }.AsMemory());
+                    await group.WriteAsync<DateTime>(
+                        observed,
+                        new[] { new DateTime(2026, 9, 22, 12, 45, 0, DateTimeKind.Utc) }.AsMemory());
+                    await group.WriteAsync<int>(maybe, new int?[] { null }.AsMemory());
+                    group.CompleteValidate();
+                }
             }
         }
         content.Position = 0;
@@ -13747,7 +13848,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
-            await using (var schema = connection.CreateCommand())
+            var schema = connection.CreateCommand();
+            await using (schema.ConfigureAwait(false))
             {
                 schema.CommandText = """
                 CREATE TABLE containers (
@@ -13785,7 +13887,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 );
                 PRAGMA user_version=1;
                 """;
-                await schema.ExecuteNonQueryAsync();
+                await schema.ExecuteNonQueryAsync().ConfigureAwait(false);
             }
             var insert = connection.CreateCommand();
             await using (insert.ConfigureAwait(false))

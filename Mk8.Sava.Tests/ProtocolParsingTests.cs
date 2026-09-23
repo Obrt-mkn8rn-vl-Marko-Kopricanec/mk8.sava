@@ -25,7 +25,8 @@ public sealed class ProtocolParsingTests
               </InputSerialization>
             </QueryRequest>
             """;
-        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        await using var bodyDisposal1 = body.ConfigureAwait(false);
 
         var request = await BlobQueryProtocol.ReadRequestAsync(body, CancellationToken.None);
 
@@ -44,7 +45,8 @@ public sealed class ProtocolParsingTests
               <OutputSerialization><Format><Type>json</Type></Format></OutputSerialization>
             </QueryRequest>
             """;
-        await using var acceptedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetInput), writable: false);
+        var acceptedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetInput), writable: false);
+        await using var acceptedBodyDisposal2 = acceptedBody.ConfigureAwait(false);
 
         var request = await BlobQueryProtocol.ReadRequestAsync(acceptedBody, CancellationToken.None);
 
@@ -58,7 +60,8 @@ public sealed class ProtocolParsingTests
               <OutputSerialization><Format><Type>parquet</Type></Format></OutputSerialization>
             </QueryRequest>
             """;
-        await using var rejectedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetOutput), writable: false);
+        var rejectedBody = new MemoryStream(Encoding.UTF8.GetBytes(parquetOutput), writable: false);
+        await using var rejectedBodyDisposal3 = rejectedBody.ConfigureAwait(false);
 
         var exception = await Assert.ThrowsAsync<AzureStorageException>(
             () => BlobQueryProtocol.ReadRequestAsync(rejectedBody, CancellationToken.None));
@@ -77,7 +80,8 @@ public sealed class ProtocolParsingTests
             xml.Append("<Uncommitted>").Append(blockId).Append("</Uncommitted>");
         xml.Append("</BlockList>");
 
-        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml.ToString()), writable: false);
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(xml.ToString()), writable: false);
+        await using var bodyDisposal4 = body.ConfigureAwait(false);
         var blocks = await ProtocolParsing.ReadBlockListAsync(body, CancellationToken.None);
 
         Assert.Equal(BlobServiceLimits.MaximumCommittedBlockCount, blocks.Count);
@@ -94,7 +98,8 @@ public sealed class ProtocolParsingTests
             xml.Append("<Latest>AA==</Latest>");
         xml.Append("</BlockList>");
 
-        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml.ToString()), writable: false);
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(xml.ToString()), writable: false);
+        await using var bodyDisposal5 = body.ConfigureAwait(false);
         var exception = await Assert.ThrowsAsync<AzureStorageException>(
             () => ProtocolParsing.ReadBlockListAsync(body, CancellationToken.None));
 
@@ -111,7 +116,8 @@ public sealed class ProtocolParsingTests
                      "<BlockList><Latest>AA==</Latest></BlockList><Other />"
                  })
         {
-            await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+            var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+            await using var bodyDisposal6 = body.ConfigureAwait(false);
             await Assert.ThrowsAsync<XmlException>(
                 () => ProtocolParsing.ReadBlockListAsync(body, CancellationToken.None));
         }
@@ -127,7 +133,8 @@ public sealed class ProtocolParsingTests
     [InlineData("<SignedIdentifiers><SignedIdentifier><Id>a</Id><AccessPolicy><Start>September 22, 2026</Start></AccessPolicy></SignedIdentifier></SignedIdentifiers>")]
     public async Task AccessPolicyParserRejectsUnknownDuplicateAndNonIsoContent(string xml)
     {
-        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        await using var bodyDisposal7 = body.ConfigureAwait(false);
         var exception = await Assert.ThrowsAsync<AzureStorageException>(
             () => ProtocolParsing.ReadAclAsync(body, CancellationToken.None));
 
@@ -154,7 +161,8 @@ public sealed class ProtocolParsingTests
               </SignedIdentifier>
             </SignedIdentifiers>
             """;
-        await using var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        var body = new MemoryStream(Encoding.UTF8.GetBytes(xml), writable: false);
+        await using var bodyDisposal8 = body.ConfigureAwait(false);
 
         var policies = await ProtocolParsing.ReadAclAsync(body, CancellationToken.None);
 

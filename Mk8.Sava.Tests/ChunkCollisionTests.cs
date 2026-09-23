@@ -12,7 +12,7 @@ public sealed class ChunkCollisionTests
     [InlineData(true)]
     public async Task EqualDigestsNeverShareStorageWithoutEqualBytes(bool packed)
     {
-        await using var application = new SavaWebApplicationFactory(
+        var application = new SavaWebApplicationFactory(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-collision-{Guid.NewGuid():N}"),
             new NullStorageFaultInjector(),
             analyticsSink: null,
@@ -23,6 +23,7 @@ public sealed class ChunkCollisionTests
             },
             deleteDataPath: true,
             disableMaintenance: true);
+        await using var applicationDisposal1 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var services = application.Services;
         var chunks = new ChunkStore(

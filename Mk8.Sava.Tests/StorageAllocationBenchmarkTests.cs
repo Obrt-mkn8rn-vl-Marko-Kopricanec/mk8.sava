@@ -27,7 +27,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
         Directory.CreateDirectory(rawRoot);
         try
         {
-            await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+            var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
             {
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true",
                 ["Sava:MaintenanceScanInterval"] = "01:00:00",
@@ -37,6 +37,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 ["Sava:SmallChunkPackingThresholdBytes"] = "49152",
                 ["Logging:LogLevel:Default"] = "Warning"
             });
+            await using var applicationDisposal1 = application.ConfigureAwait(false);
             await application.InitializeAsync();
             var account = SavaWebApplicationFactory.AccountName;
             var endpoint = new Uri($"http://{account}.localhost");
@@ -151,7 +152,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 double write = 0;
                 for (var index = 0; index < 8; index++)
                     write += await UploadAsync($"duplicate-{index}.bin", $"duplicate-{index}.bin", duplicate).ConfigureAwait(false);
-                return (write, await VerifyAsync("duplicate-7.bin", duplicate));
+                return (write, await VerifyAsync("duplicate-7.bin", duplicate).ConfigureAwait(false));
             });
 
             var sharedBase = new byte[2 * 1024 * 1024];
@@ -168,7 +169,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     sharedBase.AsSpan(2048).CopyTo(latest.AsSpan(6144));
                     write += await UploadAsync($"partial-{index}.bin", $"partial-{index}.bin", latest).ConfigureAwait(false);
                 }
-                return (write, await VerifyAsync("partial-4.bin", latest));
+                return (write, await VerifyAsync("partial-4.bin", latest).ConfigureAwait(false));
             });
 
             await RecordAsync("eight_versions", async () =>
@@ -181,7 +182,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     latest.AsSpan().Fill((byte)('A' + index));
                     write += await UploadAsync("versioned.bin", $"version-{index}.bin", latest).ConfigureAwait(false);
                 }
-                return (write, await VerifyAsync("versioned.bin", latest));
+                return (write, await VerifyAsync("versioned.bin", latest).ConfigureAwait(false));
             });
 
             await RecordAsync("one_hundred_twenty_eight_small", async () =>
@@ -194,7 +195,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     new Random(0x5300 + index).NextBytes(latest);
                     write += await UploadAsync($"small-{index}.bin", $"small-{index}.bin", latest).ConfigureAwait(false);
                 }
-                return (write, await VerifyAsync("small-127.bin", latest));
+                return (write, await VerifyAsync("small-127.bin", latest).ConfigureAwait(false));
             });
 
             await RecordAsync("four_incompressible", async () =>
@@ -207,7 +208,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     new Random(0x5400 + index).NextBytes(latest);
                     write += await UploadAsync($"random-{index}.bin", $"random-{index}.bin", latest).ConfigureAwait(false);
                 }
-                return (write, await VerifyAsync("random-3.bin", latest));
+                return (write, await VerifyAsync("random-3.bin", latest).ConfigureAwait(false));
             });
         }
         finally
