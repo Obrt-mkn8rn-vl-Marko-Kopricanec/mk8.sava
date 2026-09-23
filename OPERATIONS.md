@@ -647,7 +647,11 @@ an active transaction can still make the WAL temporarily larger. The storage
 byte gauges in `/metrics` sum serialized file lengths, not filesystem blocks.
 For measured allocation, run the Linux benchmark below, which uses GNU `du`
 over the complete live root and a raw-file baseline, including directory,
-SQLite, chunk, pack, and staging allocation:
+SQLite, chunk, pack, and staging allocation. It also samples allocated staging
+space and process working set every 10 ms during each workload. Those sampled
+peaks are lower bounds, not exact maxima; the in-process test host's working
+set is not a separate production-server measurement. MSAVA remains an unmeasured
+comparison, so do not use this benchmark alone for production performance claims:
 
 ```bash
 dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj \
