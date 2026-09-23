@@ -120,6 +120,36 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task ContainerPrefixMetadataAndPagingMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var prefix = $"mk8-azurite-{Guid.NewGuid():N}-";
+        try
+        {
+            var expected = await ExerciseContainerListingAsync(azurite, prefix).ConfigureAwait(false);
+            var actual = await ExerciseContainerListingAsync(local, prefix).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            foreach (var suffix in new[] { "a", "b", "c" })
+            {
+                await DeleteIfExistsAsync(local.GetBlobContainerClient(prefix + suffix)).ConfigureAwait(false);
+                await DeleteIfExistsAsync(azurite.GetBlobContainerClient(prefix + suffix)).ConfigureAwait(false);
+            }
+            await DeleteIfExistsAsync(local.GetBlobContainerClient(prefix[..^1] + "x")).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azurite.GetBlobContainerClient(prefix[..^1] + "x")).ConfigureAwait(false);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -288,6 +318,34 @@ public sealed class AzuriteDifferentialTests
             rejected.Status, rejected.ErrorCode, deleted.Status);
     }
 
+    private static async Task<ContainerListingObservation> ExerciseContainerListingAsync(
+        BlobServiceClient service,
+        string prefix)
+    {
+        foreach (var suffix in new[] { "a", "b", "c" })
+        {
+            await service.GetBlobContainerClient(prefix + suffix).CreateAsync(
+                metadata: new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = suffix })
+                .ConfigureAwait(false);
+        }
+        await service.GetBlobContainerClient(prefix[..^1] + "x").CreateAsync().ConfigureAwait(false);
+
+        var pages = new List<string>();
+        var continuationCount = 0;
+        await foreach (var page in service.GetBlobContainersAsync(BlobContainerTraits.Metadata, prefix: prefix)
+                           .AsPages(pageSizeHint: 1).ConfigureAwait(false))
+        {
+            pages.Add(string.Join(',', page.Values.Select(item => $"{item.Name}:{item.Properties.Metadata["phase"]}")));
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                continuationCount++;
+        }
+
+        Assert.Equal([$"{prefix}a:a", $"{prefix}b:b", $"{prefix}c:c"], pages);
+        Assert.Equal(2, continuationCount);
+
+        return new ContainerListingObservation(string.Join('|', pages), continuationCount);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -344,4 +402,6 @@ public sealed class AzuriteDifferentialTests
         int MissingLeaseStatus,
         string? MissingLeaseCode,
         int DeleteStatus);
+
+    private sealed record ContainerListingObservation(string Pages, int ContinuationCount);
 }
