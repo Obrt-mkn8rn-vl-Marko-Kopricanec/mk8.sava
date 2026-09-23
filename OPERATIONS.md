@@ -523,6 +523,16 @@ tier changes.
   blob names, but deployments should still restrict them to the monitoring
   network.
 
+The existing chunk, staging, and metadata byte gauges measure serialized file
+lengths. On Linux, `mk8_sava_storage_allocated_root_bytes` additionally measures
+actual 512-byte filesystem blocks under the complete data root, including
+SQLite journals, staging files, directories, and the root lease. It does not
+follow symlinks or count a hard-linked inode twice. The value is refreshed by a
+maintenance pass and is absent on platforms without the Linux `statx` block
+accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
+valid measurement and distinguishes an unmeasured or unsupported host from
+an empty root. This full tree walk adds I/O on large roots.
+
 Integrity scanning is controlled by
 `Sava:IntegrityScanChunksPerMaintenancePass`. Customer-provided-key chunks are
 structurally checked and counted separately because mk8.sava deliberately does

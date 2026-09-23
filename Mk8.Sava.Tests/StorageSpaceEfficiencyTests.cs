@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
@@ -8,6 +10,72 @@ namespace Mk8.Sava.Tests;
 
 public sealed class StorageSpaceEfficiencyTests
 {
+    [Fact]
+    public async Task LinuxAllocationMeterMatchesFilesystemBlocksWithoutFollowingExternalLinks()
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-allocated-{Guid.NewGuid():N}");
+        var external = Path.Combine(Path.GetTempPath(), $"mk8-sava-allocated-external-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(external);
+        var link = Path.Combine(root, "external-link");
+        try
+        {
+            var nested = Path.Combine(root, "nested");
+            Directory.CreateDirectory(nested);
+            var smallFile = Path.Combine(nested, "small.bin");
+            await File.WriteAllBytesAsync(smallFile, new byte[80]);
+            await File.WriteAllBytesAsync(Path.Combine(nested, "sparse.bin"), new byte[8192]);
+            await File.WriteAllBytesAsync(Path.Combine(external, "large.bin"), new byte[4 * 1024 * 1024]);
+            Directory.CreateSymbolicLink(link, external);
+            var hardLink = new ProcessStartInfo("ln") { RedirectStandardError = true };
+            hardLink.ArgumentList.Add(smallFile);
+            hardLink.ArgumentList.Add(Path.Combine(root, "small-hard-link.bin"));
+            using (var linkProcess = Process.Start(hardLink)!)
+            {
+                var linkError = await linkProcess.StandardError.ReadToEndAsync();
+                await linkProcess.WaitForExitAsync();
+                Assert.True(linkProcess.ExitCode == 0, linkError);
+            }
+
+            var measured = StorageAllocationMeter.MeasureRoot(root);
+            Assert.NotNull(measured);
+            using var process = new Process
+            {
+                StartInfo = new ProcessStartInfo("du")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                }
+            };
+            process.StartInfo.ArgumentList.Add("-s");
+            process.StartInfo.ArgumentList.Add("--block-size=1");
+            process.StartInfo.ArgumentList.Add("--");
+            process.StartInfo.ArgumentList.Add(root);
+            process.Start();
+            var output = await process.StandardOutput.ReadToEndAsync();
+            var error = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+            Assert.True(process.ExitCode == 0, error);
+            var separator = output.IndexOf('\t');
+            Assert.True(separator > 0, output);
+            Assert.Equal(
+                long.Parse(output.AsSpan(0, separator), CultureInfo.InvariantCulture),
+                measured.Value);
+        }
+        finally
+        {
+            if (Directory.Exists(link))
+                Directory.Delete(link);
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
+            if (Directory.Exists(external))
+                Directory.Delete(external, recursive: true);
+        }
+    }
+
     [Fact]
     public async Task StartupPrunesLegacyEmptyHashDirectoriesWithoutFollowingSymlinksOrRemovingPackedContent()
     {
