@@ -188,6 +188,15 @@ stale-ID renewal rejection and stable container ETag/last-modified values. It
 checks the [published container-lease success statuses](https://learn.microsoft.com/en-us/rest/api/storageservices/lease-container)
 and compares the SDK observations with Azurite; it does not prove every lease
 state, duration, or service-version combination.
+A thirteenth scenario compares Get Account Information through service,
+nonexistent-container, and nonexistent-blob SDK clients. Status, account kind,
+and HNS capability match. Azurite's fixed test account reports `Standard_RAGRS`,
+while mk8.sava truthfully reports its local `Standard_LRS` capability; the
+scenario explicitly records this SKU divergence rather than treating the
+emulator's SKU as the target deployment configuration. A separate local
+versioned request checks that `x-ms-is-hns-enabled` is absent before
+`2019-07-07`, as the [published account-information contract](https://learn.microsoft.com/en-us/rest/api/storageservices/get-account-information)
+requires.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
