@@ -47,23 +47,10 @@ public sealed class StorageBackupService(
                 cancellationToken).ConfigureAwait(false);
             FlushFileToDisk(metadataPath);
             StorageDurability.FlushDirectory(temporary);
-            var chunkEntries = new List<BackupChunkEntry>();
-            foreach (var id in snapshot.Inventory.ReachableChunkIds
-                         .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
-                         .Order(StringComparer.Ordinal))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var status = await chunks.VerifyChunkAsync(id, cancellationToken).ConfigureAwait(false);
-                if (status is ChunkIntegrityStatus.Missing or ChunkIntegrityStatus.Corrupt)
-                    throw new InvalidDataException($"Cannot back up chunk '{id}' because its integrity status is {status}.");
-
-                var destinationChunk = GetChunkPath(Path.Combine(temporary, "chunks"), id);
-                StorageDurability.EnsureDirectory(Path.GetDirectoryName(destinationChunk)!);
-                await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken).ConfigureAwait(false);
-                StorageDurability.FlushDirectory(Path.GetDirectoryName(destinationChunk)!);
-                var copied = await HashFileAsync(destinationChunk, cancellationToken).ConfigureAwait(false);
-                chunkEntries.Add(new BackupChunkEntry(id, copied.Length, copied.Sha256));
-            }
+            var chunkEntries = await CopyChunksForBackupAsync(
+                snapshot.Inventory.ReachableChunkIds,
+                temporary,
+                cancellationToken).ConfigureAwait(false);
 
             var metadataEntry = await HashFileAsync(metadataPath, cancellationToken).ConfigureAwait(false);
             var manifest = new BackupManifest
@@ -92,6 +79,31 @@ public sealed class StorageBackupService(
                 Directory.Delete(temporary, recursive: true);
             throw;
         }
+    }
+
+    private async Task<List<BackupChunkEntry>> CopyChunksForBackupAsync(
+        IReadOnlySet<string> reachableChunkIds,
+        string temporary,
+        CancellationToken cancellationToken)
+    {
+        var chunkEntries = new List<BackupChunkEntry>();
+        foreach (var id in reachableChunkIds
+                     .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
+                     .Order(StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var status = await chunks.VerifyChunkAsync(id, cancellationToken).ConfigureAwait(false);
+            if (status is ChunkIntegrityStatus.Missing or ChunkIntegrityStatus.Corrupt)
+                throw new InvalidDataException($"Cannot back up chunk '{id}' because its integrity status is {status}.");
+
+            var destinationChunk = GetChunkPath(Path.Combine(temporary, "chunks"), id);
+            StorageDurability.EnsureDirectory(Path.GetDirectoryName(destinationChunk)!);
+            await chunks.CopyChunkFileForBackupAsync(id, destinationChunk, cancellationToken).ConfigureAwait(false);
+            StorageDurability.FlushDirectory(Path.GetDirectoryName(destinationChunk)!);
+            var copied = await HashFileAsync(destinationChunk, cancellationToken).ConfigureAwait(false);
+            chunkEntries.Add(new BackupChunkEntry(id, copied.Length, copied.Sha256));
+        }
+        return chunkEntries;
     }
 
     public Task<StorageBackupValidation> ValidateAsync(
@@ -174,6 +186,30 @@ public sealed class StorageBackupService(
             throw new DirectoryNotFoundException($"The backup directory '{backup}' does not exist.");
         EnsureNotReparsePoint(backup, "backup root");
         var manifest = await ReadManifestAsync(backup, cancellationToken).ConfigureAwait(false);
+        ValidateManifestHeaderAndRoot(backup, manifest);
+
+        var metadataPath = Path.Combine(backup, MetadataFileName);
+        EnsureRegularFile(metadataPath, "metadata database");
+        var actualMetadata = await HashFileAsync(metadataPath, cancellationToken).ConfigureAwait(false);
+        EnsureFileMatches("metadata database", manifest.Metadata, actualMetadata);
+        var inspection = await MetadataStore.InspectDatabaseAsync(metadataPath, cancellationToken).ConfigureAwait(false);
+        ValidateMetadataAgainstManifest(inspection, manifest, options);
+        ValidateChunkManifest(inspection.Inventory.ReachableChunkIds, manifest, options);
+        var physicalBytes = await VerifyChunkFilesAsync(
+            backup, manifest.Chunks, actualMetadata.Length, cancellationToken).ConfigureAwait(false);
+
+        return new StorageBackupValidation(
+            backup,
+            manifest.CreatedAt,
+            manifest.BlobRecordCount,
+            manifest.StagedBlockCount,
+            manifest.Chunks.Count,
+            checked(manifest.LogicalBlobBytes + manifest.LogicalStagedBlockBytes),
+            physicalBytes);
+    }
+
+    private static void ValidateManifestHeaderAndRoot(string backup, BackupManifest manifest)
+    {
         if (manifest.Metadata is null || manifest.KeyRequirements is null || manifest.Chunks is null)
             throw new InvalidDataException("The backup manifest is missing required fields.");
         if (!string.Equals(manifest.Format, BackupFormat, StringComparison.Ordinal) ||
@@ -206,12 +242,13 @@ public sealed class StorageBackupService(
         {
             throw new InvalidDataException("The backup root contains files or directories outside the versioned format.");
         }
+    }
 
-        var metadataPath = Path.Combine(backup, MetadataFileName);
-        EnsureRegularFile(metadataPath, "metadata database");
-        var actualMetadata = await HashFileAsync(metadataPath, cancellationToken).ConfigureAwait(false);
-        EnsureFileMatches("metadata database", manifest.Metadata, actualMetadata);
-        var inspection = await MetadataStore.InspectDatabaseAsync(metadataPath, cancellationToken).ConfigureAwait(false);
+    private static void ValidateMetadataAgainstManifest(
+        MetadataDatabaseInspection inspection,
+        BackupManifest manifest,
+        SavaOptions options)
+    {
         if (inspection.SchemaVersion != manifest.MetadataSchemaVersion)
             throw new InvalidDataException("The backup manifest and metadata database schema versions do not match.");
         foreach (var (account, recordedMode) in inspection.AccountNamespaceModes)
@@ -231,8 +268,14 @@ public sealed class StorageBackupService(
         {
             throw new InvalidDataException("The backup manifest does not match the metadata inventory.");
         }
+    }
 
-        var expectedIds = inspection.Inventory.ReachableChunkIds
+    private static void ValidateChunkManifest(
+        IReadOnlySet<string> reachableChunkIds,
+        BackupManifest manifest,
+        SavaOptions options)
+    {
+        var expectedIds = reachableChunkIds
             .Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal))
             .ToHashSet(StringComparer.Ordinal);
         if (manifest.Chunks.Count != expectedIds.Count ||
@@ -248,14 +291,21 @@ public sealed class StorageBackupService(
             throw new InvalidDataException("The backup chunk manifest is not in canonical order.");
         }
 
-        var actualRequirements = BuildKeyRequirements(inspection.Inventory.ReachableChunkIds, options);
+        var actualRequirements = BuildKeyRequirements(reachableChunkIds, options);
         if (!DictionaryEqual(manifest.KeyRequirements, actualRequirements))
             throw new InvalidDataException("The configured encryption keys do not satisfy the backup requirements.");
+    }
 
-        long physicalBytes = actualMetadata.Length;
+    private static async Task<long> VerifyChunkFilesAsync(
+        string backup,
+        List<BackupChunkEntry> chunks,
+        long metadataLength,
+        CancellationToken cancellationToken)
+    {
+        long physicalBytes = metadataLength;
         var declaredPaths = new HashSet<string>(StringComparer.Ordinal);
 #pragma warning disable HLQ012 // A Span enumerator cannot live across awaited file verification.
-        foreach (var chunk in manifest.Chunks)
+        foreach (var chunk in chunks)
 #pragma warning restore HLQ012
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -276,14 +326,7 @@ public sealed class StorageBackupService(
                 throw new InvalidDataException($"The backup contains an undeclared chunk file '{path}'.");
         }
 
-        return new StorageBackupValidation(
-            backup,
-            manifest.CreatedAt,
-            manifest.BlobRecordCount,
-            manifest.StagedBlockCount,
-            manifest.Chunks.Count,
-            checked(manifest.LogicalBlobBytes + manifest.LogicalStagedBlockBytes),
-            physicalBytes);
+        return physicalBytes;
     }
 
     private static SortedDictionary<string, string> BuildKeyRequirements(
