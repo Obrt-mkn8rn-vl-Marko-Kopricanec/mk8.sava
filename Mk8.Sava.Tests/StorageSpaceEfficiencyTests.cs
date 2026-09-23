@@ -9,6 +9,123 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageSpaceEfficiencyTests
 {
     [Fact]
+    public async Task GarbageCollectionReclaimsEmptyStandaloneChunkDirectoriesAndCanRecreateThem()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:EnableSmallChunkPacking"] = "false",
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var chunks = application.Services.GetRequiredService<ChunkStore>();
+        var service = application.Services.GetRequiredService<BlobService>();
+        var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
+        var firstBytes = new byte[80];
+        new Random(0x6200).NextBytes(firstBytes);
+
+        for (var index = 0; index < 32; index++)
+        {
+            var bytes = new byte[80];
+            new Random(0x6200 + index).NextBytes(bytes);
+            using var stored = await chunks.StorePinnedAsync(
+                SavaWebApplicationFactory.AccountName,
+                encryption,
+                new MemoryStream(bytes, writable: false),
+                CancellationToken.None);
+            Assert.Single(stored.Manifest.Chunks);
+        }
+
+        var root = Path.Combine(application.DataPath, "chunks");
+        Assert.NotEmpty(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+        Assert.Equal(32, await service.CollectGarbageAsync(CancellationToken.None));
+        Assert.Empty(Directory.EnumerateFiles(root, "*.chunk", SearchOption.AllDirectories));
+        Assert.Empty(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+
+        using (var recreated = await chunks.StorePinnedAsync(
+                   SavaWebApplicationFactory.AccountName,
+                   encryption,
+                   new MemoryStream(firstBytes, writable: false),
+                   CancellationToken.None))
+        {
+            using var output = new MemoryStream();
+            await chunks.WriteRangeAsync(
+                recreated.Manifest,
+                encryption,
+                0,
+                firstBytes.Length,
+                output,
+                CancellationToken.None);
+            Assert.Equal(firstBytes, output.ToArray());
+        }
+
+        Assert.Equal(1, await service.CollectGarbageAsync(CancellationToken.None));
+        Assert.Empty(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task ConcurrentStandalonePublicationAndDirectoryPruningKeepPinnedBytesReadable()
+    {
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            ["Sava:EnableSmallChunkPacking"] = "false",
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        });
+        await application.InitializeAsync();
+        var chunks = application.Services.GetRequiredService<ChunkStore>();
+        var service = application.Services.GetRequiredService<BlobService>();
+        var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
+        using var stop = new CancellationTokenSource();
+        var sweeper = Task.Run(async () =>
+        {
+            try
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    await service.CollectGarbageAsync(stop.Token);
+                    await Task.Yield();
+                }
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+            }
+        });
+
+        try
+        {
+            await Task.WhenAll(Enumerable.Range(0, 48).Select(async index =>
+            {
+                var bytes = new byte[80];
+                new Random(0x6300 + index).NextBytes(bytes);
+                using var stored = await chunks.StorePinnedAsync(
+                    SavaWebApplicationFactory.AccountName,
+                    encryption,
+                    new MemoryStream(bytes, writable: false),
+                    CancellationToken.None);
+                using var output = new MemoryStream();
+                await chunks.WriteRangeAsync(
+                    stored.Manifest,
+                    encryption,
+                    0,
+                    bytes.Length,
+                    output,
+                    CancellationToken.None);
+                Assert.Equal(bytes, output.ToArray());
+            }));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await sweeper;
+        }
+
+        for (var attempt = 0; attempt < 3; attempt++)
+            await service.CollectGarbageAsync(CancellationToken.None);
+        var root = Path.Combine(application.DataPath, "chunks");
+        Assert.Empty(Directory.EnumerateFiles(root, "*.chunk", SearchOption.AllDirectories));
+        Assert.Empty(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
     public async Task PackedSmallChunksDoNotAllocateUnusedHashDirectories()
     {
         await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>

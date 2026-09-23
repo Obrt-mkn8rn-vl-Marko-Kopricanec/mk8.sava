@@ -517,7 +517,11 @@ checked through the transactional metadata index both before and after an
 exclusive chunk reservation, so reclamation remains bounded without racing a
 concurrent publication. A complete sweep resumes from the beginning; chunks
 created behind an active cursor are therefore considered during the next
-sweep.
+sweep. Deleting a standalone chunk also removes its empty hash-parent
+directories, stopping at the `chunks/` root. Publication and directory pruning
+share a gate, so a concurrent writer can safely recreate a pruned path before
+publishing its chunk. Historical empty directories from older packed-only
+writes are not removed by this per-chunk path and need a separate sweep.
 
 Reachable chunks older than `Sava:BackgroundCompressionMinimumAge` are revisited
 in cursor order, up to `Sava:BackgroundCompressionChunksPerMaintenancePass`.

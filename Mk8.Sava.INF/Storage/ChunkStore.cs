@@ -1223,7 +1223,6 @@ public sealed class ChunkStore
     {
         var hash = Convert.ToHexStringLower(SHA256.HashData(bytes));
         var baseName = $"{hash}-{bytes.Length}";
-        var directory = Path.Combine(_paths.Chunks, domain, hash[..2], hash[2..4]);
 
         for (var collision = 0; ; collision++)
         {
@@ -1296,8 +1295,6 @@ public sealed class ChunkStore
                         continue;
                     }
 
-                    _paths.EnsureDurableDirectory(directory);
-
                     Task? reservationCompletion = null;
                     var created = false;
                     lock (_pinGate)
@@ -1308,7 +1305,7 @@ public sealed class ChunkStore
                         }
                         else if (!File.Exists(finalPath))
                         {
-                            StorageDurability.PublishFile(temporaryPath, finalPath, overwrite: false);
+                            _paths.PublishStandaloneChunk(temporaryPath, finalPath);
                             _pins[id] = _pins.GetValueOrDefault(id) + 1;
                             created = true;
                         }
@@ -2006,6 +2003,7 @@ public sealed class ChunkStore
             if (File.Exists(path))
             {
                 File.Delete(path);
+                _paths.PruneEmptyChunkDirectories(path);
                 deleted = true;
             }
             deleted = await _metadata.DeletePackedChunkLocationAsync(
