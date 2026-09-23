@@ -64,6 +64,8 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
         ITestOutputHelper output)
     {
         private long _logicalBytes;
+        private long _previousSavaAllocatedBytes;
+        private long _previousRawAllocatedBytes;
 
         public async Task RunAsync()
         {
@@ -134,11 +136,14 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 .ConfigureAwait(false) +
                 await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-wal")).ConfigureAwait(false) +
                 await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "metadata.db-shm")).ConfigureAwait(false);
+            var savaAllocatedBytes = await MeasureAllocatedBytesAsync(application.DataPath).ConfigureAwait(false);
+            var rawAllocatedBytes = await MeasureAllocatedBytesAsync(rawRoot).ConfigureAwait(false);
+            AssertAllocationBudgets(workload, savaAllocatedBytes, rawAllocatedBytes, samples);
             output.WriteLine(string.Join(',',
                 workload,
                 _logicalBytes.ToString(CultureInfo.InvariantCulture),
-                (await MeasureAllocatedBytesAsync(application.DataPath).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
-                (await MeasureAllocatedBytesAsync(rawRoot).ConfigureAwait(false)).ToString(CultureInfo.InvariantCulture),
+                savaAllocatedBytes.ToString(CultureInfo.InvariantCulture),
+                rawAllocatedBytes.ToString(CultureInfo.InvariantCulture),
                 metadataBytes.ToString(CultureInfo.InvariantCulture),
                 (await MeasureAllocatedBytesAsync(Path.Combine(application.DataPath, "chunks")).ConfigureAwait(false))
                     .ToString(CultureInfo.InvariantCulture),
@@ -152,6 +157,38 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 process.WorkingSet64.ToString(CultureInfo.InvariantCulture),
                 samples.PeakTemporaryAllocation?.ToString(CultureInfo.InvariantCulture) ?? "unavailable",
                 samples.PeakWorkingSet.ToString(CultureInfo.InvariantCulture)));
+        }
+
+        private void AssertAllocationBudgets(
+            string workload,
+            long savaAllocatedBytes,
+            long rawAllocatedBytes,
+            AllocationSamples samples)
+        {
+            var maximumRatio = workload switch
+            {
+                "eight_exact_duplicates" => 0.80D,
+                "five_shifted_partials" => 0.60D,
+                "eight_versions" => 0.60D,
+                "one_hundred_twenty_eight_small" => 0.70D,
+                "four_incompressible" => 0.75D,
+                _ => throw new InvalidOperationException($"No allocation budget is defined for '{workload}'.")
+            };
+            Assert.True(rawAllocatedBytes > 0);
+            Assert.True(savaAllocatedBytes <= rawAllocatedBytes * maximumRatio,
+                $"{workload}: {savaAllocatedBytes} allocated bytes exceeds {maximumRatio:P0} of raw {rawAllocatedBytes}.");
+            if (string.Equals(workload, "four_incompressible", StringComparison.Ordinal))
+            {
+                var savaIncrement = savaAllocatedBytes - _previousSavaAllocatedBytes;
+                var rawIncrement = rawAllocatedBytes - _previousRawAllocatedBytes;
+                Assert.True(rawIncrement > 0 && savaIncrement >= 0 && savaIncrement <= rawIncrement * 1.50D,
+                    $"Incompressible bytes added {savaIncrement} allocated bytes versus {rawIncrement} raw bytes.");
+            }
+            Assert.True(samples.PeakTemporaryAllocation is >= 0 and <= 4 * 1024 * 1024,
+                $"{workload}: sampled staging peak exceeded 4 MiB or was unavailable.");
+            Assert.InRange(samples.PeakWorkingSet, 1, 512L * 1024 * 1024);
+            _previousSavaAllocatedBytes = savaAllocatedBytes;
+            _previousRawAllocatedBytes = rawAllocatedBytes;
         }
 
         private async Task<double> UploadAsync(string blobName, string rawName, byte[] content)
