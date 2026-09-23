@@ -271,6 +271,122 @@ public sealed class StorageEnospcHarnessTests
         }
     }
 
+    [Fact]
+    public async Task ExhaustedFilesystemDuringPackCompactionKeepsOldPackAuthoritative()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "compaction-data");
+        var fillerPath = Path.Combine(mountRoot, "compaction-filler.bin");
+        var liveBytes = RandomNumberGenerator.GetBytes(4096);
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00",
+            ["Sava:SmallChunkPackingThresholdBytes"] = "4096",
+            ["Sava:ChunkPackMaximumRecords"] = "2",
+            ["Sava:ChunkPackCompactionMinimumSavingsBytes"] = "1",
+            ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
+        };
+        string packId;
+        string chunkId;
+        long oldPackLength;
+
+        var first = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await first.InitializeAsync();
+            var container = CreateClient(first).GetBlobContainerClient("enospc-compaction");
+            await container.CreateAsync();
+            var deleted = container.GetBlobClient("deleted.bin");
+            var live = container.GetBlobClient("live.bin");
+            await deleted.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(4096)));
+            await live.UploadAsync(BinaryData.FromBytes(liveBytes));
+            await deleted.DeleteAsync();
+
+            var service = first.Services.GetRequiredService<BlobService>();
+            var metadata = first.Services.GetRequiredService<MetadataStore>();
+            var chunks = first.Services.GetRequiredService<ChunkStore>();
+            Assert.True(await service.CollectGarbageAsync(CancellationToken.None) > 0);
+            var liveRecord = await service.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName,
+                container.Name,
+                live.Name,
+                versionId: null,
+                snapshot: null,
+                includeDeleted: false,
+                CancellationToken.None);
+            chunkId = Assert.Single(liveRecord.Content.Chunks).Id;
+            var location = await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None);
+            Assert.NotNull(location);
+            packId = location.PackId;
+            var pack = Assert.Single((await metadata.ListSealedChunkPacksAsync(
+                after: null,
+                maximum: 16,
+                CancellationToken.None)).Items);
+            Assert.Equal(packId, pack.PackId);
+            var packPath = Path.Combine(dataPath, "packs", packId.Replace('/', Path.DirectorySeparatorChar) + ".pack");
+            oldPackLength = new FileInfo(packPath).Length;
+
+            FillUntilNoSpace(fillerPath, 4096);
+            var failure = await Assert.ThrowsAsync<IOException>(() =>
+                chunks.TryCompactPackAsync(pack, CancellationToken.None));
+            Assert.Contains("No space left on device", failure.Message, StringComparison.OrdinalIgnoreCase);
+            File.Delete(fillerPath);
+
+            Assert.Equal(oldPackLength, new FileInfo(packPath).Length);
+            Assert.Equal(packId,
+                (await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None))?.PackId);
+            Assert.Empty(Directory.EnumerateFiles(
+                Path.Combine(dataPath, "staging"), "pack-compact-*.tmp"));
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+        }
+        finally
+        {
+            await first.DisposeAsync();
+        }
+
+        var restarted = new SavaWebApplicationFactory(
+            dataPath,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: configuration,
+            deleteDataPath: false,
+            disableMaintenance: true);
+        try
+        {
+            await restarted.InitializeAsync();
+            var live = CreateClient(restarted)
+                .GetBlobContainerClient("enospc-compaction")
+                .GetBlobClient("live.bin");
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+            var metadata = restarted.Services.GetRequiredService<MetadataStore>();
+            var pack = Assert.Single((await metadata.ListSealedChunkPacksAsync(
+                after: null,
+                maximum: 16,
+                CancellationToken.None)).Items);
+            Assert.Equal(packId, pack.PackId);
+            var compacted = await restarted.Services.GetRequiredService<ChunkStore>()
+                .TryCompactPackAsync(pack, CancellationToken.None);
+            Assert.Equal(1, compacted.CompactedPacks);
+            Assert.Equal(liveBytes, (await live.DownloadContentAsync()).Value.Content.ToArray());
+            Assert.NotEqual(packId,
+                (await metadata.GetPackedChunkLocationAsync(chunkId, CancellationToken.None))?.PackId);
+        }
+        finally
+        {
+            await restarted.DisposeAsync();
+        }
+    }
+
     private static string ValidateMountRoot(string dataPath)
     {
         var fullPath = Path.GetFullPath(dataPath);
