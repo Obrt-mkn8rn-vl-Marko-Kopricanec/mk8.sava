@@ -15,6 +15,41 @@ internal static class BlobBatchProtocol
         HttpRequest request,
         CancellationToken cancellationToken)
     {
+        var (payload, boundary) = await ReadPayloadAsync(request, cancellationToken).ConfigureAwait(false);
+        var reader = new BatchLineReader(payload);
+        var delimiter = $"--{boundary}";
+        var finalDelimiter = $"--{boundary}--";
+        if (!string.Equals(reader.ReadLine(), delimiter, StringComparison.Ordinal))
+            throw InvalidBatch("The multipart payload does not begin with its declared boundary.");
+
+        var operations = new List<BlobBatchSubrequest>();
+        BlobBatchOperationKind? commonKind = null;
+        while (true)
+        {
+            var operation = ReadSubrequest(reader, commonKind);
+            commonKind = operation.Kind;
+            operations.Add(operation);
+            if (operations.Count > MaximumSubrequests)
+                throw InvalidBatch($"A blob batch cannot contain more than {MaximumSubrequests} subrequests.");
+
+            var nextBoundary = reader.ReadLine();
+            if (string.Equals(nextBoundary, finalDelimiter, StringComparison.Ordinal))
+                break;
+            if (!string.Equals(nextBoundary, delimiter, StringComparison.Ordinal))
+                throw InvalidBatch("A batch subrequest contains a nested body or an invalid multipart boundary.");
+        }
+
+        if (!reader.End)
+            throw InvalidBatch("Unexpected data follows the final multipart boundary.");
+        if (operations.Count == 0)
+            throw InvalidBatch("A blob batch request cannot be empty.");
+        return operations;
+    }
+
+    private static async Task<(string Payload, string Boundary)> ReadPayloadAsync(
+        HttpRequest request,
+        CancellationToken cancellationToken)
+    {
         if (request.ContentLength is null)
             throw InvalidBatch("A Content-Length header is required for a blob batch request.");
         if (request.ContentLength <= 0)
@@ -29,7 +64,7 @@ internal static class BlobBatchProtocol
         }
 
         var boundary = HeaderUtilities.RemoveQuotes(mediaType.Boundary).Value;
-        if (!IsValidBoundary(boundary))
+        if (boundary is null || !IsValidBoundary(boundary))
             throw AzureStorageException.InvalidHeader("Content-Type", request.ContentType);
 
         var body = new byte[request.ContentLength.Value];
@@ -46,96 +81,80 @@ internal static class BlobBatchProtocol
 
         var payload = Encoding.Latin1.GetString(body);
         ValidateCrLf(payload);
-        var reader = new BatchLineReader(payload);
-        var delimiter = $"--{boundary}";
-        var finalDelimiter = $"--{boundary}--";
-        if (!string.Equals(reader.ReadLine(), delimiter, StringComparison.Ordinal))
-            throw InvalidBatch("The multipart payload does not begin with its declared boundary.");
+        return (payload, boundary);
+    }
 
-        var operations = new List<BlobBatchSubrequest>();
-        BlobBatchOperationKind? commonKind = null;
-        while (true)
+    private static BlobBatchSubrequest ReadSubrequest(BatchLineReader reader, BlobBatchOperationKind? commonKind)
+    {
+        var partHeaders = ReadHeaders(reader);
+        if (!partHeaders.TryGetValue("Content-Type", out var partContentType) ||
+            !string.Equals(partContentType, "application/http", StringComparison.OrdinalIgnoreCase) ||
+            !partHeaders.TryGetValue("Content-Transfer-Encoding", out var transferEncoding) ||
+            !string.Equals(transferEncoding, "binary", StringComparison.OrdinalIgnoreCase))
         {
-            var partHeaders = ReadHeaders(reader);
-            if (!partHeaders.TryGetValue("Content-Type", out var partContentType) ||
-                !string.Equals(partContentType, "application/http", StringComparison.OrdinalIgnoreCase) ||
-                !partHeaders.TryGetValue("Content-Transfer-Encoding", out var transferEncoding) ||
-                !string.Equals(transferEncoding, "binary", StringComparison.OrdinalIgnoreCase))
-            {
-                throw InvalidBatch("Each batch part must be application/http with binary transfer encoding.");
-            }
-
-            partHeaders.TryGetValue("Content-ID", out var contentId);
-            var requestLine = reader.ReadLine();
-            var firstSpace = requestLine.IndexOf(' ', StringComparison.Ordinal);
-            var lastSpace = requestLine.LastIndexOf(' ');
-            if (firstSpace <= 0 || lastSpace <= firstSpace + 1 ||
-                !string.Equals(requestLine[(lastSpace + 1)..], "HTTP/1.1", StringComparison.Ordinal))
-            {
-                throw InvalidBatch("A batch subrequest has an invalid HTTP request line.");
-            }
-
-            var method = requestLine[..firstSpace];
-            var target = requestLine[(firstSpace + 1)..lastSpace];
-            var kind = method switch
-            {
-                "DELETE" => BlobBatchOperationKind.Delete,
-                "PUT" => BlobBatchOperationKind.SetTier,
-                _ => throw InvalidBatch("Blob Batch only supports Delete Blob and Set Blob Tier subrequests.")
-            };
-            if (commonKind.HasValue && commonKind.Value != kind)
-                throw InvalidBatch("All blob batch subrequests must use the same operation type.");
-            commonKind = kind;
-
-            if (!target.StartsWith('/') ||
-                target.StartsWith("//", StringComparison.Ordinal) ||
-                target.Contains("://", StringComparison.Ordinal) ||
-                target.Contains('#', StringComparison.Ordinal))
-                throw InvalidBatch("A batch subrequest URI must contain only an absolute path and query.");
-            var queryOffset = target.IndexOf('?', StringComparison.Ordinal);
-            var rawPath = queryOffset < 0 ? target : target[..queryOffset];
-            var queryString = queryOffset < 0 ? QueryString.Empty : new QueryString(target[queryOffset..]);
-            var subrequestHeaders = ReadHeaders(reader);
-            if (subrequestHeaders.ContainsKey("x-ms-version"))
-                throw InvalidBatch("Batch subrequests inherit the service version and cannot specify x-ms-version.");
-            if (subrequestHeaders.TryGetValue("Content-Length", out var contentLength) &&
-                (!long.TryParse(contentLength, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedLength) || parsedLength != 0))
-            {
-                throw InvalidBatch("Nested batch request bodies are not supported.");
-            }
-            if (subrequestHeaders.ContainsKey("Transfer-Encoding"))
-                throw InvalidBatch("Nested batch request bodies are not supported.");
-
-            var query = QueryHelpers.ParseQuery(queryString.Value ?? string.Empty);
-            var component = query.TryGetValue("comp", out var componentValue) ? componentValue.ToString() : string.Empty;
-            if ((kind == BlobBatchOperationKind.SetTier && !string.Equals(component, "tier", StringComparison.OrdinalIgnoreCase)) ||
-                (kind == BlobBatchOperationKind.Delete && !string.IsNullOrEmpty(component)))
-            {
-                throw InvalidBatch("A batch subrequest does not identify the operation declared by its HTTP method.");
-            }
-
-            operations.Add(new BlobBatchSubrequest(
-                kind,
-                method,
-                rawPath,
-                queryString,
-                subrequestHeaders,
-                StringValues.IsNullOrEmpty(contentId) ? null : contentId.ToString()));
-            if (operations.Count > MaximumSubrequests)
-                throw InvalidBatch($"A blob batch cannot contain more than {MaximumSubrequests} subrequests.");
-
-            var nextBoundary = reader.ReadLine();
-            if (string.Equals(nextBoundary, finalDelimiter, StringComparison.Ordinal))
-                break;
-            if (!string.Equals(nextBoundary, delimiter, StringComparison.Ordinal))
-                throw InvalidBatch("A batch subrequest contains a nested body or an invalid multipart boundary.");
+            throw InvalidBatch("Each batch part must be application/http with binary transfer encoding.");
         }
 
-        if (!reader.End)
-            throw InvalidBatch("Unexpected data follows the final multipart boundary.");
-        if (operations.Count == 0)
-            throw InvalidBatch("A blob batch request cannot be empty.");
-        return operations;
+        partHeaders.TryGetValue("Content-ID", out var contentId);
+        var (method, target, kind) = ParseSubrequestLine(reader.ReadLine());
+        if (commonKind.HasValue && commonKind.Value != kind)
+            throw InvalidBatch("All blob batch subrequests must use the same operation type.");
+
+        if (!target.StartsWith('/') ||
+            target.StartsWith("//", StringComparison.Ordinal) ||
+            target.Contains("://", StringComparison.Ordinal) ||
+            target.Contains('#', StringComparison.Ordinal))
+            throw InvalidBatch("A batch subrequest URI must contain only an absolute path and query.");
+        var queryOffset = target.IndexOf('?', StringComparison.Ordinal);
+        var rawPath = queryOffset < 0 ? target : target[..queryOffset];
+        var queryString = queryOffset < 0 ? QueryString.Empty : new QueryString(target[queryOffset..]);
+        var subrequestHeaders = ReadHeaders(reader);
+        if (subrequestHeaders.ContainsKey("x-ms-version"))
+            throw InvalidBatch("Batch subrequests inherit the service version and cannot specify x-ms-version.");
+        if (subrequestHeaders.TryGetValue("Content-Length", out var contentLength) &&
+            (!long.TryParse(contentLength, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedLength) || parsedLength != 0))
+        {
+            throw InvalidBatch("Nested batch request bodies are not supported.");
+        }
+        if (subrequestHeaders.ContainsKey("Transfer-Encoding"))
+            throw InvalidBatch("Nested batch request bodies are not supported.");
+
+        var query = QueryHelpers.ParseQuery(queryString.Value ?? string.Empty);
+        var component = query.TryGetValue("comp", out var componentValue) ? componentValue.ToString() : string.Empty;
+        if ((kind == BlobBatchOperationKind.SetTier && !string.Equals(component, "tier", StringComparison.OrdinalIgnoreCase)) ||
+            (kind == BlobBatchOperationKind.Delete && !string.IsNullOrEmpty(component)))
+        {
+            throw InvalidBatch("A batch subrequest does not identify the operation declared by its HTTP method.");
+        }
+
+        return new BlobBatchSubrequest(
+            kind,
+            method,
+            rawPath,
+            queryString,
+            subrequestHeaders,
+            StringValues.IsNullOrEmpty(contentId) ? null : contentId.ToString());
+    }
+
+    private static (string Method, string Target, BlobBatchOperationKind Kind) ParseSubrequestLine(string requestLine)
+    {
+        var firstSpace = requestLine.IndexOf(' ', StringComparison.Ordinal);
+        var lastSpace = requestLine.LastIndexOf(' ');
+        if (firstSpace <= 0 || lastSpace <= firstSpace + 1 ||
+            !string.Equals(requestLine[(lastSpace + 1)..], "HTTP/1.1", StringComparison.Ordinal))
+        {
+            throw InvalidBatch("A batch subrequest has an invalid HTTP request line.");
+        }
+
+        var method = requestLine[..firstSpace];
+        var target = requestLine[(firstSpace + 1)..lastSpace];
+        var kind = method switch
+        {
+            "DELETE" => BlobBatchOperationKind.Delete,
+            "PUT" => BlobBatchOperationKind.SetTier,
+            _ => throw InvalidBatch("Blob Batch only supports Delete Blob and Set Blob Tier subrequests.")
+        };
+        return (method, target, kind);
     }
 
     public static async Task WriteAsync(

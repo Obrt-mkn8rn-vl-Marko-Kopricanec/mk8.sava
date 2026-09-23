@@ -26,6 +26,60 @@ internal static partial class AzureResponseWriter
         var arrays = new List<IArrowArray>();
         var items = listing.Items;
 
+        AddArrowIdentityColumns(fields, arrays, items, includes, hierarchicalNamespace);
+        AddArrowContentColumns(fields, arrays, items);
+        AddBooleanColumn(fields, arrays, "Sealed", items, entry =>
+            entry.Blob is { Kind: BlobKind.AppendBlob } blob ? blob.IsSealed : null);
+        AddStringColumn(fields, arrays, "ArchiveStatus", items, entry => entry.Blob?.ArchiveStatus);
+        AddArrowCopyColumns(fields, arrays, items, includes);
+        AddTimestampColumn(fields, arrays, "ImmutabilityPolicyUntilDate", items, entry =>
+            includes.Contains("immutabilitypolicy") ? entry.Blob?.ImmutabilityUntil : null);
+        AddStringColumn(fields, arrays, "ImmutabilityPolicyMode", items, entry =>
+            includes.Contains("immutabilitypolicy") && entry.Blob?.ImmutabilityUntil is not null
+                ? entry.Blob.ImmutabilityLocked ? "locked" : "unlocked"
+                : null);
+        AddStringColumn(fields, arrays, "VersionId", items, entry =>
+            includes.Contains("versions") ? entry.Blob?.VersionId : null);
+        AddBooleanColumn(fields, arrays, "IsCurrentVersion", items, entry =>
+            includes.Contains("versions") && entry.Blob?.VersionId is not null
+                ? entry.Blob.IsCurrent
+                : null);
+        AddStringColumn(fields, arrays, "Snapshot", items, entry => entry.Blob?.Snapshot);
+        AddBooleanColumn(fields, arrays, "LegalHold", items, entry =>
+            includes.Contains("legalhold") && entry.Blob is { } blob ? blob.HasLegalHold : null);
+        AddBooleanColumn(fields, arrays, "Deleted", items, entry =>
+            entry.Blob?.IsDeleted == true ? true : null);
+        AddTimestampColumn(fields, arrays, "DeletedTime", items, entry => entry.Blob?.DeletedAt);
+        AddUInt64Column(fields, arrays, "RemainingRetentionDays", items, entry =>
+            entry.Blob?.DeleteRetentionUntil is { } retentionUntil
+                ? checked((ulong)RemainingRetentionDays(retentionUntil))
+                : null);
+        AddTimestampColumn(fields, arrays, "LastAccessTime", items, entry =>
+            lastAccessTimeTracking ? entry.Blob?.LastAccessedAt : null);
+        AddArrowMetadataColumns(fields, arrays, items, includes);
+
+        var schema = new Schema(
+            fields,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["NumberOfRecords"] = items.Count.ToString(CultureInfo.InvariantCulture),
+                ["NextMarker"] = nextMarker
+            });
+        using var batch = new RecordBatch(schema, arrays, items.Count);
+        context.Response.ContentType = ArrowStreamContentType;
+        using var writer = new ArrowStreamWriter(context.Response.Body, schema, leaveOpen: true);
+        await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
+        await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void AddArrowIdentityColumns(
+        List<Field> fields,
+        List<IArrowArray> arrays,
+        IReadOnlyList<BlobListEntry> items,
+        IReadOnlySet<string> includes,
+        bool hierarchicalNamespace)
+    {
         AddStringColumn(fields, arrays, "Name", items, entry => entry.Name, nullable: false, required: true);
         AddTimestampColumn(fields, arrays, "Creation-Time", items, entry => entry.Blob?.CreatedAt);
         AddTimestampColumn(fields, arrays, "Last-Modified", items, entry => entry.Blob?.LastModified);
@@ -46,13 +100,15 @@ internal static partial class AzureResponseWriter
             AddStringColumn(fields, arrays, "Owner", items, entry => entry.Blob?.Owner);
             AddStringColumn(fields, arrays, "Group", items, entry => entry.Blob?.Group);
             AddStringColumn(fields, arrays, "Permissions", items, entry => entry.Blob?.Permissions);
-            AddStringColumn(
-                fields,
-                arrays,
-                "Acl",
-                items,
-                entry => entry.Blob?.Acl);
+            AddStringColumn(fields, arrays, "Acl", items, entry => entry.Blob?.Acl);
         }
+    }
+
+    private static void AddArrowContentColumns(
+        List<Field> fields,
+        List<IArrowArray> arrays,
+        IReadOnlyList<BlobListEntry> items)
+    {
         AddUInt64Column(fields, arrays, "Content-Length", items, entry =>
             entry.Blob is { } blob
                 ? checked((ulong)blob.Content.Length)
@@ -90,9 +146,14 @@ internal static partial class AzureResponseWriter
             entry.Blob?.CustomerProvidedKeySha256);
         AddStringColumn(fields, arrays, "EncryptionScope", items, entry => entry.Blob?.EncryptionScope);
         AddStringColumn(fields, arrays, "RehydratePriority", items, entry => entry.Blob?.RehydratePriority);
-        AddBooleanColumn(fields, arrays, "Sealed", items, entry =>
-            entry.Blob is { Kind: BlobKind.AppendBlob } blob ? blob.IsSealed : null);
-        AddStringColumn(fields, arrays, "ArchiveStatus", items, entry => entry.Blob?.ArchiveStatus);
+    }
+
+    private static void AddArrowCopyColumns(
+        List<Field> fields,
+        List<IArrowArray> arrays,
+        IReadOnlyList<BlobListEntry> items,
+        IReadOnlySet<string> includes)
+    {
         AddStringColumn(fields, arrays, "CopyId", items, entry =>
             includes.Contains("copy") ? entry.Blob?.Copy?.Id : null);
         AddStringColumn(fields, arrays, "CopyStatus", items, entry =>
@@ -111,30 +172,14 @@ internal static partial class AzureResponseWriter
             string.Equals(entry.Blob?.Copy?.Status, "success", StringComparison.Ordinal)
                 ? entry.Blob?.CopyDestinationSnapshot
                 : null);
-        AddTimestampColumn(fields, arrays, "ImmutabilityPolicyUntilDate", items, entry =>
-            includes.Contains("immutabilitypolicy") ? entry.Blob?.ImmutabilityUntil : null);
-        AddStringColumn(fields, arrays, "ImmutabilityPolicyMode", items, entry =>
-            includes.Contains("immutabilitypolicy") && entry.Blob?.ImmutabilityUntil is not null
-                ? entry.Blob.ImmutabilityLocked ? "locked" : "unlocked"
-                : null);
-        AddStringColumn(fields, arrays, "VersionId", items, entry =>
-            includes.Contains("versions") ? entry.Blob?.VersionId : null);
-        AddBooleanColumn(fields, arrays, "IsCurrentVersion", items, entry =>
-            includes.Contains("versions") && entry.Blob?.VersionId is not null
-                ? entry.Blob.IsCurrent
-                : null);
-        AddStringColumn(fields, arrays, "Snapshot", items, entry => entry.Blob?.Snapshot);
-        AddBooleanColumn(fields, arrays, "LegalHold", items, entry =>
-            includes.Contains("legalhold") && entry.Blob is { } blob ? blob.HasLegalHold : null);
-        AddBooleanColumn(fields, arrays, "Deleted", items, entry =>
-            entry.Blob?.IsDeleted == true ? true : null);
-        AddTimestampColumn(fields, arrays, "DeletedTime", items, entry => entry.Blob?.DeletedAt);
-        AddUInt64Column(fields, arrays, "RemainingRetentionDays", items, entry =>
-            entry.Blob?.DeleteRetentionUntil is { } retentionUntil
-                ? checked((ulong)RemainingRetentionDays(retentionUntil))
-                : null);
-        AddTimestampColumn(fields, arrays, "LastAccessTime", items, entry =>
-            lastAccessTimeTracking ? entry.Blob?.LastAccessedAt : null);
+    }
+
+    private static void AddArrowMetadataColumns(
+        List<Field> fields,
+        List<IArrowArray> arrays,
+        IReadOnlyList<BlobListEntry> items,
+        IReadOnlySet<string> includes)
+    {
         AddMapColumn(fields, arrays, "Tags", items, entry =>
             includes.Contains("tags") && entry.Blob is { Tags.Count: > 0 } blob ? blob.Tags : null);
         AddMapColumn(fields, arrays, "OrMetadata", items, entry =>
@@ -163,20 +208,6 @@ internal static partial class AzureResponseWriter
             entry.Blob is { CustomerProvidedKeySha256: not null, Metadata.Count: > 0 }
                 ? true
                 : null);
-
-        var schema = new Schema(
-            fields,
-            new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["NumberOfRecords"] = items.Count.ToString(CultureInfo.InvariantCulture),
-                ["NextMarker"] = nextMarker
-            });
-        using var batch = new RecordBatch(schema, arrays, items.Count);
-        context.Response.ContentType = ArrowStreamContentType;
-        using var writer = new ArrowStreamWriter(context.Response.Body, schema, leaveOpen: true);
-        await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
-        await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
-        await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static void AddStringColumn(
