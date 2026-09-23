@@ -156,7 +156,8 @@ public sealed class BlobService(
         string? publicAccess,
         string? defaultEncryptionScope,
         bool preventEncryptionScopeOverride,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? creatorObjectId = null)
     {
         ValidateContainerName(name);
         if (publicAccess is not null && publicAccess is not ("blob" or "container"))
@@ -172,6 +173,8 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             CreatedAt = now,
             LastModified = now,
+            Owner = IsHierarchicalNamespaceEnabled(account) ? creatorObjectId ?? "$superuser" : "$superuser",
+            Group = IsHierarchicalNamespaceEnabled(account) ? creatorObjectId ?? "$superuser" : "$superuser",
             Metadata = userMetadata,
             PublicAccess = publicAccess,
             DefaultEncryptionScope = defaultEncryptionScope,
@@ -3282,6 +3285,7 @@ public sealed class BlobService(
             ETag = MetadataStore.NewETag(),
             CreatedAt = now,
             LastModified = now,
+            Owner = IsHierarchicalNamespaceEnabled(account) ? options.CreatorObjectId ?? "$superuser" : "$superuser",
             Metadata = options.Metadata,
             Tags = options.Tags ?? new Dictionary<string, string>(StringComparer.Ordinal),
             Http = options.Http,

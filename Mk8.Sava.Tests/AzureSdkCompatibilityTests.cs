@@ -1728,6 +1728,117 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespacePersistsBearerOwnerAndInheritedGroupAcrossOverwriteAndRestart()
+    {
+        const string creatorId = "1a26a4bf-1ae9-40de-8834-678601f7f508";
+        const string delegatedCreatorId = "08737b1c-dcce-4a21-8278-6b7cd25fe946";
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-hns-owner-{Guid.NewGuid():N}");
+        var containerName = $"hns-owner-{Guid.NewGuid():N}";
+        var configuration = new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{creatorId}:Accounts:0"] = SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{creatorId}:Permissions"] = "racwdxltmeop",
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:Permissions"] = "cw",
+            [$"Sava:BearerAuthentication:Principals:{delegatedCreatorId}:CanGenerateUserDelegationKey"] = "true"
+        };
+
+        try
+        {
+            await using (var application = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
+            {
+                await application.InitializeAsync();
+                var bearer = CreateBearerClient(
+                    application,
+                    CreateJwt(SavaWebApplicationFactory.AccountKey, creatorId, SavaWebApplicationFactory.TenantId));
+                var created = bearer.GetBlobContainerClient(containerName);
+                await created.CreateAsync();
+                await created.GetBlobClient("parent/child.txt").UploadAsync(BinaryData.FromString("original"));
+
+                var shared = CreateClient(application).GetBlobContainerClient(containerName);
+                await shared.GetBlobClient("parent/child.txt")
+                    .UploadAsync(BinaryData.FromString("replacement"), overwrite: true);
+
+                var delegator = CreateBearerClient(
+                    application,
+                    CreateJwt(
+                        SavaWebApplicationFactory.AccountKey,
+                        delegatedCreatorId,
+                        SavaWebApplicationFactory.TenantId));
+                var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+                var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+                var key = await delegator.GetUserDelegationKeyAsync(
+                    new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
+                var sasBuilder = new BlobSasBuilder
+                {
+                    BlobContainerName = containerName,
+                    BlobName = "parent/delegated.txt",
+                    Resource = "b",
+                    StartsOn = startsOn,
+                    ExpiresOn = expiresOn,
+                    Protocol = SasProtocol.HttpsAndHttp
+                };
+                sasBuilder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+                var sas = sasBuilder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
+                var delegated = CreateBlobClient(
+                    application,
+                    new Uri(
+                        $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
+                        $"{containerName}/parent/delegated.txt?{sas}"));
+                await delegated.UploadAsync(BinaryData.FromString("delegated"));
+                await AssertHierarchicalOwnershipAsync(application, shared);
+            }
+
+            await using (var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
+            {
+                await restarted.InitializeAsync();
+                await AssertHierarchicalOwnershipAsync(
+                    restarted,
+                    CreateClient(restarted).GetBlobContainerClient(containerName));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+        }
+
+        async Task AssertHierarchicalOwnershipAsync(
+            SavaWebApplicationFactory application,
+            BlobContainerClient container)
+        {
+            foreach (var name in new[] { "parent", "parent/child.txt" })
+            {
+                var properties = await container.GetBlobClient(name).GetPropertiesAsync();
+                Assert.True(properties.GetRawResponse().Headers.TryGetValue("x-ms-owner", out var owner));
+                Assert.True(properties.GetRawResponse().Headers.TryGetValue("x-ms-group", out var group));
+                Assert.Equal(creatorId, owner);
+                Assert.Equal(creatorId, group);
+            }
+            var delegatedProperties = await container.GetBlobClient("parent/delegated.txt").GetPropertiesAsync();
+            Assert.True(delegatedProperties.GetRawResponse().Headers.TryGetValue("x-ms-owner", out var delegatedOwner));
+            Assert.True(delegatedProperties.GetRawResponse().Headers.TryGetValue("x-ms-group", out var delegatedGroup));
+            Assert.Equal(delegatedCreatorId, delegatedOwner);
+            Assert.Equal(creatorId, delegatedGroup);
+
+            var listUri = AppendQuery(
+                container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "restype=container&comp=list&include=permissions&delimiter=/");
+            using var transport = new HttpClient(application.Server.CreateHandler());
+            using var request = new HttpRequestMessage(HttpMethod.Get, listUri);
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync());
+            var directory = Assert.Single(document.Descendants("BlobPrefix"));
+            Assert.Equal(creatorId, directory.Element("Properties")?.Element("Owner")?.Value);
+            Assert.Equal(creatorId, directory.Element("Properties")?.Element("Group")?.Value);
+        }
+    }
+
+    [Fact]
     public async Task HierarchicalNamespaceBlobIndexTagsRequireTheExplicitPreviewCapability()
     {
         await using var application = new SavaWebApplicationFactory(

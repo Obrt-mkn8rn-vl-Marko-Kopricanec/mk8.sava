@@ -447,12 +447,19 @@ from 2021-08-06; List Blobs exposes `EncryptionContext` from 2021-06-08. The
 header is rejected on flat-namespace accounts and on copy operations, matching
 the Azure Blob operation-specific contract.
 
+HNS file and implicit-directory ownership is persisted with each path. Shared
+Key, account SAS, and service SAS creations use `$superuser`; bearer and user
+delegation SAS creations use the authenticated object ID. A new path inherits
+its owning group from its parent directory (or the container root), while an
+overwrite keeps the existing path's owner and group. The current Blob-only
+surface retains the default POSIX permissions and ACL for files and
+directories; it does not implement the separate `dfs` ACL mutation protocol.
 HNS identity projection follows the Blob REST request shape. List Blobs accepts
 `x-ms-upn` only when `include=permissions` is present. Get Blob and Get Blob
 Properties accept it only from service version 2023-11-03. The value must be a
-Boolean and the header is rejected for flat-namespace accounts. Shared Key
-requests continue to report Azure's `$superuser` owner and group because that
-well-known identity has no user-principal-name substitution.
+Boolean and the header is rejected for flat-namespace accounts. A request with
+`x-ms-upn=true` currently returns object IDs for Entra-owned paths rather than
+resolving them to user-principal names; `$superuser` is unchanged.
 
 Blob expiry is likewise confined to HNS files. Set Blob Expiry is available
 from service version 2020-02-10 and rejects directories. Put Blob, Put Block

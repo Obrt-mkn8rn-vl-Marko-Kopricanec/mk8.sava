@@ -31,12 +31,20 @@ public sealed record StorageAuthorization(
     string? Audience = null,
     string? Issuer = null,
     string? UserPrincipalName = null,
-    string AccountWidePermissions = "")
+    string AccountWidePermissions = "",
+    string? DelegatedObjectId = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
 
     public bool Allows(char permission) => Kind == StorageAuthorizationKind.SharedKey || Permissions.Contains(permission, StringComparison.Ordinal);
+
+    public string? CreatorObjectId => Kind switch
+    {
+        StorageAuthorizationKind.Bearer => Identifier,
+        StorageAuthorizationKind.Sas => DelegatedObjectId,
+        _ => null
+    };
 }
 
 public sealed record UserDelegationKey(
@@ -658,7 +666,8 @@ public sealed class StorageAuthenticator(
             query["si"].ToString(),
             isAccountSas,
             signedResource,
-            TenantId: isUserDelegationSas ? query["sktid"].ToString() : null);
+            TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
+            DelegatedObjectId: isUserDelegationSas ? query["skoid"].ToString() : null);
     }
 
     private static string BuildSharedKeyString(
