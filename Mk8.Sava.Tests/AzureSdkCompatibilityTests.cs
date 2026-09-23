@@ -9166,13 +9166,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = service.GetBlobContainerClient($"url-{Guid.NewGuid():N}");
         await container.CreateAsync();
 
+        await AssertWholeUrlUploadAsync(container, source.Uri, sourceBytes);
+        await AssertBlockUrlStageAsync(container, source.Uri, sourceBytes);
+        await AssertAppendUrlWriteAsync(container, source.Uri, sourceBytes);
+        await AssertPageUrlWriteAsync(container, source.Uri, sourceBytes);
+    }
+
+    private static async Task AssertWholeUrlUploadAsync(BlobContainerClient container, Uri sourceUri, byte[] sourceBytes)
+    {
         var whole = container.GetBlockBlobClient("whole.bin");
         var wholeUpload = await whole.SyncUploadFromUriAsync(
-            source.Uri,
+            sourceUri,
             new BlobSyncUploadFromUriOptions
             {
                 Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["marker"] = "must-not-leak" }
-            });
+            }).ConfigureAwait(false);
         var wholeUploadHeaders = wholeUpload.GetRawResponse().Headers;
         Assert.True(wholeUploadHeaders.TryGetValue("ETag", out _));
         Assert.True(wholeUploadHeaders.TryGetValue("Last-Modified", out _));
@@ -9188,53 +9196,63 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(
             StorageCrc64Base64(sourceBytes),
             ResponseHeader(wholeUpload.GetRawResponse(), "x-ms-content-crc64"));
-        Assert.Equal(sourceBytes, (await whole.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(sourceBytes, (await whole.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertBlockUrlStageAsync(BlobContainerClient container, Uri sourceUri, byte[] sourceBytes)
+    {
         const int blockOffset = 900;
         const int blockLength = 2_300;
         var block = container.GetBlockBlobClient("block.bin");
         var blockId = Convert.ToBase64String("url-block-1"u8);
         var blockSlice = sourceBytes.AsSpan(blockOffset, blockLength).ToArray();
-        var stagedFromUri = await block.StageBlockFromUriAsync(source.Uri, blockId, new StageBlockFromUriOptions
+        var stagedFromUri = await block.StageBlockFromUriAsync(sourceUri, blockId, new StageBlockFromUriOptions
         {
             SourceRange = new HttpRange(blockOffset, blockLength),
             SourceContentHash = AzureProtocolChecksum.Md5(blockSlice)
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(
             Convert.ToBase64String(AzureProtocolChecksum.Md5(blockSlice)),
             ResponseHeader(stagedFromUri.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(blockSlice),
             ResponseHeader(stagedFromUri.GetRawResponse(), "x-ms-content-crc64"));
-        await block.CommitBlockListAsync([blockId]);
-        Assert.Equal(blockSlice, (await block.DownloadContentAsync()).Value.Content.ToArray());
+        await block.CommitBlockListAsync([blockId]).ConfigureAwait(false);
+        Assert.Equal(blockSlice, (await block.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertAppendUrlWriteAsync(BlobContainerClient container, Uri sourceUri, byte[] sourceBytes)
+    {
         const int appendOffset = 4_000;
         const int appendLength = 1_500;
         var append = container.GetAppendBlobClient("append.bin");
-        await append.CreateAsync();
+        await append.CreateAsync().ConfigureAwait(false);
         var appendSlice = sourceBytes.AsSpan(appendOffset, appendLength).ToArray();
-        var appendedFromUri = await append.AppendBlockFromUriAsync(source.Uri, new AppendBlobAppendBlockFromUriOptions
+        var appendedFromUri = await append.AppendBlockFromUriAsync(sourceUri, new AppendBlobAppendBlockFromUriOptions
         {
             SourceRange = new HttpRange(appendOffset, appendLength),
             SourceContentHash = AzureProtocolChecksum.Md5(appendSlice)
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(
             Convert.ToBase64String(AzureProtocolChecksum.Md5(appendSlice)),
             ResponseHeader(appendedFromUri.GetRawResponse(), "Content-MD5"));
         Assert.Equal(
             StorageCrc64Base64(appendSlice),
             ResponseHeader(appendedFromUri.GetRawResponse(), "x-ms-content-crc64"));
-        Assert.Equal(appendSlice, (await append.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(appendSlice, (await append.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertPageUrlWriteAsync(BlobContainerClient container, Uri sourceUri, byte[] sourceBytes)
+    {
         var page = container.GetPageBlobClient("page.bin");
-        await page.CreateAsync(1024);
+        await page.CreateAsync(1024).ConfigureAwait(false);
         var pageSlice = sourceBytes.AsSpan(0, 512).ToArray();
         var pagesFromUri = await page.UploadPagesFromUriAsync(
-            source.Uri,
+            sourceUri,
             new HttpRange(0, 512),
             new HttpRange(512, 512),
-            new PageBlobUploadPagesFromUriOptions { SourceContentHash = AzureProtocolChecksum.Md5(pageSlice) });
+            new PageBlobUploadPagesFromUriOptions { SourceContentHash = AzureProtocolChecksum.Md5(pageSlice) })
+            .ConfigureAwait(false);
         Assert.Equal(
             Convert.ToBase64String(AzureProtocolChecksum.Md5(pageSlice)),
             ResponseHeader(pagesFromUri.GetRawResponse(), "Content-MD5"));
@@ -9243,7 +9261,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             ResponseHeader(pagesFromUri.GetRawResponse(), "x-ms-content-crc64"));
         var expectedPage = new byte[1024];
         pageSlice.CopyTo(expectedPage, 512);
-        Assert.Equal(expectedPage, (await page.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(expectedPage, (await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
     }
 
     [Fact]
@@ -9486,6 +9504,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"url-errors-{Guid.NewGuid():N}");
         await container.CreateAsync();
+
+        await AssertUrlSourcePreconditionsAsync(container, source.Uri);
+        await AssertMissingUrlSourceErrorAsync(container, source.MissingUri);
+    }
+
+    private static async Task AssertUrlSourcePreconditionsAsync(BlobContainerClient container, Uri sourceUri)
+    {
         var missingEtag = new ETag("\"not-the-source-etag\"");
 
         static async Task AssertSourceConditionAsync(Func<Task> operation)
@@ -9497,54 +9522,57 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         var whole = container.GetBlockBlobClient("whole.bin");
         await AssertSourceConditionAsync(() => whole.SyncUploadFromUriAsync(
-            source.Uri,
+            sourceUri,
             new BlobSyncUploadFromUriOptions
             {
                 SourceConditions = new BlobRequestConditions { IfMatch = missingEtag }
-            }));
-        Assert.False((await whole.ExistsAsync()).Value);
+            })).ConfigureAwait(false);
+        Assert.False((await whole.ExistsAsync().ConfigureAwait(false)).Value);
 
         var block = container.GetBlockBlobClient("block.bin");
         await AssertSourceConditionAsync(() => block.StageBlockFromUriAsync(
-            source.Uri,
+            sourceUri,
             Convert.ToBase64String("conditioned-block"u8),
             new StageBlockFromUriOptions
             {
                 SourceConditions = new RequestConditions { IfMatch = missingEtag }
-            }));
-        Assert.False((await block.ExistsAsync()).Value);
+            })).ConfigureAwait(false);
+        Assert.False((await block.ExistsAsync().ConfigureAwait(false)).Value);
 
         var append = container.GetAppendBlobClient("append.bin");
-        await append.CreateAsync();
+        await append.CreateAsync().ConfigureAwait(false);
         await AssertSourceConditionAsync(() => append.AppendBlockFromUriAsync(
-            source.Uri,
+            sourceUri,
             new AppendBlobAppendBlockFromUriOptions
             {
                 SourceConditions = new AppendBlobRequestConditions { IfMatch = missingEtag }
-            }));
-        Assert.Equal(0, (await append.GetPropertiesAsync()).Value.ContentLength);
+            })).ConfigureAwait(false);
+        Assert.Equal(0, (await append.GetPropertiesAsync().ConfigureAwait(false)).Value.ContentLength);
 
         var page = container.GetPageBlobClient("page.bin");
-        await page.CreateAsync(512);
+        await page.CreateAsync(512).ConfigureAwait(false);
         await AssertSourceConditionAsync(() => page.UploadPagesFromUriAsync(
-            source.Uri,
+            sourceUri,
             new HttpRange(0, 512),
             new HttpRange(0, 512),
             new PageBlobUploadPagesFromUriOptions
             {
                 SourceConditions = new PageBlobRequestConditions { IfMatch = missingEtag }
-            }));
-        Assert.Equal(new byte[512], (await page.DownloadContentAsync()).Value.Content.ToArray());
+            })).ConfigureAwait(false);
+        Assert.Equal(new byte[512], (await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
 
         var copied = container.GetBlobClient("copied.bin");
         await AssertSourceConditionAsync(() => copied.StartCopyFromUriAsync(
-            source.Uri,
+            sourceUri,
             new BlobCopyFromUriOptions
             {
                 SourceConditions = new BlobRequestConditions { IfMatch = missingEtag }
-            }));
-        Assert.False((await copied.ExistsAsync()).Value);
+            })).ConfigureAwait(false);
+        Assert.False((await copied.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private async Task AssertMissingUrlSourceErrorAsync(BlobContainerClient container, Uri missingSourceUri)
+    {
         var missing = container.GetBlobClient("missing-source.bin");
         var missingUri = missing.GenerateSasUri(
             BlobSasPermissions.Create | BlobSasPermissions.Write,
@@ -9555,18 +9583,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Content = new ByteArrayContent([])
         };
         request.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
-        request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.MissingUri.ToString());
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", missingSourceUri.ToString());
         request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-        using var response = await transport.SendAsync(request);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
         Assert.Equal("CannotVerifyCopySource", response.Headers.GetValues("x-ms-error-code").Single());
         Assert.Equal("404", response.Headers.GetValues("x-ms-copy-source-status-code").Single());
         Assert.Equal("BlobNotFound", response.Headers.GetValues("x-ms-copy-source-error-code").Single());
-        var error = await response.Content.ReadAsStringAsync();
+        var error = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
         Assert.Contains("<CopySourceStatusCode>404</CopySourceStatusCode>", error, StringComparison.Ordinal);
         Assert.Contains("<CopySourceErrorCode>BlobNotFound</CopySourceErrorCode>", error, StringComparison.Ordinal);
         Assert.Contains("<CopySourceErrorMessage>The specified blob does not exist.</CopySourceErrorMessage>", error, StringComparison.Ordinal);
-        Assert.False((await missing.ExistsAsync()).Value);
+        Assert.False((await missing.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
@@ -9876,28 +9904,43 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             firstExpected,
             (await destination.WithSnapshot(firstDestinationSnapshot).DownloadContentAsync()).Value.Content.ToArray());
 
+        await AssertIncrementalCopyRejectedTransitionsAsync(source, destination, firstSourceSnapshot);
+        await AssertIncrementalCopyListingsAsync(container, destination, secondProperties.DestinationSnapshot);
+    }
+
+    private static async Task AssertIncrementalCopyRejectedTransitionsAsync(
+        PageBlobClient source,
+        PageBlobClient destination,
+        string firstSourceSnapshot)
+    {
         var earlier = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            destination.StartCopyIncrementalAsync(source.Uri, firstSourceSnapshot));
+            destination.StartCopyIncrementalAsync(source.Uri, firstSourceSnapshot)).ConfigureAwait(false);
         Assert.Equal(409, earlier.Status);
         Assert.Equal("IncrementalCopyOfEarlierVersionSnapshotNotAllowed", earlier.ErrorCode);
 
-        await source.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
-        await source.CreateAsync(2048);
-        var replacementSnapshot = (await source.CreateSnapshotAsync()).Value.Snapshot;
+        await source.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(false);
+        await source.CreateAsync(2048).ConfigureAwait(false);
+        var replacementSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
         var replacedSource = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            destination.StartCopyIncrementalAsync(source.Uri, replacementSnapshot));
+            destination.StartCopyIncrementalAsync(source.Uri, replacementSnapshot)).ConfigureAwait(false);
         Assert.Equal(409, replacedSource.Status);
         Assert.Equal("IncrementalCopyBlobMismatch", replacedSource.ErrorCode);
+    }
 
+    private async Task AssertIncrementalCopyListingsAsync(
+        BlobContainerClient container,
+        PageBlobClient destination,
+        string? secondDestinationSnapshot)
+    {
         var listed = new List<BlobItem>();
         await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
         {
             States = BlobStates.Snapshots,
             Prefix = destination.Name
-        }))
+        }).ConfigureAwait(false))
             listed.Add(item);
         var listedBase = Assert.Single(listed, item => item.Snapshot is null);
-        Assert.Equal(secondProperties.DestinationSnapshot, listedBase.Properties.DestinationSnapshot);
+        Assert.Equal(secondDestinationSnapshot, listedBase.Properties.DestinationSnapshot);
         Assert.Equal(2, listed.Count(item => item.Snapshot is not null));
 
         var listUri = new UriBuilder(container.GenerateSasUri(
@@ -9905,7 +9948,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             DateTimeOffset.UtcNow.AddMinutes(5)));
         listUri.Query = $"{listUri.Query.TrimStart('?')}&restype=container&comp=list&include=snapshots&prefix={destination.Name}";
         using var httpClient = new HttpClient(factory.Server.CreateHandler());
-        var listXml = await httpClient.GetStringAsync(listUri.Uri);
+        var listXml = await httpClient.GetStringAsync(listUri.Uri).ConfigureAwait(false);
         Assert.Equal(3, listXml.Split("<IncrementalCopy>true</IncrementalCopy>", StringSplitOptions.None).Length - 1);
     }
 
