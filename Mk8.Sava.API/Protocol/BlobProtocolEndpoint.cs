@@ -2502,15 +2502,26 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             await using (seekableContent.ConfigureAwait(false))
             {
                 await BlobQueryProtocol.ExecuteAsync(
-                query,
-                seekableContent,
-                http.Response.Body,
-                blob.Content.Length,
-                cancellationToken).ConfigureAwait(false);
+                    query,
+                    seekableContent,
+                    http.Response.Body,
+                    blob.Content.Length,
+                    cancellationToken).ConfigureAwait(false);
                 return;
             }
         }
 
+        await ExecuteTextQueryAsync(http, service, blob, query, encryption, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ExecuteTextQueryAsync(
+        HttpContext http,
+        BlobService service,
+        BlobRecord blob,
+        BlobQueryRequest query,
+        BlobEncryption encryption,
+        CancellationToken cancellationToken)
+    {
         var pipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: 1024 * 1024,
             resumeWriterThreshold: 512 * 1024,
@@ -3705,6 +3716,24 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         bool supportsBlobIndexTags,
         bool supportsBlobSnapshots)
     {
+        ValidateBlobListIncludeFeatures(
+            request,
+            includes,
+            delimiter,
+            hierarchicalNamespace,
+            supportsBlobIndexTags,
+            supportsBlobSnapshots);
+        return ResolveBlobListShowOnly(request, includes, showOnly, hierarchicalNamespace);
+    }
+
+    private static void ValidateBlobListIncludeFeatures(
+        StorageRequestContext request,
+        HashSet<string> includes,
+        string delimiter,
+        bool hierarchicalNamespace,
+        bool supportsBlobIndexTags,
+        bool supportsBlobSnapshots)
+    {
         var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "snapshots",
@@ -3761,7 +3790,14 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
             throw AzureStorageException.InvalidQuery("include");
         }
+    }
 
+    private static BlobListShowOnly ResolveBlobListShowOnly(
+        StorageRequestContext request,
+        HashSet<string> includes,
+        string showOnly,
+        bool hierarchicalNamespace)
+    {
         if (string.IsNullOrEmpty(showOnly))
             return BlobListShowOnly.None;
         if (!hierarchicalNamespace)
