@@ -65,7 +65,9 @@ builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Tim
     .RemoveAllLoggers()
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
     {
-        AllowAutoRedirect = true,
+        // Source-only authorization and customer-provided encryption headers must not
+        // be forwarded to an authority chosen by a redirecting copy source.
+        AllowAutoRedirect = false,
         MaxAutomaticRedirections = 5,
         AutomaticDecompression = DecompressionMethods.None
     });
