@@ -153,18 +153,15 @@ public sealed class AzurePutBlobTypeSemanticsTests(SavaWebApplicationFactory fac
 
     private BlobServiceClient CreateClient()
     {
-        var transportClient = new HttpClient(factory.Server.CreateHandler())
-        {
-            BaseAddress = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost")
-        };
+        var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
         return new BlobServiceClient(
-            transportClient.BaseAddress,
+            endpoint,
             new StorageSharedKeyCredential(
                 SavaWebApplicationFactory.AccountName,
                 SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(transportClient),
+                Transport = new HttpClientTransport(factory.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }

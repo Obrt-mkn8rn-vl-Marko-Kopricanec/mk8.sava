@@ -340,10 +340,7 @@ public sealed class StorageSpaceEfficiencyTests
             new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }
@@ -428,10 +425,7 @@ public sealed class StorageSpaceEfficiencyTests
             new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
         var container = client.GetBlobContainerClient($"packed-directories-{Guid.NewGuid():N}");
@@ -473,10 +467,7 @@ public sealed class StorageSpaceEfficiencyTests
             new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
         var container = client.GetBlobContainerClient($"shifted-{Guid.NewGuid():N}");

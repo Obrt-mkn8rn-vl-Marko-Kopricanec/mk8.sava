@@ -344,10 +344,7 @@ public sealed class ObjectReplicationTests
         var endpoint = new Uri($"http://{account}.localhost");
         var options = new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(factory.Server.CreateHandler())
-            {
-                BaseAddress = endpoint
-            }),
+            Transport = new HttpClientTransport(factory.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         };
         return new BlobServiceClient(endpoint, new StorageSharedKeyCredential(account, key), options);

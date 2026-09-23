@@ -293,18 +293,15 @@ public sealed class AzureRehydrationPriorityTests
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory application)
     {
-        var transportClient = new HttpClient(application.Server.CreateHandler())
-        {
-            BaseAddress = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost")
-        };
+        var endpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
         return new BlobServiceClient(
-            transportClient.BaseAddress,
+            endpoint,
             new StorageSharedKeyCredential(
                 SavaWebApplicationFactory.AccountName,
                 SavaWebApplicationFactory.AccountKey),
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(transportClient),
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
     }

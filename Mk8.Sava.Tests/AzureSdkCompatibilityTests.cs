@@ -64,10 +64,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var endpoint = new Uri($"http://localhost/{SavaWebApplicationFactory.AccountName}");
         var options = new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(factory.Server.CreateHandler())
-            {
-                BaseAddress = endpoint
-            }),
+            Transport = new HttpClientTransport(factory.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         };
         var service = new BlobServiceClient(
@@ -1319,7 +1316,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Assert.Equal(10, head.Content.Headers.ContentLength);
                 Assert.Empty(await head.Content.ReadAsByteArrayAsync());
             }
-            using (var post = await web.PostAsync(new Uri(endpoint + "/" + assetName, UriKind.RelativeOrAbsolute), new ByteArrayContent([])))
+            using var postContent = new ByteArrayContent([]);
+            using (var post = await web.PostAsync(new Uri(endpoint + "/" + assetName, UriKind.RelativeOrAbsolute), postContent))
             {
                 Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
                 Assert.True(post.Content.Headers.TryGetValues("Allow", out var allowedMethods));
@@ -2024,10 +2022,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.OK, metadataResponse.StatusCode);
         var signedBlockBlob = new BlockBlobClient(owned.Uri, new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-            {
-                BaseAddress = owned.Uri
-            }),
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
         var ownedQuery = await signedBlockBlob.QueryAsync("SELECT _1 FROM BlobStorage;");
@@ -2038,10 +2033,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var signedAppendUri = WithSuoid("parent/log.txt", ownerObjectId).Uri;
         var signedAppend = new AppendBlobClient(signedAppendUri, new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
-            {
-                BaseAddress = signedAppendUri
-            }),
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
         await signedAppend.AppendBlockAsync(new MemoryStream("signed-append"u8.ToArray(), writable: false));
@@ -3211,7 +3203,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         async Task<HttpResponseMessage> GetPropertiesAsync(BlobBaseClient blob, string version)
         {
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Head,
                 blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
@@ -3371,7 +3363,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     BlobContainerSasPermissions.List,
                     DateTimeOffset.UtcNow.AddMinutes(5)),
                 $"restype=container&comp=list{include}");
-            var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
             request.Headers.TryAddWithoutValidation("x-ms-upn", upn);
             return await transport.SendAsync(request).ConfigureAwait(false);
@@ -3403,7 +3395,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             string upn,
             HttpClient client)
         {
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Head,
                 target.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
@@ -3483,7 +3475,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             string? expiryTime,
             byte[] content)
         {
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Put,
                 target.GenerateSasUri(
                     BlobSasPermissions.Create | BlobSasPermissions.Write,
@@ -3505,7 +3497,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             string option,
             string? expiryTime)
         {
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Put,
                 AppendQuery(
                     target.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
@@ -3572,7 +3564,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         async Task<HttpResponseMessage> GetPropertiesAsync(string version)
         {
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Head,
                 direct.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
             request.Headers.TryAddWithoutValidation("x-ms-version", version);
@@ -3660,7 +3652,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         async Task<HttpResponseMessage> CommitBlocksAsync(bool includeExpiry)
         {
             var mode = includeExpiry ? "Latest" : "Committed";
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Put,
                 AppendQuery(
                     block.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
@@ -3694,7 +3686,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await using (source.ConfigureAwait(false))
         {
             var destination = container.GetBlockBlobClient("from-url.bin");
-            var request = new HttpRequestMessage(
+            using var request = new HttpRequestMessage(
                 HttpMethod.Put,
                 destination.GenerateSasUri(
                     BlobSasPermissions.Create | BlobSasPermissions.Write,
@@ -3869,10 +3861,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             endpoint,
             new BlobClientOptions
             {
-                Transport = new HttpClientTransport(new HttpClient(factory.Server.CreateHandler())
-                {
-                    BaseAddress = endpoint
-                }),
+                Transport = new HttpClientTransport(factory.Server.CreateHandler()),
                 Retry = { MaxRetries = 0 }
             });
 
@@ -4759,7 +4748,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             async Task<HttpResponseMessage> ListContainersAsync(string version, string query)
             {
-                var request = new HttpRequestMessage(
+                using var request = new HttpRequestMessage(
                     HttpMethod.Get,
                     AppendQuery(serviceSasUri, $"comp=list&{query}"));
                 request.Headers.TryAddWithoutValidation("x-ms-version", version);
@@ -4768,7 +4757,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             async Task<HttpResponseMessage> ListBlobsAsync(string version, string query)
             {
-                var request = new HttpRequestMessage(
+                using var request = new HttpRequestMessage(
                     HttpMethod.Get,
                     AppendQuery(containerSasUri, $"restype=container&comp=list&{query}"));
                 request.Headers.TryAddWithoutValidation("x-ms-version", version);
@@ -8937,7 +8926,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task FileRequestIntentIsValidatedAndForwardedForEverySupportedUrlOperation()
     {
         var sourceBytes = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
-        var source = new FileIntentSourceHandler(sourceBytes);
+        using var source = new FileIntentSourceHandler(sourceBytes);
         var application = new SavaWebApplicationFactory(() => source);
         try
         {
@@ -9214,7 +9203,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var sourceBytes = Enumerable.Range(0, 2048).Select(index => (byte)(index % 239)).ToArray();
         var sourceKey = RandomNumberGenerator.GetBytes(32);
         var sourceHash = SHA256.HashData(sourceKey);
-        var source = new EncryptedSourceHandler(sourceBytes, sourceKey, sourceHash);
+        using var source = new EncryptedSourceHandler(sourceBytes, sourceKey, sourceHash);
         var application = new SavaWebApplicationFactory(() => source);
         try
         {
@@ -10511,10 +10500,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
 
         var oldEndpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
-        var oldTransport = new HttpClient(factory.Server.CreateHandler()) { BaseAddress = oldEndpoint };
         var oldOptions = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2021_12_02)
         {
-            Transport = new HttpClientTransport(oldTransport),
+            Transport = new HttpClientTransport(factory.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         };
         var oldService = new BlobServiceClient(
@@ -14134,17 +14122,14 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory app, string accountName, string accountKey)
     {
-        var transportClient = new HttpClient(app.Server.CreateHandler())
-        {
-            BaseAddress = new Uri($"http://{accountName}.localhost")
-        };
+        var endpoint = new Uri($"http://{accountName}.localhost");
         var options = new BlobClientOptions
         {
-            Transport = new HttpClientTransport(transportClient),
+            Transport = new HttpClientTransport(app.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         };
         return new BlobServiceClient(
-            new Uri($"http://{accountName}.localhost"),
+            endpoint,
             new StorageSharedKeyCredential(accountName, accountKey),
             options);
     }
@@ -14152,7 +14137,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
     private static BlobClient CreateBlobClient(SavaWebApplicationFactory app, Uri uri) =>
         new(uri, new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = uri }),
+            Transport = new HttpClientTransport(app.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
 
@@ -14164,7 +14149,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         var endpoint = new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost");
         var options = new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = endpoint }),
+            Transport = new HttpClientTransport(app.Server.CreateHandler()),
             CustomerProvidedKey = customerProvidedKey,
             EncryptionScope = encryptionScope,
             Retry = { MaxRetries = 0 }
@@ -14180,7 +14165,7 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         var endpoint = new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost");
         return new BlobServiceClient(endpoint, new StaticTokenCredential(token), new BlobClientOptions
         {
-            Transport = new HttpClientTransport(new HttpClient(app.Server.CreateHandler()) { BaseAddress = endpoint }),
+            Transport = new HttpClientTransport(app.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
     }
