@@ -13,32 +13,20 @@ public sealed class StorageDataKeyContinuity(
     public async Task EnsureAsync(CancellationToken cancellationToken)
     {
         var inventory = await metadata.GetStorageInventoryAsync(cancellationToken);
-        var representatives = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+        var requiredKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var id in inventory.ReachableChunkIds)
-            AddRepresentative(id);
+            AddRequiredKey(id);
         await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(cancellationToken))
-            AddRepresentative(id);
+            AddRequiredKey(id);
 
-        void AddRepresentative(string id)
+        void AddRequiredKey(string id)
         {
-            if (id.EndsWith("/$zero", StringComparison.Ordinal))
-                return;
-            var domain = ChunkStore.GetDomainFromChunkId(id);
-            if (domain.Contains("/$cpk-", StringComparison.Ordinal))
-                return;
-            var keyId = domain == "$global"
-                ? "cross-account"
-                : $"account:{domain.Split('/', 2)[0]}";
-            if (!representatives.TryGetValue(keyId, out var domains))
-            {
-                domains = new Dictionary<string, string>(StringComparer.Ordinal);
-                representatives.Add(keyId, domains);
-            }
-            domains.TryAdd(domain, id);
+            if (KeyIdForChunk(id) is { } keyId)
+                requiredKeys.Add(keyId);
         }
 
         var fingerprints = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var keyId in representatives.Keys)
+        foreach (var keyId in requiredKeys)
         {
             var encoded = keyId == "cross-account"
                 ? _options.CrossAccountEncryptionKey
@@ -51,17 +39,40 @@ public sealed class StorageDataKeyContinuity(
             fingerprints,
             async (keyId, token) =>
             {
-                foreach (var id in representatives[keyId].Values)
+                foreach (var id in inventory.ReachableChunkIds)
                 {
-                    var status = await chunks.VerifyChunkAsync(id, token);
-                    if (status != ChunkIntegrityStatus.Verified)
-                    {
-                        throw new InvalidDataException(
-                            $"Cannot establish data encryption key continuity for '{keyId}': " +
-                            $"representative chunk '{id}' is {status}.");
-                    }
+                    if (KeyIdForChunk(id) == keyId)
+                        await VerifyAsync(id, keyId, token);
+                }
+                await foreach (var id in chunks.EnumeratePhysicalChunkIdsForStartupAsync(token))
+                {
+                    if (!inventory.ReachableChunkIds.Contains(id) && KeyIdForChunk(id) == keyId)
+                        await VerifyAsync(id, keyId, token);
                 }
             },
             cancellationToken);
+
+        async Task VerifyAsync(string id, string keyId, CancellationToken token)
+        {
+            var status = await chunks.VerifyChunkAsync(id, token);
+            if (status != ChunkIntegrityStatus.Verified)
+            {
+                throw new InvalidDataException(
+                    $"Cannot establish data encryption key continuity for '{keyId}': " +
+                    $"chunk '{id}' is {status}.");
+            }
+        }
+    }
+
+    private static string? KeyIdForChunk(string id)
+    {
+        if (id.EndsWith("/$zero", StringComparison.Ordinal))
+            return null;
+        var domain = ChunkStore.GetDomainFromChunkId(id);
+        if (domain.Contains("/$cpk-", StringComparison.Ordinal))
+            return null;
+        return domain == "$global"
+            ? "cross-account"
+            : $"account:{domain.Split('/', 2)[0]}";
     }
 }

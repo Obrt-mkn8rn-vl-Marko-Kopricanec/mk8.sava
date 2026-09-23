@@ -306,10 +306,11 @@ physically reusable chunks and rejects a mismatch at startup, before accepting
 requests. Startup also inventories standalone chunks and registered pack
 locators, so crash-abandoned but unreferenced extents keep their key requirement
 until garbage collection removes them. On the first start after an older
-metadata schema, it verifies one encrypted chunk per distinct domain before
-recording the fingerprints. This migration check is not a full integrity scan,
-and online data-key rotation is still outstanding. Preserve data keys
-separately from backups.
+metadata schema, it verifies every reachable and physically reusable encrypted
+chunk before recording the fingerprints. This one-time migration check can take
+longer on a large root; regular startups use the recorded fingerprints instead
+of repeating it. Online data-key rotation is still outstanding. Preserve data
+keys separately from backups.
 
 `AllowSharedKeyAccessForServices:Blob:Enabled` mirrors Azure's Blob-specific
 management setting. When set to `false`, it denies Blob Shared Key, Shared Key
