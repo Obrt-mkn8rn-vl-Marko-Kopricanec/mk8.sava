@@ -1898,6 +1898,148 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalNamespaceUserDelegationSuoidChecksOwnerAndEveryAncestorBeforeRead()
+    {
+        const string ownerObjectId = "11e1e2fd-3f95-4e15-b855-c83472392325";
+        const string foreignObjectId = "68679a90-477a-4584-94d1-c520340668b1";
+        await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Permissions"] = "racwdxltmeop",
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:CanGenerateUserDelegationKey"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:CanManageOwnership"] = "true"
+        });
+        await application.InitializeAsync();
+        var bearer = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, ownerObjectId, SavaWebApplicationFactory.TenantId));
+        var container = bearer.GetBlobContainerClient($"suoid-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        await container.GetBlobClient("parent/child.txt").UploadAsync(BinaryData.FromString("owned-content"));
+
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await bearer.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+
+        BlobClient WithSuoid(string name, string objectId)
+        {
+            const string signedVersion = "2023-11-03";
+            var signedStart = startsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            var signedExpiry = expiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+            var canonicalResource =
+                $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{name}";
+            var stringToSign = string.Join(
+                '\n',
+                "rw",
+                signedStart,
+                signedExpiry,
+                canonicalResource,
+                key.SignedObjectId,
+                key.SignedTenantId,
+                keyStart,
+                keyExpiry,
+                key.SignedService,
+                key.SignedVersion,
+                string.Empty,
+                objectId,
+                string.Empty,
+                string.Empty,
+                "https,http",
+                signedVersion,
+                "b",
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty,
+                string.Empty);
+            var signature = Convert.ToBase64String(HMACSHA256.HashData(
+                Convert.FromBase64String(key.Value),
+                Encoding.UTF8.GetBytes(stringToSign)));
+            var query =
+                $"sp=rw&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
+                $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
+                $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
+                $"&sks={key.SignedService}&skv={key.SignedVersion}" +
+                $"&suoid={objectId}&spr=https%2Chttp&sv={signedVersion}&sr=b" +
+                $"&sig={Uri.EscapeDataString(signature)}";
+            return CreateBlobClient(
+                application,
+                new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}?{query}"));
+        }
+
+        var owned = WithSuoid("parent/child.txt", ownerObjectId);
+        Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal(13, (await owned.GetPropertiesAsync()).Value.ContentLength);
+        var deniedMutation = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true));
+        Assert.Equal("AuthorizationFailure", deniedMutation.ErrorCode);
+        Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
+
+        var foreignAgent = WithSuoid("parent/child.txt", foreignObjectId);
+        var deniedTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            foreignAgent.DownloadContentAsync());
+        Assert.Equal("AuthorizationFailure", deniedTraversal.ErrorCode);
+        var tampered = CreateBlobClient(
+            application,
+            new Uri(owned.Uri.AbsoluteUri.Replace(
+                $"suoid={ownerObjectId}",
+                $"suoid={foreignObjectId}",
+                StringComparison.Ordinal)));
+        var deniedTampering = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            tampered.DownloadContentAsync());
+        Assert.Equal("AuthenticationFailed", deniedTampering.ErrorCode);
+
+        var delegatedWrite = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = "parent/foreign.txt",
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp,
+            PreauthorizedAgentObjectId = foreignObjectId
+        };
+        delegatedWrite.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+        var writeSas = delegatedWrite.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName);
+        var foreignOwned = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/parent/foreign.txt" +
+                $"?{writeSas}"));
+        await foreignOwned.UploadAsync(BinaryData.FromString("foreign-content"));
+        var deniedTarget = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            WithSuoid("parent/foreign.txt", ownerObjectId).DownloadContentAsync());
+        Assert.Equal("AuthorizationFailure", deniedTarget.ErrorCode);
+
+        delegatedWrite.BlobName = "foreign-parent/seed.txt";
+        var parentWriteSas = delegatedWrite.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName);
+        await CreateBlobClient(
+                application,
+                new Uri(
+                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/foreign-parent/seed.txt" +
+                    $"?{parentWriteSas}"))
+            .UploadAsync(BinaryData.FromString("seed"));
+        await container.GetBlobClient("foreign-parent/owned.txt").UploadAsync(BinaryData.FromString("owned"));
+        var deniedParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            WithSuoid("foreign-parent/owned.txt", ownerObjectId).DownloadContentAsync());
+        Assert.Equal("AuthorizationFailure", deniedParent.ErrorCode);
+
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            WithSuoid("parent/missing.txt", ownerObjectId).DownloadContentAsync());
+        Assert.Equal("BlobNotFound", missing.ErrorCode);
+        var missingParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            WithSuoid("missing-parent/missing.txt", ownerObjectId).DownloadContentAsync());
+        Assert.Equal("BlobNotFound", missingParent.ErrorCode);
+    }
+
+    [Fact]
     public async Task HierarchicalNamespaceBlobIndexTagsRequireTheExplicitPreviewCapability()
     {
         await using var application = new SavaWebApplicationFactory(
