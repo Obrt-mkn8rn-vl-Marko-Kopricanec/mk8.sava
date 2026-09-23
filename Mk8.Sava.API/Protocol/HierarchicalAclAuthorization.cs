@@ -9,15 +9,70 @@ internal static class HierarchicalAclAuthorization
         if (request.ResourceKind != StorageResourceKind.Blob ||
             request.Container is null ||
             request.Blob is null ||
-            http.Query["comp"].ToString().Length > 0 ||
             http.Query.ContainsKey("snapshot") ||
             http.Query.ContainsKey("versionid") ||
             http.Query.ContainsKey("deletetype"))
             return null;
 
-        if (HttpMethods.IsPut(http.Method))
+        var component = http.Query["comp"].ToString();
+        if (HttpMethods.IsPut(http.Method) &&
+            (component.Length == 0 ||
+             component.Equals("block", StringComparison.OrdinalIgnoreCase) ||
+             component.Equals("blocklist", StringComparison.OrdinalIgnoreCase)))
             return 'w';
-        return HttpMethods.IsDelete(http.Method) ? 'd' : null;
+        return HttpMethods.IsDelete(http.Method) && component.Length == 0 ? 'd' : null;
+    }
+
+    internal static bool IsAppendOperation(HttpRequest http, StorageRequestContext request) =>
+        request.ResourceKind == StorageResourceKind.Blob &&
+        request.Container is not null &&
+        request.Blob is not null &&
+        HttpMethods.IsPut(http.Method) &&
+        http.Query["comp"].ToString().Equals("appendblock", StringComparison.OrdinalIgnoreCase) &&
+        !http.Query.ContainsKey("snapshot") &&
+        !http.Query.ContainsKey("versionid");
+
+    internal static async Task<string> EnsureAppendAsync(
+        MetadataStore metadata,
+        HttpRequest http,
+        StorageRequestContext request,
+        string objectId,
+        IReadOnlySet<string> groups,
+        string signedPermissions,
+        CancellationToken cancellationToken)
+    {
+        if (!IsAppendOperation(http, request) ||
+            !signedPermissions.Contains('a', StringComparison.Ordinal) &&
+            !signedPermissions.Contains('w', StringComparison.Ordinal))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var root = await metadata.GetContainerAsync(
+            request.Account, request.Container!, includeDeleted: false, cancellationToken);
+        if (root is null ||
+            !PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'x'))
+            throw AzureStorageException.AuthorizationFailure();
+
+        var name = request.Blob!;
+        var separator = name.IndexOf('/', StringComparison.Ordinal);
+        while (separator > 0)
+        {
+            var parent = await metadata.GetBlobAsync(
+                request.Account, request.Container!, name[..separator],
+                versionId: null, snapshot: null, includeDeleted: false, cancellationToken);
+            if (parent is null || !parent.IsDirectory ||
+                !PosixAccessControl.Allows(parent.Acl, parent.Owner, parent.Group, objectId, groups, 'x'))
+                throw AzureStorageException.AuthorizationFailure();
+            separator = name.IndexOf('/', separator + 1);
+        }
+
+        var blob = await metadata.GetBlobAsync(
+            request.Account, request.Container!, name,
+            versionId: null, snapshot: null, includeDeleted: false, cancellationToken);
+        if (blob is null || blob.IsDirectory ||
+            !PosixAccessControl.Allows(blob.Acl, blob.Owner, blob.Group, objectId, groups, 'r') ||
+            !PosixAccessControl.Allows(blob.Acl, blob.Owner, blob.Group, objectId, groups, 'w'))
+            throw AzureStorageException.AuthorizationFailure();
+        return blob.GenerationId;
     }
 
     internal static async Task EnsureParentMutationAsync(
@@ -150,7 +205,7 @@ internal static class HierarchicalAclAuthorization
 
     internal static void EnsureAuthorizedGeneration(StorageAuthorization authorization, string generationId)
     {
-        if (authorization.AclReadChecked &&
+        if ((authorization.AclReadChecked || authorization.AclAppendChecked) &&
             !string.Equals(authorization.AclAuthorizedGenerationId, generationId, StringComparison.Ordinal))
         {
             throw AzureStorageException.AuthorizationFailure();

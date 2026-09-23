@@ -40,7 +40,10 @@ public sealed record StorageAuthorization(
     IReadOnlySet<string>? AclListGroups = null,
     bool AclMutationChecked = false,
     string? AclMutationObjectId = null,
-    IReadOnlySet<string>? AclMutationGroups = null)
+    IReadOnlySet<string>? AclMutationGroups = null,
+    bool AclAppendChecked = false,
+    string? AclAppendObjectId = null,
+    IReadOnlySet<string>? AclAppendGroups = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");
@@ -335,6 +338,34 @@ public sealed class StorageAuthenticator(
             }
         }
 
+        var aclAppendChecked = false;
+        IReadOnlySet<string>? aclAppendGroups = null;
+        if (requireDataAuthorization &&
+            !granted.Contains('a') &&
+            !granted.Contains('w') &&
+            objectId is not null &&
+            Guid.TryParse(objectId, out _) &&
+            IsHierarchicalNamespaceEnabled(request.Account) &&
+            HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
+        {
+            try
+            {
+                var groups = principal.FindAll("groups")
+                    .Select(claim => claim.Value)
+                    .Where(value => Guid.TryParse(value, out _))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
+                    metadata, context.Request, request, objectId, groups, "a", context.RequestAborted);
+                aclAppendGroups = groups;
+                aclAppendChecked = true;
+                granted.Add('a');
+            }
+            catch (AzureStorageException error) when (error.ErrorCode == "AuthorizationFailure")
+            {
+                // An ACL cannot grant this append; retain only the configured RBAC grants.
+            }
+        }
+
         if (requireDataAuthorization && granted.Count == 0)
             throw AzureStorageException.AuthorizationFailure();
         var permissions = new string("racwdxytlfmeiopk".Where(granted.Contains).ToArray());
@@ -356,7 +387,10 @@ public sealed class StorageAuthenticator(
             AclListGroups: aclListGroups,
             AclMutationChecked: aclMutationChecked,
             AclMutationObjectId: aclMutationChecked ? objectId : null,
-            AclMutationGroups: aclMutationGroups);
+            AclMutationGroups: aclMutationGroups,
+            AclAppendChecked: aclAppendChecked,
+            AclAppendObjectId: aclAppendChecked ? objectId : null,
+            AclAppendGroups: aclAppendGroups);
     }
 
     private StorageAuthorization AuthenticateSharedKey(
@@ -773,9 +807,17 @@ public sealed class StorageAuthenticator(
         string? aclAuthorizedGenerationId = null;
         var aclListChecked = false;
         var aclMutationChecked = false;
+        var aclAppendChecked = false;
         if (aclObjectId is not null)
         {
-            if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
+            if (HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
+            {
+                aclAuthorizedGenerationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
+                    metadata, context.Request, request, aclObjectId, NoGroups,
+                    permissions, cancellationToken);
+                aclAppendChecked = true;
+            }
+            else if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
             {
                 await HierarchicalAclAuthorization.EnsureParentMutationAsync(
                     metadata, context.Request, request, aclObjectId, NoGroups,
@@ -812,14 +854,17 @@ public sealed class StorageAuthenticator(
             signedResource,
             TenantId: isUserDelegationSas ? query["sktid"].ToString() : null,
             DelegatedObjectId: delegatedCreatorObjectId,
-            AclReadChecked: aclObjectId is not null && !aclListChecked && !aclMutationChecked,
+            AclReadChecked: aclObjectId is not null && !aclListChecked && !aclMutationChecked && !aclAppendChecked,
             AclAuthorizedGenerationId: aclAuthorizedGenerationId,
             AclListChecked: aclListChecked,
             AclListObjectId: aclListChecked ? aclObjectId : null,
             AclListGroups: aclListChecked ? NoGroups : null,
             AclMutationChecked: aclMutationChecked,
             AclMutationObjectId: aclMutationChecked ? aclObjectId : null,
-            AclMutationGroups: aclMutationChecked ? NoGroups : null);
+            AclMutationGroups: aclMutationChecked ? NoGroups : null,
+            AclAppendChecked: aclAppendChecked,
+            AclAppendObjectId: aclAppendChecked ? aclObjectId : null,
+            AclAppendGroups: aclAppendChecked ? NoGroups : null);
     }
 
     private static string BuildSharedKeyString(
