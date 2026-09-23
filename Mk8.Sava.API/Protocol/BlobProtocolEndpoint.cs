@@ -410,301 +410,480 @@ internal static class BlobProtocolEndpoint
             }
             throw AzureStorageException.AuthorizationPermissionMismatch();
         }
+        if (await HandleContainerWithoutFetchAsync(
+                http, request, service, containerName, comp, cancellationToken).ConfigureAwait(false))
+            return;
+        var container = await service.GetContainerAsync(
+            request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        await HandleExistingContainerAsync(http, request, service, container, comp, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> HandleContainerWithoutFetchAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string comp,
+        CancellationToken cancellationToken)
+    {
         if (string.Equals(comp, "batch", StringComparison.Ordinal) && HttpMethods.IsPost(http.Request.Method))
         {
-            Require(request, 'w');
-            _ = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
-            await HandleBatchAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
-            return;
+            await HandleContainerBatchAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+            return true;
         }
         if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "blobs", StringComparison.Ordinal))
         {
-            Require(request, 'f');
-            RequireBlobIndexTags(request, service, "Find Blobs by Tags");
-            _ = await service.GetContainerAsync(
-                request.Account,
-                containerName,
-                includeDeleted: false,
-                cancellationToken).ConfigureAwait(false);
-            await WriteFindByTagsAsync(
-                http,
-                request,
-                service,
-                containerName,
-                cancellationToken).ConfigureAwait(false);
-            return;
+            await FindContainerBlobsByTagsAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
-            RequireAccountSasForContainerOperation(request);
-            RequireAny(request, 'c', 'w');
-            RequireZeroContentLength(http.Request);
-            var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
-            if (publicAccess is not null)
-                RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
-            var encryptionPolicy = ReadContainerEncryptionPolicy(http.Request);
-            var created = await service.CreateContainerAsync(
-                request.Account,
-                containerName,
-                ProtocolParsing.ReadMetadata(http.Request.Headers),
-                publicAccess,
-                encryptionPolicy.DefaultScope,
-                encryptionPolicy.PreventOverride,
-                cancellationToken,
-                request.Authorization.CreatorObjectId).ConfigureAwait(false);
-            AzureResponseWriter.AddContainerHeaders(http.Response, created);
-            http.Response.StatusCode = StatusCodes.Status201Created;
-            return;
+            await CreateContainerAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         if (string.Equals(comp, "undelete", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
-            RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
-            RequireAccountSasForContainerOperation(request);
-            Require(request, 'w');
-            RequireZeroContentLength(http.Request);
-            var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name")
-                              ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-name");
-            var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
-                          ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-version");
-            _ = await service.RestoreContainerAsync(
-                request.Account,
-                deletedName,
-                containerName,
-                version,
-                cancellationToken).ConfigureAwait(false);
-            http.Response.StatusCode = StatusCodes.Status201Created;
-            http.Response.ContentLength = 0;
-            return;
+            await RestoreContainerAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         if (string.Equals(comp, "rename", StringComparison.Ordinal) && HttpMethods.IsPut(http.Request.Method))
         {
-            RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Rename Container");
-            RequireAccountSasForContainerOperation(request);
-            Require(request, 'w');
-            RequireZeroContentLength(http.Request);
-            var sourceName = ProtocolParsing.First(http.Request.Headers, "x-ms-source-container-name")
-                             ?? throw AzureStorageException.MissingHeader("x-ms-source-container-name");
-            http.RequestServices.GetRequiredService<StorageAuthenticator>()
-                .EnsureContainerPermission(request, sourceName, 'w');
-            _ = await service.RenameContainerAsync(
-                request.Account,
-                sourceName,
-                containerName,
-                ProtocolParsing.First(http.Request.Headers, "x-ms-source-lease-id"),
-                cancellationToken).ConfigureAwait(false);
-            http.Response.ContentLength = 0;
-            return;
+            await RenameContainerAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+            return true;
         }
+        return false;
+    }
 
-        var container = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+    private static async Task HandleExistingContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        string comp,
+        CancellationToken cancellationToken)
+    {
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
             string.IsNullOrEmpty(comp))
         {
-            RequireAccountSasForContainerOperation(request);
-            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
-            ValidateOptionalLease(http.Request, container.Lease, "container");
-            AzureResponseWriter.AddContainerPropertiesHeaders(http.Response, container);
+            await GetContainerPropertiesAsync(http, request, service, container).ConfigureAwait(false);
             return;
         }
 
         if (HttpMethods.IsGet(http.Request.Method) && string.Equals(comp, "list", StringComparison.Ordinal))
         {
-            await AuthorizeContainerListAsync(request, service, container).ConfigureAwait(false);
-            var includes = SplitCsv(http.Request.Query["include"].ToString());
-            var prefix = http.Request.Query["prefix"].ToString();
-            var startFrom = http.Request.Query["startfrom"].ToString();
-            var endBefore = http.Request.Query["endbefore"].ToString();
-            var delimiter = http.Request.Query["delimiter"].ToString();
-            var marker = http.Request.Query["marker"].ToString();
-            var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
-            var hierarchicalNamespace = service.IsHierarchicalNamespaceEnabled(request.Account);
-            var showOnly = ValidateBlobListFeatures(
-                request,
-                includes,
-                delimiter,
-                http.Request.Query["showonly"].ToString(),
-                hierarchicalNamespace,
-                service.SupportsBlobIndexTags(request.Account),
-                service.SupportsBlobSnapshots(request.Account));
-            ValidateListUpnHeader(http.Request, hierarchicalNamespace, includes.Contains("permissions"));
-            if (http.Request.Query.ContainsKey("startfrom") &&
-                !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
-            {
-                throw AzureStorageException.FeatureVersionMismatch(
-                    "The startFrom parameter requires service version 2023-05-03 or later.");
-            }
-            var arrow = IsArrowListRequest(http.Request, request);
-            if (arrow && hierarchicalNamespace)
-                throw AzureStorageException.BlobOperationNotSupported();
-            if (http.Request.Query.ContainsKey("endbefore"))
-            {
-                if (!IsServiceVersionAtLeast(request, new DateOnly(2026, 6, 6)))
-                {
-                    throw AzureStorageException.FeatureVersionMismatch(
-                        "The endBefore parameter requires service version 2026-06-06 or later.");
-                }
-                if (string.IsNullOrEmpty(endBefore))
-                    throw AzureStorageException.InvalidQuery("endbefore");
-                if (!arrow)
-                    throw AzureStorageException.InvalidQuery("endbefore");
-                if (!string.IsNullOrEmpty(startFrom) &&
-                    string.CompareOrdinal(endBefore, startFrom) < 0)
-                {
-                    throw AzureStorageException.InvalidQuery("endbefore");
-                }
-            }
-            var decodedMarker = AzureResponseWriter.DecodeBlobMarker(
-                http,
-                prefix,
-                startFrom,
-                endBefore,
-                delimiter,
-                http.Request.Query["showonly"].ToString(),
-                includes,
-                marker);
-            var blobs = await service.ListBlobsPageAsync(
-                request.Account,
-                containerName,
-                showOnly,
-                includes.Contains("versions"),
-                includes.Contains("snapshots"),
-                includes.Contains("deleted") || includes.Contains("deletedwithversions"),
-                includes.Contains("uncommittedblobs"),
-                prefix,
-                startFrom,
-                endBefore,
-                delimiter,
-                decodedMarker,
-                maxResults,
-                cancellationToken).ConfigureAwait(false);
-            if (request.Authorization.AclListChecked)
-            {
-                await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                    http.RequestServices.GetRequiredService<MetadataStore>(),
-                    http.Request,
-                    request,
-                    request.Authorization.AclListObjectId!,
-                    request.Authorization.AclListGroups!,
-                    request.Authorization.Permissions,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            ValidateListedBlobTypes(request, blobs);
-            await AzureResponseWriter.WriteBlobsAsync(
-                http,
-                blobs,
-                prefix,
-                startFrom,
-                endBefore,
-                delimiter,
-                marker,
-                maxResults,
-                includes,
-                arrow,
-                hierarchicalNamespace,
-                service.IsLastAccessTimeTrackingEnabled(request.Account),
-                cancellationToken).ConfigureAwait(false);
+            await HandleContainerListAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
 string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
-            RequireAccountSasForContainerOperation(request);
-            await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
-            ValidateOptionalLease(http.Request, container.Lease, "container");
-            AzureResponseWriter.AddContainerMetadataHeaders(http.Response, container);
+            await GetContainerMetadataAsync(http, request, service, container).ConfigureAwait(false);
             return;
         }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "metadata", StringComparison.Ordinal))
         {
-            RequireAccountSasForContainerOperation(request);
-            Require(request, 'w');
-            RequireZeroContentLength(http.Request);
-            BlobConditionEvaluator.EvaluateContainerWrite(
-                http.Request,
-                container.LastModified,
-                supportsIfUnmodifiedSince: false);
-            ValidateOptionalLease(http.Request, container.Lease, "container");
-            var updated = await service.SetContainerMetadataAsync(container, ProtocolParsing.ReadMetadata(http.Request.Headers), cancellationToken).ConfigureAwait(false);
-            AzureResponseWriter.AddContainerHeaders(http.Response, updated);
+            await SetContainerMetadataAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if ((HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)) &&
 string.Equals(comp, "acl", StringComparison.Ordinal))
         {
-            RequireContainerAclPermission(request);
-            ValidateOptionalLease(http.Request, container.Lease, "container");
-            if (!IsServiceVersionAtLeast(request, new DateOnly(2015, 4, 5)) &&
-                container.AccessPolicies.Values.Any(policy =>
-                    policy.Permission.Contains('a', StringComparison.Ordinal) ||
-                    policy.Permission.Contains('c', StringComparison.Ordinal)))
-            {
-                throw AzureStorageException.FeatureVersionMismatch(
-                    "Stored access policy contains a permission that is not supported by this version.");
-            }
-            AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
-            if (HttpMethods.IsGet(http.Request.Method))
-                await AzureResponseWriter.WriteAclAsync(http, container, cancellationToken).ConfigureAwait(false);
+            await GetContainerAclAsync(http, request, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "acl", StringComparison.Ordinal))
         {
-            RequireContainerAclPermission(request);
-            BlobConditionEvaluator.EvaluateContainerWrite(
-                http.Request,
-                container.LastModified,
-                supportsIfUnmodifiedSince: true);
-            ValidateOptionalLease(http.Request, container.Lease, "container");
-            var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
-            if (publicAccess is not null)
-                RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
-            var policies = http.Request.ContentLength is null or 0
-                ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
-                : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
-            var updated = await service.SetContainerAclAsync(
-                container,
-                publicAccess,
-                policies,
-                cancellationToken).ConfigureAwait(false);
-            AzureResponseWriter.AddContainerHeaders(http.Response, updated);
+            await SetContainerAclAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (HttpMethods.IsPut(http.Request.Method) && string.Equals(comp, "lease", StringComparison.Ordinal))
         {
-            RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Lease Container");
-            RequireContainerLeasePermission(request, http.Request);
-            BlobConditionEvaluator.EvaluateContainerWrite(
-                http.Request,
-                container.LastModified,
-                supportsIfUnmodifiedSince: true);
-            RequireZeroContentLength(http.Request);
-            await HandleContainerLeaseAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
+            await LeaseContainerAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         if (HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp))
         {
-            RequireAccountSasForContainerOperation(request);
-            Require(request, 'd');
-            BlobConditionEvaluator.EvaluateContainerWrite(
-                http.Request,
-                container.LastModified,
-                supportsIfUnmodifiedSince: true);
-            EnsureLease(http.Request, container.Lease, "container");
-            await service.DeleteContainerAsync(container, cancellationToken).ConfigureAwait(false);
-            http.Response.StatusCode = StatusCodes.Status202Accepted;
+            await DeleteContainerAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
             return;
         }
 
         throw UnsupportedOperation();
+    }
+
+    private static async Task CreateContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        CancellationToken cancellationToken)
+    {
+        RequireAccountSasForContainerOperation(request);
+        RequireAny(request, 'c', 'w');
+        RequireZeroContentLength(http.Request);
+        var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
+        if (publicAccess is not null)
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
+        var encryptionPolicy = ReadContainerEncryptionPolicy(http.Request);
+        var created = await service.CreateContainerAsync(
+            request.Account,
+            containerName,
+            ProtocolParsing.ReadMetadata(http.Request.Headers),
+            publicAccess,
+            encryptionPolicy.DefaultScope,
+            encryptionPolicy.PreventOverride,
+            cancellationToken,
+            request.Authorization.CreatorObjectId).ConfigureAwait(false);
+        AzureResponseWriter.AddContainerHeaders(http.Response, created);
+        http.Response.StatusCode = StatusCodes.Status201Created;
+    }
+
+    private static async Task RestoreContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        CancellationToken cancellationToken)
+    {
+        RequireFeatureVersion(request, new DateOnly(2019, 12, 12), "Restore Container");
+        RequireAccountSasForContainerOperation(request);
+        Require(request, 'w');
+        RequireZeroContentLength(http.Request);
+        var deletedName = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-name")
+                          ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-name");
+        var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
+                      ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-version");
+        _ = await service.RestoreContainerAsync(
+            request.Account,
+            deletedName,
+            containerName,
+            version,
+            cancellationToken).ConfigureAwait(false);
+        http.Response.StatusCode = StatusCodes.Status201Created;
+        http.Response.ContentLength = 0;
+    }
+
+    private static async Task RenameContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        CancellationToken cancellationToken)
+    {
+        RequireFeatureVersion(request, new DateOnly(2020, 6, 12), "Rename Container");
+        RequireAccountSasForContainerOperation(request);
+        Require(request, 'w');
+        RequireZeroContentLength(http.Request);
+        var sourceName = ProtocolParsing.First(http.Request.Headers, "x-ms-source-container-name")
+                         ?? throw AzureStorageException.MissingHeader("x-ms-source-container-name");
+        http.RequestServices.GetRequiredService<StorageAuthenticator>()
+            .EnsureContainerPermission(request, sourceName, 'w');
+        _ = await service.RenameContainerAsync(
+            request.Account,
+            sourceName,
+            containerName,
+            ProtocolParsing.First(http.Request.Headers, "x-ms-source-lease-id"),
+            cancellationToken).ConfigureAwait(false);
+        http.Response.ContentLength = 0;
+    }
+
+    private static async Task HandleContainerBatchAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        CancellationToken cancellationToken)
+    {
+        Require(request, 'w');
+        _ = await service.GetContainerAsync(request.Account, containerName, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        await HandleBatchAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task FindContainerBlobsByTagsAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        CancellationToken cancellationToken)
+    {
+        Require(request, 'f');
+        RequireBlobIndexTags(request, service, "Find Blobs by Tags");
+        _ = await service.GetContainerAsync(
+            request.Account,
+            containerName,
+            includeDeleted: false,
+            cancellationToken).ConfigureAwait(false);
+        await WriteFindByTagsAsync(http, request, service, containerName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task GetContainerPropertiesAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container)
+    {
+        RequireAccountSasForContainerOperation(request);
+        await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
+        ValidateOptionalLease(http.Request, container.Lease, "container");
+        AzureResponseWriter.AddContainerPropertiesHeaders(http.Response, container);
+    }
+
+    private static async Task GetContainerMetadataAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container)
+    {
+        RequireAccountSasForContainerOperation(request);
+        await AuthorizeContainerReadAsync(request, service, container, allowContainerPublic: true).ConfigureAwait(false);
+        ValidateOptionalLease(http.Request, container.Lease, "container");
+        AzureResponseWriter.AddContainerMetadataHeaders(http.Response, container);
+    }
+
+    private static async Task SetContainerMetadataAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        RequireAccountSasForContainerOperation(request);
+        Require(request, 'w');
+        RequireZeroContentLength(http.Request);
+        BlobConditionEvaluator.EvaluateContainerWrite(
+            http.Request,
+            container.LastModified,
+            supportsIfUnmodifiedSince: false);
+        ValidateOptionalLease(http.Request, container.Lease, "container");
+        var updated = await service.SetContainerMetadataAsync(
+            container,
+            ProtocolParsing.ReadMetadata(http.Request.Headers),
+            cancellationToken).ConfigureAwait(false);
+        AzureResponseWriter.AddContainerHeaders(http.Response, updated);
+    }
+
+    private static async Task GetContainerAclAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        RequireContainerAclPermission(request);
+        ValidateOptionalLease(http.Request, container.Lease, "container");
+        if (!IsServiceVersionAtLeast(request, new DateOnly(2015, 4, 5)) &&
+            container.AccessPolicies.Values.Any(policy =>
+                policy.Permission.Contains('a', StringComparison.Ordinal) ||
+                policy.Permission.Contains('c', StringComparison.Ordinal)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "Stored access policy contains a permission that is not supported by this version.");
+        }
+        AzureResponseWriter.AddContainerAccessPolicyHeaders(http.Response, container);
+        if (HttpMethods.IsGet(http.Request.Method))
+            await AzureResponseWriter.WriteAclAsync(http, container, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task SetContainerAclAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        RequireContainerAclPermission(request);
+        BlobConditionEvaluator.EvaluateContainerWrite(
+            http.Request,
+            container.LastModified,
+            supportsIfUnmodifiedSince: true);
+        ValidateOptionalLease(http.Request, container.Lease, "container");
+        var publicAccess = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-public-access");
+        if (publicAccess is not null)
+            RequireFeatureVersion(request, new DateOnly(2009, 9, 19), "Container public access");
+        var policies = http.Request.ContentLength is null or 0
+            ? new Dictionary<string, StoredAccessPolicy>(StringComparer.Ordinal)
+            : await ProtocolParsing.ReadAclAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
+        var updated = await service.SetContainerAclAsync(
+            container,
+            publicAccess,
+            policies,
+            cancellationToken).ConfigureAwait(false);
+        AzureResponseWriter.AddContainerHeaders(http.Response, updated);
+    }
+
+    private static async Task LeaseContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        RequireFeatureVersion(request, new DateOnly(2012, 2, 12), "Lease Container");
+        RequireContainerLeasePermission(request, http.Request);
+        BlobConditionEvaluator.EvaluateContainerWrite(
+            http.Request,
+            container.LastModified,
+            supportsIfUnmodifiedSince: true);
+        RequireZeroContentLength(http.Request);
+        await HandleContainerLeaseAsync(http, request, service, container, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task DeleteContainerAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        RequireAccountSasForContainerOperation(request);
+        Require(request, 'd');
+        BlobConditionEvaluator.EvaluateContainerWrite(
+            http.Request,
+            container.LastModified,
+            supportsIfUnmodifiedSince: true);
+        EnsureLease(http.Request, container.Lease, "container");
+        await service.DeleteContainerAsync(container, cancellationToken).ConfigureAwait(false);
+        http.Response.StatusCode = StatusCodes.Status202Accepted;
+    }
+
+    private static async Task HandleContainerListAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        ContainerRecord container,
+        CancellationToken cancellationToken)
+    {
+        await AuthorizeContainerListAsync(request, service, container).ConfigureAwait(false);
+        var includes = SplitCsv(http.Request.Query["include"].ToString());
+        var prefix = http.Request.Query["prefix"].ToString();
+        var startFrom = http.Request.Query["startfrom"].ToString();
+        var endBefore = http.Request.Query["endbefore"].ToString();
+        var delimiter = http.Request.Query["delimiter"].ToString();
+        var marker = http.Request.Query["marker"].ToString();
+        var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
+        var hierarchicalNamespace = service.IsHierarchicalNamespaceEnabled(request.Account);
+        var showOnly = ValidateBlobListFeatures(
+            request,
+            includes,
+            delimiter,
+            http.Request.Query["showonly"].ToString(),
+            hierarchicalNamespace,
+            service.SupportsBlobIndexTags(request.Account),
+            service.SupportsBlobSnapshots(request.Account));
+        ValidateListUpnHeader(http.Request, hierarchicalNamespace, includes.Contains("permissions"));
+        ValidateBlobListStartFrom(http, request);
+        var arrow = IsArrowListRequest(http.Request, request);
+        if (arrow && hierarchicalNamespace)
+            throw AzureStorageException.BlobOperationNotSupported();
+        ValidateBlobListEndBefore(http, request, startFrom, endBefore, arrow);
+        var decodedMarker = DecodeContainerBlobMarker(http, includes);
+        var blobs = await service.ListBlobsPageAsync(
+            request.Account,
+            container.Name,
+            showOnly,
+            includes.Contains("versions"),
+            includes.Contains("snapshots"),
+            includes.Contains("deleted") || includes.Contains("deletedwithversions"),
+            includes.Contains("uncommittedblobs"),
+            prefix,
+            startFrom,
+            endBefore,
+            delimiter,
+            decodedMarker,
+            maxResults,
+            cancellationToken).ConfigureAwait(false);
+        await ValidateContainerListResultAsync(http, request, blobs, cancellationToken).ConfigureAwait(false);
+        await AzureResponseWriter.WriteBlobsAsync(
+            http,
+            blobs,
+            prefix,
+            startFrom,
+            endBefore,
+            delimiter,
+            marker,
+            maxResults,
+            includes,
+            arrow,
+            hierarchicalNamespace,
+            service.IsLastAccessTimeTrackingEnabled(request.Account),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static BlobListingMarker DecodeContainerBlobMarker(HttpContext http, IReadOnlySet<string> includes)
+    {
+        var query = http.Request.Query;
+        return AzureResponseWriter.DecodeBlobMarker(
+            http,
+            query["prefix"].ToString(),
+            query["startfrom"].ToString(),
+            query["endbefore"].ToString(),
+            query["delimiter"].ToString(),
+            query["showonly"].ToString(),
+            includes,
+            query["marker"].ToString());
+    }
+
+    private static async Task ValidateContainerListResultAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobListPage blobs,
+        CancellationToken cancellationToken)
+    {
+        if (request.Authorization.AclListChecked)
+        {
+            await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
+                http.RequestServices.GetRequiredService<MetadataStore>(),
+                http.Request,
+                request,
+                request.Authorization.AclListObjectId!,
+                request.Authorization.AclListGroups!,
+                request.Authorization.Permissions,
+                cancellationToken).ConfigureAwait(false);
+        }
+        ValidateListedBlobTypes(request, blobs);
+    }
+
+    private static void ValidateBlobListStartFrom(HttpContext http, StorageRequestContext request)
+    {
+        if (http.Request.Query.ContainsKey("startfrom") &&
+            !IsServiceVersionAtLeast(request, new DateOnly(2023, 5, 3)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "The startFrom parameter requires service version 2023-05-03 or later.");
+        }
+    }
+
+    private static void ValidateBlobListEndBefore(
+        HttpContext http,
+        StorageRequestContext request,
+        string startFrom,
+        string endBefore,
+        bool arrow)
+    {
+        if (!http.Request.Query.ContainsKey("endbefore"))
+            return;
+        if (!IsServiceVersionAtLeast(request, new DateOnly(2026, 6, 6)))
+        {
+            throw AzureStorageException.FeatureVersionMismatch(
+                "The endBefore parameter requires service version 2026-06-06 or later.");
+        }
+        if (string.IsNullOrEmpty(endBefore))
+            throw AzureStorageException.InvalidQuery("endbefore");
+        if (!arrow)
+            throw AzureStorageException.InvalidQuery("endbefore");
+        if (!string.IsNullOrEmpty(startFrom) &&
+            string.CompareOrdinal(endBefore, startFrom) < 0)
+        {
+            throw AzureStorageException.InvalidQuery("endbefore");
+        }
     }
 
     private static async Task HandleBatchAsync(
