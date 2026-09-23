@@ -86,6 +86,53 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
         }
     }
 
+    public int PruneLegacyEmptyChunkDirectories()
+    {
+        lock (_directoryGate)
+        {
+            if ((File.GetAttributes(Chunks) & FileAttributes.ReparsePoint) != 0)
+                return 0;
+
+            var removed = 0;
+            var pending = new Stack<(string Path, bool ChildrenVisited)>();
+            pending.Push((Chunks, false));
+            while (pending.TryPop(out var entry))
+            {
+                if (!entry.ChildrenVisited)
+                {
+                    pending.Push((entry.Path, true));
+                    foreach (var child in Directory.EnumerateDirectories(entry.Path))
+                    {
+                        if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                            pending.Push((child, false));
+                    }
+                    continue;
+                }
+
+                if (string.Equals(entry.Path, Chunks, PathComparison))
+                    continue;
+                try
+                {
+                    Directory.Delete(entry.Path, recursive: false);
+                }
+                catch (IOException)
+                {
+                    continue;
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    continue;
+                }
+
+                _durableDirectories.Remove(Path.GetFullPath(entry.Path));
+                StorageDurability.FlushDirectory(Directory.GetParent(entry.Path)!.FullName);
+                removed++;
+            }
+
+            return removed;
+        }
+    }
+
     private void EnsureDurableDirectoryCore(string fullPath)
     {
         var pending = new Stack<string>();

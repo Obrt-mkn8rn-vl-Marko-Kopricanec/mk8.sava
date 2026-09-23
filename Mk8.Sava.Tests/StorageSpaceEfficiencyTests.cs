@@ -9,6 +9,78 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageSpaceEfficiencyTests
 {
     [Fact]
+    public async Task StartupPrunesLegacyEmptyHashDirectoriesWithoutFollowingSymlinksOrRemovingPackedContent()
+    {
+        var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-legacy-chunk-dirs-{Guid.NewGuid():N}");
+        var externalPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-external-dir-{Guid.NewGuid():N}");
+        var containerName = $"legacy-directories-{Guid.NewGuid():N}";
+        var configuration = new Dictionary<string, string?>
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+        var bytes = new byte[80];
+        new Random(0x6400).NextBytes(bytes);
+
+        try
+        {
+            await using (var first = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
+            {
+                await first.InitializeAsync();
+                await CreateClient(first).GetBlobContainerClient(containerName)
+                    .CreateIfNotExistsAsync();
+                await CreateClient(first).GetBlobContainerClient(containerName)
+                    .GetBlobClient("packed.bin").UploadAsync(BinaryData.FromBytes(bytes));
+                Assert.Empty(Directory.EnumerateDirectories(
+                    Path.Combine(dataPath, "chunks"),
+                    "*",
+                    SearchOption.AllDirectories));
+            }
+
+            var chunksRoot = Path.Combine(dataPath, "chunks");
+            var emptyLeaf = Path.Combine(chunksRoot, "legacy", "domain", "hash");
+            var occupied = Path.Combine(chunksRoot, "occupied");
+            Directory.CreateDirectory(emptyLeaf);
+            Directory.CreateDirectory(occupied);
+            await File.WriteAllBytesAsync(Path.Combine(occupied, "keep.bin"), [7]);
+
+            if (OperatingSystem.IsLinux())
+            {
+                Directory.CreateDirectory(Path.Combine(externalPath, "outside-empty"));
+                Directory.CreateSymbolicLink(Path.Combine(chunksRoot, "linked"), externalPath);
+            }
+
+            await using (var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false))
+            {
+                await restarted.InitializeAsync();
+                Assert.False(Directory.Exists(emptyLeaf));
+                Assert.False(Directory.Exists(Path.Combine(chunksRoot, "legacy")));
+                Assert.True(File.Exists(Path.Combine(occupied, "keep.bin")));
+                if (OperatingSystem.IsLinux())
+                {
+                    Assert.True(Directory.Exists(Path.Combine(externalPath, "outside-empty")));
+                    Assert.True(Directory.Exists(Path.Combine(chunksRoot, "linked")));
+                }
+
+                var downloaded = await CreateClient(restarted)
+                    .GetBlobContainerClient(containerName)
+                    .GetBlobClient("packed.bin")
+                    .DownloadContentAsync();
+                Assert.Equal(bytes, downloaded.Value.Content.ToArray());
+            }
+        }
+        finally
+        {
+            var link = Path.Combine(dataPath, "chunks", "linked");
+            if (OperatingSystem.IsLinux() && Directory.Exists(link))
+                Directory.Delete(link);
+            if (Directory.Exists(dataPath))
+                Directory.Delete(dataPath, recursive: true);
+            if (Directory.Exists(externalPath))
+                Directory.Delete(externalPath, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task GarbageCollectionReclaimsEmptyStandaloneChunkDirectoriesAndCanRecreateThem()
     {
         await using var application = new SavaWebApplicationFactory(new Dictionary<string, string?>
@@ -60,6 +132,23 @@ public sealed class StorageSpaceEfficiencyTests
 
         Assert.Equal(1, await service.CollectGarbageAsync(CancellationToken.None));
         Assert.Empty(Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories));
+    }
+
+    private static BlobServiceClient CreateClient(SavaWebApplicationFactory application)
+    {
+        var account = SavaWebApplicationFactory.AccountName;
+        var endpoint = new Uri($"http://{account}.localhost");
+        return new BlobServiceClient(
+            endpoint,
+            new StorageSharedKeyCredential(account, SavaWebApplicationFactory.AccountKey),
+            new BlobClientOptions
+            {
+                Transport = new HttpClientTransport(new HttpClient(application.Server.CreateHandler())
+                {
+                    BaseAddress = endpoint
+                }),
+                Retry = { MaxRetries = 0 }
+            });
     }
 
     [Fact]

@@ -529,8 +529,10 @@ created behind an active cursor are therefore considered during the next
 sweep. Deleting a standalone chunk also removes its empty hash-parent
 directories, stopping at the `chunks/` root. Publication and directory pruning
 share a gate, so a concurrent writer can safely recreate a pruned path before
-publishing its chunk. Historical empty directories from older packed-only
-writes are not removed by this per-chunk path and need a separate sweep.
+publishing its chunk. At startup, a one-time bottom-up sweep also removes
+historical empty directories left by older packed-only writes. It never follows
+directory symlinks, never removes the `chunks/` root, and preserves any
+nonempty directory; on very large roots, its directory scan adds startup time.
 
 Reachable chunks older than `Sava:BackgroundCompressionMinimumAge` are revisited
 in cursor order, up to `Sava:BackgroundCompressionChunksPerMaintenancePass`.
