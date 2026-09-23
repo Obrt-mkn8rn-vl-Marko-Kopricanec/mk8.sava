@@ -46,7 +46,7 @@ internal static class StructuredBodyEncoder
             await destination.WriteAsync(segmentHeader, cancellationToken).ConfigureAwait(false);
 
             var segmentCrc64 = new StorageCrc64();
-            var hashingDestination = new Crc64WriteStream(
+            using var hashingDestination = new Crc64WriteStream(
                 destination,
                 segmentCrc64,
                 messageCrc64,

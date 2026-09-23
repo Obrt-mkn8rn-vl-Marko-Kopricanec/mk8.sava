@@ -566,8 +566,8 @@ internal sealed class BlobQueryPlan
                 ToNonNegativeInt(arguments[2].Evaluate(row), "SUBSTRING length"),
                 characters.Length - start);
         var result = new StringBuilder(length);
-        for (var index = start; index < start + length; index++)
-            result.Append(characters[index]);
+        foreach (ref readonly var character in characters.AsSpan(start, length))
+            result.Append(character);
         return new QueryCell(result.ToString());
     }
 

@@ -103,7 +103,7 @@ internal sealed class BlobQueryAvroWriter(Stream destination) : IDisposable
         WriteLong(block, 1);
         WriteLong(block, payload.Length);
         payload.Position = 0;
-        payload.CopyTo(block);
+        await payload.CopyToAsync(block, cancellationToken).ConfigureAwait(false);
         block.Write(_syncMarker);
         await destination.WriteAsync(block.GetBuffer().AsMemory(0, checked((int)block.Length)), cancellationToken).ConfigureAwait(false);
     }

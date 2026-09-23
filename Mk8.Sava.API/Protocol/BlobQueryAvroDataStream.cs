@@ -27,7 +27,10 @@ internal sealed class BlobQueryAvroDataStream(
 
     public override void Write(ReadOnlySpan<byte> buffer)
     {
+        // Stream's synchronous fallback is required by the Arrow writer; the async path is used for async writes.
+#pragma warning disable VSTHRD002
         writer.AppendDataAsync(buffer.ToArray(), requestCancellationToken).GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
         _position += buffer.Length;
     }
 

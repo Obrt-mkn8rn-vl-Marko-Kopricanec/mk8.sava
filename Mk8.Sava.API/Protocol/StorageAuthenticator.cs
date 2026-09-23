@@ -15,7 +15,7 @@ internal sealed class StorageAuthenticator(
     ILogger<StorageAuthenticator> logger)
 {
     public const string BearerScheme = "StorageBearer";
-    private static readonly IReadOnlySet<string> NoGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly HashSet<string> NoGroups = new(StringComparer.OrdinalIgnoreCase);
 
     private readonly SavaOptions _options = options.Value;
 
@@ -223,7 +223,7 @@ internal sealed class StorageAuthenticator(
         }
 
         var aclListChecked = false;
-        IReadOnlySet<string>? aclListGroups = null;
+        HashSet<string>? aclListGroups = null;
         if (requireDataAuthorization &&
             !granted.Contains('l') &&
             objectId is not null &&
@@ -250,7 +250,7 @@ internal sealed class StorageAuthenticator(
         }
 
         var aclMutationChecked = false;
-        IReadOnlySet<string>? aclMutationGroups = null;
+        HashSet<string>? aclMutationGroups = null;
         var parentMutationPermission = HierarchicalAclAuthorization.GetParentMutationPermission(
             context.Request, request);
         if (requireDataAuthorization &&
@@ -280,7 +280,7 @@ internal sealed class StorageAuthenticator(
         }
 
         var aclAppendChecked = false;
-        IReadOnlySet<string>? aclAppendGroups = null;
+        HashSet<string>? aclAppendGroups = null;
         if (requireDataAuthorization &&
             !granted.Contains('a') &&
             !granted.Contains('w') &&
@@ -1247,10 +1247,7 @@ internal sealed class StorageAuthenticator(
             throw AzureStorageException.AuthorizationFailure();
         if (capabilities.RequireUserBoundUserDelegationSasAction == SasPolicyViolationAction.Log)
         {
-            logger.LogWarning(
-                "SAS request {RequestId} for account {Account} is not bound to an end-user identity.",
-                request.RequestId,
-                request.Account);
+            StorageLogMessages.UserBoundSasMissing(logger, request.RequestId, request.Account);
         }
     }
 
@@ -1277,11 +1274,7 @@ internal sealed class StorageAuthenticator(
 
         if (capabilities.SasExpirationAction == SasExpirationPolicyAction.Block)
             throw AzureStorageException.AuthorizationFailure();
-        logger.LogWarning(
-            "SAS request {RequestId} for account {Account} {Violation}.",
-            request.RequestId,
-            request.Account,
-            violation);
+        StorageLogMessages.SasExpirationPolicyViolated(logger, request.RequestId, request.Account, violation);
     }
 
     private static bool SameTenant(string left, string right) =>

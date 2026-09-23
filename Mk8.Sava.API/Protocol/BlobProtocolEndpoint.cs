@@ -13,7 +13,7 @@ namespace Mk8.Sava.Protocol;
 
 internal static class BlobProtocolEndpoint
 {
-    private static readonly IReadOnlyDictionary<string, string> EmptyBlobTags =
+    private static readonly Dictionary<string, string> EmptyBlobTags =
         new Dictionary<string, string>(StringComparer.Ordinal);
 
     public static async Task HandleAsync(HttpContext http)
@@ -894,10 +894,12 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             var storageException = MapBatchException(exception);
             if (string.Equals(storageException.ErrorCode, "InternalError", StringComparison.Ordinal))
             {
-                outer.RequestServices
-                    .GetRequiredService<ILoggerFactory>()
-                    .CreateLogger(typeof(BlobProtocolEndpoint))
-                    .LogError(exception, "Blob batch subrequest {RequestId} failed unexpectedly.", subrequestContext.RequestId);
+                StorageLogMessages.BlobBatchSubrequestFailed(
+                    outer.RequestServices
+                        .GetRequiredService<ILoggerFactory>()
+                        .CreateLogger(typeof(BlobProtocolEndpoint)),
+                    exception,
+                    subrequestContext.RequestId);
             }
             var headers = CreateBatchCommonHeaders(subrequestContext, inner.Request);
             headers["x-ms-error-code"] = storageException.ErrorCode;
@@ -2535,7 +2537,7 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
             }
             finally
             {
-                producerCancellation.Cancel();
+                await producerCancellation.CancelAsync().ConfigureAwait(false);
                 await pipe.Reader.CompleteAsync().ConfigureAwait(false);
                 try
                 {
@@ -4335,7 +4337,16 @@ string.Equals(comp, "metadata", StringComparison.Ordinal))
                     throw AzureStorageException.InvalidHeader("x-ms-encryption-key-sha256", encodedHash);
                 }
             }
-            request.HttpContext.Response.RegisterForDispose(new SensitiveBufferLease(key));
+            SensitiveBufferLease? lease = new(key);
+            try
+            {
+                request.HttpContext.Response.RegisterForDispose(lease);
+                lease = null;
+            }
+            finally
+            {
+                lease?.Dispose();
+            }
             return new BlobEncryption(null, Convert.ToBase64String(actualHash), key);
         }
         catch

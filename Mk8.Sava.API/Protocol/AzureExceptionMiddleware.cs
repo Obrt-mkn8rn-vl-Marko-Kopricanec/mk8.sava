@@ -68,7 +68,8 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
 #pragma warning disable CA1031 // The outer HTTP boundary must translate unexpected failures to Azure's InternalError response.
         catch (Exception exception)
         {
-            logger.LogError(exception, "Storage operation failed for request {RequestId}.", GetRequestId(context));
+            if (logger.IsEnabled(LogLevel.Error))
+                StorageLogMessages.StorageOperationFailed(logger, exception, GetRequestId(context));
             await WriteErrorAsync(context, new AzureStorageException(
                 StatusCodes.Status500InternalServerError,
                 "InternalError",
@@ -107,25 +108,26 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         {
             OmitXmlDeclaration = true,
             Encoding = Encoding.UTF8,
-            Indent = false
+            Indent = false,
+            Async = true
         }))
         {
-            writer.WriteStartElement("Error");
-            writer.WriteElementString("Code", exception.ErrorCode);
-            writer.WriteStartElement("Message");
-            writer.WriteString(exception.Message);
-            writer.WriteString("\nRequestId:");
-            writer.WriteString(GetRequestId(context));
-            writer.WriteString("\nTime:");
-            writer.WriteString(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture));
-            writer.WriteEndElement();
+            await writer.WriteStartElementAsync(null, "Error", null).ConfigureAwait(false);
+            await writer.WriteElementStringAsync(null, "Code", null, exception.ErrorCode).ConfigureAwait(false);
+            await writer.WriteStartElementAsync(null, "Message", null).ConfigureAwait(false);
+            await writer.WriteStringAsync(exception.Message).ConfigureAwait(false);
+            await writer.WriteStringAsync("\nRequestId:").ConfigureAwait(false);
+            await writer.WriteStringAsync(GetRequestId(context)).ConfigureAwait(false);
+            await writer.WriteStringAsync("\nTime:").ConfigureAwait(false);
+            await writer.WriteStringAsync(DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture)).ConfigureAwait(false);
+            await writer.WriteEndElementAsync().ConfigureAwait(false);
             if (exception.HeaderName is not null)
-                writer.WriteElementString("HeaderName", exception.HeaderName);
+                await writer.WriteElementStringAsync(null, "HeaderName", null, exception.HeaderName).ConfigureAwait(false);
             if (exception.HeaderValue is not null)
-                writer.WriteElementString("HeaderValue", exception.HeaderValue);
+                await writer.WriteElementStringAsync(null, "HeaderValue", null, exception.HeaderValue).ConfigureAwait(false);
             foreach (var detail in exception.Details)
-                writer.WriteElementString(detail.Key, detail.Value);
-            writer.WriteEndElement();
+                await writer.WriteElementStringAsync(null, detail.Key, null, detail.Value).ConfigureAwait(false);
+            await writer.WriteEndElementAsync().ConfigureAwait(false);
         }
 
         await context.Response.WriteAsync(builder.ToString(), context.RequestAborted).ConfigureAwait(false);

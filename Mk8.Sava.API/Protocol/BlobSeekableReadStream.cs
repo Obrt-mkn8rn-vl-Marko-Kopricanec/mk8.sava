@@ -20,8 +20,13 @@ internal sealed class BlobSeekableReadStream(
         set => Seek(value, SeekOrigin.Begin);
     }
 
-    public override int Read(byte[] buffer, int offset, int count) =>
-        ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        // Parquet's Stream contract includes synchronous reads; the query path otherwise uses the async override.
+#pragma warning disable VSTHRD002
+        return ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
+    }
 
     public override int Read(Span<byte> buffer)
     {
@@ -30,7 +35,10 @@ internal sealed class BlobSeekableReadStream(
         var rented = ArrayPool<byte>.Shared.Rent(buffer.Length);
         try
         {
+            // Keep the synchronous Stream fallback available to Parquet; all I/O continuations avoid context capture.
+#pragma warning disable VSTHRD002
             var read = ReadAsync(rented.AsMemory(0, buffer.Length)).AsTask().GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
             rented.AsSpan(0, read).CopyTo(buffer);
             return read;
         }
