@@ -11,7 +11,7 @@ validation_filter='FullyQualifiedName=Mk8.Sava.Tests.StorageCrashHarnessTests.Va
 
 "$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore
 
-for scenario in chunk-publication metadata-precommit metadata-postcommit reclamation-delete pack-metadata-precommit pack-metadata-postcommit; do
+for scenario in chunk-staging-write chunk-publication metadata-precommit metadata-postcommit reclamation-delete pack-record-append pack-metadata-precommit pack-metadata-postcommit; do
     data_path=$(mktemp -d "${TMPDIR:-/tmp}/mk8-sava-${scenario}-XXXXXX")
     echo "Injecting process termination for ${scenario} using ${data_path}"
     if env \

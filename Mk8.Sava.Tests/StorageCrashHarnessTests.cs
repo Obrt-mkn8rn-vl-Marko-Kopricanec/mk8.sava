@@ -57,6 +57,10 @@ public sealed class StorageCrashHarnessTests
 
             switch (scenario)
             {
+                case "chunk-staging-write":
+                    faultInjector.ArmTermination(StorageFaultPoint.DuringChunkStagingWrite);
+                    await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
+                    break;
                 case "chunk-publication":
                     faultInjector.ArmTermination(StorageFaultPoint.BeforeChunkPublication);
                     await blob.UploadAsync(BinaryData.FromBytes(content), overwrite: true);
@@ -93,6 +97,12 @@ public sealed class StorageCrashHarnessTests
                         .GetRequiredService<BlobService>()
                         .RunMaintenanceAsync(CancellationToken.None);
                     break;
+                case "pack-record-append":
+                    await blob.UploadAsync(BinaryData.FromBytes(CreateSmallContent(29)));
+                    faultInjector.ArmTermination(StorageFaultPoint.DuringPackRecordAppend);
+                    await container.GetBlobClient("interrupted.bin")
+                        .UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
+                    break;
                 default:
                     throw new InvalidOperationException($"Unknown crash scenario '{scenario}'.");
             }
@@ -123,6 +133,19 @@ public sealed class StorageCrashHarnessTests
                 .GetBlobContainerClient(ContainerName)
                 .GetBlobClient(BlobName);
 
+            if (scenario == "pack-record-append")
+            {
+                Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
+                var interrupted = CreateClient(application)
+                    .GetBlobContainerClient(ContainerName)
+                    .GetBlobClient("interrupted.bin");
+                Assert.False((await interrupted.ExistsAsync()).Value);
+                await interrupted.UploadAsync(BinaryData.FromBytes(CreateSmallContent(17)));
+                Assert.Equal(CreateSmallContent(17), (await interrupted.DownloadContentAsync()).Value.Content.ToArray());
+                Assert.Equal(2, application.Services.GetRequiredService<MetadataStore>().CountPackedChunks());
+                return;
+            }
+
             if (scenario.StartsWith("pack-", StringComparison.Ordinal))
             {
                 Assert.Equal(CreateSmallContent(29), (await blob.DownloadContentAsync()).Value.Content.ToArray());
@@ -143,7 +166,7 @@ public sealed class StorageCrashHarnessTests
 
             Assert.False((await blob.ExistsAsync()).Value);
             var service = application.Services.GetRequiredService<BlobService>();
-            if (scenario == "chunk-publication")
+            if (scenario is "chunk-staging-write" or "chunk-publication")
             {
                 var stagingFiles = EnumerateStagingFiles(dataPath);
                 Assert.NotEmpty(stagingFiles);
