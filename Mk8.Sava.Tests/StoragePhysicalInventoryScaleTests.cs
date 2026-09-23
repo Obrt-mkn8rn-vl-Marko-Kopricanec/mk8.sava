@@ -5,6 +5,7 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
+[Collection("Physical inventory scale")]
 public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
 {
     private const int EntriesPerPass = 1024;
