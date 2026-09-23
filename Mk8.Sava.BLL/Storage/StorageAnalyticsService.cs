@@ -16,19 +16,21 @@ public sealed class StorageAnalyticsService(
         StorageAnalyticsRequest request,
         CancellationToken cancellationToken)
     {
-        var properties = await metadata.GetServicePropertiesAsync(request.Account, cancellationToken);
+        ArgumentNullException.ThrowIfNull(request);
+        var properties = await metadata.GetServicePropertiesAsync(request.Account, cancellationToken).ConfigureAwait(false);
         var logging = properties.Logging;
         if (!IsEnabled(logging, request.Category) || !ShouldLog(request))
             return;
 
-        await EnsureContainerAsync(request.Account, cancellationToken);
+        await EnsureContainerAsync(request.Account, cancellationToken).ConfigureAwait(false);
         var bytes = Encoding.UTF8.GetBytes(FormatRecord(logging.Version, request));
-        await using var source = new MemoryStream(bytes, writable: false);
+        var source = new MemoryStream(bytes, writable: false);
+        await using var sourceDisposal = source.ConfigureAwait(false);
         using var content = await chunks.StorePinnedAsync(
             request.Account,
             Unencrypted,
             source,
-            cancellationToken);
+            cancellationToken).ConfigureAwait(false);
 
         var completedAt = request.CompletedAt.ToUniversalTime();
         var prefix = $"blob/{completedAt:yyyy/MM/dd/HH}00/";
@@ -39,7 +41,7 @@ public sealed class StorageAnalyticsService(
                 request.Account,
                 LogsContainerName,
                 prefix,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             var counter = NextCounter(prefix, lastName);
             var now = metadata.GetUtcNow();
             var proposed = new BlobRecord
@@ -74,7 +76,7 @@ public sealed class StorageAnalyticsService(
                     null,
                     null,
                     hierarchicalNamespace: false,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 return;
             }
             catch (StorageConcurrencyException)
@@ -92,7 +94,7 @@ public sealed class StorageAnalyticsService(
                 account,
                 LogsContainerName,
                 includeDeleted: true,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (existing is { DeletedAt: null })
                 return;
 
@@ -108,7 +110,7 @@ public sealed class StorageAnalyticsService(
                     CreatedAt = now,
                     LastModified = now
                 };
-                if (await metadata.TryCreateContainerAsync(container, cancellationToken))
+                if (await metadata.TryCreateContainerAsync(container, cancellationToken).ConfigureAwait(false))
                     return;
                 continue;
             }
@@ -125,7 +127,7 @@ public sealed class StorageAnalyticsService(
             };
             try
             {
-                await metadata.PutContainerAsync(restored, existing.Revision, cancellationToken);
+                await metadata.PutContainerAsync(restored, existing.Revision, cancellationToken).ConfigureAwait(false);
                 return;
             }
             catch (StorageConcurrencyException)
@@ -167,7 +169,7 @@ public sealed class StorageAnalyticsService(
 
     private static string FormatRecord(string version, StorageAnalyticsRequest request)
     {
-        var fields = new List<string>(version == "2.0" ? 38 : 30)
+        var fields = new List<string>(string.Equals(version, "2.0", StringComparison.Ordinal) ? 38 : 30)
         {
             version,
             request.StartedAt.UtcDateTime.ToString("O", CultureInfo.InvariantCulture),
@@ -200,7 +202,7 @@ public sealed class StorageAnalyticsService(
             Quote(request.Referrer),
             Quote(request.ClientRequestId)
         };
-        if (version == "2.0")
+        if (string.Equals(version, "2.0", StringComparison.Ordinal))
         {
             fields.Add(Quote(request.UserObjectId));
             fields.Add(Quote(request.TenantId));
