@@ -532,6 +532,8 @@ maintenance pass and is absent on platforms without the Linux `statx` block
 accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
 valid measurement and distinguishes an unmeasured or unsupported host from
 an empty root. This full tree walk adds I/O on large roots.
+The serialized chunk and pack inventory also skips linked files and directories,
+so an external or cyclic link cannot inflate or trap its maintenance scan.
 
 Integrity scanning is controlled by
 `Sava:IntegrityScanChunksPerMaintenancePass`. Customer-provided-key chunks are

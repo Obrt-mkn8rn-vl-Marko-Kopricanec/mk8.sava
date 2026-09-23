@@ -814,9 +814,14 @@ public sealed class ChunkStore
 
     public StoragePhysicalUsage MeasurePhysicalUsage()
     {
+        var storedFileEnumeration = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            AttributesToSkip = FileAttributes.ReparsePoint
+        };
         long chunkBytes = 0;
         var chunkCount = 0;
-        foreach (var path in Directory.EnumerateFiles(_paths.Chunks, "*.chunk", SearchOption.AllDirectories))
+        foreach (var path in Directory.EnumerateFiles(_paths.Chunks, "*.chunk", storedFileEnumeration))
         {
             try
             {
@@ -828,7 +833,7 @@ public sealed class ChunkStore
                 // A concurrent reclamation removed the file after enumeration.
             }
         }
-        foreach (var path in Directory.EnumerateFiles(_paths.Packs, "*.pack", SearchOption.AllDirectories))
+        foreach (var path in Directory.EnumerateFiles(_paths.Packs, "*.pack", storedFileEnumeration))
         {
             try
             {
