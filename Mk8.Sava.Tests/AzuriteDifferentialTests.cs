@@ -327,6 +327,34 @@ public sealed class AzuriteDifferentialTests
         }
     }
 
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
+    public async Task ContainerLeaseLifecycleMatchesAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseContainerLeaseLifecycleAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseContainerLeaseLifecycleAsync(localContainer).ConfigureAwait(false);
+            AssertPublishedContainerLeaseStatusCodes(expected);
+            Assert.Equal(expected, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
     private static BlobServiceClient CreateLocalClient(SavaWebApplicationFactory application)
     {
         var account = SavaWebApplicationFactory.AccountName;
@@ -513,6 +541,58 @@ public sealed class AzuriteDifferentialTests
     }
 
     private static void AssertPublishedBlobLeaseStatusCodes(BlobLeaseLifecycleObservation observation)
+    {
+        Assert.Equal(201, observation.AcquireStatus);
+        Assert.Equal(200, observation.RenewStatus);
+        Assert.Equal(200, observation.ChangeStatus);
+        Assert.True(observation.ChangedIdMatches);
+        Assert.Equal(409, observation.StaleLeaseStatus);
+        Assert.Equal(200, observation.ReleaseStatus);
+        Assert.Equal(201, observation.SecondAcquireStatus);
+        Assert.Equal(202, observation.BreakStatus);
+        Assert.Equal(0, observation.BreakTime);
+        Assert.Equal("Broken", observation.BrokenState);
+        Assert.Equal(201, observation.ReacquireStatus);
+    }
+
+    private static async Task<ContainerLeaseLifecycleObservation> ExerciseContainerLeaseLifecycleAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var original = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var acquired = await container.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var originalId = acquired.Value.LeaseId;
+        var currentLease = container.GetBlobLeaseClient(originalId);
+        var renewed = await currentLease.RenewAsync().ConfigureAwait(false);
+        var changedId = Guid.NewGuid().ToString();
+        var changed = await currentLease.ChangeAsync(changedId).ConfigureAwait(false);
+        var stale = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            container.GetBlobLeaseClient(originalId).RenewAsync()).ConfigureAwait(false);
+        var released = await container.GetBlobLeaseClient(changedId).ReleaseAsync().ConfigureAwait(false);
+        var afterRelease = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+
+        var second = await container.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var broken = await container.GetBlobLeaseClient(second.Value.LeaseId)
+            .BreakAsync(TimeSpan.Zero).ConfigureAwait(false);
+        var afterBreak = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var reacquired = await container.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        await container.GetBlobLeaseClient(reacquired.Value.LeaseId).ReleaseAsync().ConfigureAwait(false);
+
+        Assert.Equal(original.ETag, afterRelease.ETag);
+        Assert.Equal(original.LastModified, afterRelease.LastModified);
+        Assert.Equal(original.ETag, afterBreak.ETag);
+        Assert.Equal(original.LastModified, afterBreak.LastModified);
+        return new ContainerLeaseLifecycleObservation(
+            acquired.GetRawResponse().Status, renewed.GetRawResponse().Status,
+            changed.GetRawResponse().Status,
+            string.Equals(changed.Value.LeaseId, changedId, StringComparison.Ordinal),
+            stale.Status, stale.ErrorCode, released.GetRawResponse().Status,
+            second.GetRawResponse().Status, broken.GetRawResponse().Status,
+            broken.Value.LeaseTime, afterBreak.LeaseState?.ToString() ?? string.Empty,
+            reacquired.GetRawResponse().Status);
+    }
+
+    private static void AssertPublishedContainerLeaseStatusCodes(ContainerLeaseLifecycleObservation observation)
     {
         Assert.Equal(201, observation.AcquireStatus);
         Assert.Equal(200, observation.RenewStatus);
@@ -856,6 +936,12 @@ public sealed class AzuriteDifferentialTests
         int RemainingRanges);
 
     private sealed record BlobLeaseLifecycleObservation(
+        int AcquireStatus, int RenewStatus, int ChangeStatus, bool ChangedIdMatches,
+        int StaleLeaseStatus, string? StaleLeaseCode, int ReleaseStatus,
+        int SecondAcquireStatus, int BreakStatus, int? BreakTime,
+        string BrokenState, int ReacquireStatus);
+
+    private sealed record ContainerLeaseLifecycleObservation(
         int AcquireStatus, int RenewStatus, int ChangeStatus, bool ChangedIdMatches,
         int StaleLeaseStatus, string? StaleLeaseCode, int ReleaseStatus,
         int SecondAcquireStatus, int BreakStatus, int? BreakTime,
