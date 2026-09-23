@@ -9850,6 +9850,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var metrics = await operatorClient.GetStringAsync("/metrics");
         Assert.Contains("mk8_sava_integrity_corrupt_chunks 1", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_storage_physical_chunk_bytes", metrics, StringComparison.Ordinal);
+        Assert.Contains(
+            $"mk8_sava_storage_allocation_available {(OperatingSystem.IsLinux() ? 1 : 0)}",
+            metrics,
+            StringComparison.Ordinal);
+        if (OperatingSystem.IsLinux())
+            Assert.Contains("mk8_sava_storage_allocated_root_bytes", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_http_request_duration_seconds_sum", metrics, StringComparison.Ordinal);
 
         await blob.DeleteAsync();

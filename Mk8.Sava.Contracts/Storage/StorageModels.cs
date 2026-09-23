@@ -384,7 +384,8 @@ public sealed record StorageUsageSnapshot(
     int BlobRecordCount,
     int StagedBlockCount,
     int UniqueChunkCount,
-    int ReachableChunkCount)
+    int ReachableChunkCount,
+    long? AllocatedRootBytes = null)
 {
     public static StorageUsageSnapshot Empty { get; } = new(0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
@@ -393,7 +394,8 @@ public sealed record StoragePhysicalUsage(
     long ChunkBytes,
     long StagingBytes,
     long MetadataBytes,
-    int ChunkCount);
+    int ChunkCount,
+    long? AllocatedRootBytes = null);
 
 public sealed record ChunkRecompressionResult(
     int ExaminedChunks,

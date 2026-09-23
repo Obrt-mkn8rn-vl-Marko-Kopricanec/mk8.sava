@@ -866,7 +866,12 @@ public sealed class ChunkStore
             }
         }
 
-        return new StoragePhysicalUsage(chunkBytes, stagingBytes, metadataBytes, chunkCount);
+        return new StoragePhysicalUsage(
+            chunkBytes,
+            stagingBytes,
+            metadataBytes,
+            chunkCount,
+            StorageAllocationMeter.MeasureRoot(_paths.Root));
     }
 
     public int DeleteAbandonedStagingFiles(DateTimeOffset olderThan, int maximumFiles)

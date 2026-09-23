@@ -2627,7 +2627,8 @@ public sealed class BlobService(
             summary.BlobRecordCount,
             summary.StagedBlockCount,
             physical.ChunkCount,
-            summary.ReachableChunkCount);
+            summary.ReachableChunkCount,
+            physical.AllocatedRootBytes);
         var result = new StorageMaintenanceResult(
             completedCopies,
             completedObjectReplications,
