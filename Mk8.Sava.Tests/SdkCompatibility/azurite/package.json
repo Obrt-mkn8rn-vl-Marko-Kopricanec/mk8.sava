@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "name": "mk8-sava-azurite-differential",
+  "version": "1.0.0",
+  "dependencies": {
+    "azurite": "3.35.0"
+  }
+}
