@@ -551,7 +551,7 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
-    public async Task SnapshotListingMatchesAzuriteExceptOneItemPaginationBug()
+    public async Task SnapshotListingFollowsPublishedOrderDespiteAzuritePagingBug()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
             ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
@@ -567,14 +567,17 @@ public sealed class AzuriteDifferentialTests
         {
             var expected = await ExerciseSnapshotListingAsync(azuriteContainer).ConfigureAwait(false);
             var actual = await ExerciseSnapshotListingAsync(localContainer).ConfigureAwait(false);
-            Assert.Equal(expected.Unpaged, actual.Unpaged);
             Assert.Equal(actual.Unpaged, actual.Pages);
-            Assert.Equal("folder/a.bin:snapshot:old:3|folder/a.bin:current:new:3|folder/b.bin:current:none:4",
+            Assert.Equal("folder/a.bin:snapshot:old:3|folder/a.bin:snapshot:middle:3|" +
+                         "folder/a.bin:current:new:3|folder/b.bin:current:none:4",
                 actual.Pages);
-            Assert.Equal(2, actual.ContinuationCount);
-            // Azurite 3.35.0 skips the current blob when one-item paging encounters
-            // a snapshot of the same name. The REST contract includes both objects.
-            Assert.Equal("folder/a.bin:snapshot:old:3|folder/b.bin:current:none:4", expected.Pages);
+            Assert.Equal(3, actual.ContinuationCount);
+            // Azurite 3.35.0 reverses the documented oldest-to-newest snapshot
+            // order and loses the older snapshot and current blob when paged.
+            Assert.Equal("folder/a.bin:snapshot:middle:3|folder/a.bin:snapshot:old:3|" +
+                         "folder/a.bin:current:new:3|folder/b.bin:current:none:4",
+                expected.Unpaged);
+            Assert.Equal("folder/a.bin:snapshot:middle:3|folder/b.bin:current:none:4", expected.Pages);
             Assert.Equal(1, expected.ContinuationCount);
         }
         finally
@@ -1447,6 +1450,11 @@ public sealed class AzuriteDifferentialTests
         await blob.UploadAsync(BinaryData.FromString("old"), new BlobUploadOptions
         {
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "old" }
+        }).ConfigureAwait(false);
+        await blob.CreateSnapshotAsync().ConfigureAwait(false);
+        await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "middle"
         }).ConfigureAwait(false);
         await blob.CreateSnapshotAsync().ConfigureAwait(false);
         await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
