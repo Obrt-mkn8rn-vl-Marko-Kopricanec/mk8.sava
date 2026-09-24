@@ -724,6 +724,10 @@ independent blobs named `file` and `file/child`. This follows the published
 [List Blobs prefix rule](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs#uri-parameters);
 the exact Azure error-code parity for that HNS edge is not yet established by
 the documentation.
+Recursive HNS listings use the published special ordering that treats `/` as
+the lowest sort character. The order is applied to result pages, continuation
+markers, and `startFrom` bounds; flat-namespace listing retains binary name
+order. Local SDK tests cover both modes across one-item pages and range starts.
 
 Blob expiry is likewise confined to HNS files. Set Blob Expiry is available
 from service version 2020-02-10 and rejects directories. Put Blob, Put Block
