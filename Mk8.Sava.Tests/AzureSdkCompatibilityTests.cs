@@ -11755,103 +11755,110 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await container.CreateAsync();
             var metadata = application.Services.GetRequiredService<MetadataStore>();
             var blobs = application.Services.GetRequiredService<BlobService>();
-            var serviceProperties = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                serviceProperties with
-                {
-                    BlobSoftDeleteEnabled = true,
-                    BlobSoftDeleteRetentionDays = 365
-                },
-                CancellationToken.None);
-
-            var managedBytes = Enumerable.Range(0, 128 * 1024 + 1)
-                .Select(index => (byte)(index % 251))
-                .ToArray();
-            var managed = container.GetBlobClient("managed.bin");
-            await managed.UploadAsync(
-                BinaryData.FromBytes(managedBytes),
-                new BlobUploadOptions { AccessTier = AccessTier.Smart });
-            var small = container.GetBlobClient("small.bin");
-            await small.UploadAsync(
-                BinaryData.FromBytes(new byte[128 * 1024]),
-                new BlobUploadOptions { AccessTier = AccessTier.Smart });
-            var deleted = container.GetBlobClient("deleted.bin");
-            await deleted.UploadAsync(
-                BinaryData.FromBytes(managedBytes),
-                new BlobUploadOptions { AccessTier = AccessTier.Smart });
-            await deleted.DeleteAsync();
-
-            var original = (await managed.GetPropertiesAsync()).Value;
-            Assert.Equal(AccessTier.Smart, original.AccessTier);
-            Assert.Equal("Hot", original.SmartAccessTier);
-
-            clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
-            var early = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal(0, early.CompletedSmartTierTransitions);
-            Assert.Equal("Hot", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
-
-            clock.Advance(TimeSpan.FromTicks(1));
-            var cooled = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal(2, cooled.CompletedSmartTierTransitions);
-            var coolProperties = (await managed.GetPropertiesAsync()).Value;
-            Assert.Equal("Cool", coolProperties.SmartAccessTier);
-            Assert.Equal(original.ETag, coolProperties.ETag);
-            Assert.Equal(original.LastModified, coolProperties.LastModified);
-            Assert.Equal("Hot", (await small.GetPropertiesAsync()).Value.SmartAccessTier);
-            var deletedRecord = await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                deleted.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.Equal("Cool", deletedRecord?.SmartAccessTier);
-
-            _ = await managed.GetPropertiesAsync();
-            _ = await managed.GetTagsAsync();
-            await managed.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["observed"] = "without-access" });
-            clock.Advance(TimeSpan.FromDays(60));
-            var chilled = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal(2, chilled.CompletedSmartTierTransitions);
-            Assert.Equal("Cold", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
-            Assert.Equal("Hot", (await small.GetPropertiesAsync()).Value.SmartAccessTier);
-
-            Assert.Equal(managedBytes, (await managed.DownloadContentAsync()).Value.Content.ToArray());
-            var reheated = (await managed.GetPropertiesAsync()).Value;
-            Assert.Equal("Hot", reheated.SmartAccessTier);
-            var accessedRecord = await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                managed.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: false,
-                CancellationToken.None);
-            Assert.Equal(clock.GetUtcNow(), accessedRecord?.SmartTierLastAccessedAt);
-
-            clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
-            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal("Hot", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
-            clock.Advance(TimeSpan.FromTicks(1));
-            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal("Cool", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
-
-            clock.Advance(TimeSpan.FromDays(60));
-            _ = await blobs.RunMaintenanceAsync(CancellationToken.None);
-            Assert.Equal("Cold", (await managed.GetPropertiesAsync()).Value.SmartAccessTier);
-            await managed.UploadAsync(BinaryData.FromBytes(managedBytes), overwrite: true);
-            var rewritten = (await managed.GetPropertiesAsync()).Value;
-            Assert.Equal(AccessTier.Smart, rewritten.AccessTier);
-            Assert.Equal("Hot", rewritten.SmartAccessTier);
+            var scenario = await CreateSmartTierScenarioAsync(metadata, container);
+            await AssertSmartTierCoolingAsync(clock, blobs, metadata, container, scenario);
+            await AssertSmartTierReheatAndRewriteAsync(clock, blobs, metadata, container, scenario);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private sealed record SmartTierScenario(
+        byte[] ManagedBytes, BlobClient Managed, BlobClient Small, BlobClient Deleted, BlobProperties Original);
+
+    private static async Task<SmartTierScenario> CreateSmartTierScenarioAsync(
+        MetadataStore metadata, BlobContainerClient container)
+    {
+        var serviceProperties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName, CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            serviceProperties with { BlobSoftDeleteEnabled = true, BlobSoftDeleteRetentionDays = 365 },
+            CancellationToken.None).ConfigureAwait(false);
+
+        var managedBytes = Enumerable.Range(0, 128 * 1024 + 1)
+            .Select(index => (byte)(index % 251)).ToArray();
+        var managed = container.GetBlobClient("managed.bin");
+        await managed.UploadAsync(BinaryData.FromBytes(managedBytes),
+            new BlobUploadOptions { AccessTier = AccessTier.Smart }).ConfigureAwait(false);
+        var small = container.GetBlobClient("small.bin");
+        await small.UploadAsync(BinaryData.FromBytes(new byte[128 * 1024]),
+            new BlobUploadOptions { AccessTier = AccessTier.Smart }).ConfigureAwait(false);
+        var deleted = container.GetBlobClient("deleted.bin");
+        await deleted.UploadAsync(BinaryData.FromBytes(managedBytes),
+            new BlobUploadOptions { AccessTier = AccessTier.Smart }).ConfigureAwait(false);
+        await deleted.DeleteAsync().ConfigureAwait(false);
+
+        var original = (await managed.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(AccessTier.Smart, original.AccessTier);
+        Assert.Equal("Hot", original.SmartAccessTier);
+        return new SmartTierScenario(managedBytes, managed, small, deleted, original);
+    }
+
+    private static async Task AssertSmartTierCoolingAsync(
+        AdjustableTimeProvider clock, BlobService blobs, MetadataStore metadata,
+        BlobContainerClient container, SmartTierScenario scenario)
+    {
+        clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
+        var early = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(0, early.CompletedSmartTierTransitions);
+        Assert.Equal("Hot", (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+
+        clock.Advance(TimeSpan.FromTicks(1));
+        var cooled = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(2, cooled.CompletedSmartTierTransitions);
+        var coolProperties = (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("Cool", coolProperties.SmartAccessTier);
+        Assert.Equal(scenario.Original.ETag, coolProperties.ETag);
+        Assert.Equal(scenario.Original.LastModified, coolProperties.LastModified);
+        Assert.Equal("Hot", (await scenario.Small.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+        var deletedRecord = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, scenario.Deleted.Name,
+            versionId: null, snapshot: null, includeDeleted: true, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("Cool", deletedRecord?.SmartAccessTier);
+
+        _ = await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false);
+        _ = await scenario.Managed.GetTagsAsync().ConfigureAwait(false);
+        await scenario.Managed.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["observed"] = "without-access" })
+            .ConfigureAwait(false);
+        clock.Advance(TimeSpan.FromDays(60));
+        var chilled = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(2, chilled.CompletedSmartTierTransitions);
+        Assert.Equal("Cold", (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+        Assert.Equal("Hot", (await scenario.Small.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+    }
+
+    private static async Task AssertSmartTierReheatAndRewriteAsync(
+        AdjustableTimeProvider clock, BlobService blobs, MetadataStore metadata,
+        BlobContainerClient container, SmartTierScenario scenario)
+    {
+        Assert.Equal(scenario.ManagedBytes,
+            (await scenario.Managed.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var reheated = (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("Hot", reheated.SmartAccessTier);
+        var accessedRecord = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, container.Name, scenario.Managed.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(clock.GetUtcNow(), accessedRecord?.SmartTierLastAccessedAt);
+
+        clock.Advance(TimeSpan.FromDays(30) - TimeSpan.FromTicks(1));
+        _ = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("Hot", (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+        clock.Advance(TimeSpan.FromTicks(1));
+        _ = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("Cool", (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+
+        clock.Advance(TimeSpan.FromDays(60));
+        _ = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("Cold", (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value.SmartAccessTier);
+        await scenario.Managed.UploadAsync(BinaryData.FromBytes(scenario.ManagedBytes), overwrite: true)
+            .ConfigureAwait(false);
+        var rewritten = (await scenario.Managed.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(AccessTier.Smart, rewritten.AccessTier);
+        Assert.Equal("Hot", rewritten.SmartAccessTier);
     }
 
     [Fact]
