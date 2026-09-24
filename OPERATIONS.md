@@ -104,6 +104,19 @@ then succeed without changing live bytes.
 The mount is private to the harness process and is unmounted on exit. This
 does not cover every SQLite commit, filesystem, Windows, or power-loss boundary.
 
+## Continuous offline validation
+
+The [offline conformance workflow](.github/workflows/offline-conformance.yml)
+builds with strict analyzers and runs the .NET SDK/REST suite on Linux and
+Windows 2025 hosted runners. Its Linux job also verifies formatting, runs the
+pinned Azurite differential, and exercises an independent JavaScript Blob SDK
+against a disposable loopback service. Live Azure connection-string variables
+are explicitly empty and the ordinary test command excludes live and Azurite
+categories; Azurite is run separately against only its local emulator.
+The Linux-only ENOSPC and process-termination harnesses remain separate local
+release gates. A CI pass does not establish Windows power-loss durability or
+full Azure operation/version/account/auth conformance.
+
 ## SDK substitution checks
 
 The normal .NET integration suite uses the official Azure Storage client.
