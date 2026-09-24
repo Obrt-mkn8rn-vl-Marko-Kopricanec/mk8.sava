@@ -2317,39 +2317,64 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             application, key, container.Name, name, objectId, "rw", startsOn, expiresOn);
 
         var owned = WithSuoid("parent/child.txt", ownerObjectId);
-        Assert.Equal("owned-content", (await owned.DownloadContentAsync()).Value.Content.ToString());
-        Assert.Equal(13, (await owned.GetPropertiesAsync()).Value.ContentLength);
+        await AssertOwnedSuoidOperationsAsync(application, container, owned, WithSuoid, ownerObjectId);
+
+        var foreignAgent = WithSuoid("parent/child.txt", foreignObjectId);
+        await AssertForeignSuoidDeniedAsync(application, owned, foreignAgent, ownerObjectId, foreignObjectId);
+        await AssertForeignOwnedSuoidPathsAsync(
+            application, container, key, WithSuoid, startsOn, expiresOn, ownerObjectId, foreignObjectId);
+        await AssertSuoidMissingPathsAsync(WithSuoid, ownerObjectId);
+        await GrantForeignSuoidReadAsync(application, container, foreignAgent, foreignObjectId);
+    }
+
+    private static async Task AssertOwnedSuoidOperationsAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient owned,
+        Func<string, string, BlobClient> withSuoid,
+        string ownerObjectId)
+    {
+        Assert.Equal("owned-content", (await owned.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        Assert.Equal(13, (await owned.GetPropertiesAsync().ConfigureAwait(false)).Value.ContentLength);
         using (var transport = new HttpClient(application.Server.CreateHandler()))
         using (var metadataRequest = new HttpRequestMessage(
                    HttpMethod.Get, new Uri(owned.Uri + "&comp=metadata", UriKind.Absolute)))
-        using (var metadataResponse = await transport.SendAsync(metadataRequest))
+        using (var metadataResponse = await transport.SendAsync(metadataRequest).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.OK, metadataResponse.StatusCode);
         var signedBlockBlob = new BlockBlobClient(owned.Uri, new BlobClientOptions
         {
             Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
-        var ownedQuery = await signedBlockBlob.QueryAsync("SELECT _1 FROM BlobStorage;");
+        var ownedQuery = await signedBlockBlob.QueryAsync("SELECT _1 FROM BlobStorage;").ConfigureAwait(false);
         using (var reader = new StreamReader(ownedQuery.Value.Content))
-            Assert.Contains("owned-content", await reader.ReadToEndAsync(), StringComparison.Ordinal);
-        await owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true);
-        Assert.Equal("changed", (await owned.DownloadContentAsync()).Value.Content.ToString());
-        var signedAppendUri = WithSuoid("parent/log.txt", ownerObjectId).Uri;
+            Assert.Contains("owned-content", await reader.ReadToEndAsync().ConfigureAwait(false), StringComparison.Ordinal);
+        await owned.UploadAsync(BinaryData.FromString("changed"), overwrite: true).ConfigureAwait(false);
+        Assert.Equal("changed", (await owned.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        var signedAppendUri = withSuoid("parent/log.txt", ownerObjectId).Uri;
         var signedAppend = new AppendBlobClient(signedAppendUri, new BlobClientOptions
         {
             Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
-        await signedAppend.AppendBlockAsync(new MemoryStream("signed-append"u8.ToArray(), writable: false));
-        Assert.Equal("signed-append", (await container.GetBlobClient("parent/log.txt").DownloadContentAsync())
-            .Value.Content.ToString());
+        using var payload = new MemoryStream("signed-append"u8.ToArray(), writable: false);
+        await signedAppend.AppendBlockAsync(payload).ConfigureAwait(false);
+        Assert.Equal("signed-append", (await container.GetBlobClient("parent/log.txt")
+            .DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+    }
 
-        var foreignAgent = WithSuoid("parent/child.txt", foreignObjectId);
+    private static async Task AssertForeignSuoidDeniedAsync(
+        SavaWebApplicationFactory application,
+        BlobClient owned,
+        BlobClient foreignAgent,
+        string ownerObjectId,
+        string foreignObjectId)
+    {
         var deniedTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            foreignAgent.DownloadContentAsync());
+            foreignAgent.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("AuthorizationFailure", deniedTraversal.ErrorCode);
         var deniedMutation = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            foreignAgent.UploadAsync(BinaryData.FromString("forbidden"), overwrite: true));
+            foreignAgent.UploadAsync(BinaryData.FromString("forbidden"), overwrite: true)).ConfigureAwait(false);
         Assert.Equal("AuthorizationFailure", deniedMutation.ErrorCode);
         var tampered = CreateBlobClient(
             application,
@@ -2358,9 +2383,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 $"suoid={foreignObjectId}",
                 StringComparison.Ordinal)));
         var deniedTampering = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            tampered.DownloadContentAsync());
+            tampered.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("AuthenticationFailed", deniedTampering.ErrorCode);
+    }
 
+    private static async Task AssertForeignOwnedSuoidPathsAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        Func<string, string, BlobClient> withSuoid,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn,
+        string ownerObjectId,
+        string foreignObjectId)
+    {
         var delegatedWrite = new BlobSasBuilder
         {
             BlobContainerName = container.Name,
@@ -2378,9 +2414,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             new Uri(
                 $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/parent/foreign.txt" +
                 $"?{writeSas}"));
-        await foreignOwned.UploadAsync(BinaryData.FromString("foreign-content"));
+        await foreignOwned.UploadAsync(BinaryData.FromString("foreign-content")).ConfigureAwait(false);
         var deniedTarget = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            WithSuoid("parent/foreign.txt", ownerObjectId).DownloadContentAsync());
+            withSuoid("parent/foreign.txt", ownerObjectId).DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("AuthorizationFailure", deniedTarget.ErrorCode);
 
         delegatedWrite.BlobName = "foreign-parent/seed.txt";
@@ -2390,30 +2426,43 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 new Uri(
                     $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/foreign-parent/seed.txt" +
                     $"?{parentWriteSas}"))
-            .UploadAsync(BinaryData.FromString("seed"));
-        await container.GetBlobClient("foreign-parent/owned.txt").UploadAsync(BinaryData.FromString("owned"));
+            .UploadAsync(BinaryData.FromString("seed")).ConfigureAwait(false);
+        await container.GetBlobClient("foreign-parent/owned.txt")
+            .UploadAsync(BinaryData.FromString("owned")).ConfigureAwait(false);
         var deniedParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            WithSuoid("foreign-parent/owned.txt", ownerObjectId).DownloadContentAsync());
+            withSuoid("foreign-parent/owned.txt", ownerObjectId).DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("AuthorizationFailure", deniedParent.ErrorCode);
+    }
 
+    private static async Task AssertSuoidMissingPathsAsync(
+        Func<string, string, BlobClient> withSuoid,
+        string ownerObjectId)
+    {
         var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            WithSuoid("parent/missing.txt", ownerObjectId).DownloadContentAsync());
+            withSuoid("parent/missing.txt", ownerObjectId).DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("BlobNotFound", missing.ErrorCode);
         var missingParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            WithSuoid("missing-parent/missing.txt", ownerObjectId).DownloadContentAsync());
+            withSuoid("missing-parent/missing.txt", ownerObjectId).DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("BlobNotFound", missingParent.ErrorCode);
+    }
 
+    private static async Task GrantForeignSuoidReadAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient foreignAgent,
+        string foreignObjectId)
+    {
         var metadata = application.Services.GetRequiredService<MetadataStore>();
         var root = await metadata.GetContainerAsync(
             SavaWebApplicationFactory.AccountName,
             container.Name,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(root);
         await metadata.PutContainerAsync(
             root with { AccessAcl = $"user::rwx,user:{foreignObjectId}:--x,group::r-x,mask::r-x,other::---" },
             root.Revision,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         var parent = await metadata.GetBlobAsync(
             SavaWebApplicationFactory.AccountName,
             container.Name,
@@ -2421,12 +2470,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             versionId: null,
             snapshot: null,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(parent);
         await metadata.PutBlobRecordAsync(
             parent with { AccessAcl = $"user::rwx,user:{foreignObjectId}:--x,group::r-x,mask::r-x,other::---" },
             parent.Revision,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         var target = await metadata.GetBlobAsync(
             SavaWebApplicationFactory.AccountName,
             container.Name,
@@ -2434,13 +2483,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             versionId: null,
             snapshot: null,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(target);
         await metadata.PutBlobRecordAsync(
             target with { AccessAcl = $"user::rw-,user:{foreignObjectId}:r--,group::r--,mask::r--,other::---" },
             target.Revision,
-            CancellationToken.None);
-        Assert.Equal("changed", (await foreignAgent.DownloadContentAsync()).Value.Content.ToString());
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal("changed", (await foreignAgent.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
     }
 
     private static BlobClient CreateSuoidBlobClient(
