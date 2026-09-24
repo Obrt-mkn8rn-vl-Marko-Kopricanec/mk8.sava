@@ -1418,113 +1418,139 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         try
         {
-            var configured = (await service.GetPropertiesAsync()).Value;
-            configured.StaticWebsite.Enabled = true;
-            configured.StaticWebsite.IndexDocument = indexName;
-            configured.StaticWebsite.DefaultIndexDocumentPath = null;
-            configured.StaticWebsite.ErrorDocument404Path = errorName;
-            await service.SetPropertiesAsync(configured);
-
-            var roundTrip = (await service.GetPropertiesAsync()).Value.StaticWebsite;
-            Assert.True(roundTrip.Enabled);
-            Assert.Equal(indexName, roundTrip.IndexDocument);
-            Assert.Equal(errorName, roundTrip.ErrorDocument404Path);
-            Assert.Null(roundTrip.DefaultIndexDocumentPath);
-
-            var website = service.GetBlobContainerClient("$web");
-            Assert.True((await website.ExistsAsync()).Value);
-            await website.GetBlobClient(indexName).UploadAsync(
-                BinaryData.FromString("root index"),
-                new BlobUploadOptions
-                {
-                    HttpHeaders = new BlobHttpHeaders
-                    {
-                        ContentType = "text/html; charset=utf-8",
-                        CacheControl = "public,max-age=60"
-                    }
-                });
-            await website.GetBlobClient($"folder/{indexName}").UploadAsync(BinaryData.FromString("folder index"));
-            await website.GetBlobClient(errorName).UploadAsync(
-                BinaryData.FromString("custom not found"),
-                new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/html" } });
-            await website.GetBlobClient(assetName).UploadAsync(
-                BinaryData.FromString("0123456789"),
-                new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/plain" } });
-            await website.GetBlobClient(defaultName).UploadAsync(
-                BinaryData.FromString("single page fallback"),
-                new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/html" } });
+            await ConfigureStaticWebsiteFixtureAsync(service, indexName, errorName, assetName, defaultName);
 
             using var web = new HttpClient(factory.Server.CreateHandler());
             var endpoint = $"http://{SavaWebApplicationFactory.AccountName}.z99.web.local";
-
-            using (var root = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute)))
-            {
-                Assert.Equal(HttpStatusCode.OK, root.StatusCode);
-                Assert.Equal("root index", await root.Content.ReadAsStringAsync());
-                Assert.Equal("text/html", root.Content.Headers.ContentType?.MediaType);
-                Assert.Equal("public, max-age=60", root.Headers.CacheControl?.ToString());
-            }
-            using (var folder = await web.GetAsync(new Uri(endpoint + "/folder/", UriKind.RelativeOrAbsolute)))
-            {
-                Assert.Equal(HttpStatusCode.OK, folder.StatusCode);
-                Assert.Equal("folder index", await folder.Content.ReadAsStringAsync());
-            }
-            using (var missing = await web.GetAsync(new Uri(endpoint + "/missing", UriKind.RelativeOrAbsolute)))
-            {
-                Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
-                Assert.Equal("custom not found", await missing.Content.ReadAsStringAsync());
-                Assert.Equal("text/html", missing.Content.Headers.ContentType?.MediaType);
-            }
-            using (var rangeRequest = new HttpRequestMessage(HttpMethod.Get, endpoint + "/" + assetName))
-            {
-                rangeRequest.Headers.Range = new RangeHeaderValue(2, 5);
-                using var range = await web.SendAsync(rangeRequest);
-                Assert.Equal(HttpStatusCode.PartialContent, range.StatusCode);
-                Assert.Equal("2345", await range.Content.ReadAsStringAsync());
-                Assert.Equal($"bytes 2-5/10", range.Content.Headers.ContentRange?.ToString());
-            }
-            using (var headRequest = new HttpRequestMessage(HttpMethod.Head, endpoint + "/" + assetName))
-            using (var head = await web.SendAsync(headRequest))
-            {
-                Assert.Equal(HttpStatusCode.OK, head.StatusCode);
-                Assert.Equal(10, head.Content.Headers.ContentLength);
-                Assert.Empty(await head.Content.ReadAsByteArrayAsync());
-            }
-            using var postContent = new ByteArrayContent([]);
-            using (var post = await web.PostAsync(new Uri(endpoint + "/" + assetName, UriKind.RelativeOrAbsolute), postContent))
-            {
-                Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
-                Assert.True(post.Content.Headers.TryGetValues("Allow", out var allowedMethods));
-                Assert.Equal(["GET", "HEAD"], allowedMethods, StringComparer.Ordinal);
-                Assert.Equal("text/html", post.Content.Headers.ContentType?.MediaType);
-            }
-
-            configured = (await service.GetPropertiesAsync()).Value;
-            configured.StaticWebsite.IndexDocument = null;
-            configured.StaticWebsite.DefaultIndexDocumentPath = defaultName;
-            await service.SetPropertiesAsync(configured);
-            roundTrip = (await service.GetPropertiesAsync()).Value.StaticWebsite;
-            Assert.Null(roundTrip.IndexDocument);
-            Assert.Equal(defaultName, roundTrip.DefaultIndexDocumentPath);
-            using (var fallback = await web.GetAsync(new Uri(endpoint + "/client/side/route", UriKind.RelativeOrAbsolute)))
-            {
-                Assert.Equal(HttpStatusCode.OK, fallback.StatusCode);
-                Assert.Equal("single page fallback", await fallback.Content.ReadAsStringAsync());
-            }
-
-            configured.StaticWebsite.Enabled = false;
-            await service.SetPropertiesAsync(configured);
-            using (var disabled = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute)))
-            {
-                Assert.Equal(HttpStatusCode.NotFound, disabled.StatusCode);
-                Assert.Equal("text/html", disabled.Content.Headers.ContentType?.MediaType);
-                Assert.Contains("requested content does not exist", await disabled.Content.ReadAsStringAsync(), StringComparison.Ordinal);
-            }
+            await AssertStaticWebsiteReadsAsync(web, endpoint, assetName);
+            await AssertStaticWebsiteFallbackAndDisableAsync(service, web, endpoint, defaultName);
         }
         finally
         {
             await service.SetPropertiesAsync(original);
         }
+    }
+
+    private static async Task AssertStaticWebsiteFallbackAndDisableAsync(
+        BlobServiceClient service, HttpClient web, string endpoint, string defaultName)
+    {
+        var configured = (await service.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        configured.StaticWebsite.IndexDocument = null;
+        configured.StaticWebsite.DefaultIndexDocumentPath = defaultName;
+        await service.SetPropertiesAsync(configured).ConfigureAwait(false);
+        var roundTrip = (await service.GetPropertiesAsync().ConfigureAwait(false)).Value.StaticWebsite;
+        Assert.Null(roundTrip.IndexDocument);
+        Assert.Equal(defaultName, roundTrip.DefaultIndexDocumentPath);
+        using (var fallback = await web.GetAsync(new Uri(endpoint + "/client/side/route", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, fallback.StatusCode);
+            Assert.Equal("single page fallback", await fallback.Content.ReadAsStringAsync().ConfigureAwait(false));
+        }
+
+        configured.StaticWebsite.Enabled = false;
+        await service.SetPropertiesAsync(configured).ConfigureAwait(false);
+        using var disabled = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.NotFound, disabled.StatusCode);
+        Assert.Equal("text/html", disabled.Content.Headers.ContentType?.MediaType);
+        Assert.Contains("requested content does not exist",
+            await disabled.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+    }
+
+    private static async Task AssertStaticWebsiteReadsAsync(
+        HttpClient web, string endpoint, string assetName)
+    {
+        using (var root = await web.GetAsync(new Uri(endpoint + "/", UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, root.StatusCode);
+            Assert.Equal("root index", await root.Content.ReadAsStringAsync().ConfigureAwait(false));
+            Assert.Equal("text/html", root.Content.Headers.ContentType?.MediaType);
+            Assert.Equal("public, max-age=60", root.Headers.CacheControl?.ToString());
+        }
+        using (var folder = await web.GetAsync(new Uri(endpoint + "/folder/", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, folder.StatusCode);
+            Assert.Equal("folder index", await folder.Content.ReadAsStringAsync().ConfigureAwait(false));
+        }
+        using (var missing = await web.GetAsync(new Uri(endpoint + "/missing", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
+            Assert.Equal("custom not found", await missing.Content.ReadAsStringAsync().ConfigureAwait(false));
+            Assert.Equal("text/html", missing.Content.Headers.ContentType?.MediaType);
+        }
+        using (var rangeRequest = new HttpRequestMessage(HttpMethod.Get, endpoint + "/" + assetName))
+        {
+            rangeRequest.Headers.Range = new RangeHeaderValue(2, 5);
+            using var range = await web.SendAsync(rangeRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.PartialContent, range.StatusCode);
+            Assert.Equal("2345", await range.Content.ReadAsStringAsync().ConfigureAwait(false));
+            Assert.Equal("bytes 2-5/10", range.Content.Headers.ContentRange?.ToString());
+        }
+        using (var headRequest = new HttpRequestMessage(HttpMethod.Head, endpoint + "/" + assetName))
+        using (var head = await web.SendAsync(headRequest).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, head.StatusCode);
+            Assert.Equal(10, head.Content.Headers.ContentLength);
+            Assert.Empty(await head.Content.ReadAsByteArrayAsync().ConfigureAwait(false));
+        }
+        using var postContent = new ByteArrayContent([]);
+        using var post = await web.PostAsync(new Uri(endpoint + "/" + assetName, UriKind.RelativeOrAbsolute), postContent)
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, post.StatusCode);
+        Assert.True(post.Content.Headers.TryGetValues("Allow", out var allowedMethods));
+        Assert.Equal(["GET", "HEAD"], allowedMethods, StringComparer.Ordinal);
+        Assert.Equal("text/html", post.Content.Headers.ContentType?.MediaType);
+    }
+
+    private static async Task ConfigureStaticWebsiteFixtureAsync(
+        BlobServiceClient service,
+        string indexName,
+        string errorName,
+        string assetName,
+        string defaultName)
+    {
+        var configured = (await service.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        configured.StaticWebsite.Enabled = true;
+        configured.StaticWebsite.IndexDocument = indexName;
+        configured.StaticWebsite.DefaultIndexDocumentPath = null;
+        configured.StaticWebsite.ErrorDocument404Path = errorName;
+        await service.SetPropertiesAsync(configured).ConfigureAwait(false);
+
+        var roundTrip = (await service.GetPropertiesAsync().ConfigureAwait(false)).Value.StaticWebsite;
+        Assert.True(roundTrip.Enabled);
+        Assert.Equal(indexName, roundTrip.IndexDocument);
+        Assert.Equal(errorName, roundTrip.ErrorDocument404Path);
+        Assert.Null(roundTrip.DefaultIndexDocumentPath);
+
+        var website = service.GetBlobContainerClient("$web");
+        Assert.True((await website.ExistsAsync().ConfigureAwait(false)).Value);
+        await website.GetBlobClient(indexName).UploadAsync(
+            BinaryData.FromString("root index"),
+            new BlobUploadOptions
+            {
+                HttpHeaders = new BlobHttpHeaders
+                {
+                    ContentType = "text/html; charset=utf-8",
+                    CacheControl = "public,max-age=60"
+                }
+            }).ConfigureAwait(false);
+        await website.GetBlobClient($"folder/{indexName}").UploadAsync(BinaryData.FromString("folder index"))
+            .ConfigureAwait(false);
+        await website.GetBlobClient(errorName).UploadAsync(
+            BinaryData.FromString("custom not found"),
+            new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/html" } })
+            .ConfigureAwait(false);
+        await website.GetBlobClient(assetName).UploadAsync(
+            BinaryData.FromString("0123456789"),
+            new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/plain" } })
+            .ConfigureAwait(false);
+        await website.GetBlobClient(defaultName).UploadAsync(
+            BinaryData.FromString("single page fallback"),
+            new BlobUploadOptions { HttpHeaders = new BlobHttpHeaders { ContentType = "text/html" } })
+            .ConfigureAwait(false);
     }
 
     [Fact]
