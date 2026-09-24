@@ -889,8 +889,8 @@ over the complete live root and a raw-file baseline, including directory,
 SQLite, chunk, pack, and staging allocation. It also samples allocated staging
 space and process working set every 10 ms during each workload. Those sampled
 peaks are lower bounds, not exact maxima; the in-process test host's working
-set is not a separate production-server measurement. MSAVA remains an unmeasured
-comparison, so do not use this benchmark alone for production performance claims:
+set is not a separate production-server measurement. Do not use this benchmark
+alone for production performance claims:
 
 ```bash
 dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj \
@@ -904,7 +904,7 @@ component, upload/read latency, process CPU time, and process working set after
 exact duplicates, shifted partial sharing, retained versions, small files, and
 incompressible files. Timings are an in-process diagnostic, not a network or
 MSAVA production-performance claim; rerun them on the target filesystem and
-with a separately characterized MSAVA baseline before setting release budgets.
+with a separately characterized full MSAVA deployment before setting release budgets.
 The Linux fixture now enforces controlled cumulative mk8.sava/raw allocation
 ceilings of 80%, 60%, 60%, 70%, and 75% for those five workloads respectively.
 The incompressible workload additionally limits its incremental allocated bytes
@@ -912,6 +912,31 @@ to 150% of its raw-file increment; every workload limits sampled staging peak
 to 4 MiB and in-process working set to 512 MiB. These are regression budgets
 for this small, isolated fixture, not deployment-filesystem latency or memory
 service-level objectives.
+
+An optional [MSAVA-INF baseline tool](tools/MsavaInfBaseline/README.md) compiles
+the actual storage-manager, content-path, and LiteDB source files from clean
+MSAVA revision `17ccf1c`, outside the mk8.sava solution. A local 2026-09-24
+run on the same Linux filesystem measured these cumulative allocated bytes for
+the identical content fixtures:
+
+| Workload checkpoint | Raw files | MSAVA-INF storage root | mk8.sava storage root | mk8.sava relative to MSAVA-INF |
+| --- | ---: | ---: | ---: | ---: |
+| Eight exact duplicates | 2,101,248 | 331,776 | 1,081,344 | 3.26× larger |
+| Five shifted partials | 12,607,488 | 10,838,016 | 4,096,000 | 62.2% smaller |
+| Eight retained versions | 13,656,064 | 11,886,592 | 4,665,344 | 60.8% smaller |
+| 128 small files | 14,180,352 | 12,525,568 | 6,144,000 | 51.0% smaller |
+| Four incompressible files | 16,277,504 | 14,630,912 | 8,646,656 | 40.9% smaller |
+
+The first checkpoint exposes mk8.sava's larger fixed SQLite/schema overhead;
+do not claim it wins every workload. The MSAVA-INF measurement includes its
+SHA-256-named content files, LiteDB file, and root/directory allocation, but
+excludes MSAVA's PostgreSQL business database, HTTP API, backups, and deployment
+replication. The `eight_versions` MSAVA-INF case stores eight distinct content
+records, not Blob versioning. Its timing and memory measurements are not
+comparable with mk8.sava's SDK-over-HTTP measurements. These local numbers are
+neither a full MSAVA-deployment comparison nor production CPU, latency,
+memory, or peak-space budgets. Rerun both on each target filesystem before
+using them to set such budgets.
 
 ## Create and validate a backup
 
