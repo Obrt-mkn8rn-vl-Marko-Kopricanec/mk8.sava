@@ -704,13 +704,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 }
             });
 
+        var currentEtag = await AssertTagReadWriteConditionsAsync(source);
+        await AssertTagSqlGrammarAsync(source);
+        await AssertTagCopySourceConditionsAsync(container, source);
+        await AssertTagSasAndHeaderConditionsAsync(factory, source, currentEtag);
+    }
+
+    private static async Task<ETag> AssertTagReadWriteConditionsAsync(BlobClient source)
+    {
         var successfulRead = await source.DownloadContentAsync(new BlobDownloadOptions
         {
             Conditions = new BlobRequestConditions
             {
                 TagConditions = "(Status <> 'Pending' AND Priority >= '05') OR \"special key\" = 'no'"
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Equal("conditioned", successfulRead.Value.Content.ToString());
 
         var metadata = await source.SetMetadataAsync(
@@ -718,14 +726,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             new BlobRequestConditions
             {
                 TagConditions = "Status = 'Pending' AND Priority >= '05' OR \"special key\" = 'yes'"
-            });
+            }).ConfigureAwait(false);
         Assert.Equal(200, metadata.GetRawResponse().Status);
 
-        var currentEtag = (await source.GetPropertiesAsync()).Value.ETag;
-        var conditionedTags = await source.GetTagsAsync(new BlobRequestConditions { IfMatch = currentEtag });
+        var currentEtag = (await source.GetPropertiesAsync().ConfigureAwait(false)).Value.ETag;
+        var conditionedTags = await source.GetTagsAsync(
+            new BlobRequestConditions { IfMatch = currentEtag }).ConfigureAwait(false);
         Assert.Equal("Done", conditionedTags.Value.Tags["Status"]);
         var rejectedTagRead = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            source.GetTagsAsync(new BlobRequestConditions { IfMatch = new ETag("\"not-the-current-etag\"") }));
+            source.GetTagsAsync(new BlobRequestConditions
+            {
+                IfMatch = new ETag("\"not-the-current-etag\"")
+            })).ConfigureAwait(false);
         Assert.Equal(412, rejectedTagRead.Status);
         Assert.Equal("ConditionNotMet", rejectedTagRead.ErrorCode);
         await source.SetTagsAsync(
@@ -735,14 +747,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 ["Priority"] = "07",
                 ["special key"] = "yes"
             },
-            new BlobRequestConditions { IfMatch = currentEtag });
+            new BlobRequestConditions { IfMatch = currentEtag }).ConfigureAwait(false);
         var rejectedTagWrite = await Assert.ThrowsAsync<RequestFailedException>(() =>
             source.SetTagsAsync(
                 new Dictionary<string, string>(StringComparer.Ordinal) { ["Status"] = "rejected" },
-                new BlobRequestConditions { IfMatch = new ETag("\"not-the-current-etag\"") }));
+                new BlobRequestConditions { IfMatch = new ETag("\"not-the-current-etag\"") }))
+            .ConfigureAwait(false);
         Assert.Equal(412, rejectedTagWrite.Status);
         Assert.Equal("ConditionNotMet", rejectedTagWrite.ErrorCode);
+        return currentEtag;
+    }
 
+    private static async Task AssertTagSqlGrammarAsync(BlobClient source)
+    {
         var falseCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
             source.DownloadContentAsync(new BlobDownloadOptions
             {
@@ -750,7 +767,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 {
                     TagConditions = "(Status = 'Pending' OR Priority < '05') AND \"special key\" = 'yes'"
                 }
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(412, falseCondition.Status);
         Assert.Equal("ConditionNotMet", falseCondition.ErrorCode);
 
@@ -758,14 +775,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             source.DownloadContentAsync(new BlobDownloadOptions
             {
                 Conditions = new BlobRequestConditions { TagConditions = "Missing <> 'value'" }
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(412, missingTagIsNotUnequal.Status);
 
         var invalidCondition = await Assert.ThrowsAsync<RequestFailedException>(() =>
             source.DownloadContentAsync(new BlobDownloadOptions
             {
                 Conditions = new BlobRequestConditions { TagConditions = "Status = 'Done' OR OR Priority = '07'" }
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(400, invalidCondition.Status);
         Assert.Equal("InvalidHeaderValue", invalidCondition.ErrorCode);
 
@@ -776,10 +793,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             source.DownloadContentAsync(new BlobDownloadOptions
             {
                 Conditions = new BlobRequestConditions { TagConditions = excessiveCondition }
-            }));
+            })).ConfigureAwait(false);
         Assert.Equal(400, excessiveOperations.Status);
         Assert.Equal("InvalidHeaderValue", excessiveOperations.ErrorCode);
+    }
 
+    private static async Task AssertTagCopySourceConditionsAsync(
+        BlobContainerClient container, BlobClient source)
+    {
         var destination = container.GetBlobClient("destination.txt");
         var copy = await destination.StartCopyFromUriAsync(
             source.Uri,
@@ -789,7 +810,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 {
                     TagConditions = "Status = 'Done' AND Priority <= '07'"
                 }
-            });
+            }).ConfigureAwait(false);
         Assert.Equal(202, copy.GetRawResponse().Status);
 
         var rejectedCopy = await Assert.ThrowsAsync<RequestFailedException>(() =>
@@ -798,18 +819,22 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 new BlobCopyFromUriOptions
                 {
                     SourceConditions = new BlobRequestConditions { TagConditions = "Status = 'Pending'" }
-                }));
+                })).ConfigureAwait(false);
         Assert.Equal(412, rejectedCopy.Status);
         Assert.Equal("SourceConditionNotMet", rejectedCopy.ErrorCode);
+    }
 
-        using var transport = new HttpClient(factory.Server.CreateHandler());
+    private static async Task AssertTagSasAndHeaderConditionsAsync(
+        SavaWebApplicationFactory application, BlobClient source, ETag currentEtag)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
         var readOnlyUri = source.GenerateSasUri(
             BlobSasPermissions.Read,
             DateTimeOffset.UtcNow.AddMinutes(5));
         using var unauthorizedRequest = new HttpRequestMessage(HttpMethod.Get, readOnlyUri);
         unauthorizedRequest.Headers.Add("x-ms-version", "2023-11-03");
         unauthorizedRequest.Headers.Add("x-ms-if-tags", "Status = 'Done'");
-        using var unauthorizedResponse = await transport.SendAsync(unauthorizedRequest);
+        using var unauthorizedResponse = await transport.SendAsync(unauthorizedRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.Forbidden, unauthorizedResponse.StatusCode);
         Assert.Equal(
             "AuthorizationPermissionMismatch",
@@ -821,7 +846,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using var authorizedRequest = new HttpRequestMessage(HttpMethod.Get, taggedReadUri);
         authorizedRequest.Headers.Add("x-ms-version", "2023-11-03");
         authorizedRequest.Headers.Add("x-ms-if-tags", "Status = 'Done'");
-        using var authorizedResponse = await transport.SendAsync(authorizedRequest);
+        using var authorizedResponse = await transport.SendAsync(authorizedRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, authorizedResponse.StatusCode);
 
         var oldVersionTagsUri = AppendQuery(
@@ -832,7 +857,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using var oldVersionCondition = new HttpRequestMessage(HttpMethod.Get, oldVersionTagsUri);
         oldVersionCondition.Headers.Add("x-ms-version", "2023-11-03");
         oldVersionCondition.Headers.Add("x-ms-blob-if-match", currentEtag.ToString());
-        using var oldVersionConditionResponse = await transport.SendAsync(oldVersionCondition);
+        using var oldVersionConditionResponse = await transport.SendAsync(oldVersionCondition).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.Conflict, oldVersionConditionResponse.StatusCode);
         Assert.Equal(
             "FeatureVersionMismatch",
@@ -849,10 +874,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         badChecksumTags.Headers.Add("x-ms-version", "2026-06-06");
         badChecksumTags.Headers.Add("x-ms-content-crc64", Convert.ToBase64String(new byte[8]));
         badChecksumTags.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/xml; charset=utf-8");
-        using var badChecksumTagsResponse = await transport.SendAsync(badChecksumTags);
+        using var badChecksumTagsResponse = await transport.SendAsync(badChecksumTags).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.BadRequest, badChecksumTagsResponse.StatusCode);
         Assert.Equal("Crc64Mismatch", badChecksumTagsResponse.Headers.GetValues("x-ms-error-code").Single());
-        Assert.Equal("Done", (await source.GetTagsAsync()).Value.Tags["Status"]);
+        Assert.Equal("Done", (await source.GetTagsAsync().ConfigureAwait(false)).Value.Tags["Status"]);
     }
 
     [Fact]
