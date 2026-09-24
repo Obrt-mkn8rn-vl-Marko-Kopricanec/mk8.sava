@@ -107,8 +107,12 @@ internal static class HierarchicalAclAuthorization
             if (!PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'w'))
                 throw AzureStorageException.AuthorizationFailure();
             if (permission == 'd')
+            {
                 await EnsureStickyDeleteAsync(metadata, request, objectId, root.Owner, root.StickyBit,
                     cancellationToken).ConfigureAwait(false);
+                await EnsureDirectoryDeletePermissionsAsync(metadata, request, objectId, groups,
+                    cancellationToken).ConfigureAwait(false);
+            }
             return;
         }
 
@@ -127,6 +131,29 @@ internal static class HierarchicalAclAuthorization
                 await EnsureStickyDeleteAsync(metadata, request, objectId, parent.Owner, parent.StickyBit,
                     cancellationToken).ConfigureAwait(false);
             separator = name.IndexOf('/', separator + 1);
+        }
+        if (permission == 'd')
+            await EnsureDirectoryDeletePermissionsAsync(metadata, request, objectId, groups,
+                cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureDirectoryDeletePermissionsAsync(
+        MetadataStore metadata,
+        StorageRequestContext request,
+        string objectId,
+        IReadOnlySet<string> groups,
+        CancellationToken cancellationToken)
+    {
+        var child = await metadata.GetBlobAsync(
+            request.Account, request.Container!, request.Blob!,
+            versionId: null, snapshot: null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        if (child is not { IsDirectory: true })
+            return;
+        if (!PosixAccessControl.Allows(child.Acl, child.Owner, child.Group, objectId, groups, 'r') ||
+            !PosixAccessControl.Allows(child.Acl, child.Owner, child.Group, objectId, groups, 'w') ||
+            !PosixAccessControl.Allows(child.Acl, child.Owner, child.Group, objectId, groups, 'x'))
+        {
+            throw AzureStorageException.AuthorizationFailure();
         }
     }
 
