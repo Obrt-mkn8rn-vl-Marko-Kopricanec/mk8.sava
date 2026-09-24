@@ -7541,57 +7541,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blob = container.GetBlobClient("protected.txt");
         await blob.UploadAsync(BinaryData.FromString("delegated only"));
 
-        static void AssertKeyBasedAuthenticationNotPermitted(RequestFailedException exception)
-        {
-            Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
-            Assert.Equal("KeyBasedAuthenticationNotPermitted", exception.ErrorCode);
-        }
-
         var sharedKeyBlob = CreateClient(application)
             .GetBlobContainerClient(container.Name)
             .GetBlobClient(blob.Name);
         AssertKeyBasedAuthenticationNotPermitted(
             await Assert.ThrowsAsync<RequestFailedException>(() => sharedKeyBlob.DownloadContentAsync()));
 
-        var credential = new StorageSharedKeyCredential(
-            SavaWebApplicationFactory.AccountName,
-            SavaWebApplicationFactory.AccountKey);
         var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
         var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10);
-        var serviceBuilder = new BlobSasBuilder
-        {
-            BlobContainerName = container.Name,
-            BlobName = blob.Name,
-            Resource = "b",
-            StartsOn = startsOn,
-            ExpiresOn = expiresOn,
-            Protocol = SasProtocol.HttpsAndHttp
-        };
-        serviceBuilder.SetPermissions(BlobSasPermissions.Read);
-        var serviceSasBlob = CreateBlobClient(
-            application,
-            new Uri(
-                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
-                $"?{serviceBuilder.ToSasQueryParameters(credential)}"));
-        AssertKeyBasedAuthenticationNotPermitted(
-            await Assert.ThrowsAsync<RequestFailedException>(() => serviceSasBlob.DownloadContentAsync()));
-
-        var accountBuilder = new AccountSasBuilder
-        {
-            Services = AccountSasServices.Blobs,
-            ResourceTypes = AccountSasResourceTypes.Object,
-            StartsOn = startsOn,
-            ExpiresOn = expiresOn,
-            Protocol = SasProtocol.HttpsAndHttp
-        };
-        accountBuilder.SetPermissions(AccountSasPermissions.Read);
-        var accountSasBlob = CreateBlobClient(
-            application,
-            new Uri(
-                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}" +
-                $"?{accountBuilder.ToSasQueryParameters(credential)}"));
-        AssertKeyBasedAuthenticationNotPermitted(
-            await Assert.ThrowsAsync<RequestFailedException>(() => accountSasBlob.DownloadContentAsync()));
+        await AssertSharedKeySasDeniedAsync(application, container.Name, blob.Name, startsOn, expiresOn);
 
         var key = (await bearer.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
@@ -7613,6 +7571,60 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(
             "delegated only",
             (await delegationSasBlob.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    private static void AssertKeyBasedAuthenticationNotPermitted(RequestFailedException exception)
+    {
+        Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
+        Assert.Equal("KeyBasedAuthenticationNotPermitted", exception.ErrorCode);
+    }
+
+    private static async Task AssertSharedKeySasDeniedAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        string blobName,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var serviceBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        serviceBuilder.SetPermissions(BlobSasPermissions.Read);
+        var serviceSasBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{serviceBuilder.ToSasQueryParameters(credential)}"));
+        AssertKeyBasedAuthenticationNotPermitted(
+            await Assert.ThrowsAsync<RequestFailedException>(() => serviceSasBlob.DownloadContentAsync())
+                .ConfigureAwait(false));
+
+        var accountBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Object,
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        accountBuilder.SetPermissions(AccountSasPermissions.Read);
+        var accountSasBlob = CreateBlobClient(
+            application,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{accountBuilder.ToSasQueryParameters(credential)}"));
+        AssertKeyBasedAuthenticationNotPermitted(
+            await Assert.ThrowsAsync<RequestFailedException>(() => accountSasBlob.DownloadContentAsync())
+                .ConfigureAwait(false));
     }
 
     [Fact]
@@ -9235,56 +9247,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(SavaWebApplicationFactory.DelegatorObjectId, key.Value.SignedObjectId);
             Assert.Equal(SavaWebApplicationFactory.TenantId, key.Value.SignedTenantId);
 
-            var builder = new BlobSasBuilder
-            {
-                BlobContainerName = containerName,
-                BlobName = blobName,
-                Resource = "b",
-                StartsOn = startsOn,
-                ExpiresOn = expiresOn,
-                Protocol = SasProtocol.HttpsAndHttp
-            };
-            builder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.Delete);
-            var sas = builder.ToSasQueryParameters(key.Value, SavaWebApplicationFactory.AccountName);
-            var delegatedBlob = CreateBlobClient(
-                factory,
-                new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
-
-            Assert.Equal("delegated payload", (await delegatedBlob.DownloadContentAsync()).Value.Content.ToString());
-            var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => delegatedBlob.DeleteAsync());
-            Assert.Equal(403, deniedDelete.Status);
-
-            var versionBuilder = new BlobSasBuilder
-            {
-                BlobContainerName = containerName,
-                BlobName = blobName,
-                BlobVersionId = versionId,
-                Resource = "bv",
-                StartsOn = startsOn,
-                ExpiresOn = expiresOn,
-                Protocol = SasProtocol.HttpsAndHttp
-            };
-            versionBuilder.SetPermissions(BlobSasPermissions.Read);
-            var versionSas = versionBuilder.ToSasQueryParameters(
-                key.Value,
-                SavaWebApplicationFactory.AccountName);
-            var delegatedVersion = CreateBlobClient(
-                factory,
-                new Uri(
-                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                    $"?versionid={Uri.EscapeDataString(versionId!)}&{versionSas}"));
-            Assert.Equal(
-                "delegated payload",
-                (await delegatedVersion.DownloadContentAsync()).Value.Content.ToString());
-
-            var versionTokenOnBaseBlob = CreateBlobClient(
-                factory,
-                new Uri(
-                    $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                    $"?{versionSas}"));
-            var wrongResource = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                versionTokenOnBaseBlob.DownloadContentAsync());
-            Assert.Equal(403, wrongResource.Status);
+            await AssertBlobScopedUserDelegationSasAsync(
+                containerName, blobName, key.Value, startsOn, expiresOn);
+            await AssertVersionScopedUserDelegationSasAsync(
+                containerName, blobName, versionId!, key.Value, startsOn, expiresOn);
         }
         finally
         {
@@ -9293,6 +9259,73 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 original,
                 CancellationToken.None);
         }
+    }
+
+    private async Task AssertBlobScopedUserDelegationSasAsync(
+        string containerName,
+        string blobName,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            Resource = "b",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(BlobSasPermissions.Read | BlobSasPermissions.Delete);
+        var sas = builder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName);
+        var delegatedBlob = CreateBlobClient(
+            factory,
+            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
+
+        Assert.Equal("delegated payload",
+            (await delegatedBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        var deniedDelete = await Assert.ThrowsAsync<RequestFailedException>(() => delegatedBlob.DeleteAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(403, deniedDelete.Status);
+    }
+
+    private async Task AssertVersionScopedUserDelegationSasAsync(
+        string containerName,
+        string blobName,
+        string versionId,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
+        var versionBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = containerName,
+            BlobName = blobName,
+            BlobVersionId = versionId,
+            Resource = "bv",
+            StartsOn = startsOn,
+            ExpiresOn = expiresOn,
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        versionBuilder.SetPermissions(BlobSasPermissions.Read);
+        var versionSas = versionBuilder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName);
+        var delegatedVersion = CreateBlobClient(
+            factory,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?versionid={Uri.EscapeDataString(versionId)}&{versionSas}"));
+        Assert.Equal("delegated payload", (await delegatedVersion.DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+
+        var versionTokenOnBaseBlob = CreateBlobClient(
+            factory,
+            new Uri(
+                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                $"?{versionSas}"));
+        var wrongResource = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            versionTokenOnBaseBlob.DownloadContentAsync()).ConfigureAwait(false);
+        Assert.Equal(403, wrongResource.Status);
     }
 
     [Fact]
@@ -10812,47 +10845,59 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = service.GetBlobContainerClient($"copy-{Guid.NewGuid():N}");
         await container.CreateAsync();
 
+        await AssertAbortableRemoteCopyAsync(container, remote.Uri);
+        await AssertCompletedSameAccountCopyAsync(container, remoteBytes);
+    }
+
+    private static async Task AssertAbortableRemoteCopyAsync(BlobContainerClient container, Uri remoteUri)
+    {
         var abortDestination = container.GetBlobClient("abort.bin");
-        var credentialedSource = new UriBuilder(remote.Uri) { Query = "source=remote&sig=must-not-leak" }.Uri;
+        var credentialedSource = new UriBuilder(remoteUri) { Query = "source=remote&sig=must-not-leak" }.Uri;
         var abortOperation = await abortDestination.StartCopyFromUriAsync(
             credentialedSource,
             new BlobCopyFromUriOptions
             {
                 Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["copy"] = "abort" }
-            });
+            }).ConfigureAwait(false);
         Assert.Equal(202, abortOperation.GetRawResponse().Status);
         Assert.False(abortOperation.HasCompleted);
-        var pending = (await abortDestination.GetPropertiesAsync()).Value;
+        var pending = (await abortDestination.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(CopyStatus.Pending, pending.CopyStatus);
         Assert.Equal(0, pending.ContentLength);
         Assert.Contains("source=remote", pending.CopySource.AbsoluteUri, StringComparison.Ordinal);
         Assert.DoesNotContain("sig=", pending.CopySource.AbsoluteUri, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("abort", pending.Metadata["copy"]);
 
-        var aborted = await abortDestination.AbortCopyFromUriAsync(abortOperation.Id);
+        var aborted = await abortDestination.AbortCopyFromUriAsync(abortOperation.Id).ConfigureAwait(false);
         Assert.Equal(204, aborted.Status);
-        var abortedProperties = (await abortDestination.GetPropertiesAsync()).Value;
+        var abortedProperties = (await abortDestination.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(CopyStatus.Aborted, abortedProperties.CopyStatus);
         Assert.Equal(0, abortedProperties.ContentLength);
         Assert.Equal("abort", abortedProperties.Metadata["copy"]);
+    }
 
+    private static async Task AssertCompletedSameAccountCopyAsync(BlobContainerClient container, byte[] remoteBytes)
+    {
         var source = container.GetBlobClient("nested//source%.bin");
         await source.UploadAsync(BinaryData.FromBytes(remoteBytes), new BlobUploadOptions
         {
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["origin"] = "internal" },
             Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["class"] = "copy" }
-        });
+        }).ConfigureAwait(false);
         var completedDestination = container.GetBlobClient("completed.bin");
-        var completion = await completedDestination.StartCopyFromUriAsync(source.Uri);
-        Assert.Equal(CopyStatus.Pending, (await completedDestination.GetPropertiesAsync()).Value.CopyStatus);
-        await completion.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var completion = await completedDestination.StartCopyFromUriAsync(source.Uri).ConfigureAwait(false);
+        Assert.Equal(CopyStatus.Pending,
+            (await completedDestination.GetPropertiesAsync().ConfigureAwait(false)).Value.CopyStatus);
+        await completion.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(false);
 
-        var completed = (await completedDestination.GetPropertiesAsync()).Value;
+        var completed = (await completedDestination.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(CopyStatus.Success, completed.CopyStatus);
         Assert.Equal($"{remoteBytes.LongLength}/{remoteBytes.LongLength}", completed.CopyProgress);
         Assert.Equal("internal", completed.Metadata["origin"]);
-        Assert.Empty((await completedDestination.GetTagsAsync()).Value.Tags);
-        Assert.Equal(remoteBytes, (await completedDestination.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Empty((await completedDestination.GetTagsAsync().ConfigureAwait(false)).Value.Tags);
+        Assert.Equal(remoteBytes,
+            (await completedDestination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
     }
 
     [Fact]
@@ -10861,18 +10906,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"legacy-copy-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        var source = container.GetBlockBlobClient("source.bin");
-        var firstBlockId = Convert.ToBase64String("legacy-copy-block-0001"u8);
-        var secondBlockId = Convert.ToBase64String("legacy-copy-block-0002"u8);
-        await source.StageBlockAsync(firstBlockId, BinaryData.FromString("first|").ToStream());
-        await source.StageBlockAsync(secondBlockId, BinaryData.FromString("second").ToStream());
-        await source.CommitBlockListAsync(
-            [firstBlockId, secondBlockId],
-            new CommitBlockListOptions
-            {
-                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["origin"] = "legacy" },
-                HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-legacy-copy" }
-            });
+        var (source, firstBlockId, secondBlockId) = await CreateLegacyCopySourceAsync(container);
         var sourcePath = $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{source.Name}";
         var sourceLeaseId = Guid.NewGuid().ToString();
         var sourceLease = source.GetBlobLeaseClient(sourceLeaseId);
@@ -10888,24 +10922,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
         Assert.False((await mismatchedTarget.ExistsAsync()).Value);
 
-        var destination = container.GetBlockBlobClient("destination.bin");
-        using (var request = CreateLegacyCopyRequest(destination.Uri, sourcePath, sourceLeaseId))
-        using (var response = await transport.SendAsync(request))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            Assert.NotNull(response.Headers.ETag);
-            Assert.True(response.Content.Headers.LastModified.HasValue);
-            Assert.False(response.Headers.Contains("x-ms-copy-id"));
-            Assert.False(response.Headers.Contains("x-ms-copy-status"));
-        }
-
-        var properties = (await destination.GetPropertiesAsync()).Value;
-        Assert.Equal(default, properties.CopyStatus);
-        Assert.Equal("application/x-legacy-copy", properties.ContentType);
-        Assert.Equal("legacy", properties.Metadata["origin"]);
-        Assert.Equal("first|second", (await destination.DownloadContentAsync()).Value.Content.ToString());
-        var blocks = (await destination.GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks;
-        Assert.Equal([firstBlockId, secondBlockId], blocks.Select(block => block.Name), StringComparer.Ordinal);
+        await AssertLegacyBlockCopyAsync(
+            container, transport, sourcePath, sourceLeaseId, firstBlockId, secondBlockId);
 
         var noSourceLeaseHeaderTarget = container.GetBlobClient("source-lease-optional.bin");
         using (var request = CreateLegacyCopyRequest(noSourceLeaseHeaderTarget.Uri, sourcePath))
@@ -10922,33 +10940,87 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
         Assert.False((await absentSourceLeaseTarget.ExistsAsync()).Value);
 
+        await AssertLegacyPageAndCrossAccountCopyAsync(container, source.Name, transport);
+    }
+
+    private static async Task<(BlockBlobClient Source, string FirstBlockId, string SecondBlockId)>
+        CreateLegacyCopySourceAsync(BlobContainerClient container)
+    {
+        var source = container.GetBlockBlobClient("source.bin");
+        var firstBlockId = Convert.ToBase64String("legacy-copy-block-0001"u8);
+        var secondBlockId = Convert.ToBase64String("legacy-copy-block-0002"u8);
+        await source.StageBlockAsync(firstBlockId, BinaryData.FromString("first|").ToStream()).ConfigureAwait(false);
+        await source.StageBlockAsync(secondBlockId, BinaryData.FromString("second").ToStream()).ConfigureAwait(false);
+        await source.CommitBlockListAsync(
+            [firstBlockId, secondBlockId],
+            new CommitBlockListOptions
+            {
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["origin"] = "legacy" },
+                HttpHeaders = new BlobHttpHeaders { ContentType = "application/x-legacy-copy" }
+            }).ConfigureAwait(false);
+        return (source, firstBlockId, secondBlockId);
+    }
+
+    private static async Task AssertLegacyBlockCopyAsync(
+        BlobContainerClient container,
+        HttpClient transport,
+        string sourcePath,
+        string sourceLeaseId,
+        string firstBlockId,
+        string secondBlockId)
+    {
+        var destination = container.GetBlockBlobClient("destination.bin");
+        using (var request = CreateLegacyCopyRequest(destination.Uri, sourcePath, sourceLeaseId))
+        using (var response = await transport.SendAsync(request).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            Assert.NotNull(response.Headers.ETag);
+            Assert.True(response.Content.Headers.LastModified.HasValue);
+            Assert.False(response.Headers.Contains("x-ms-copy-id"));
+            Assert.False(response.Headers.Contains("x-ms-copy-status"));
+        }
+
+        var properties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(default, properties.CopyStatus);
+        Assert.Equal("application/x-legacy-copy", properties.ContentType);
+        Assert.Equal("legacy", properties.Metadata["origin"]);
+        Assert.Equal("first|second", (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        var blocks = (await destination.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(false)).Value.CommittedBlocks;
+        Assert.Equal([firstBlockId, secondBlockId], blocks.Select(block => block.Name), StringComparer.Ordinal);
+    }
+
+    private static async Task AssertLegacyPageAndCrossAccountCopyAsync(
+        BlobContainerClient container,
+        string blockSourceName,
+        HttpClient transport)
+    {
         var pageSource = container.GetPageBlobClient("source.vhd");
-        await pageSource.CreateAsync(1024, new PageBlobCreateOptions { SequenceNumber = 9 });
+        await pageSource.CreateAsync(1024, new PageBlobCreateOptions { SequenceNumber = 9 }).ConfigureAwait(false);
         await pageSource.UploadPagesAsync(
             new MemoryStream(Enumerable.Repeat((byte)0x51, 512).ToArray()),
-            offset: 512);
+            offset: 512).ConfigureAwait(false);
         var pageDestination = container.GetPageBlobClient("destination.vhd");
         var pageSourcePath = $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{pageSource.Name}";
         using (var request = CreateLegacyCopyRequest(pageDestination.Uri, pageSourcePath))
-        using (var response = await transport.SendAsync(request))
+        using (var response = await transport.SendAsync(request).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-        var pageProperties = (await pageDestination.GetPropertiesAsync()).Value;
+        var pageProperties = (await pageDestination.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(BlobType.Page, pageProperties.BlobType);
         Assert.Equal(9, pageProperties.BlobSequenceNumber);
         Assert.Equal(default, pageProperties.CopyStatus);
-        var pageRange = Assert.Single((await pageDestination.GetPageRangesAsync()).Value.PageRanges);
+        var pageRange = Assert.Single((await pageDestination.GetPageRangesAsync().ConfigureAwait(false)).Value.PageRanges);
         Assert.Equal(512, pageRange.Offset);
         Assert.Equal(512, pageRange.Length);
 
         var crossAccountTarget = container.GetBlobClient("cross-account.bin");
-        var crossAccountSource = $"/{SavaWebApplicationFactory.SecondAccountName}/{container.Name}/{source.Name}";
+        var crossAccountSource = $"/{SavaWebApplicationFactory.SecondAccountName}/{container.Name}/{blockSourceName}";
         using (var request = CreateLegacyCopyRequest(crossAccountTarget.Uri, crossAccountSource))
-        using (var response = await transport.SendAsync(request))
+        using (var response = await transport.SendAsync(request).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "CopyAcrossAccountsNotSupported");
+            await AssertVersionedErrorAsync(response, "CopyAcrossAccountsNotSupported").ConfigureAwait(false);
         }
-        Assert.False((await crossAccountTarget.ExistsAsync()).Value);
+        Assert.False((await crossAccountTarget.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
