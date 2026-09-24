@@ -65,7 +65,11 @@ builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<TokenCredential, DefaultAzureCredential>();
 builder.Services.AddHttpClient<MicrosoftGraphGroupMembershipResolver>(client =>
-    client.Timeout = TimeSpan.FromSeconds(5));
+    client.Timeout = TimeSpan.FromSeconds(5))
+    .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false
+    });
 builder.Services.AddSingleton<IGroupMembershipResolver>(services =>
     services.GetRequiredService<MicrosoftGraphGroupMembershipResolver>());
 builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)

@@ -76,6 +76,7 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
 
     [Theory]
     [InlineData(HttpStatusCode.Forbidden, "{\"error\":\"forbidden\"}")]
+    [InlineData(HttpStatusCode.BadRequest, "{\"error\":{\"code\":\"InvalidRequest\"}}")]
     [InlineData(HttpStatusCode.OK, "{\"value\":[\"not-a-guid\"]}")]
     [InlineData(HttpStatusCode.OK, "{\"value\":null}")]
     [InlineData(HttpStatusCode.OK, "not-json")]
@@ -89,6 +90,80 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
             Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None));
 
         Assert.Equal("AuthorizationFailure", error.ErrorCode);
+        Assert.Equal(1, handler.Calls);
+    }
+
+    [Theory]
+    [InlineData("#microsoft.graph.user", "users")]
+    [InlineData("#microsoft.graph.servicePrincipal", "servicePrincipals")]
+    public async Task GroupLimitFallsBackToValidatedTransitivePages(string objectType, string collection)
+    {
+        var membershipPath = $"/v1.0/{collection}/{ReaderObjectId}/transitiveMemberOf/microsoft.graph.group";
+        var continuation = $"https://graph.microsoft.com{membershipPath}?%24skiptoken=page-two";
+        using var handler = new GraphHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post)
+                return JsonResponse(HttpStatusCode.BadRequest,
+                    "{\"error\":{\"code\":\"Directory_ResultSizeLimitExceeded\"}}");
+            if (request.RequestUri?.AbsolutePath == $"/v1.0/directoryObjects/{ReaderObjectId}")
+                return JsonResponse(HttpStatusCode.OK, $"{{\"@odata.type\":\"{objectType}\"}}");
+
+            Assert.Equal(membershipPath, request.RequestUri?.AbsolutePath);
+            Assert.Equal("eventual", request.Headers.GetValues("ConsistencyLevel").Single());
+            Assert.Equal("graph-test-token", request.Headers.Authorization?.Parameter);
+            return request.RequestUri?.Query.Contains("skiptoken", StringComparison.Ordinal) == true
+                ? JsonResponse(HttpStatusCode.OK,
+                    $"{{\"value\":[{{\"id\":\"{ReaderGroupId}\",\"securityEnabled\":true}}]}}")
+                : JsonResponse(HttpStatusCode.OK,
+                    $"{{\"value\":[{{\"id\":\"{Guid.NewGuid():D}\",\"securityEnabled\":false}}]," +
+                    $"\"@odata.nextLink\":\"{continuation}\"}}");
+        });
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, new GraphCredential());
+
+        var groups = await resolver.ResolveAsync(
+            Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None);
+
+        Assert.Equal([ReaderGroupId], groups);
+        Assert.Equal(4, handler.Calls);
+    }
+
+    [Theory]
+    [InlineData("wrong-host")]
+    [InlineData("wrong-scheme")]
+    [InlineData("wrong-path")]
+    [InlineData("repeated-page")]
+    public async Task GroupLimitRejectsUntrustedOrCyclicNextLinks(string linkKind)
+    {
+        var path = $"/v1.0/users/{ReaderObjectId}/transitiveMemberOf/microsoft.graph.group";
+        var nextLink = linkKind switch
+        {
+            "wrong-host" => $"https://example.com{path}?%24skiptoken=stolen",
+            "wrong-scheme" => $"http://graph.microsoft.com{path}?%24skiptoken=stolen",
+            "wrong-path" => $"https://graph.microsoft.com/v1.0/users/{ReaderObjectId}/messages",
+            "repeated-page" => $"https://graph.microsoft.com{path}?%24skiptoken=loop",
+            _ => throw new ArgumentOutOfRangeException(nameof(linkKind))
+        };
+        using var handler = new GraphHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post)
+                return JsonResponse(HttpStatusCode.BadRequest,
+                    "{\"error\":{\"code\":\"Directory_ResultSizeLimitExceeded\"}}");
+            if (request.RequestUri?.AbsolutePath == $"/v1.0/directoryObjects/{ReaderObjectId}")
+                return JsonResponse(HttpStatusCode.OK, "{\"@odata.type\":\"#microsoft.graph.user\"}");
+            Assert.Equal(path, request.RequestUri?.AbsolutePath);
+            return JsonResponse(HttpStatusCode.OK,
+                $"{{\"value\":[{{\"id\":\"{ReaderGroupId}\",\"securityEnabled\":true}}]," +
+                $"\"@odata.nextLink\":\"{nextLink}\"}}");
+        });
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, new GraphCredential());
+
+        var error = await Assert.ThrowsAsync<AzureStorageException>(() => resolver.ResolveAsync(
+            Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None));
+
+        Assert.Equal("AuthorizationFailure", error.ErrorCode);
+        Assert.InRange(handler.Calls, 3, 4);
     }
 
     [Fact]

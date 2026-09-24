@@ -702,11 +702,18 @@ trusted tenant GUID. The service uses `DefaultAzureCredential` to request the
 its credential through the normal Azure identity environment or managed
 identity, never through a Blob request. The token's `_claim_sources` URL is
 ignored, including legacy Azure AD Graph URLs, as [Microsoft recommends](https://learn.microsoft.com/en-us/security/zero-trust/develop/configure-tokens-group-claims-app-roles#group-overages).
-Resolution has a five-second HTTP timeout and a 1 MiB response cap; a missing
+Each Graph call has a five-second timeout and a 1 MiB response cap; a missing
 or wrong tenant, disabled resolver, lookup failure, or malformed response
 denies ACL-only access without changing independent RBAC grants. Graph's
-`getMemberGroups` limit is 11,000 IDs; larger memberships still need the
-paged `transitiveMemberOf` fallback before full HNS parity can be claimed.
+`getMemberGroups` limit is 11,000 IDs. On that specific Graph error, the
+resolver identifies the object as a user or service principal and follows the
+corresponding v1.0 [`transitiveMemberOf`](https://learn.microsoft.com/en-us/graph/api/user-list-transitivememberof?view=graph-rest-1.0) group pages. It keeps only security-enabled groups, reapplies the
+`ConsistencyLevel: eventual` header on every page, and accepts continuation
+URLs only on the same HTTPS Graph host and exact membership path. This fallback
+is bounded to 128 pages and 100,000 distinct group IDs; exceeding a bound or
+losing a page denies the whole ACL grant rather than using a partial group set.
+Sovereign-cloud Graph endpoint selection and production identity integration
+remain unqualified.
 Local signed-token, fake-Graph, and SDK-over-HTTP tests cover this path without
 live Azure accounts. Bearer ACL fallback for other operations remains incomplete.
 For HNS List Blobs, bearer `oid` and signed user-delegation `suoid` ACL
