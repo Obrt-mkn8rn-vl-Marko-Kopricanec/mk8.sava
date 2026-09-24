@@ -907,6 +907,217 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
+    private static async Task<(BlobContainerClient Container,
+        BlobContainerClient DeletedContainer)> CreateHistoricalListingFixtureAsync(
+        SavaWebApplicationFactory application)
+    {
+        var service = CreateClient(application);
+        var container = service.GetBlobContainerClient($"listing-{Guid.NewGuid():N}");
+        await container.CreateAsync(
+            PublicAccessType.Blob,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["purpose"] = "listing" })
+            .ConfigureAwait(false);
+        await container.GetBlobClient("folder/a b.txt").UploadAsync(
+            BinaryData.FromString("listing payload"),
+            new BlobUploadOptions
+            {
+                HttpHeaders = new BlobHttpHeaders
+                {
+                    ContentType = "text/plain",
+                    ContentEncoding = "gzip"
+                }
+            }).ConfigureAwait(false);
+        await container.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var serviceProperties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            serviceProperties with
+            {
+                ContainerSoftDeleteEnabled = true,
+                ContainerSoftDeleteRetentionDays = 7
+            },
+            CancellationToken.None).ConfigureAwait(false);
+        var deletedContainer = service.GetBlobContainerClient($"deleted-{Guid.NewGuid():N}");
+        await deletedContainer.CreateAsync().ConfigureAwait(false);
+        await deletedContainer.DeleteAsync().ConfigureAwait(false);
+        return (container, deletedContainer);
+    }
+
+    private static async Task<HttpResponseMessage> SendHistoricalContainerListAsync(
+        HttpClient transport,
+        Uri serviceSasUri,
+        string version,
+        string query)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, AppendQuery(serviceSasUri, $"comp=list&{query}"));
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    private static async Task<HttpResponseMessage> SendHistoricalBlobListAsync(
+        HttpClient transport,
+        Uri containerSasUri,
+        string version,
+        string query)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            AppendQuery(containerSasUri, $"restype=container&comp=list&{query}"));
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    private static async Task AssertModernContainerListingAsync(
+        HttpClient transport,
+        Uri serviceSasUri,
+        string containerName,
+        string deletedContainerName)
+    {
+        using var modernContainers = await SendHistoricalContainerListAsync(
+            transport, serviceSasUri, "2019-12-12", "include=metadata,deleted&maxresults=6000")
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, modernContainers.StatusCode);
+        var document = System.Xml.Linq.XDocument.Parse(
+            await modernContainers.Content.ReadAsStringAsync().ConfigureAwait(false));
+        Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/",
+            document.Root?.Attribute("ServiceEndpoint")?.Value);
+        Assert.Null(document.Root?.Attribute("AccountName"));
+        Assert.Equal("5000", document.Root?.Element("MaxResults")?.Value);
+
+        var active = document.Descendants("Container")
+            .Single(item => string.Equals(item.Element("Name")?.Value, containerName, StringComparison.Ordinal));
+        Assert.Null(active.Element("Url"));
+        Assert.Null(active.Element("Deleted"));
+        Assert.Equal("blob", active.Element("Properties")?.Element("PublicAccess")?.Value);
+        Assert.Equal("locked", active.Element("Properties")?.Element("LeaseStatus")?.Value);
+        Assert.Equal("leased", active.Element("Properties")?.Element("LeaseState")?.Value);
+        Assert.Equal("fixed", active.Element("Properties")?.Element("LeaseDuration")?.Value);
+        Assert.Equal("false", active.Element("Properties")?.Element("HasImmutabilityPolicy")?.Value);
+        Assert.Equal("false", active.Element("Properties")?.Element("HasLegalHold")?.Value);
+        Assert.Equal("listing", active.Element("Metadata")?.Element("purpose")?.Value);
+
+        var deleted = document.Descendants("Container")
+            .Single(item => string.Equals(item.Element("Name")?.Value, deletedContainerName, StringComparison.Ordinal));
+        Assert.Equal("true", deleted.Element("Deleted")?.Value);
+        Assert.NotEmpty(Assert.IsType<string>(deleted.Element("Version")?.Value));
+        Assert.Null(deleted.Element("Properties")?.Element("Deleted"));
+        Assert.NotNull(deleted.Element("Properties")?.Element("DeletedTime"));
+        Assert.NotNull(deleted.Element("Properties")?.Element("RemainingRetentionDays"));
+        Assert.Null(deleted.Element("Properties")?.Element("LeaseStatus"));
+    }
+
+    private static async Task AssertLegacyContainerListingsAsync(
+        HttpClient transport,
+        Uri serviceSasUri,
+        string containerName)
+    {
+        using (var legacyContainers = await SendHistoricalContainerListAsync(
+            transport, serviceSasUri, "2012-02-12", "prefix=listing-&maxresults=1").ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, legacyContainers.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(
+                await legacyContainers.Content.ReadAsStringAsync().ConfigureAwait(false));
+            Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/",
+                document.Root?.Attribute("AccountName")?.Value);
+            Assert.Null(document.Root?.Attribute("ServiceEndpoint"));
+            var listed = Assert.Single(document.Descendants("Container"));
+            Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}",
+                listed.Element("Url")?.Value);
+            Assert.NotNull(listed.Element("Properties")?.Element("Last-Modified"));
+            Assert.NotNull(listed.Element("Properties")?.Element("LeaseState"));
+            Assert.Null(listed.Element("Properties")?.Element("PublicAccess"));
+        }
+
+        using var oldestContainers = await SendHistoricalContainerListAsync(
+            transport, serviceSasUri, "2008-10-27", "prefix=listing-&maxresults=1").ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, oldestContainers.StatusCode);
+        var oldestDocument = System.Xml.Linq.XDocument.Parse(
+            await oldestContainers.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var properties = Assert.Single(oldestDocument.Descendants("Container")).Element("Properties");
+        Assert.NotNull(properties?.Element("LastModified"));
+        Assert.Null(properties?.Element("Last-Modified"));
+        Assert.DoesNotContain('"', Assert.IsType<string>(properties?.Element("Etag")?.Value));
+        Assert.Null(properties?.Element("LeaseStatus"));
+    }
+
+    private static async Task AssertHistoricalBlobListingsAsync(
+        HttpClient transport,
+        Uri containerSasUri,
+        string containerName)
+    {
+        using (var oldestBlobs = await SendHistoricalBlobListAsync(
+            transport, containerSasUri, "2008-10-27", "prefix=folder/&maxresults=6001").ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, oldestBlobs.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(
+                await oldestBlobs.Content.ReadAsStringAsync().ConfigureAwait(false));
+            Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}",
+                document.Root?.Attribute("ContainerName")?.Value);
+            Assert.Null(document.Root?.Attribute("ServiceEndpoint"));
+            Assert.Equal("5000", document.Root?.Element("MaxResults")?.Value);
+            var listed = Assert.Single(document.Descendants("Blob"));
+            Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/folder/a%20b.txt",
+                listed.Element("Url")?.Value);
+            Assert.NotNull(listed.Element("LastModified"));
+            Assert.Equal("15", listed.Element("Size")?.Value);
+            Assert.Equal("text/plain", listed.Element("ContentType")?.Value);
+            Assert.Equal("gzip", listed.Element("ContentEncoding")?.Value);
+            Assert.Null(listed.Element("Properties"));
+            Assert.Null(listed.Element("BlobType"));
+        }
+
+        using (var transitionalBlobs = await SendHistoricalBlobListAsync(
+            transport, containerSasUri, "2009-09-19", "prefix=folder/").ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, transitionalBlobs.StatusCode);
+            var document = System.Xml.Linq.XDocument.Parse(
+                await transitionalBlobs.Content.ReadAsStringAsync().ConfigureAwait(false));
+            var listed = Assert.Single(document.Descendants("Blob"));
+            Assert.NotNull(listed.Element("Url"));
+            Assert.NotNull(listed.Element("Properties")?.Element("Last-Modified"));
+            Assert.Equal("BlockBlob", listed.Element("Properties")?.Element("BlobType")?.Value);
+            Assert.Equal("unlocked", listed.Element("Properties")?.Element("LeaseStatus")?.Value);
+        }
+
+        using var modernBlobs = await SendHistoricalBlobListAsync(
+            transport, containerSasUri, "2013-08-15", "prefix=folder/").ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, modernBlobs.StatusCode);
+        var modernDocument = System.Xml.Linq.XDocument.Parse(
+            await modernBlobs.Content.ReadAsStringAsync().ConfigureAwait(false));
+        Assert.Equal($"http://{SavaWebApplicationFactory.AccountName}.localhost/",
+            modernDocument.Root?.Attribute("ServiceEndpoint")?.Value);
+        Assert.Equal(containerName, modernDocument.Root?.Attribute("ContainerName")?.Value);
+        Assert.Null(Assert.Single(modernDocument.Descendants("Blob")).Element("Url"));
+    }
+
+    private static async Task AssertInvalidHistoricalListingsAsync(
+        HttpClient transport,
+        Uri serviceSasUri,
+        Uri containerSasUri)
+    {
+        using (var oldDeletedContainers = await SendHistoricalContainerListAsync(
+            transport, serviceSasUri, "2019-07-07", "include=deleted").ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, oldDeletedContainers.StatusCode);
+            Assert.Equal("FeatureVersionMismatch",
+                oldDeletedContainers.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var oldCopyListing = await SendHistoricalBlobListAsync(
+            transport, containerSasUri, "2011-08-18", "include=copy").ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, oldCopyListing.StatusCode);
+            await AssertVersionedErrorAsync(oldCopyListing, "FeatureVersionMismatch").ConfigureAwait(false);
+        }
+        using var unknownListing = await SendHistoricalBlobListAsync(
+            transport, containerSasUri, "2023-11-03", "include=unknown").ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.BadRequest, unknownListing.StatusCode);
+        Assert.Equal("InvalidQueryParameterValue", unknownListing.Headers.GetValues("x-ms-error-code").Single());
+    }
+
     private static async Task<BlobClient> CreateVersionedListingBlobAsync(
         MetadataStore metadata, BlobContainerClient container)
     {
@@ -5887,39 +6098,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         });
         try
         {
-            var service = CreateClient(application);
-            var containerName = $"listing-{Guid.NewGuid():N}";
-            var container = service.GetBlobContainerClient(containerName);
-            await container.CreateAsync(
-                PublicAccessType.Blob,
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["purpose"] = "listing" });
-            await container.GetBlobClient("folder/a b.txt").UploadAsync(
-                BinaryData.FromString("listing payload"),
-                new BlobUploadOptions
-                {
-                    HttpHeaders = new BlobHttpHeaders
-                    {
-                        ContentType = "text/plain",
-                        ContentEncoding = "gzip"
-                    }
-                });
-            await container.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(60));
-
-            var metadata = application.Services.GetRequiredService<MetadataStore>();
-            var serviceProperties = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                serviceProperties with
-                {
-                    ContainerSoftDeleteEnabled = true,
-                    ContainerSoftDeleteRetentionDays = 7
-                },
-                CancellationToken.None);
-            var deletedContainer = service.GetBlobContainerClient($"deleted-{Guid.NewGuid():N}");
-            await deletedContainer.CreateAsync();
-            await deletedContainer.DeleteAsync();
+            var (container, deletedContainer) = await CreateHistoricalListingFixtureAsync(application);
 
             var credential = new StorageSharedKeyCredential(
                 SavaWebApplicationFactory.AccountName,
@@ -5941,149 +6120,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 DateTimeOffset.UtcNow.AddMinutes(10));
             using var transport = new HttpClient(application.Server.CreateHandler());
 
-            async Task<HttpResponseMessage> ListContainersAsync(string version, string query)
-            {
-                using var request = new HttpRequestMessage(
-                    HttpMethod.Get,
-                    AppendQuery(serviceSasUri, $"comp=list&{query}"));
-                request.Headers.TryAddWithoutValidation("x-ms-version", version);
-                return await transport.SendAsync(request).ConfigureAwait(false);
-            }
+            await AssertModernContainerListingAsync(transport, serviceSasUri, container.Name, deletedContainer.Name);
 
-            async Task<HttpResponseMessage> ListBlobsAsync(string version, string query)
-            {
-                using var request = new HttpRequestMessage(
-                    HttpMethod.Get,
-                    AppendQuery(containerSasUri, $"restype=container&comp=list&{query}"));
-                request.Headers.TryAddWithoutValidation("x-ms-version", version);
-                return await transport.SendAsync(request).ConfigureAwait(false);
-            }
+            await AssertLegacyContainerListingsAsync(transport, serviceSasUri, container.Name);
 
-            using (var modernContainers = await ListContainersAsync(
-                       "2019-12-12",
-                       "include=metadata,deleted&maxresults=6000"))
-            {
-                Assert.Equal(HttpStatusCode.OK, modernContainers.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(
-                    await modernContainers.Content.ReadAsStringAsync());
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/",
-                    document.Root?.Attribute("ServiceEndpoint")?.Value);
-                Assert.Null(document.Root?.Attribute("AccountName"));
-                Assert.Equal("5000", document.Root?.Element("MaxResults")?.Value);
+            await AssertHistoricalBlobListingsAsync(transport, containerSasUri, container.Name);
 
-                var active = document.Descendants("Container")
-                    .Single(item => string.Equals(item.Element("Name")?.Value, containerName, StringComparison.Ordinal));
-                Assert.Null(active.Element("Url"));
-                Assert.Null(active.Element("Deleted"));
-                Assert.Equal("blob", active.Element("Properties")?.Element("PublicAccess")?.Value);
-                Assert.Equal("locked", active.Element("Properties")?.Element("LeaseStatus")?.Value);
-                Assert.Equal("leased", active.Element("Properties")?.Element("LeaseState")?.Value);
-                Assert.Equal("fixed", active.Element("Properties")?.Element("LeaseDuration")?.Value);
-                Assert.Equal("false", active.Element("Properties")?.Element("HasImmutabilityPolicy")?.Value);
-                Assert.Equal("false", active.Element("Properties")?.Element("HasLegalHold")?.Value);
-                Assert.Equal("listing", active.Element("Metadata")?.Element("purpose")?.Value);
-
-                var deleted = document.Descendants("Container")
-                    .Single(item => string.Equals(item.Element("Name")?.Value, deletedContainer.Name, StringComparison.Ordinal));
-                Assert.Equal("true", deleted.Element("Deleted")?.Value);
-                Assert.NotEmpty(Assert.IsType<string>(deleted.Element("Version")?.Value));
-                Assert.Null(deleted.Element("Properties")?.Element("Deleted"));
-                Assert.NotNull(deleted.Element("Properties")?.Element("DeletedTime"));
-                Assert.NotNull(deleted.Element("Properties")?.Element("RemainingRetentionDays"));
-                Assert.Null(deleted.Element("Properties")?.Element("LeaseStatus"));
-            }
-
-            using (var legacyContainers = await ListContainersAsync("2012-02-12", "prefix=listing-&maxresults=1"))
-            {
-                Assert.Equal(HttpStatusCode.OK, legacyContainers.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(
-                    await legacyContainers.Content.ReadAsStringAsync());
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/",
-                    document.Root?.Attribute("AccountName")?.Value);
-                Assert.Null(document.Root?.Attribute("ServiceEndpoint"));
-                var listed = Assert.Single(document.Descendants("Container"));
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}",
-                    listed.Element("Url")?.Value);
-                Assert.NotNull(listed.Element("Properties")?.Element("Last-Modified"));
-                Assert.NotNull(listed.Element("Properties")?.Element("LeaseState"));
-                Assert.Null(listed.Element("Properties")?.Element("PublicAccess"));
-            }
-
-            using (var oldestContainers = await ListContainersAsync("2008-10-27", "prefix=listing-&maxresults=1"))
-            {
-                Assert.Equal(HttpStatusCode.OK, oldestContainers.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(
-                    await oldestContainers.Content.ReadAsStringAsync());
-                var properties = Assert.Single(document.Descendants("Container")).Element("Properties");
-                Assert.NotNull(properties?.Element("LastModified"));
-                Assert.Null(properties?.Element("Last-Modified"));
-                Assert.DoesNotContain('"', Assert.IsType<string>(properties?.Element("Etag")?.Value));
-                Assert.Null(properties?.Element("LeaseStatus"));
-            }
-
-            using (var oldestBlobs = await ListBlobsAsync("2008-10-27", "prefix=folder/&maxresults=6001"))
-            {
-                Assert.Equal(HttpStatusCode.OK, oldestBlobs.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(await oldestBlobs.Content.ReadAsStringAsync());
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}",
-                    document.Root?.Attribute("ContainerName")?.Value);
-                Assert.Null(document.Root?.Attribute("ServiceEndpoint"));
-                Assert.Equal("5000", document.Root?.Element("MaxResults")?.Value);
-                var listed = Assert.Single(document.Descendants("Blob"));
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/folder/a%20b.txt",
-                    listed.Element("Url")?.Value);
-                Assert.NotNull(listed.Element("LastModified"));
-                Assert.Equal("15", listed.Element("Size")?.Value);
-                Assert.Equal("text/plain", listed.Element("ContentType")?.Value);
-                Assert.Equal("gzip", listed.Element("ContentEncoding")?.Value);
-                Assert.Null(listed.Element("Properties"));
-                Assert.Null(listed.Element("BlobType"));
-            }
-
-            using (var transitionalBlobs = await ListBlobsAsync("2009-09-19", "prefix=folder/"))
-            {
-                Assert.Equal(HttpStatusCode.OK, transitionalBlobs.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(await transitionalBlobs.Content.ReadAsStringAsync());
-                var listed = Assert.Single(document.Descendants("Blob"));
-                Assert.NotNull(listed.Element("Url"));
-                Assert.NotNull(listed.Element("Properties")?.Element("Last-Modified"));
-                Assert.Equal("BlockBlob", listed.Element("Properties")?.Element("BlobType")?.Value);
-                Assert.Equal("unlocked", listed.Element("Properties")?.Element("LeaseStatus")?.Value);
-            }
-
-            using (var modernBlobs = await ListBlobsAsync("2013-08-15", "prefix=folder/"))
-            {
-                Assert.Equal(HttpStatusCode.OK, modernBlobs.StatusCode);
-                var document = System.Xml.Linq.XDocument.Parse(await modernBlobs.Content.ReadAsStringAsync());
-                Assert.Equal(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/",
-                    document.Root?.Attribute("ServiceEndpoint")?.Value);
-                Assert.Equal(containerName, document.Root?.Attribute("ContainerName")?.Value);
-                Assert.Null(Assert.Single(document.Descendants("Blob")).Element("Url"));
-            }
-
-            using (var oldDeletedContainers = await ListContainersAsync("2019-07-07", "include=deleted"))
-            {
-                Assert.Equal(HttpStatusCode.Conflict, oldDeletedContainers.StatusCode);
-                Assert.Equal(
-                    "FeatureVersionMismatch",
-                    oldDeletedContainers.Headers.GetValues("x-ms-error-code").Single());
-            }
-            using (var oldCopyListing = await ListBlobsAsync("2011-08-18", "include=copy"))
-            {
-                Assert.Equal(HttpStatusCode.Conflict, oldCopyListing.StatusCode);
-                await AssertVersionedErrorAsync(oldCopyListing, "FeatureVersionMismatch");
-            }
-            using (var unknownListing = await ListBlobsAsync("2023-11-03", "include=unknown"))
-            {
-                Assert.Equal(HttpStatusCode.BadRequest, unknownListing.StatusCode);
-                Assert.Equal("InvalidQueryParameterValue", unknownListing.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertInvalidHistoricalListingsAsync(transport, serviceSasUri, containerSasUri);
         }
         finally
         {
