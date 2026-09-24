@@ -51,7 +51,7 @@ public sealed class StorageAccountModeContinuityTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
             if (Directory.Exists(backupPath))
                 Directory.Delete(backupPath, recursive: true);
             if (Directory.Exists(restoredPath))
@@ -94,7 +94,7 @@ public sealed class StorageAccountModeContinuityTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 
