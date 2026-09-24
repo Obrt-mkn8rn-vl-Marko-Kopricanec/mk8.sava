@@ -25,6 +25,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private readonly IStorageAnalyticsSink? _analyticsSink;
     private readonly bool _disableMaintenance;
     private readonly bool _deleteDataPath;
+    private StoragePaths? _storagePaths;
 
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
@@ -258,12 +259,18 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public Task InitializeAsync()
     {
         _ = Server;
+        _storagePaths = Services.GetRequiredService<StoragePaths>();
         return Task.CompletedTask;
     }
 
-    public new async Task DisposeAsync()
+    Task IAsyncLifetime.DisposeAsync() => DisposeAsync().AsTask();
+
+    public override async ValueTask DisposeAsync()
     {
         await base.DisposeAsync().ConfigureAwait(false);
+        // The test root is removed immediately below; explicitly release its
+        // lease even if a host implementation defers singleton disposal.
+        _storagePaths?.Dispose();
         if (_deleteDataPath && Directory.Exists(DataPath))
             Directory.Delete(DataPath, recursive: true);
     }

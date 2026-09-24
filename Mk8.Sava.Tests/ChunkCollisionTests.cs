@@ -26,7 +26,7 @@ public sealed class ChunkCollisionTests
         await using var applicationDisposal1 = application.ConfigureAwait(false);
         await application.InitializeAsync();
         var services = application.Services;
-        var chunks = CreateCollisionStore(services);
+        using var chunks = CreateCollisionStore(services);
         var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
         var firstBytes = new byte[1024];
         var secondBytes = new byte[1024];

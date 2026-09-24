@@ -195,6 +195,10 @@ public sealed class AzuriteDifferentialTests
             Assert.Equal(expected, actual);
             Assert.Equal(412, expected.OnlyWithoutLeaseStatus);
             Assert.Equal("LeaseIdMissing", expected.OnlyWithoutLeaseCode);
+            Assert.Equal(412, expected.OnlyWithWrongLeaseStatus);
+            Assert.Equal("LeaseIdMismatchWithBlobOperation", expected.OnlyWithWrongLeaseCode);
+            Assert.Equal("leased payload", expected.BaseBeforeOnly);
+            Assert.Equal("leased payload", expected.SnapshotBeforeOnly);
             Assert.Equal(202, expected.OnlyWithLeaseStatus);
             Assert.Equal("leased payload", expected.BaseAfterOnly);
             Assert.False(expected.SnapshotAfterOnly);
@@ -1428,6 +1432,11 @@ public sealed class AzuriteDifferentialTests
         var condition = new BlobRequestConditions { LeaseId = leaseId };
         var onlyWithoutLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
             blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots)).ConfigureAwait(false);
+        var onlyWithWrongLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString("D") })).ConfigureAwait(false);
+        var baseBeforeOnly = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var snapshotBeforeOnly = (await snapshot.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
         var onlyWithLease = await blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots, condition)
             .ConfigureAwait(false);
         var baseAfterOnly = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
@@ -1438,6 +1447,8 @@ public sealed class AzuriteDifferentialTests
         var baseAfterDelete = (await blob.ExistsAsync().ConfigureAwait(false)).Value;
         return new LeasedSnapshotDeleteObservation(
             onlyWithoutLease.Status, onlyWithoutLease.ErrorCode,
+            onlyWithWrongLease.Status, onlyWithWrongLease.ErrorCode,
+            baseBeforeOnly, snapshotBeforeOnly,
             onlyWithLease.Status, baseAfterOnly, snapshotAfterOnly,
             baseWithoutLease.Status, baseWithoutLease.ErrorCode,
             baseWithLease.Status, baseAfterDelete);
@@ -1526,6 +1537,8 @@ public sealed class AzuriteDifferentialTests
 
     private sealed record LeasedSnapshotDeleteObservation(
         int OnlyWithoutLeaseStatus, string? OnlyWithoutLeaseCode,
+        int OnlyWithWrongLeaseStatus, string? OnlyWithWrongLeaseCode,
+        string BaseBeforeOnly, string SnapshotBeforeOnly,
         int OnlyWithLeaseStatus, string BaseAfterOnly, bool SnapshotAfterOnly,
         int BaseWithoutLeaseStatus, string? BaseWithoutLeaseCode,
         int BaseWithLeaseStatus, bool BaseAfterDelete);
