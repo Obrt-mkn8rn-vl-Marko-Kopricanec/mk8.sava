@@ -1910,7 +1910,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
                          ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         var publicSource = SanitizeCopySource(copySource);
-        var resolvedSource = ResolveInternalCopySource(http.Request, request, copySource);
+        var resolvedSource = ResolveInternalCopySource(
+            http.Request, request, copySource, allowSasCrossAccount: true);
         BlobRecord copied;
         if (resolvedSource is not null)
         {
@@ -3653,7 +3654,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static ResolvedInternalCopySource? ResolveInternalCopySource(
         HttpRequest destination,
         StorageRequestContext destinationRequest,
-        string sourceValue)
+        string sourceValue,
+        bool allowSasCrossAccount = false)
     {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
@@ -3677,13 +3679,15 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             offset = 1;
         }
 
-        if (!string.Equals(account, destinationRequest.Account, StringComparison.Ordinal))
-            return null;
-
         var (container, name) = StorageResourcePath.ResolveBlob(segments, offset);
         if (string.IsNullOrEmpty(container) || string.IsNullOrEmpty(name))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         var query = QueryHelpers.ParseQuery(sourceUri.Query);
+        if (!string.Equals(account, destinationRequest.Account, StringComparison.Ordinal) &&
+            (!allowSasCrossAccount || !query.ContainsKey("sig") ||
+             !string.Equals(sourceUri.Scheme, destination.Scheme, StringComparison.OrdinalIgnoreCase) ||
+             !string.Equals(sourceUri.Authority, destination.Host.Value, StringComparison.OrdinalIgnoreCase)))
+            return null;
         return new ResolvedInternalCopySource(
             sourceUri,
             account,
