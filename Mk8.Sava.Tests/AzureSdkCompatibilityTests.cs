@@ -6685,6 +6685,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             CancellationToken.None);
         var container = service.GetBlobContainerClient($"permanent-delete-{Guid.NewGuid():N}");
         await container.CreateAsync();
+        var propertiesUri = CreatePermanentDeletePropertiesUri();
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        try
+        {
+            await AssertPermanentDeletePropertiesAsync(transport, propertiesUri, metadata);
+
+            var (blob, snapshot, snapshotId) = await CreateSoftDeletedSnapshotAsync(container, metadata);
+
+            var (permanentUri, activeSnapshot) = await AssertPermanentDeleteGuardsAsync(transport, blob, snapshot);
+
+            await AssertDisabledPermanentDeleteAsync(
+                transport, propertiesUri, permanentUri, metadata, container, blob, snapshotId);
+            await AssertPermanentSnapshotPurgeAsync(
+                transport, propertiesUri, permanentUri, metadata, container, blob, snapshot, snapshotId, activeSnapshot);
+        }
+        finally
+        {
+            await metadata.PutServicePropertiesAsync(
+                SavaWebApplicationFactory.AccountName,
+                original,
+                CancellationToken.None);
+        }
+    }
+
+    private static Uri CreatePermanentDeletePropertiesUri()
+    {
         var credential = new StorageSharedKeyCredential(
             SavaWebApplicationFactory.AccountName,
             SavaWebApplicationFactory.AccountKey);
@@ -6697,209 +6724,226 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Protocol = SasProtocol.HttpsAndHttp
         };
         accountSas.SetPermissions(AccountSasPermissions.Read | AccountSasPermissions.Write);
-        var propertiesUri = new Uri(
+        return new Uri(
             $"http://{SavaWebApplicationFactory.AccountName}.localhost/" +
             $"?restype=service&comp=properties&{accountSas.ToSasQueryParameters(credential)}");
-        using var transport = new HttpClient(factory.Server.CreateHandler());
+    }
 
-        async Task SetPermanentDeleteAsync(bool enabled)
+    private static async Task SetPermanentDeleteAsync(HttpClient transport, Uri propertiesUri, bool enabled)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
-            {
-                Content = new StringContent(
-                    $"""
-                    <StorageServiceProperties>
-                      <DeleteRetentionPolicy>
-                        <Enabled>true</Enabled>
-                        <Days>7</Days>
-                        <AllowPermanentDelete>{(enabled ? "true" : "false")}</AllowPermanentDelete>
-                      </DeleteRetentionPolicy>
-                    </StorageServiceProperties>
-                    """,
-                    Encoding.UTF8,
-                    "application/xml")
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(request).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Content = new StringContent(
+                $"""
+                <StorageServiceProperties>
+                  <DeleteRetentionPolicy>
+                    <Enabled>true</Enabled>
+                    <Days>7</Days>
+                    <AllowPermanentDelete>{(enabled ? "true" : "false")}</AllowPermanentDelete>
+                  </DeleteRetentionPolicy>
+                </StorageServiceProperties>
+                """,
+                Encoding.UTF8,
+                "application/xml")
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+    }
+
+    private static async Task AssertOldPermanentDeleteSettingAsync(HttpClient transport, Uri propertiesUri)
+    {
+        using var oldSetting = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
+        {
+            Content = new StringContent(
+                """
+                <StorageServiceProperties>
+                  <DeleteRetentionPolicy>
+                    <Enabled>true</Enabled>
+                    <Days>7</Days>
+                    <AllowPermanentDelete>true</AllowPermanentDelete>
+                  </DeleteRetentionPolicy>
+                </StorageServiceProperties>
+                """,
+                Encoding.UTF8,
+                "application/xml")
+        };
+        oldSetting.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+        using var response = await transport.SendAsync(oldSetting).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+    }
+
+    private static async Task AssertPermanentDeletePropertiesAsync(
+        HttpClient transport,
+        Uri propertiesUri,
+        MetadataStore metadata)
+    {
+        await AssertOldPermanentDeleteSettingAsync(transport, propertiesUri).ConfigureAwait(false);
+        await SetPermanentDeleteAsync(transport, propertiesUri, enabled: true).ConfigureAwait(false);
+        var roundTrip = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.True(roundTrip.BlobSoftDeleteEnabled);
+        Assert.Equal(7, roundTrip.BlobSoftDeleteRetentionDays);
+        Assert.True(roundTrip.BlobPermanentDeleteEnabled);
+        using (var propertiesRequest = new HttpRequestMessage(HttpMethod.Get, propertiesUri))
+        {
+            propertiesRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(propertiesRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Contains("<AllowPermanentDelete>true</AllowPermanentDelete>",
+                await response.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+        }
+        using var oldPropertiesRequest = new HttpRequestMessage(HttpMethod.Get, propertiesUri);
+        oldPropertiesRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+        using var oldResponse = await transport.SendAsync(oldPropertiesRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, oldResponse.StatusCode);
+        Assert.DoesNotContain("<AllowPermanentDelete>",
+            await oldResponse.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+    }
+
+    private static async Task<(BlobClient Blob, BlobClient Snapshot, string SnapshotId)>
+        CreateSoftDeletedSnapshotAsync(BlobContainerClient container, MetadataStore metadata)
+    {
+        var blob = container.GetBlobClient("purge.txt");
+        await blob.UploadAsync(BinaryData.FromString("retained snapshot")).ConfigureAwait(false);
+        var snapshotId = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var snapshot = blob.WithSnapshot(snapshotId);
+        var softDelete = await snapshot.DeleteAsync().ConfigureAwait(false);
+        Assert.True(softDelete.Headers.TryGetValue("x-ms-delete-type-permanent", out var softDeleteHeader));
+        Assert.Equal("false", softDeleteHeader);
+        var deletedSnapshot = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: snapshotId,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.True(deletedSnapshot?.IsDeleted);
+        return (blob, snapshot, snapshotId);
+    }
+
+    private static async Task<(Uri PermanentUri, BlobClient ActiveSnapshot)> AssertPermanentDeleteGuardsAsync(
+        HttpClient transport,
+        BlobClient blob,
+        BlobClient snapshot)
+    {
+        using (var denied = new HttpRequestMessage(
+            HttpMethod.Delete,
+            AppendQuery(
+                snapshot.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "deletetype=permanent")))
+        {
+            denied.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(denied).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
         }
 
-        try
+        var permanentUri = AppendQuery(
+            snapshot.GenerateSasUri(BlobSasPermissions.PermanentDelete, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "deletetype=permanent");
+        using (var oldVersion = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
         {
-            using (var oldSetting = new HttpRequestMessage(HttpMethod.Put, propertiesUri)
-            {
-                Content = new StringContent(
-                    """
-                    <StorageServiceProperties>
-                      <DeleteRetentionPolicy>
-                        <Enabled>true</Enabled>
-                        <Days>7</Days>
-                        <AllowPermanentDelete>true</AllowPermanentDelete>
-                      </DeleteRetentionPolicy>
-                    </StorageServiceProperties>
-                    """,
-                    Encoding.UTF8,
-                    "application/xml")
-            })
-            {
-                oldSetting.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
-                using var response = await transport.SendAsync(oldSetting);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
-            }
+            oldVersion.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            using var response = await transport.SendAsync(oldVersion).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+        }
 
-            await SetPermanentDeleteAsync(enabled: true);
-            var roundTrip = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            Assert.True(roundTrip.BlobSoftDeleteEnabled);
-            Assert.Equal(7, roundTrip.BlobSoftDeleteRetentionDays);
-            Assert.True(roundTrip.BlobPermanentDeleteEnabled);
-            using (var propertiesRequest = new HttpRequestMessage(HttpMethod.Get, propertiesUri))
-            {
-                propertiesRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(propertiesRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Contains(
-                    "<AllowPermanentDelete>true</AllowPermanentDelete>",
-                    await response.Content.ReadAsStringAsync(),
-                    StringComparison.Ordinal);
-            }
-            using (var oldPropertiesRequest = new HttpRequestMessage(HttpMethod.Get, propertiesUri))
-            {
-                oldPropertiesRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
-                using var response = await transport.SendAsync(oldPropertiesRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.DoesNotContain(
-                    "<AllowPermanentDelete>",
-                    await response.Content.ReadAsStringAsync(),
-                    StringComparison.Ordinal);
-            }
+        using (var rootDelete = new HttpRequestMessage(
+            HttpMethod.Delete,
+            AppendQuery(
+                blob.GenerateSasUri(BlobSasPermissions.PermanentDelete, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "deletetype=permanent")))
+        {
+            rootDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(rootDelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("PermanentDeleteNotSupportedOnRootBlob",
+                response.Headers.GetValues("x-ms-error-code").Single());
+        }
 
-            var blob = container.GetBlobClient("purge.txt");
-            await blob.UploadAsync(BinaryData.FromString("retained snapshot"));
-            var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
-            var snapshot = blob.WithSnapshot(snapshotId);
-            var softDelete = await snapshot.DeleteAsync();
-            Assert.True(softDelete.Headers.TryGetValue("x-ms-delete-type-permanent", out var softDeleteHeader));
-            Assert.Equal("false", softDeleteHeader);
+        var activeSnapshotId = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var activeSnapshot = blob.WithSnapshot(activeSnapshotId);
+        using var activeDelete = new HttpRequestMessage(
+            HttpMethod.Delete,
+            AppendQuery(
+                activeSnapshot.GenerateSasUri(BlobSasPermissions.PermanentDelete, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "deletetype=permanent"));
+        activeDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var activeResponse = await transport.SendAsync(activeDelete).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, activeResponse.StatusCode);
+        return (permanentUri, activeSnapshot);
+    }
 
-            var deletedSnapshot = await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                blob.Name,
-                versionId: null,
-                snapshot: snapshotId,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.True(deletedSnapshot?.IsDeleted);
+    private static async Task AssertDisabledPermanentDeleteAsync(
+        HttpClient transport,
+        Uri propertiesUri,
+        Uri permanentUri,
+        MetadataStore metadata,
+        BlobContainerClient container,
+        BlobClient blob,
+        string snapshotId)
+    {
+        await SetPermanentDeleteAsync(transport, propertiesUri, enabled: false).ConfigureAwait(false);
+        using (var disabledDelete = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
+        {
+            disabledDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(disabledDelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        }
+        Assert.NotNull(await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: snapshotId,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false));
+    }
 
-            using (var denied = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       AppendQuery(
-                           snapshot.GenerateSasUri(BlobSasPermissions.Delete, DateTimeOffset.UtcNow.AddMinutes(5)),
-                           "deletetype=permanent")))
-            {
-                denied.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(denied);
-                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            }
-
-            var permanentUri = AppendQuery(
+    private static async Task AssertPermanentSnapshotPurgeAsync(
+        HttpClient transport,
+        Uri propertiesUri,
+        Uri permanentUri,
+        MetadataStore metadata,
+        BlobContainerClient container,
+        BlobClient blob,
+        BlobClient snapshot,
+        string snapshotId,
+        BlobClient activeSnapshot)
+    {
+        await SetPermanentDeleteAsync(transport, propertiesUri, enabled: true).ConfigureAwait(false);
+        using (var invalidDeleteType = new HttpRequestMessage(
+            HttpMethod.Delete,
+            AppendQuery(
                 snapshot.GenerateSasUri(BlobSasPermissions.PermanentDelete, DateTimeOffset.UtcNow.AddMinutes(5)),
-                "deletetype=permanent");
-            using (var oldVersion = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
-            {
-                oldVersion.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
-                using var response = await transport.SendAsync(oldVersion);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            using (var rootDelete = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       AppendQuery(
-                           blob.GenerateSasUri(BlobSasPermissions.PermanentDelete, DateTimeOffset.UtcNow.AddMinutes(5)),
-                           "deletetype=permanent")))
-            {
-                rootDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(rootDelete);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal(
-                    "PermanentDeleteNotSupportedOnRootBlob",
-                    response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            var activeSnapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
-            var activeSnapshot = blob.WithSnapshot(activeSnapshotId);
-            using (var activeDelete = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       AppendQuery(
-                           activeSnapshot.GenerateSasUri(
-                               BlobSasPermissions.PermanentDelete,
-                               DateTimeOffset.UtcNow.AddMinutes(5)),
-                           "deletetype=permanent")))
-            {
-                activeDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(activeDelete);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            }
-
-            await SetPermanentDeleteAsync(enabled: false);
-            using (var disabledDelete = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
-            {
-                disabledDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(disabledDelete);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            }
-            Assert.NotNull(await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                blob.Name,
-                versionId: null,
-                snapshot: snapshotId,
-                includeDeleted: true,
-                CancellationToken.None));
-
-            await SetPermanentDeleteAsync(enabled: true);
-            using (var invalidDeleteType = new HttpRequestMessage(
-                       HttpMethod.Delete,
-                       AppendQuery(
-                           snapshot.GenerateSasUri(
-                               BlobSasPermissions.PermanentDelete,
-                               DateTimeOffset.UtcNow.AddMinutes(5)),
-                           "deletetype=Permanent")))
-            {
-                invalidDeleteType.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(invalidDeleteType);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidQueryParameterValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            using (var permanentDelete = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
-            {
-                permanentDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(permanentDelete);
-                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-                Assert.Equal("true", response.Headers.GetValues("x-ms-delete-type-permanent").Single());
-            }
-            Assert.Null(await metadata.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                blob.Name,
-                versionId: null,
-                snapshot: snapshotId,
-                includeDeleted: true,
-                CancellationToken.None));
-            Assert.True((await activeSnapshot.ExistsAsync()).Value);
-        }
-        finally
+                "deletetype=Permanent")))
         {
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                original,
-                CancellationToken.None);
+            invalidDeleteType.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(invalidDeleteType).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidQueryParameterValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
+
+        using (var permanentDelete = new HttpRequestMessage(HttpMethod.Delete, permanentUri))
+        {
+            permanentDelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(permanentDelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.Equal("true", response.Headers.GetValues("x-ms-delete-type-permanent").Single());
+        }
+        Assert.Null(await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            blob.Name,
+            versionId: null,
+            snapshot: snapshotId,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false));
+        Assert.True((await activeSnapshot.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
