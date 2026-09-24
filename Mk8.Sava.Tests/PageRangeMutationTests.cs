@@ -1,8 +1,11 @@
+using Azure;
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
+using Microsoft.Extensions.DependencyInjection;
+using Mk8.Sava.Storage;
 using System.Net;
 
 namespace Mk8.Sava.Tests;
@@ -178,6 +181,114 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
             .ConfigureAwait(true);
         await AssertPageDiffVersionAsync(transport, pageList, "2019-07-07", previousUrl, HttpStatusCode.OK)
             .ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task PageDiffPaginationPreservesAddressOrderAcrossUpdatedAndClearedRanges()
+    {
+        var container = CreateClient(application).GetBlobContainerClient($"paged-page-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        var page = container.GetPageBlobClient("disk.vhd");
+        await page.CreateAsync(2048).ConfigureAwait(true);
+        var original = new byte[2048];
+        await page.UploadPagesAsync(new MemoryStream(original), 0).ConfigureAwait(true);
+        var snapshot = (await page.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        await page.ClearPagesAsync(new HttpRange(512, 512)).ConfigureAwait(true);
+        await page.ClearPagesAsync(new HttpRange(1536, 512)).ConfigureAwait(true);
+        await page.UploadPagesAsync(new MemoryStream(original[..512]), 0).ConfigureAwait(true);
+        await page.UploadPagesAsync(new MemoryStream(original[..512]), 1024).ConfigureAwait(true);
+
+        var pageSas = page.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var listUri = new Uri($"{pageSas}&comp=pagelist&prevsnapshot={Uri.EscapeDataString(snapshot)}");
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        var unpaged = await ReadPageListAsync(transport, listUri, "2023-11-03").ConfigureAwait(true);
+        Assert.Equal(new[] { "PageRange:0", "ClearRange:512", "PageRange:1024", "ClearRange:1536" },
+            DescribePageRanges(unpaged));
+
+        var firstPage = await ReadPageListAsync(
+            transport, new Uri($"{listUri}&maxresults=3"), "2023-11-03").ConfigureAwait(true);
+        Assert.Equal(new[] { "PageRange:0", "ClearRange:512", "PageRange:1024" },
+            DescribePageRanges(firstPage));
+        Assert.Equal("3", firstPage.Root?.Element("NextMarker")?.Value);
+
+        var lastPage = await ReadPageListAsync(
+            transport, new Uri($"{listUri}&maxresults=3&marker=3"), "2023-11-03").ConfigureAwait(true);
+        Assert.Equal(new[] { "ClearRange:1536" }, DescribePageRanges(lastPage));
+        Assert.Equal(string.Empty, lastPage.Root?.Element("NextMarker")?.Value);
+
+        await AssertPageListStatusAsync(
+            transport, new Uri($"{listUri}&maxresults=1"), "2019-07-07", HttpStatusCode.Conflict)
+            .ConfigureAwait(true);
+        var firstVersionedPage = await ReadPageListAsync(
+            transport, new Uri($"{listUri}&maxresults=1"), "2020-10-02").ConfigureAwait(true);
+        Assert.Equal(new[] { "PageRange:0" }, DescribePageRanges(firstVersionedPage));
+        Assert.Equal("1", firstVersionedPage.Root?.Element("NextMarker")?.Value);
+        await AssertPageListStatusAsync(
+            transport, new Uri($"{listUri}&maxresults=0"), "2023-11-03", HttpStatusCode.BadRequest)
+            .ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task FragmentedPageListCapsResultsAtTenThousandAndContinues()
+    {
+        var container = CreateClient(application).GetBlobContainerClient($"fragmented-page-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        var page = container.GetPageBlobClient("disk.vhd");
+        await page.CreateAsync(10_001L * 1024).ConfigureAwait(true);
+
+        // Seed fragmentation without 10,001 network writes; the public page-list route still reads persisted metadata.
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        var record = await metadata.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            page.Name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None).ConfigureAwait(true);
+        Assert.NotNull(record);
+        var ranges = Enumerable.Range(0, 10_001)
+            .Select(index => new PageRange(index * 1024L, index * 1024L + 511))
+            .ToArray();
+        await metadata.PutBlobRecordAsync(
+            record with { PageRanges = ranges }, record.Revision, CancellationToken.None).ConfigureAwait(true);
+
+        var pageSas = page.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var listUri = new Uri($"{pageSas}&comp=pagelist&maxresults=20000");
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        var firstPage = await ReadPageListAsync(transport, listUri, "2020-10-02").ConfigureAwait(true);
+        Assert.Equal(10_000, DescribePageRanges(firstPage).Length);
+        Assert.Equal("10000", firstPage.Root?.Element("NextMarker")?.Value);
+
+        var lastPage = await ReadPageListAsync(
+            transport, new Uri($"{listUri}&marker=10000"), "2020-10-02").ConfigureAwait(true);
+        Assert.Equal(new[] { "PageRange:10240000" }, DescribePageRanges(lastPage));
+        Assert.Equal(string.Empty, lastPage.Root?.Element("NextMarker")?.Value);
+    }
+
+    private static string[] DescribePageRanges(System.Xml.Linq.XDocument document) =>
+        document.Root!.Elements()
+            .Where(element => !string.Equals(element.Name.LocalName, "NextMarker", StringComparison.Ordinal))
+            .Select(element => $"{element.Name.LocalName}:{element.Element("Start")?.Value}")
+            .ToArray();
+
+    private static async Task<System.Xml.Linq.XDocument> ReadPageListAsync(
+        HttpClient transport, Uri uri, string version)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        using var response = await transport.SendAsync(request).ConfigureAwait(true);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(true));
+    }
+
+    private static async Task AssertPageListStatusAsync(
+        HttpClient transport, Uri uri, string version, HttpStatusCode expectedStatus)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        using var response = await transport.SendAsync(request).ConfigureAwait(true);
+        Assert.Equal(expectedStatus, response.StatusCode);
     }
 
     private static async Task AssertPageDiffVersionAsync(

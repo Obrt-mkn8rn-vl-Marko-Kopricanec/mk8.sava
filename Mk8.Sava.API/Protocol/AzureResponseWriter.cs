@@ -694,23 +694,15 @@ internal static partial class AzureResponseWriter
 
     public static Task WritePageRangesAsync(
         HttpContext context,
-        IReadOnlyList<PageRange> ranges,
-        IReadOnlyList<PageRange> clearRanges,
+        IReadOnlyList<(PageRange Range, bool IsClear)> ranges,
         string? nextMarker,
         CancellationToken cancellationToken) =>
         WriteXmlAsync(context, writer =>
         {
             writer.WriteStartElement("PageList");
-            foreach (var range in ranges)
+            foreach (var (range, isClear) in ranges)
             {
-                writer.WriteStartElement("PageRange");
-                writer.WriteElementString("Start", range.Start.ToString(CultureInfo.InvariantCulture));
-                writer.WriteElementString("End", range.End.ToString(CultureInfo.InvariantCulture));
-                writer.WriteEndElement();
-            }
-            foreach (var range in clearRanges)
-            {
-                writer.WriteStartElement("ClearRange");
+                writer.WriteStartElement(isClear ? "ClearRange" : "PageRange");
                 writer.WriteElementString("Start", range.Start.ToString(CultureInfo.InvariantCulture));
                 writer.WriteElementString("End", range.End.ToString(CultureInfo.InvariantCulture));
                 writer.WriteEndElement();
