@@ -6227,8 +6227,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=0-").ConfigureAwait(false);
         await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=0-1023").ConfigureAwait(false);
         await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=1-511").ConfigureAwait(false);
-        Assert.All((await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray(),
-            value => Assert.Equal(0, value));
+        Assert.All((await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray(), value => Assert.Equal(0, value));
 
         await page.ResizeAsync(2560).ConfigureAwait(false);
         foreach (var offset in new long[] { 0, 1024, 2048 })
@@ -14420,7 +14419,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = service.GetBlobContainerClient($"write-limits-{Guid.NewGuid():N}");
         await container.CreateAsync();
         using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertHistoricalBlockWriteLimitAsync(container, transport, mebibyte);
+        await AssertHistoricalPutBlobLimitAsync(container, transport, mebibyte);
+        var appendUri = await AssertHistoricalAppendWriteLimitAsync(container, transport, mebibyte);
+        var pageUri = await AssertHistoricalPageWriteLimitAsync(container, transport, mebibyte);
+        await AssertHistoricalPageCreateValidationAsync(container, transport);
+        await AssertHistoricalAppendTypeVersionAsync(container, transport);
+        var blockFromUrlUri = await AssertOldBlockFromUrlVersionAsync(container, transport);
+        await AssertOldBlockSourceHeaderVersionsAsync(transport, blockFromUrlUri);
+        await AssertOldAppendAndPageFromUrlVersionsAsync(transport, appendUri, pageUri);
+        await AssertOldPutBlobFromUrlVersionAsync(container, transport);
+    }
 
+    private static async Task AssertHistoricalBlockWriteLimitAsync(
+        BlobContainerClient container, HttpClient transport, int mebibyte)
+    {
         var blockBlob = container.GetBlockBlobClient("blocks.bin");
         var blockSas = blockBlob.GenerateSasUri(
             BlobSasPermissions.Create | BlobSasPermissions.Write,
@@ -14434,7 +14447,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             boundaryBlockRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
-            using var boundaryBlockResponse = await transport.SendAsync(boundaryBlockRequest);
+            using var boundaryBlockResponse = await transport.SendAsync(boundaryBlockRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, boundaryBlockResponse.StatusCode);
         }
 
@@ -14447,13 +14460,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             oversizedBlockRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
-            using var oversizedBlockResponse = await transport.SendAsync(oversizedBlockRequest);
+            using var oversizedBlockResponse = await transport.SendAsync(oversizedBlockRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedBlockResponse.StatusCode);
-            await AssertVersionedErrorAsync(oversizedBlockResponse, "RequestBodyTooLarge");
+            await AssertVersionedErrorAsync(oversizedBlockResponse, "RequestBodyTooLarge").ConfigureAwait(false);
         }
-        var staged = await blockBlob.GetBlockListAsync(BlockListTypes.Uncommitted);
+        var staged = await blockBlob.GetBlockListAsync(BlockListTypes.Uncommitted).ConfigureAwait(false);
         Assert.Equal([firstBlockId], staged.Value.UncommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
+    }
 
+    private static async Task AssertHistoricalPutBlobLimitAsync(
+        BlobContainerClient container, HttpClient transport, int mebibyte)
+    {
         var oversizedPutBlob = container.GetBlobClient("oversized-put.bin");
         using (var oversizedPutRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14466,13 +14483,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             oversizedPutRequest.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
             oversizedPutRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            using var oversizedPutResponse = await transport.SendAsync(oversizedPutRequest);
+            using var oversizedPutResponse = await transport.SendAsync(oversizedPutRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPutResponse.StatusCode);
         }
-        Assert.False((await oversizedPutBlob.ExistsAsync()).Value);
+        Assert.False((await oversizedPutBlob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task<Uri> AssertHistoricalAppendWriteLimitAsync(
+        BlobContainerClient container, HttpClient transport, int mebibyte)
+    {
         var appendBlob = container.GetAppendBlobClient("append.bin");
-        await appendBlob.CreateAsync();
+        await appendBlob.CreateAsync().ConfigureAwait(false);
         var appendUri = new Uri(
             appendBlob.GenerateSasUri(
                 BlobSasPermissions.Add | BlobSasPermissions.Write,
@@ -14483,7 +14504,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             boundaryAppendRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
-            using var boundaryAppendResponse = await transport.SendAsync(boundaryAppendRequest);
+            using var boundaryAppendResponse = await transport.SendAsync(boundaryAppendRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, boundaryAppendResponse.StatusCode);
         }
         using (var oversizedAppendRequest = new HttpRequestMessage(HttpMethod.Put, appendUri)
@@ -14492,13 +14513,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             oversizedAppendRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
-            using var oversizedAppendResponse = await transport.SendAsync(oversizedAppendRequest);
+            using var oversizedAppendResponse = await transport.SendAsync(oversizedAppendRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedAppendResponse.StatusCode);
         }
-        Assert.Equal(4L * mebibyte, (await appendBlob.GetPropertiesAsync()).Value.ContentLength);
+        Assert.Equal(4L * mebibyte,
+            (await appendBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.ContentLength);
+        return appendUri;
+    }
 
+    private static async Task<Uri> AssertHistoricalPageWriteLimitAsync(
+        BlobContainerClient container, HttpClient transport, int mebibyte)
+    {
         var pageBlob = container.GetPageBlobClient("pages.bin");
-        await pageBlob.CreateAsync(8L * mebibyte);
+        await pageBlob.CreateAsync(8L * mebibyte).ConfigureAwait(false);
         var pageUri = new Uri(
             pageBlob.GenerateSasUri(
                 BlobSasPermissions.Write,
@@ -14511,7 +14538,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
             boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
             boundaryPageRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes=0-{4 * mebibyte - 1}");
-            using var boundaryPageResponse = await transport.SendAsync(boundaryPageRequest);
+            using var boundaryPageResponse = await transport.SendAsync(boundaryPageRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, boundaryPageResponse.StatusCode);
         }
         using (var oversizedPageRequest = new HttpRequestMessage(HttpMethod.Put, pageUri)
@@ -14522,12 +14549,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
             oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
             oversizedPageRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes=0-{4 * mebibyte + 511}");
-            using var oversizedPageResponse = await transport.SendAsync(oversizedPageRequest);
+            using var oversizedPageResponse = await transport.SendAsync(oversizedPageRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPageResponse.StatusCode);
         }
-        var pageRanges = await pageBlob.GetPageRangesAsync();
+        var pageRanges = await pageBlob.GetPageRangesAsync().ConfigureAwait(false);
         Assert.Equal([new HttpRange(0, 4L * mebibyte)], pageRanges.Value.PageRanges);
+        return pageUri;
+    }
 
+    private static async Task AssertHistoricalPageCreateValidationAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var oversizedPageBlob = container.GetPageBlobClient("oversized-page.bin");
         using (var oversizedPageCreateRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14543,10 +14575,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oversizedPageCreateRequest.Headers.TryAddWithoutValidation(
                 "x-ms-blob-content-length",
                 (8L * 1024 * 1024 * 1024 * 1024 + 512).ToString(CultureInfo.InvariantCulture));
-            using var oversizedPageCreateResponse = await transport.SendAsync(oversizedPageCreateRequest);
+            using var oversizedPageCreateResponse = await transport.SendAsync(oversizedPageCreateRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.RequestEntityTooLarge, oversizedPageCreateResponse.StatusCode);
         }
-        Assert.False((await oversizedPageBlob.ExistsAsync()).Value);
+        Assert.False((await oversizedPageBlob.ExistsAsync().ConfigureAwait(false)).Value);
 
         var negativeSequenceBlob = container.GetPageBlobClient("negative-sequence.bin");
         using (var negativeSequenceRequest = new HttpRequestMessage(
@@ -14562,11 +14595,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "PageBlob");
             negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
             negativeSequenceRequest.Headers.TryAddWithoutValidation("x-ms-blob-sequence-number", "-1");
-            using var negativeSequenceResponse = await transport.SendAsync(negativeSequenceRequest);
+            using var negativeSequenceResponse = await transport.SendAsync(negativeSequenceRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, negativeSequenceResponse.StatusCode);
         }
-        Assert.False((await negativeSequenceBlob.ExistsAsync()).Value);
+        Assert.False((await negativeSequenceBlob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertHistoricalAppendTypeVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var oldAppendBlob = container.GetAppendBlobClient("old-append.bin");
         using (var oldAppendCreateRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14579,12 +14617,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             oldAppendCreateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
             oldAppendCreateRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "AppendBlob");
-            using var oldAppendCreateResponse = await transport.SendAsync(oldAppendCreateRequest);
+            using var oldAppendCreateResponse = await transport.SendAsync(oldAppendCreateRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldAppendCreateResponse.StatusCode);
-            await AssertVersionedErrorAsync(oldAppendCreateResponse, "FeatureVersionMismatch");
+            await AssertVersionedErrorAsync(oldAppendCreateResponse, "FeatureVersionMismatch")
+                .ConfigureAwait(false);
         }
-        Assert.False((await oldAppendBlob.ExistsAsync()).Value);
+        Assert.False((await oldAppendBlob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task<Uri> AssertOldBlockFromUrlVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         const string unreachableSource = "https://source.invalid/blob";
         var oldUrlBlock = container.GetBlockBlobClient("old-url-block.bin");
         var oldUrlBlockId = Convert.ToBase64String("old-url-block-id"u8);
@@ -14598,7 +14642,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             oldBlockFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
             oldBlockFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
-            using var oldBlockFromUrlResponse = await transport.SendAsync(oldBlockFromUrlRequest);
+            using var oldBlockFromUrlResponse = await transport.SendAsync(oldBlockFromUrlRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldBlockFromUrlResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldBlockFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -14608,12 +14653,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 BlobSasPermissions.Create | BlobSasPermissions.Write,
                 DateTimeOffset.UtcNow.AddMinutes(5)) +
             "&comp=block&blockid=" + Uri.EscapeDataString(oldUrlBlockId));
+        return supportedBlockFromUrlUri;
+    }
+
+    private static async Task AssertOldBlockSourceHeaderVersionsAsync(HttpClient transport, Uri supportedBlockFromUrlUri)
+    {
+        const string unreachableSource = "https://source.invalid/blob";
         using (var oldSourceCrcRequest = new HttpRequestMessage(HttpMethod.Put, supportedBlockFromUrlUri))
         {
             oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-11-09");
             oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
             oldSourceCrcRequest.Headers.TryAddWithoutValidation("x-ms-source-content-crc64", Convert.ToBase64String(new byte[8]));
-            using var oldSourceCrcResponse = await transport.SendAsync(oldSourceCrcRequest);
+            using var oldSourceCrcResponse = await transport.SendAsync(oldSourceCrcRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldSourceCrcResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldSourceCrcResponse.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -14622,7 +14673,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-version", "2020-04-08");
             oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
             oldSourceAuthorizationRequest.Headers.TryAddWithoutValidation("x-ms-copy-source-authorization", "Bearer opaque-token");
-            using var oldSourceAuthorizationResponse = await transport.SendAsync(oldSourceAuthorizationRequest);
+            using var oldSourceAuthorizationResponse = await transport.SendAsync(oldSourceAuthorizationRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldSourceAuthorizationResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldSourceAuthorizationResponse.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -14631,16 +14683,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
             oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
             oldSourceTagConditionRequest.Headers.TryAddWithoutValidation("x-ms-source-if-tags", "\"project\" = 'mk8'");
-            using var oldSourceTagConditionResponse = await transport.SendAsync(oldSourceTagConditionRequest);
+            using var oldSourceTagConditionResponse = await transport.SendAsync(oldSourceTagConditionRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldSourceTagConditionResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldSourceTagConditionResponse.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
+    private static async Task AssertOldAppendAndPageFromUrlVersionsAsync(
+        HttpClient transport, Uri appendUri, Uri pageUri)
+    {
+        const string unreachableSource = "https://source.invalid/blob";
         using (var oldAppendFromUrlRequest = new HttpRequestMessage(HttpMethod.Put, appendUri))
         {
             oldAppendFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
             oldAppendFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
-            using var oldAppendFromUrlResponse = await transport.SendAsync(oldAppendFromUrlRequest);
+            using var oldAppendFromUrlResponse = await transport.SendAsync(oldAppendFromUrlRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldAppendFromUrlResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldAppendFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -14651,11 +14710,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
             oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
             oldPageFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
-            using var oldPageFromUrlResponse = await transport.SendAsync(oldPageFromUrlRequest);
+            using var oldPageFromUrlResponse = await transport.SendAsync(oldPageFromUrlRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldPageFromUrlResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldPageFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
+    private static async Task AssertOldPutBlobFromUrlVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        const string unreachableSource = "https://source.invalid/blob";
         var oldPutBlobFromUrl = container.GetBlockBlobClient("old-put-blob-url.bin");
         using (var oldPutBlobFromUrlRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14666,11 +14731,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
             oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", unreachableSource);
             oldPutBlobFromUrlRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            using var oldPutBlobFromUrlResponse = await transport.SendAsync(oldPutBlobFromUrlRequest);
+            using var oldPutBlobFromUrlResponse = await transport.SendAsync(oldPutBlobFromUrlRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldPutBlobFromUrlResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldPutBlobFromUrlResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await oldPutBlobFromUrl.ExistsAsync()).Value);
+        Assert.False((await oldPutBlobFromUrl.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
@@ -14685,14 +14751,26 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var page = container.GetPageBlobClient("disk.vhd");
         await page.CreateAsync(512);
         using var transport = new HttpClient(factory.Server.CreateHandler());
+        var appendSas = await AssertHistoricalAppendBlobTypeAsync(append, transport);
+        await AssertHistoricalPageBlobTypeAsync(page, container, transport);
+        var containerSas = container.GenerateSasUri(
+            BlobContainerSasPermissions.All,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        await AssertHistoricalListRejectsAsync(containerSas, transport, append.Name, "2014-02-14");
+        await AssertHistoricalListRejectsAsync(containerSas, transport, page.Name, "2009-07-17");
+        await AssertHistoricalCopySourceTypeAsync(container, transport, appendSas);
+    }
 
+    private static async Task<Uri> AssertHistoricalAppendBlobTypeAsync(
+        AppendBlobClient append, HttpClient transport)
+    {
         var appendSas = append.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
         using (var oldRead = new HttpRequestMessage(HttpMethod.Head, appendSas))
         {
             oldRead.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
-            using var response = await transport.SendAsync(oldRead);
+            using var response = await transport.SendAsync(oldRead).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
         }
         using (var oldAppend = new HttpRequestMessage(HttpMethod.Put, AppendQuery(appendSas, "comp=appendblock"))
         {
@@ -14700,9 +14778,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             oldAppend.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
-            using var response = await transport.SendAsync(oldAppend);
+            using var response = await transport.SendAsync(oldAppend).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
         }
         using (var oldOverwrite = new HttpRequestMessage(HttpMethod.Put, appendSas)
         {
@@ -14711,21 +14789,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             oldOverwrite.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
             oldOverwrite.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            using var response = await transport.SendAsync(oldOverwrite);
+            using var response = await transport.SendAsync(oldOverwrite).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
         }
         Assert.Equal(
             "retained append payload",
-            (await append.DownloadContentAsync()).Value.Content.ToString());
+            (await append.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        return appendSas;
+    }
 
+    private static async Task AssertHistoricalPageBlobTypeAsync(
+        PageBlobClient page, BlobContainerClient container, HttpClient transport)
+    {
         var pageSas = page.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
         using (var oldRead = new HttpRequestMessage(HttpMethod.Head, pageSas))
         {
             oldRead.Headers.TryAddWithoutValidation("x-ms-version", "2009-07-17");
-            using var response = await transport.SendAsync(oldRead);
+            using var response = await transport.SendAsync(oldRead).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation")
+                .ConfigureAwait(false);
         }
         using (var oldPageWrite = new HttpRequestMessage(HttpMethod.Put, AppendQuery(pageSas, "comp=page"))
         {
@@ -14735,11 +14819,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldPageWrite.Headers.TryAddWithoutValidation("x-ms-version", "2009-07-17");
             oldPageWrite.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
             oldPageWrite.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
-            using var response = await transport.SendAsync(oldPageWrite);
+            using var response = await transport.SendAsync(oldPageWrite).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation")
+                .ConfigureAwait(false);
         }
-        Assert.All((await page.DownloadContentAsync()).Value.Content.ToArray(), value => Assert.Equal(0, value));
+        Assert.All((await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray(),
+            value => Assert.Equal(0, value));
 
         var oldPageCreate = container.GetPageBlobClient("old-disk.vhd");
         using (var oldCreate = new HttpRequestMessage(
@@ -14754,29 +14840,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldCreate.Headers.TryAddWithoutValidation("x-ms-version", "2009-07-17");
             oldCreate.Headers.TryAddWithoutValidation("x-ms-blob-type", "PageBlob");
             oldCreate.Headers.TryAddWithoutValidation("x-ms-blob-content-length", "512");
-            using var response = await transport.SendAsync(oldCreate);
+            using var response = await transport.SendAsync(oldCreate).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation");
+            await AssertVersionedErrorAsync(response, "InvalidVersionForPageBlobOperation")
+                .ConfigureAwait(false);
         }
-        Assert.False((await oldPageCreate.ExistsAsync()).Value);
+        Assert.False((await oldPageCreate.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
-        var containerSas = container.GenerateSasUri(
-            BlobContainerSasPermissions.All,
-            DateTimeOffset.UtcNow.AddMinutes(5));
-        async Task AssertOldListRejectsAsync(string prefix, string version)
-        {
-            var uri = AppendQuery(
-                containerSas,
-                $"restype=container&comp=list&prefix={Uri.EscapeDataString(prefix)}");
-            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            using var response = await transport.SendAsync(request).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
-        }
-        await AssertOldListRejectsAsync(append.Name, "2014-02-14");
-        await AssertOldListRejectsAsync(page.Name, "2009-07-17");
+    private static async Task AssertHistoricalListRejectsAsync(
+        Uri containerSas, HttpClient transport, string prefix, string version)
+    {
+        var uri = AppendQuery(
+            containerSas,
+            $"restype=container&comp=list&prefix={Uri.EscapeDataString(prefix)}");
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+    }
 
+    private static async Task AssertHistoricalCopySourceTypeAsync(
+        BlobContainerClient container, HttpClient transport, Uri appendSas)
+    {
         var copied = container.GetBlobClient("copied-events.log");
         using (var oldCopy = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14789,11 +14876,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             oldCopy.Headers.TryAddWithoutValidation("x-ms-version", "2014-02-14");
             oldCopy.Headers.TryAddWithoutValidation("x-ms-copy-source", appendSas.ToString());
-            using var response = await transport.SendAsync(oldCopy);
+            using var response = await transport.SendAsync(oldCopy).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
         }
-        Assert.False((await copied.ExistsAsync()).Value);
+        Assert.False((await copied.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
