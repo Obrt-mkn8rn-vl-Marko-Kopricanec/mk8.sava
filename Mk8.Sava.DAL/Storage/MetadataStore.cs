@@ -177,10 +177,27 @@ public sealed partial class MetadataStore(
 
     public void Dispose()
     {
-        using var connection = new SqliteConnection(_connectionString);
-        SqliteConnection.ClearPool(connection);
+        ClearPool(_connectionString);
         _writeGate.Dispose();
         GC.SuppressFinalize(this);
+    }
+
+    internal static void ClearPoolForDatabase(string database)
+    {
+        var connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = database,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Shared,
+            Pooling = true
+        }.ToString();
+        ClearPool(connectionString);
+    }
+
+    private static void ClearPool(string connectionString)
+    {
+        using var connection = new SqliteConnection(connectionString);
+        SqliteConnection.ClearPool(connection);
     }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
