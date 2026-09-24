@@ -68,10 +68,14 @@ public sealed record BlobRecord
     public string? IncrementalCopySource { get; init; }
     public string? IncrementalCopySourceSnapshot { get; init; }
     public DateTimeOffset? IncrementalCopySourceCreatedAt { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? IncrementalCopySourceIncarnationId { get; init; }
     public string? CopyDestinationSnapshot { get; init; }
     public IReadOnlyList<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
     public IReadOnlyList<PageRange> PageRanges { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? PageBlobIncarnationId { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public long PageMutationSequence { get; init; }
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

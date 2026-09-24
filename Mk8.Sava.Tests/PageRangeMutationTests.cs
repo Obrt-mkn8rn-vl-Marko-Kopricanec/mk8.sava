@@ -1,5 +1,6 @@
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 using System.Net;
@@ -103,6 +104,58 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
     }
 
     [Fact]
+    public async Task PageDiffRejectsOverwriteEvenWhenCreationTimeIsUnchanged()
+    {
+        var clock = new FixedTimeProvider(DateTimeOffset.UtcNow);
+        var fixedApplication = new SavaWebApplicationFactory(
+            clock, new Dictionary<string, string?>(StringComparer.Ordinal));
+        await using var fixedApplicationDisposal = fixedApplication.ConfigureAwait(true);
+        var container = CreateClient(fixedApplication).GetBlobContainerClient($"overwrite-page-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        var page = container.GetPageBlobClient("disk.vhd");
+        await page.CreateAsync(512).ConfigureAwait(true);
+        await page.UploadPagesAsync(new MemoryStream(new byte[512]), 0).ConfigureAwait(true);
+        var originalSnapshot = (await page.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+
+        await page.CreateAsync(512).ConfigureAwait(true);
+        Assert.True((await page.WithSnapshot(originalSnapshot).ExistsAsync().ConfigureAwait(true)).Value);
+        var error = await Assert.ThrowsAsync<Azure.RequestFailedException>(async () =>
+            await page.GetPageRangesDiffAsync(previousSnapshot: originalSnapshot).ConfigureAwait(true))
+            .ConfigureAwait(true);
+        Assert.Equal(409, error.Status);
+        Assert.Equal("BlobOverwritten", error.ErrorCode);
+    }
+
+    [Fact]
+    public async Task IncrementalCopyRejectsRecreatedSourceWithTheSameCreationTime()
+    {
+        var clock = new FixedTimeProvider(DateTimeOffset.UtcNow);
+        var fixedApplication = new SavaWebApplicationFactory(clock, new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:AsyncCopyCompletionDelay"] = "00:00:00"
+        });
+        await using var fixedApplicationDisposal = fixedApplication.ConfigureAwait(true);
+        var container = CreateClient(fixedApplication).GetBlobContainerClient($"same-time-copy-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        var source = container.GetPageBlobClient("source.vhd");
+        await source.CreateAsync(512).ConfigureAwait(true);
+        var firstSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var destination = container.GetPageBlobClient("backup.vhd");
+        var copy = await destination.StartCopyIncrementalAsync(source.Uri, firstSnapshot).ConfigureAwait(true);
+        await copy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(true);
+
+        await source.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(true);
+        await source.CreateAsync(512).ConfigureAwait(true);
+        var replacementSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var error = await Assert.ThrowsAsync<Azure.RequestFailedException>(async () =>
+            await destination.StartCopyIncrementalAsync(source.Uri, replacementSnapshot).ConfigureAwait(true))
+            .ConfigureAwait(true);
+        Assert.Equal(409, error.Status);
+        Assert.Equal("IncrementalCopyBlobMismatch", error.ErrorCode);
+    }
+
+    [Fact]
     public async Task PageDiffParametersRequireTheirPublishedServiceVersions()
     {
         var container = CreateClient(application).GetBlobContainerClient($"version-page-{Guid.NewGuid():N}");
@@ -157,4 +210,9 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
         {
             Transport = new Azure.Core.Pipeline.HttpClientTransport(factory.Server.CreateHandler())
         });
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
+    }
 }
