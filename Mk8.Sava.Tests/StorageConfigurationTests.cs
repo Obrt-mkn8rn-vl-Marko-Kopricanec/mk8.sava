@@ -5,6 +5,28 @@ namespace Mk8.Sava.Tests;
 
 public sealed class StorageConfigurationTests
 {
+    [Fact]
+    public void UnsupportedGraphCloudIsRejectedBeforeServingRequests()
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
+            },
+            BearerAuthentication = new BearerAuthenticationOptions
+            {
+                GraphGroupResolution = new GraphGroupResolutionOptions
+                {
+                    Cloud = (MicrosoftGraphCloud)int.MaxValue
+                }
+            }
+        };
+
+        Assert.Contains(options.Validate(new ValidationContext(options)), error =>
+            error.ErrorMessage?.Contains("supported Microsoft Graph cloud", StringComparison.Ordinal) == true);
+    }
+
     [Theory]
     [InlineData("00:00:00")]
     [InlineData("-00:00:01")]

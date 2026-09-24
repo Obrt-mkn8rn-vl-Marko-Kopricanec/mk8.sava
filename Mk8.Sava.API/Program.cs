@@ -63,7 +63,20 @@ builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddSingleton<StorageDataKeyContinuity>();
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
-builder.Services.AddSingleton<TokenCredential, DefaultAzureCredential>();
+builder.Services.AddSingleton<TokenCredential>(services =>
+{
+    var cloud = services.GetRequiredService<IOptions<SavaOptions>>().Value
+        .BearerAuthentication.GraphGroupResolution.Cloud;
+    var authority = cloud switch
+    {
+        MicrosoftGraphCloud.Global => AzureAuthorityHosts.AzurePublicCloud,
+        MicrosoftGraphCloud.UsGovernment or MicrosoftGraphCloud.UsGovernmentDod =>
+            AzureAuthorityHosts.AzureGovernment,
+        MicrosoftGraphCloud.China => AzureAuthorityHosts.AzureChina,
+        _ => throw new InvalidOperationException("Unsupported Microsoft Graph cloud.")
+    };
+    return new DefaultAzureCredential(new DefaultAzureCredentialOptions { AuthorityHost = authority });
+});
 builder.Services.AddHttpClient<MicrosoftGraphGroupMembershipResolver>(client =>
     client.Timeout = TimeSpan.FromSeconds(5))
     .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler

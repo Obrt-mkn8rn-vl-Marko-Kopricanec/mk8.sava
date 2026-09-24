@@ -695,13 +695,21 @@ entries. An Entra token with `hasgroups=true` or a `groups` entry in
 Graph when `Sava:BearerAuthentication:GraphGroupResolution:Enabled=true` and
 `Sava:BearerAuthentication:GraphGroupResolution:TenantId` is the token's
 trusted tenant GUID. The service uses `DefaultAzureCredential` to request the
-`https://graph.microsoft.com/.default` scope and calls the fixed
+Graph `/.default` scope and calls the fixed
 [`directoryObjects/{oid}/getMemberGroups`](https://learn.microsoft.com/en-us/graph/api/directoryobject-getmembergroups?view=graph-rest-1.0) endpoint with
 `securityEnabledOnly=true`. Grant the service identity the documented Graph
 `Directory.Read.All` application permission with administrator consent; supply
 its credential through the normal Azure identity environment or managed
 identity, never through a Blob request. The token's `_claim_sources` URL is
 ignored, including legacy Azure AD Graph URLs, as [Microsoft recommends](https://learn.microsoft.com/en-us/security/zero-trust/develop/configure-tokens-group-claims-app-roles#group-overages).
+`Sava:BearerAuthentication:GraphGroupResolution:Cloud` selects a fixed
+Microsoft Graph deployment: `Global` (default), `UsGovernment` (GCC High),
+`UsGovernmentDod`, or `China`. The choice fixes the Graph host and token
+audience, selects the corresponding Entra authority for credential acquisition,
+and pins every continuation URL to that same host. Ordinary GCC tenants use
+`Global`. Configure the matching tenant and application registration in that
+cloud; tokens from different clouds are not interchangeable. These endpoints
+follow [Microsoft's national-cloud deployment table](https://learn.microsoft.com/en-us/graph/deployments).
 Each Graph call has a five-second timeout and a 1 MiB response cap; a missing
 or wrong tenant, disabled resolver, lookup failure, or malformed response
 denies ACL-only access without changing independent RBAC grants. Graph's
@@ -712,8 +720,9 @@ corresponding v1.0 [`transitiveMemberOf`](https://learn.microsoft.com/en-us/grap
 URLs only on the same HTTPS Graph host and exact membership path. This fallback
 is bounded to 128 pages and 100,000 distinct group IDs; exceeding a bound or
 losing a page denies the whole ACL grant rather than using a partial group set.
-Sovereign-cloud Graph endpoint selection and production identity integration
-remain unqualified.
+Local fake-Graph tests cover all four cloud choices, selected audiences, same-
+cloud paging, and cross-cloud continuation denial. Actual national-cloud API
+availability and production identity integration remain unqualified.
 Local signed-token, fake-Graph, and SDK-over-HTTP tests cover this path without
 live Azure accounts. Bearer ACL fallback for other operations remains incomplete.
 For HNS List Blobs, bearer `oid` and signed user-delegation `suoid` ACL
@@ -734,8 +743,8 @@ write/execute on the immediate parent directory plus execute on ancestors.
 When Delete Blob targets an empty HNS directory, ACL-only authorization also
 requires read, write, and execute on that directory itself, following the
 [documented directory-deletion permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions).
-An SDK test denies deletion when any of those three bits is missing and
-permits it after the full grant. Nonempty directories retain their separate
+Bearer and signed-`suoid` SDK tests deny deletion when any of those three bits
+is missing and permit it after the full grant. Nonempty directories retain their separate
 `DirectoryIsNotEmpty` rejection.
 When the immediate parent has a sticky bit, ACL-only deletion also requires
 the caller to own the child or that parent, per Microsoft's

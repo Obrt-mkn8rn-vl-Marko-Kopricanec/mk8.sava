@@ -3539,6 +3539,85 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalSignedSuoidRequiresDirectoryRwxBeforeDeletingAnEmptyDirectory()
+    {
+        const string deleterObjectId = "d9d25825-751d-4625-8e17-d1a36c350491";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "wd",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanGenerateUserDelegationKey"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-suoid-dir-delete-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var seed = container.GetBlobClient("empty/seed.txt");
+        await seed.UploadAsync(BinaryData.FromString("seed"));
+        await seed.DeleteAsync();
+        var directory = container.GetBlobClient("empty");
+        Assert.True((await directory.ExistsAsync()).Value);
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = $"user::rwx,user:{deleterObjectId}:-wx,group::r-x,mask::rwx,other::---"
+        });
+
+        var delegator = CreateBearerClient(application, CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId,
+            SavaWebApplicationFactory.TenantId));
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
+        var deleter = CreateSuoidBlobClient(
+            application, key, container.Name, directory.Name, deleterObjectId,
+            "d", startsOn, expiresOn);
+        await AssertSignedDirectoryDeletionRequiresRwxAsync(
+            application, container, directory, deleter, deleterObjectId);
+    }
+
+    private static async Task AssertSignedDirectoryDeletionRequiresRwxAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient directory,
+        BlobClient deleter,
+        string deleterObjectId)
+    {
+        foreach (var permissions in new[] { "--x", "-wx", "r-x", "rw-" })
+        {
+            await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = directory.Name,
+                AccessAcl = $"user::rwx,user:{deleterObjectId}:{permissions},group::r-x,mask::rwx,other::---"
+            }).ConfigureAwait(false);
+            var denied = await Assert.ThrowsAsync<RequestFailedException>(() => deleter.DeleteAsync())
+                .ConfigureAwait(false);
+            Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
+            Assert.Equal("AuthorizationFailure", denied.ErrorCode);
+            Assert.True((await directory.ExistsAsync().ConfigureAwait(false)).Value);
+        }
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = directory.Name,
+            AccessAcl = $"user::rwx,user:{deleterObjectId}:rwx,group::r-x,mask::rwx,other::---"
+        }).ConfigureAwait(false);
+        await deleter.DeleteAsync().ConfigureAwait(false);
+        Assert.False((await directory.ExistsAsync().ConfigureAwait(false)).Value);
+    }
+
+    [Fact]
     public async Task HierarchicalStickyDirectoryRejectsDeletionOfAnotherOwnersChild()
     {
         const string writerObjectId = "e054929f-c734-4e3b-b19b-b810eb24be22";

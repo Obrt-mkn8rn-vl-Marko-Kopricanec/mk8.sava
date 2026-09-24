@@ -75,6 +75,33 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
     }
 
     [Theory]
+    [InlineData(MicrosoftGraphCloud.UsGovernment, "graph.microsoft.us")]
+    [InlineData(MicrosoftGraphCloud.UsGovernmentDod, "dod-graph.microsoft.us")]
+    [InlineData(MicrosoftGraphCloud.China, "microsoftgraph.chinacloudapi.cn")]
+    public async Task NationalCloudOverageUsesOnlySelectedGraphHostAndAudience(
+        MicrosoftGraphCloud cloud, string host)
+    {
+        using var handler = new GraphHandler(request =>
+        {
+            Assert.Equal(host, request.RequestUri?.Host);
+            Assert.Equal($"/v1.0/directoryObjects/{ReaderObjectId}/getMemberGroups",
+                request.RequestUri?.AbsolutePath);
+            return JsonResponse(HttpStatusCode.OK, $"{{\"value\":[\"{ReaderGroupId}\"]}}");
+        });
+        var credential = new GraphCredential();
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, credential, cloud: cloud);
+
+        var groups = await resolver.ResolveAsync(
+            Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None);
+
+        Assert.Equal([ReaderGroupId], groups);
+        Assert.NotNull(credential.Scopes);
+        Assert.Equal([$"https://{host}/.default"], credential.Scopes);
+        Assert.Equal(1, handler.Calls);
+    }
+
+    [Theory]
     [InlineData(HttpStatusCode.Forbidden, "{\"error\":\"forbidden\"}")]
     [InlineData(HttpStatusCode.BadRequest, "{\"error\":{\"code\":\"InvalidRequest\"}}")]
     [InlineData(HttpStatusCode.OK, "{\"value\":[\"not-a-guid\"]}")]
@@ -105,7 +132,8 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
             if (request.Method == HttpMethod.Post)
                 return JsonResponse(HttpStatusCode.BadRequest,
                     "{\"error\":{\"code\":\"Directory_ResultSizeLimitExceeded\"}}");
-            if (request.RequestUri?.AbsolutePath == $"/v1.0/directoryObjects/{ReaderObjectId}")
+            if (string.Equals(request.RequestUri?.AbsolutePath,
+                    $"/v1.0/directoryObjects/{ReaderObjectId}", StringComparison.Ordinal))
                 return JsonResponse(HttpStatusCode.OK, $"{{\"@odata.type\":\"{objectType}\"}}");
 
             Assert.Equal(membershipPath, request.RequestUri?.AbsolutePath);
@@ -129,6 +157,54 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
     }
 
     [Theory]
+    [InlineData(MicrosoftGraphCloud.UsGovernment, "graph.microsoft.us", false)]
+    [InlineData(MicrosoftGraphCloud.UsGovernmentDod, "dod-graph.microsoft.us", false)]
+    [InlineData(MicrosoftGraphCloud.China, "microsoftgraph.chinacloudapi.cn", false)]
+    [InlineData(MicrosoftGraphCloud.UsGovernment, "graph.microsoft.us", true)]
+    [InlineData(MicrosoftGraphCloud.UsGovernmentDod, "dod-graph.microsoft.us", true)]
+    [InlineData(MicrosoftGraphCloud.China, "microsoftgraph.chinacloudapi.cn", true)]
+    public async Task NationalCloudPagingStaysWithinSelectedGraph(
+        MicrosoftGraphCloud cloud, string host, bool crossCloud)
+    {
+        var membershipPath = $"/v1.0/users/{ReaderObjectId}/transitiveMemberOf/microsoft.graph.group";
+        using var handler = new GraphHandler(request =>
+        {
+            Assert.Equal(host, request.RequestUri?.Host);
+            if (request.Method == HttpMethod.Post)
+                return JsonResponse(HttpStatusCode.BadRequest,
+                    "{\"error\":{\"code\":\"Directory_ResultSizeLimitExceeded\"}}");
+            if (string.Equals(request.RequestUri?.AbsolutePath,
+                    $"/v1.0/directoryObjects/{ReaderObjectId}", StringComparison.Ordinal))
+                return JsonResponse(HttpStatusCode.OK, "{\"@odata.type\":\"#microsoft.graph.user\"}");
+            Assert.Equal(membershipPath, request.RequestUri?.AbsolutePath);
+            if (request.RequestUri?.Query.Contains("skiptoken", StringComparison.Ordinal) == true)
+                return JsonResponse(HttpStatusCode.OK,
+                    $"{{\"value\":[{{\"id\":\"{ReaderGroupId}\",\"securityEnabled\":true}}]}}");
+            var continuationHost = crossCloud ? "graph.microsoft.com" : host;
+            return JsonResponse(HttpStatusCode.OK,
+                $"{{\"value\":[],\"@odata.nextLink\":\"https://{continuationHost}" +
+                $"{membershipPath}?%24skiptoken=page-two\"}}");
+        });
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, new GraphCredential(), cloud: cloud);
+
+        if (crossCloud)
+        {
+            var error = await Assert.ThrowsAsync<AzureStorageException>(() => resolver.ResolveAsync(
+                Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None));
+            Assert.Equal("AuthorizationFailure", error.ErrorCode);
+            Assert.Equal(3, handler.Calls);
+        }
+        else
+        {
+            var groups = await resolver.ResolveAsync(
+                Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None);
+            Assert.Equal([ReaderGroupId], groups);
+            Assert.Equal(4, handler.Calls);
+        }
+    }
+
+    [Theory]
     [InlineData("wrong-host")]
     [InlineData("wrong-scheme")]
     [InlineData("wrong-path")]
@@ -149,7 +225,8 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
             if (request.Method == HttpMethod.Post)
                 return JsonResponse(HttpStatusCode.BadRequest,
                     "{\"error\":{\"code\":\"Directory_ResultSizeLimitExceeded\"}}");
-            if (request.RequestUri?.AbsolutePath == $"/v1.0/directoryObjects/{ReaderObjectId}")
+            if (string.Equals(request.RequestUri?.AbsolutePath,
+                    $"/v1.0/directoryObjects/{ReaderObjectId}", StringComparison.Ordinal))
                 return JsonResponse(HttpStatusCode.OK, "{\"@odata.type\":\"#microsoft.graph.user\"}");
             Assert.Equal(path, request.RequestUri?.AbsolutePath);
             return JsonResponse(HttpStatusCode.OK,
@@ -207,18 +284,26 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
     }
 
     [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task HnsBlobReadUsesResolvedOverageGroupThroughBearerAclFallback(bool distributedClaim)
+    [InlineData(false, MicrosoftGraphCloud.Global, "graph.microsoft.com")]
+    [InlineData(true, MicrosoftGraphCloud.Global, "graph.microsoft.com")]
+    [InlineData(false, MicrosoftGraphCloud.UsGovernment, "graph.microsoft.us")]
+    [InlineData(false, MicrosoftGraphCloud.UsGovernmentDod, "dod-graph.microsoft.us")]
+    [InlineData(false, MicrosoftGraphCloud.China, "microsoftgraph.chinacloudapi.cn")]
+    public async Task HnsBlobReadUsesResolvedOverageGroupThroughBearerAclFallback(
+        bool distributedClaim, MicrosoftGraphCloud cloud, string host)
     {
-        using var handler = new GraphHandler(_ => JsonResponse(
-            HttpStatusCode.OK, $"{{\"value\":[\"{ReaderGroupId}\"]}}"));
+        using var handler = new GraphHandler(request =>
+        {
+            Assert.Equal(host, request.RequestUri?.Host);
+            return JsonResponse(HttpStatusCode.OK, $"{{\"value\":[\"{ReaderGroupId}\"]}}");
+        });
         var credential = new GraphCredential();
         var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
         {
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:BearerAuthentication:GraphGroupResolution:Enabled"] = "true",
-            ["Sava:BearerAuthentication:GraphGroupResolution:TenantId"] = SavaWebApplicationFactory.TenantId
+            ["Sava:BearerAuthentication:GraphGroupResolution:TenantId"] = SavaWebApplicationFactory.TenantId,
+            ["Sava:BearerAuthentication:GraphGroupResolution:Cloud"] = cloud.ToString()
         };
         var application = new SavaWebApplicationFactory(configuration, () => handler, credential);
         await using var applicationDisposal = application.ConfigureAwait(false);
@@ -236,7 +321,25 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
         var container = writer.GetBlobContainerClient(containerName);
         await container.CreateAsync();
         await container.GetBlobClient("group.txt").UploadAsync(BinaryData.FromString("group-only"));
-        await application.Services.GetRequiredService<MetadataStore>().ApplyHierarchicalAclEntriesAsync(
+        await SeedGroupOnlyBlobAclAsync(application, containerName);
+
+        var token = CreateOverageJwt(distributedClaim);
+        var reader = new BlobServiceClient(endpoint, new GraphCredential(token), new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
+            Retry = { MaxRetries = 0 }
+        });
+        var downloaded = await reader.GetBlobContainerClient(containerName)
+            .GetBlobClient("group.txt").DownloadContentAsync();
+
+        Assert.Equal("group-only", downloaded.Value.Content.ToString());
+        Assert.Equal(1, handler.Calls);
+        Assert.NotNull(credential.Scopes);
+        Assert.Equal([$"https://{host}/.default"], credential.Scopes);
+    }
+
+    private static Task SeedGroupOnlyBlobAclAsync(SavaWebApplicationFactory application, string containerName) =>
+        application.Services.GetRequiredService<MetadataStore>().ApplyHierarchicalAclEntriesAsync(
         [
             new HierarchicalAclManifestEntry
             {
@@ -254,21 +357,9 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
             }
         ], CancellationToken.None);
 
-        var token = CreateOverageJwt(distributedClaim);
-        var reader = new BlobServiceClient(endpoint, new GraphCredential(token), new BlobClientOptions
-        {
-            Transport = new HttpClientTransport(application.Server.CreateHandler()),
-            Retry = { MaxRetries = 0 }
-        });
-        var downloaded = await reader.GetBlobContainerClient(containerName)
-            .GetBlobClient("group.txt").DownloadContentAsync();
-
-        Assert.Equal("group-only", downloaded.Value.Content.ToString());
-        Assert.Equal(1, handler.Calls);
-    }
-
     private static MicrosoftGraphGroupMembershipResolver CreateResolver(
-        HttpClient client, GraphCredential credential, bool enabled = true)
+        HttpClient client, GraphCredential credential, bool enabled = true,
+        MicrosoftGraphCloud cloud = MicrosoftGraphCloud.Global)
     {
         var options = Options.Create(new SavaOptions
         {
@@ -278,7 +369,8 @@ public sealed class MicrosoftGraphGroupMembershipResolverTests
                 GraphGroupResolution = new GraphGroupResolutionOptions
                 {
                     Enabled = enabled,
-                    TenantId = SavaWebApplicationFactory.TenantId
+                    TenantId = SavaWebApplicationFactory.TenantId,
+                    Cloud = cloud
                 }
             }
         });
