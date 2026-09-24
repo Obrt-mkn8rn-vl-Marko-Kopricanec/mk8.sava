@@ -10022,6 +10022,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString("policy payload"));
         var policyStart = DateTimeOffset.UtcNow.AddMinutes(-1);
         var policyExpiry = DateTimeOffset.UtcNow.AddMinutes(10);
+        await SetStoredAccessPoliciesAsync(container, policyStart, policyExpiry);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        var policyBlob = await AssertStoredPolicyValidTokensAsync(
+            factory, containerName, blobName, credential, policyStart, policyExpiry);
+        await AssertStoredPolicyInvalidTokensAsync(
+            factory, containerName, blobName, credential, policyStart, policyExpiry);
+        await AssertStoredPolicyRevocationAndAclAsync(factory, container, policyBlob);
+    }
+
+    private static async Task SetStoredAccessPoliciesAsync(
+        BlobContainerClient container, DateTimeOffset policyStart, DateTimeOffset policyExpiry)
+    {
         await container.SetAccessPolicyAsync(
             PublicAccessType.None,
             [
@@ -10059,8 +10072,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                         Permissions = "r"
                     }
                 }
-            ]);
+            ]).ConfigureAwait(false);
+    }
 
+    private static async Task<BlobClient> AssertStoredPolicyValidTokensAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        string blobName,
+        StorageSharedKeyCredential credential,
+        DateTimeOffset policyStart,
+        DateTimeOffset policyExpiry)
+    {
         var builder = new BlobSasBuilder
         {
             BlobContainerName = containerName,
@@ -10069,10 +10091,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Identifier = "read-policy",
             Protocol = SasProtocol.HttpsAndHttp
         };
-        var credential = new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
         var sas = builder.ToSasQueryParameters(credential);
-        var policyBlob = CreateBlobClient(factory, new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
-        Assert.Equal("policy payload", (await policyBlob.DownloadContentAsync()).Value.Content.ToString());
+        var policyBlob = CreateBlobClient(application,
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}"));
+        Assert.Equal("policy payload",
+            (await policyBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
 
         var tokenPermissionBuilder = new BlobSasBuilder
         {
@@ -10083,14 +10106,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Protocol = SasProtocol.HttpsAndHttp
         };
         tokenPermissionBuilder.SetPermissions(BlobSasPermissions.Read);
-        var tokenPermissionBlob = CreateBlobClient(
-            factory,
-            new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                $"?{tokenPermissionBuilder.ToSasQueryParameters(credential)}"));
-        Assert.Equal(
-            "policy payload",
-            (await tokenPermissionBlob.DownloadContentAsync()).Value.Content.ToString());
+        var tokenPermissionBlob = CreateBlobClient(application,
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?{tokenPermissionBuilder.ToSasQueryParameters(credential)}"));
+        Assert.Equal("policy payload",
+            (await tokenPermissionBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
 
         var tokenTimeBuilder = new BlobSasBuilder
         {
@@ -10102,15 +10122,22 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             ExpiresOn = policyExpiry,
             Protocol = SasProtocol.HttpsAndHttp
         };
-        var tokenTimeBlob = CreateBlobClient(
-            factory,
-            new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                $"?{tokenTimeBuilder.ToSasQueryParameters(credential)}"));
-        Assert.Equal(
-            "policy payload",
-            (await tokenTimeBlob.DownloadContentAsync()).Value.Content.ToString());
+        var tokenTimeBlob = CreateBlobClient(application,
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?{tokenTimeBuilder.ToSasQueryParameters(credential)}"));
+        Assert.Equal("policy payload",
+            (await tokenTimeBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        return policyBlob;
+    }
 
+    private static async Task AssertStoredPolicyInvalidTokensAsync(
+        SavaWebApplicationFactory application,
+        string containerName,
+        string blobName,
+        StorageSharedKeyCredential credential,
+        DateTimeOffset policyStart,
+        DateTimeOffset policyExpiry)
+    {
         var duplicateBuilder = new BlobSasBuilder
         {
             BlobContainerName = containerName,
@@ -10122,13 +10149,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Protocol = SasProtocol.HttpsAndHttp
         };
         duplicateBuilder.SetPermissions(BlobSasPermissions.Read);
-        var duplicateBlob = CreateBlobClient(
-            factory,
-            new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                $"?{duplicateBuilder.ToSasQueryParameters(credential)}"));
-        var duplicate = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            duplicateBlob.DownloadContentAsync());
+        var duplicateBlob = CreateBlobClient(application,
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                    $"?{duplicateBuilder.ToSasQueryParameters(credential)}"));
+        var duplicate = await Assert.ThrowsAsync<RequestFailedException>(() => duplicateBlob.DownloadContentAsync())
+            .ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status400BadRequest, duplicate.Status);
         Assert.Equal("InvalidQueryParameterValue", duplicate.ErrorCode);
 
@@ -10141,32 +10166,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Protocol = SasProtocol.HttpsAndHttp
         };
         accountBuilder.SetPermissions(AccountSasPermissions.Read);
-        var accountSasWithIdentifier = CreateBlobClient(
-            factory,
+        var accountSasWithIdentifier = CreateBlobClient(application,
             AppendQuery(
-                new Uri(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
-                    $"?{accountBuilder.ToSasQueryParameters(credential)}"),
+                new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}" +
+                        $"?{accountBuilder.ToSasQueryParameters(credential)}"),
                 "si=read-policy"));
         var unsupportedIdentifier = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            accountSasWithIdentifier.DownloadContentAsync());
+            accountSasWithIdentifier.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, unsupportedIdentifier.Status);
         Assert.Equal("AuthenticationFailed", unsupportedIdentifier.ErrorCode);
+    }
 
-        await container.SetAccessPolicyAsync(PublicAccessType.None, []);
-        var revoked = await Assert.ThrowsAsync<RequestFailedException>(() => policyBlob.DownloadContentAsync());
+    private static async Task AssertStoredPolicyRevocationAndAclAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, BlobClient policyBlob)
+    {
+        await container.SetAccessPolicyAsync(PublicAccessType.None, []).ConfigureAwait(false);
+        var revoked = await Assert.ThrowsAsync<RequestFailedException>(() => policyBlob.DownloadContentAsync())
+            .ConfigureAwait(false);
         Assert.Equal(403, revoked.Status);
 
         var aclUri = AppendQuery(
-            container.GenerateSasUri(
-                BlobContainerSasPermissions.All,
-                DateTimeOffset.UtcNow.AddMinutes(5)),
+            container.GenerateSasUri(BlobContainerSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
             "restype=container&comp=acl");
-        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var transport = new HttpClient(application.Server.CreateHandler());
         using (var getAcl = new HttpRequestMessage(HttpMethod.Get, aclUri))
         {
             getAcl.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(getAcl);
+            using var response = await transport.SendAsync(getAcl).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
             Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -10176,7 +10202,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             setAcl.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(setAcl);
+            using var response = await transport.SendAsync(setAcl).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
             Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
         }
