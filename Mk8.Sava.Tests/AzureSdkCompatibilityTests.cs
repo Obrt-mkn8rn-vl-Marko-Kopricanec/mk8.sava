@@ -11881,88 +11881,103 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await container.CreateAsync();
             var blob = container.GetBlobClient("tracked.bin");
             await blob.UploadAsync(BinaryData.FromString("first"));
-
-            var created = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(initialTime, created.LastAccessed);
-
-            clock.Advance(TimeSpan.FromHours(23));
-            var propertiesOnly = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(initialTime, propertiesOnly.LastAccessed);
-            var firstRead = (await blob.DownloadContentAsync()).Value;
-            Assert.Equal("first", firstRead.Content.ToString());
-            Assert.Equal(initialTime, firstRead.Details.LastAccessed);
-
-            clock.Advance(TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
-            var secondAccess = clock.GetUtcNow();
-            var secondRead = (await blob.DownloadContentAsync()).Value;
-            Assert.Equal(secondAccess, secondRead.Details.LastAccessed);
-            Assert.Equal(secondAccess, (await blob.GetPropertiesAsync()).Value.LastAccessed);
-
-            BlobItem? listed = null;
-            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions { Prefix = blob.Name }))
-                listed = item;
-            Assert.NotNull(listed);
-            Assert.Equal(secondAccess, listed!.Properties.LastAccessedOn);
-
-            clock.Advance(TimeSpan.FromMinutes(5));
-            var rewrittenAt = clock.GetUtcNow();
-            await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true);
-            Assert.Equal(rewrittenAt, (await blob.GetPropertiesAsync()).Value.LastAccessed);
-
-            clock.Advance(TimeSpan.FromHours(24) + TimeSpan.FromSeconds(1));
-            var copiedAt = clock.GetUtcNow();
-            var copied = container.GetBlobClient("copied.bin");
-            await copied.SyncCopyFromUriAsync(
-                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7)));
-            Assert.Equal(copiedAt, (await blob.GetPropertiesAsync()).Value.LastAccessed);
-            Assert.Equal(copiedAt, (await copied.GetPropertiesAsync()).Value.LastAccessed);
-
+            var copiedAt = await AssertLastAccessReadWriteAndCopyAsync(clock, container, blob, initialTime);
             using var transport = new HttpClient(application.Server.CreateHandler());
-            var arrowUri = AppendQuery(
-                container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddDays(7)),
-                "restype=container&comp=list");
-            using (var arrowRequest = new HttpRequestMessage(HttpMethod.Get, arrowUri))
-            {
-                arrowRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
-                arrowRequest.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
-                using var response = await transport.SendAsync(arrowRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                var stream = (await response.Content.ReadAsStreamAsync());
-                await using var streamDisposal42 = stream.ConfigureAwait(false);
-                using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(stream);
-                using var batch = await reader.ReadNextRecordBatchAsync();
-                Assert.NotNull(batch);
-                var names = Assert.IsType<Apache.Arrow.StringArray>(batch.Column("Name", StringComparer.Ordinal));
-                var accesses = Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("LastAccessTime", StringComparer.Ordinal));
-                var sourceIndex = Enumerable.Range(0, batch.Length).Single(index => string.Equals(names.GetString(index), blob.Name, StringComparison.Ordinal));
-                Assert.Equal(copiedAt, accesses.GetTimestamp(sourceIndex));
-            }
-
-            using (var legacy = new HttpRequestMessage(
-                       HttpMethod.Head,
-                       blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7))))
-            {
-                legacy.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
-                using var response = await transport.SendAsync(legacy);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.False(response.Headers.Contains("x-ms-last-access-time"));
-            }
-
-            var untrackedService = CreateClient(
-                application,
-                SavaWebApplicationFactory.SecondAccountName,
-                SavaWebApplicationFactory.SecondAccountKey);
-            var untrackedContainer = untrackedService.GetBlobContainerClient($"last-access-off-{Guid.NewGuid():N}");
-            await untrackedContainer.CreateAsync();
-            var untracked = untrackedContainer.GetBlobClient("untracked.bin");
-            await untracked.UploadAsync(BinaryData.FromString("untracked"));
-            Assert.Equal(default, (await untracked.GetPropertiesAsync()).Value.LastAccessed);
-            Assert.Equal(default, (await untracked.DownloadContentAsync()).Value.Details.LastAccessed);
+            await AssertLastAccessArrowAndVersionHeadersAsync(container, blob, transport, copiedAt);
+            await AssertUntrackedLastAccessAsync(application);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static async Task<DateTimeOffset> AssertLastAccessReadWriteAndCopyAsync(
+        AdjustableTimeProvider clock, BlobContainerClient container, BlobClient blob, DateTimeOffset initialTime)
+    {
+        var created = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(initialTime, created.LastAccessed);
+
+        clock.Advance(TimeSpan.FromHours(23));
+        var propertiesOnly = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(initialTime, propertiesOnly.LastAccessed);
+        var firstRead = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("first", firstRead.Content.ToString());
+        Assert.Equal(initialTime, firstRead.Details.LastAccessed);
+
+        clock.Advance(TimeSpan.FromHours(1) + TimeSpan.FromSeconds(1));
+        var secondAccess = clock.GetUtcNow();
+        var secondRead = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(secondAccess, secondRead.Details.LastAccessed);
+        Assert.Equal(secondAccess, (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LastAccessed);
+
+        BlobItem? listed = null;
+        await foreach (var item in container.GetBlobsAsync(
+                           new GetBlobsOptions { Prefix = blob.Name }).ConfigureAwait(false))
+            listed = item;
+        Assert.NotNull(listed);
+        Assert.Equal(secondAccess, listed!.Properties.LastAccessedOn);
+
+        clock.Advance(TimeSpan.FromMinutes(5));
+        var rewrittenAt = clock.GetUtcNow();
+        await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true).ConfigureAwait(false);
+        Assert.Equal(rewrittenAt, (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LastAccessed);
+
+        clock.Advance(TimeSpan.FromHours(24) + TimeSpan.FromSeconds(1));
+        var copiedAt = clock.GetUtcNow();
+        var copied = container.GetBlobClient("copied.bin");
+        await copied.SyncCopyFromUriAsync(
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7))).ConfigureAwait(false);
+        Assert.Equal(copiedAt, (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LastAccessed);
+        Assert.Equal(copiedAt, (await copied.GetPropertiesAsync().ConfigureAwait(false)).Value.LastAccessed);
+        return copiedAt;
+    }
+
+    private static async Task AssertLastAccessArrowAndVersionHeadersAsync(
+        BlobContainerClient container, BlobClient blob, HttpClient transport, DateTimeOffset copiedAt)
+    {
+        var arrowUri = AppendQuery(
+            container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddDays(7)),
+            "restype=container&comp=list");
+        using (var arrowRequest = new HttpRequestMessage(HttpMethod.Get, arrowUri))
+        {
+            arrowRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+            arrowRequest.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
+            using var response = await transport.SendAsync(arrowRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+            await using var streamDisposal42 = stream.ConfigureAwait(false);
+            using var reader = new Apache.Arrow.Ipc.ArrowStreamReader(stream);
+            using var batch = await reader.ReadNextRecordBatchAsync().ConfigureAwait(false);
+            Assert.NotNull(batch);
+            var names = Assert.IsType<Apache.Arrow.StringArray>(batch.Column("Name", StringComparer.Ordinal));
+            var accesses = Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("LastAccessTime", StringComparer.Ordinal));
+            var sourceIndex = Enumerable.Range(0, batch.Length).Single(index =>
+                string.Equals(names.GetString(index), blob.Name, StringComparison.Ordinal));
+            Assert.Equal(copiedAt, accesses.GetTimestamp(sourceIndex));
+        }
+
+        using (var legacy = new HttpRequestMessage(
+                   HttpMethod.Head,
+                   blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddDays(7))))
+        {
+            legacy.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
+            using var response = await transport.SendAsync(legacy).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.False(response.Headers.Contains("x-ms-last-access-time"));
+        }
+    }
+
+    private static async Task AssertUntrackedLastAccessAsync(SavaWebApplicationFactory application)
+    {
+        var untrackedService = CreateClient(application,
+            SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey);
+        var untrackedContainer = untrackedService.GetBlobContainerClient($"last-access-off-{Guid.NewGuid():N}");
+        await untrackedContainer.CreateAsync().ConfigureAwait(false);
+        var untracked = untrackedContainer.GetBlobClient("untracked.bin");
+        await untracked.UploadAsync(BinaryData.FromString("untracked")).ConfigureAwait(false);
+        Assert.Equal(default, (await untracked.GetPropertiesAsync().ConfigureAwait(false)).Value.LastAccessed);
+        Assert.Equal(default, (await untracked.DownloadContentAsync().ConfigureAwait(false)).Value.Details.LastAccessed);
     }
 
     [Fact]
