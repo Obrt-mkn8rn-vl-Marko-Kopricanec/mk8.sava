@@ -7162,6 +7162,35 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task LeasedSnapshotDeletionRequiresTheBaseBlobLeaseId()
+    {
+        var container = CreateClient(factory)
+            .GetBlobContainerClient($"leased-snapshot-delete-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("leased.bin");
+        await blob.UploadAsync(BinaryData.FromString("retained"));
+        var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+        var snapshot = blob.WithSnapshot(snapshotId);
+        var leaseId = (await blob.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15))).Value.LeaseId;
+        var condition = new BlobRequestConditions { LeaseId = leaseId };
+
+        var missingSnapshotLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots));
+        Assert.Equal(412, missingSnapshotLease.Status);
+        Assert.Equal("LeaseIdMissing", missingSnapshotLease.ErrorCode);
+        Assert.True((await snapshot.ExistsAsync()).Value);
+        Assert.Equal(202, (await blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots, condition)).Status);
+        Assert.False((await snapshot.ExistsAsync()).Value);
+        Assert.Equal("retained", (await blob.DownloadContentAsync()).Value.Content.ToString());
+
+        var missingBaseLease = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DeleteAsync());
+        Assert.Equal(412, missingBaseLease.Status);
+        Assert.Equal("LeaseIdMissing", missingBaseLease.ErrorCode);
+        Assert.Equal(202, (await blob.DeleteAsync(conditions: condition)).Status);
+        Assert.False((await blob.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task DeleteBlobUsesExplicitVersionTargetAndDeleteVersionPermission()
     {
         var service = CreateClient(factory);

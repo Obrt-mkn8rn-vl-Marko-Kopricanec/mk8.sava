@@ -214,6 +214,12 @@ snapshot, and 202 for `only` and `include`; the test checks that each mode
 preserves or removes the base and snapshots as specified by the
 [Delete Blob contract](https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob)
 and its [error catalog](https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes).
+A nineteenth scenario crosses snapshot deletion with an active blob lease.
+Both services reject snapshot-only and base-blob deletion without the lease ID
+with 412 `LeaseIdMissing`, then accept the same operations with the active ID
+and preserve or remove the base as requested. An ordinary local SDK test
+retains this guard even when Azurite is not installed. This is one lease state,
+not the complete snapshot/lease/version matrix.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
