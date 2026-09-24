@@ -2618,8 +2618,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         http.Response.Headers["x-ms-blob-content-length"] = blob.Content.Length.ToString(CultureInfo.InvariantCulture);
         await AzureResponseWriter.WritePageRangesAsync(
             http,
-            page.Where(item => !item.IsClear).Select(item => item.Range).ToArray(),
-            page.Where(item => item.IsClear).Select(item => item.Range).ToArray(),
+            page,
             nextMarker,
             cancellationToken).ConfigureAwait(false);
         return;
