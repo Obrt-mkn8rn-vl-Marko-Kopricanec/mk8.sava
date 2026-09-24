@@ -378,6 +378,7 @@ public sealed class AzuriteDifferentialTests
             Assert.Equal("MDAwNA==", expected.CurrentUncommitted);
             Assert.Equal(string.Empty, actual.SnapshotUncommitted);
             Assert.False(expected.OmittedTypeIncludesUncommitted);
+            Assert.Equal(400, expected.EmptyTypeStatus);
         }
         finally
         {
@@ -1047,6 +1048,11 @@ public sealed class AzuriteDifferentialTests
         }.Uri;
         using var response = await transport.GetAsync(defaultRequestUri).ConfigureAwait(false);
         var defaultBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        var emptyTypeUri = new UriBuilder(sasUri)
+        {
+            Query = sasUri.Query.TrimStart('?') + "&comp=blocklist&blocklisttype="
+        }.Uri;
+        using var emptyTypeResponse = await transport.GetAsync(emptyTypeUri).ConfigureAwait(false);
         var conditionalUri = new UriBuilder(sasUri)
         {
             Query = sasUri.Query.TrimStart('?') + "&comp=blocklist&blocklisttype=committed"
@@ -1065,6 +1071,7 @@ public sealed class AzuriteDifferentialTests
             string.Join(',', historical.UncommittedBlocks.Select(block => block.Name)),
             (int)response.StatusCode,
             defaultBody.Contains("<UncommittedBlocks>", StringComparison.Ordinal),
+            (int)emptyTypeResponse.StatusCode,
             (int)conditionalResponse.StatusCode,
             conditionCode);
     }
@@ -1675,6 +1682,7 @@ public sealed class AzuriteDifferentialTests
         string SnapshotUncommitted,
         int OmittedTypeStatus,
         bool OmittedTypeIncludesUncommitted,
+        int EmptyTypeStatus,
         int StaleIfMatchStatus,
         string? StaleIfMatchCode);
 

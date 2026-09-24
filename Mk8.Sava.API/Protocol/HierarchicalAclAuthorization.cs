@@ -292,6 +292,8 @@ internal static class HierarchicalAclAuthorization
         var component = http.Query["comp"].ToString();
         return ((HttpMethods.IsGet(http.Method) || HttpMethods.IsHead(http.Method)) &&
                 (component.Length == 0 || component.Equals("metadata", StringComparison.OrdinalIgnoreCase))) ||
+               (HttpMethods.IsGet(http.Method) &&
+                component.Equals("blocklist", StringComparison.OrdinalIgnoreCase)) ||
                (HttpMethods.IsPost(http.Method) && component.Equals("query", StringComparison.OrdinalIgnoreCase));
     }
 

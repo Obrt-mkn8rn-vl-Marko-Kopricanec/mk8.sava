@@ -2528,6 +2528,24 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         BlobClient WithSuoid(string name, string objectId) => CreateSuoidBlobClient(
             application, key, container.Name, name, objectId, "rw", startsOn, expiresOn);
 
+        var signedBlockId = Convert.ToBase64String("0001"u8);
+        var blockBlob = container.GetBlockBlobClient("parent/blocks.bin");
+        using (var content = new MemoryStream("signed blocks"u8.ToArray(), writable: false))
+            await blockBlob.StageBlockAsync(signedBlockId, content);
+        await blockBlob.CommitBlockListAsync([signedBlockId]);
+        BlockBlobClient SignedBlocks(string objectId) => new(
+            WithSuoid("parent/blocks.bin", objectId).Uri,
+            new BlobClientOptions
+            {
+                Transport = new HttpClientTransport(application.Server.CreateHandler()),
+                Retry = { MaxRetries = 0 }
+            });
+        Assert.Equal(signedBlockId, Assert.Single((await SignedBlocks(ownerObjectId)
+            .GetBlockListAsync(BlockListTypes.Committed)).Value.CommittedBlocks).Name);
+        var deniedBlockList = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            SignedBlocks(foreignObjectId).GetBlockListAsync(BlockListTypes.Committed));
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedBlockList.Status);
+
         var owned = WithSuoid("parent/child.txt", ownerObjectId);
         await AssertOwnedSuoidOperationsAsync(application, container, owned, WithSuoid, ownerObjectId);
 
@@ -2788,6 +2806,70 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(StatusCodes.Status403Forbidden, deniedStranger.Status);
 
         await AssertBearerAclNegativeCasesAsync(application, owner, ownerObjectId, containerName);
+    }
+
+    [Fact]
+    public async Task HierarchicalAclReadAuthorizesCommittedBlockListButNotMissingOrRevokedPaths()
+    {
+        const string ownerObjectId = "dcba2f35-0450-46ce-b469-c761a12c50f7";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Accounts:0"] =
+                SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{ownerObjectId}:Permissions"] = "cw"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var bearer = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, ownerObjectId, SavaWebApplicationFactory.TenantId));
+        var container = bearer.GetBlobContainerClient($"hns-block-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var block = container.GetBlockBlobClient("parent/owned.bin");
+        var blockId = Convert.ToBase64String("0001"u8);
+        using (var content = new MemoryStream("owned bytes"u8.ToArray(), writable: false))
+            await block.StageBlockAsync(blockId, content);
+        await block.CommitBlockListAsync([blockId]);
+
+        var committed = (await block.GetBlockListAsync(BlockListTypes.All)).Value;
+        Assert.Equal(blockId, Assert.Single(committed.CommittedBlocks).Name);
+        Assert.Empty(committed.UncommittedBlocks);
+
+        var stagedOnly = container.GetBlockBlobClient("parent/uncommitted.bin");
+        using (var content = new MemoryStream("staged bytes"u8.ToArray(), writable: false))
+            await stagedOnly.StageBlockAsync(blockId, content);
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            stagedOnly.GetBlockListAsync(BlockListTypes.All));
+        Assert.Equal(StatusCodes.Status403Forbidden, missing.Status);
+
+        var fileEntry = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "parent/owned.bin",
+            AccessAcl = "user::-w-,group::---,other::---"
+        };
+        await ApplyAclManifestAsync(application, fileEntry);
+        var noFileRead = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            block.GetBlockListAsync(BlockListTypes.Committed));
+        Assert.Equal(StatusCodes.Status403Forbidden, noFileRead.Status);
+
+        await ApplyAclManifestAsync(application, fileEntry with
+        {
+            AccessAcl = "user::rw-,group::---,other::---"
+        });
+        Assert.Equal(blockId, Assert.Single((await block.GetBlockListAsync(BlockListTypes.Committed))
+            .Value.CommittedBlocks).Name);
+
+        await ApplyAclManifestAsync(application, fileEntry with
+        {
+            Path = "parent",
+            AccessAcl = "user::rw-,group::---,other::---"
+        });
+        var noTraversal = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            block.GetBlockListAsync(BlockListTypes.Committed));
+        Assert.Equal(StatusCodes.Status403Forbidden, noTraversal.Status);
     }
 
     private static async Task AssertBearerAclNegativeCasesAsync(
