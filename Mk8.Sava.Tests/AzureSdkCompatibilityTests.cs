@@ -4492,89 +4492,108 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blobService = application.Services.GetRequiredService<BlobService>();
         using var transport = new HttpClient(application.Server.CreateHandler());
 
-        async Task<BlobRecord> GetRecordAsync(string name) =>
-            await blobService.GetBlobAsync(
-                SavaWebApplicationFactory.SecondAccountName,
-                container.Name,
-                name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: false,
-                CancellationToken.None).ConfigureAwait(false);
+        await AssertExpiryPutValidationAsync(transport, container);
 
-        async Task<HttpResponseMessage> PutBlobAsync(
-            HttpClient client,
-            BlobClient target,
-            string version,
-            string option,
-            string? expiryTime,
-            byte[] content)
+        var (direct, absoluteExpiry) = await AssertDirectExpiryWriteAsync(transport, container, blobService);
+        await AssertExpiryReadProjectionAsync(transport, container, direct, absoluteExpiry);
+
+        await AssertExpiryMutationAsync(transport, container, blobService, direct, absoluteExpiry);
+
+        await AssertExpiryBlockCommitAsync(transport, container, blobService, absoluteExpiry);
+
+        await AssertExpiryPutFromUrlAsync(transport, container, blobService);
+        await AssertExpiryCopyRejectionAsync(transport, container);
+
+        await AssertFlatExpiryRejectionAsync();
+    }
+
+    private static Task<BlobRecord> GetExpiryRecordAsync(
+        BlobService blobService,
+        BlobContainerClient container,
+        string name) =>
+        blobService.GetBlobAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            name,
+            versionId: null,
+            snapshot: null,
+            includeDeleted: false,
+            CancellationToken.None);
+
+    private static async Task<HttpResponseMessage> PutExpiryBlobAsync(
+        HttpClient client,
+        BlobClient target,
+        string version,
+        string option,
+        string? expiryTime,
+        byte[] content)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            target.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)))
         {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Put,
-                target.GenerateSasUri(
-                    BlobSasPermissions.Create | BlobSasPermissions.Write,
-                    DateTimeOffset.UtcNow.AddMinutes(5)))
-            {
-                Content = new ByteArrayContent(content)
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", option);
-            if (expiryTime is not null)
-                request.Headers.TryAddWithoutValidation("x-ms-expiry-time", expiryTime);
-            return await client.SendAsync(request).ConfigureAwait(false);
-        }
+            Content = new ByteArrayContent(content)
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        request.Headers.TryAddWithoutValidation("x-ms-expiry-option", option);
+        if (expiryTime is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", expiryTime);
+        return await client.SendAsync(request).ConfigureAwait(false);
+    }
 
-        async Task<HttpResponseMessage> SetExpiryAsync(
-            BlobClient target,
-            string version,
-            string option,
-            string? expiryTime)
+    private static async Task<HttpResponseMessage> SetBlobExpiryRestAsync(
+        HttpClient transport,
+        BlobClient target,
+        string version,
+        string option,
+        string? expiryTime)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            AppendQuery(
+                target.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "comp=expiry"))
         {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Put,
-                AppendQuery(
-                    target.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-                    "comp=expiry"))
-            {
-                Content = new ByteArrayContent([])
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", option);
-            if (expiryTime is not null)
-                request.Headers.TryAddWithoutValidation("x-ms-expiry-time", expiryTime);
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        request.Headers.TryAddWithoutValidation("x-ms-expiry-option", option);
+        if (expiryTime is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", expiryTime);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
 
+    private static async Task AssertExpiryPutValidationAsync(HttpClient transport, BlobContainerClient container)
+    {
         var oldVersion = container.GetBlobClient("old-version.bin");
-        using (var response = await PutBlobAsync(
-                   transport,
-                   oldVersion,
-                   "2021-08-06",
-                   "RelativeToNow",
-                   "600000",
-                   "must not publish"u8.ToArray()).ConfigureAwait(true))
+        using (var response = await PutExpiryBlobAsync(
+            transport, oldVersion, "2021-08-06", "RelativeToNow", "600000", "must not publish"u8.ToArray())
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal("FeatureVersionMismatch", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.False((await oldVersion.ExistsAsync().ConfigureAwait(true)).Value);
+        Assert.False((await oldVersion.ExistsAsync().ConfigureAwait(false)).Value);
 
         var invalidCreationOption = container.GetBlobClient("relative-to-creation.bin");
-        using (var response = await PutBlobAsync(
-                   transport,
-                   invalidCreationOption,
-                   "2023-08-03",
-                   "RelativeToCreation",
-                   "600000",
-                   "must not publish"u8.ToArray()).ConfigureAwait(true))
+        using (var response = await PutExpiryBlobAsync(
+            transport, invalidCreationOption, "2023-08-03", "RelativeToCreation", "600000",
+            "must not publish"u8.ToArray()).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.False((await invalidCreationOption.ExistsAsync().ConfigureAwait(true)).Value);
+        Assert.False((await invalidCreationOption.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task<(BlobClient Direct, DateTimeOffset AbsoluteExpiry)> AssertDirectExpiryWriteAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobService blobService)
+    {
         var absoluteExpiry = DateTimeOffset.UtcNow.AddMinutes(20);
         absoluteExpiry = new DateTimeOffset(
             absoluteExpiry.Year,
@@ -4585,139 +4604,170 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             absoluteExpiry.Second,
             TimeSpan.Zero);
         var direct = container.GetBlobClient("direct.bin");
-        using (var response = await PutBlobAsync(
-                   transport,
-                   direct,
-                   "2023-08-03",
-                   "Absolute",
-                   absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
-                   "direct expiry"u8.ToArray()).ConfigureAwait(true))
-        {
+        using (var response = await PutExpiryBlobAsync(
+            transport, direct, "2023-08-03", "Absolute",
+            absoluteExpiry.ToString("R", CultureInfo.InvariantCulture), "direct expiry"u8.ToArray())
+            .ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-        }
-        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
+        Assert.Equal(absoluteExpiry,
+            (await GetExpiryRecordAsync(blobService, container, direct.Name).ConfigureAwait(false)).ExpiresAt);
+        return (direct, absoluteExpiry);
+    }
 
-        async Task<HttpResponseMessage> GetPropertiesAsync(string version)
-        {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Head,
-                direct.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
+    private static async Task<HttpResponseMessage> GetExpiryPropertiesAsync(
+        HttpClient transport,
+        BlobClient direct,
+        string version)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Head,
+            direct.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
 
-        using (var legacyProperties = await GetPropertiesAsync("2019-12-12").ConfigureAwait(true))
+    private static async Task AssertExpiryReadProjectionAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobClient direct,
+        DateTimeOffset absoluteExpiry)
+    {
+        using (var legacyProperties = await GetExpiryPropertiesAsync(transport, direct, "2019-12-12")
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, legacyProperties.StatusCode);
             Assert.False(legacyProperties.Headers.Contains("x-ms-expiry-time"));
         }
-        using (var properties = await GetPropertiesAsync("2020-02-10").ConfigureAwait(true))
+        using (var properties = await GetExpiryPropertiesAsync(transport, direct, "2020-02-10")
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, properties.StatusCode);
-            Assert.Equal(
-                absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
+            Assert.Equal(absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
                 GetResponseHeader(properties, "x-ms-expiry-time"));
         }
 
         var listUri = AppendQuery(
             container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
             "restype=container&comp=list");
-        using (var request = new HttpRequestMessage(HttpMethod.Get, listUri))
-        {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
-            using var response = await transport.SendAsync(request).ConfigureAwait(true);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(true));
-            var listed = document.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, direct.Name, StringComparison.Ordinal));
-            Assert.Equal(
-                absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
-                listed.Element("Properties")?.Element("Expiry-Time")?.Value);
-        }
+        using var request = new HttpRequestMessage(HttpMethod.Get, listUri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var document = System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var listed = document.Descendants("Blob").Single(element =>
+            string.Equals(element.Element("Name")?.Value, direct.Name, StringComparison.Ordinal));
+        Assert.Equal(absoluteExpiry.ToString("R", CultureInfo.InvariantCulture),
+            listed.Element("Properties")?.Element("Expiry-Time")?.Value);
+    }
 
-        using (var malformed = await SetExpiryAsync(
-                   direct,
-                   "2020-02-10",
-                   "Absolute",
-                   DateTimeOffset.UtcNow.AddMinutes(30).ToString("O", CultureInfo.InvariantCulture)).ConfigureAwait(true))
+    private static async Task AssertExpiryMutationAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobService blobService,
+        BlobClient direct,
+        DateTimeOffset absoluteExpiry)
+    {
+        using (var malformed = await SetBlobExpiryRestAsync(
+            transport, direct, "2020-02-10", "Absolute",
+            DateTimeOffset.UtcNow.AddMinutes(30).ToString("O", CultureInfo.InvariantCulture))
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, malformed.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(malformed, "x-ms-error-code"));
         }
-        Assert.Equal(absoluteExpiry, (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
+        Assert.Equal(absoluteExpiry,
+            (await GetExpiryRecordAsync(blobService, container, direct.Name).ConfigureAwait(false)).ExpiresAt);
 
-        var beforeRelative = await GetRecordAsync(direct.Name).ConfigureAwait(true);
-        using (var response = await SetExpiryAsync(
-                   direct,
-                   "2020-02-10",
-                   "rElAtIvEtOcReAtIoN",
-                   "1800000").ConfigureAwait(true))
+        var beforeRelative = await GetExpiryRecordAsync(blobService, container, direct.Name).ConfigureAwait(false);
+        using (var response = await SetBlobExpiryRestAsync(
+            transport, direct, "2020-02-10", "rElAtIvEtOcReAtIoN", "1800000").ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.True(response.Headers.Contains("ETag"));
             Assert.NotNull(response.Content.Headers.LastModified);
         }
-        Assert.Equal(beforeRelative.CreatedAt.AddMinutes(30), (await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
+        Assert.Equal(beforeRelative.CreatedAt.AddMinutes(30),
+            (await GetExpiryRecordAsync(blobService, container, direct.Name).ConfigureAwait(false)).ExpiresAt);
 
-        using (var invalidNever = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", "1").ConfigureAwait(true))
+        using (var invalidNever = await SetBlobExpiryRestAsync(
+            transport, direct, "2020-02-10", "NeverExpire", "1").ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, invalidNever.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(invalidNever, "x-ms-error-code"));
         }
-        using (var cleared = await SetExpiryAsync(direct, "2020-02-10", "NeverExpire", expiryTime: null).ConfigureAwait(true))
-        {
+        using (var cleared = await SetBlobExpiryRestAsync(
+            transport, direct, "2020-02-10", "NeverExpire", expiryTime: null).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.OK, cleared.StatusCode);
-        }
-        Assert.Null((await GetRecordAsync(direct.Name).ConfigureAwait(true)).ExpiresAt);
+        Assert.Null((await GetExpiryRecordAsync(blobService, container, direct.Name).ConfigureAwait(false)).ExpiresAt);
 
-        await container.GetBlobClient("folder/child.bin").UploadAsync(BinaryData.FromString("child")).ConfigureAwait(true);
-        using (var directory = await SetExpiryAsync(
-                   container.GetBlobClient("folder"),
-                   "2020-02-10",
-                   "RelativeToNow",
-                   "600000").ConfigureAwait(true))
+        await container.GetBlobClient("folder/child.bin")
+            .UploadAsync(BinaryData.FromString("child")).ConfigureAwait(false);
+        using var directory = await SetBlobExpiryRestAsync(
+            transport, container.GetBlobClient("folder"), "2020-02-10", "RelativeToNow", "600000")
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, directory.StatusCode);
+        Assert.Equal("BlobOperationNotSupported", GetResponseHeader(directory, "x-ms-error-code"));
+    }
+
+    private static async Task<HttpResponseMessage> CommitExpiryBlocksAsync(
+        HttpClient transport,
+        BlockBlobClient block,
+        string blockId,
+        DateTimeOffset blockExpiry,
+        bool includeExpiry)
+    {
+        var mode = includeExpiry ? "Latest" : "Committed";
+        using var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            AppendQuery(
+                block.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+                "comp=blocklist"))
         {
-            Assert.Equal(HttpStatusCode.Conflict, directory.StatusCode);
-            Assert.Equal("BlobOperationNotSupported", GetResponseHeader(directory, "x-ms-error-code"));
+            Content = new StringContent(
+                $"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><{mode}>{blockId}</{mode}></BlockList>",
+                Encoding.UTF8,
+                "application/xml")
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-08-03");
+        if (includeExpiry)
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "Absolute");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time",
+                blockExpiry.ToString("R", CultureInfo.InvariantCulture));
         }
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
 
+    private static async Task AssertExpiryBlockCommitAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobService blobService,
+        DateTimeOffset absoluteExpiry)
+    {
         var block = container.GetBlockBlobClient("blocks.bin");
         var blockId = Convert.ToBase64String("expiry-block-0001"u8);
-        await block.StageBlockAsync(blockId, BinaryData.FromString("block expiry").ToStream()).ConfigureAwait(true);
+        using var payload = BinaryData.FromString("block expiry").ToStream();
+        await block.StageBlockAsync(blockId, payload).ConfigureAwait(false);
         var blockExpiry = absoluteExpiry.AddMinutes(10);
-        async Task<HttpResponseMessage> CommitBlocksAsync(bool includeExpiry)
-        {
-            var mode = includeExpiry ? "Latest" : "Committed";
-            using var request = new HttpRequestMessage(
-                HttpMethod.Put,
-                AppendQuery(
-                    block.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-                    "comp=blocklist"))
-            {
-                Content = new StringContent(
-                    $"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><{mode}>{blockId}</{mode}></BlockList>",
-                    Encoding.UTF8,
-                    "application/xml")
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-08-03");
-            if (includeExpiry)
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "Absolute");
-                request.Headers.TryAddWithoutValidation(
-                    "x-ms-expiry-time",
-                    blockExpiry.ToString("R", CultureInfo.InvariantCulture));
-            }
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
-
-        using (var committed = await CommitBlocksAsync(includeExpiry: true).ConfigureAwait(true))
+        using (var committed = await CommitExpiryBlocksAsync(
+            transport, block, blockId, blockExpiry, includeExpiry: true).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Created, committed.StatusCode);
-        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name).ConfigureAwait(true)).ExpiresAt);
-        using (var recommitted = await CommitBlocksAsync(includeExpiry: false).ConfigureAwait(true))
+        Assert.Equal(blockExpiry,
+            (await GetExpiryRecordAsync(blobService, container, block.Name).ConfigureAwait(false)).ExpiresAt);
+        using (var recommitted = await CommitExpiryBlocksAsync(
+            transport, block, blockId, blockExpiry, includeExpiry: false).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Created, recommitted.StatusCode);
-        Assert.Equal(blockExpiry, (await GetRecordAsync(block.Name).ConfigureAwait(true)).ExpiresAt);
+        Assert.Equal(blockExpiry,
+            (await GetExpiryRecordAsync(blobService, container, block.Name).ConfigureAwait(false)).ExpiresAt);
+    }
 
+    private static async Task AssertExpiryPutFromUrlAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobService blobService)
+    {
         var urlBytes = "put blob from url expiry"u8.ToArray();
-        var source = await LoopbackSource.StartAsync(urlBytes).ConfigureAwait(true);
+        var source = await LoopbackSource.StartAsync(urlBytes).ConfigureAwait(false);
         await using (source.ConfigureAwait(false))
         {
             var destination = container.GetBlockBlobClient("from-url.bin");
@@ -4734,52 +4784,54 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "1200000");
-            using var response = await transport.SendAsync(request).ConfigureAwait(true);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            Assert.Equal(urlBytes, (await destination.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
-            Assert.NotNull((await GetRecordAsync(destination.Name).ConfigureAwait(true)).ExpiresAt);
+            Assert.Equal(urlBytes,
+                (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            Assert.NotNull((await GetExpiryRecordAsync(blobService, container, destination.Name)
+                .ConfigureAwait(false)).ExpiresAt);
         }
+    }
 
+    private static async Task AssertExpiryCopyRejectionAsync(HttpClient transport, BlobContainerClient container)
+    {
         var copyTarget = container.GetBlobClient("copy-rejects-expiry.bin");
-        using (var request = new HttpRequestMessage(
-                   HttpMethod.Put,
-                   copyTarget.GenerateSasUri(
-                       BlobSasPermissions.Create | BlobSasPermissions.Write,
-                       DateTimeOffset.UtcNow.AddMinutes(5)))
+        using var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            copyTarget.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)))
         {
             Content = new ByteArrayContent([])
-        })
-        {
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-08-03");
-            request.Headers.TryAddWithoutValidation("x-ms-copy-source", "https://source.invalid/blob");
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
-            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
-            using var response = await transport.SendAsync(request).ConfigureAwait(true);
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
-        }
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-08-03");
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", "https://source.invalid/blob");
+        request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
+        request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
+    }
 
+    private static async Task AssertFlatExpiryRejectionAsync()
+    {
         var flatApplication = new SavaWebApplicationFactory();
         await using (flatApplication.ConfigureAwait(false))
         {
             var flatService = CreateClient(flatApplication);
             var flatContainer = flatService.GetBlobContainerClient($"flat-expiry-{Guid.NewGuid():N}");
-            await flatContainer.CreateAsync().ConfigureAwait(true);
+            await flatContainer.CreateAsync().ConfigureAwait(false);
             var flat = flatContainer.GetBlobClient("flat.bin");
             using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
-            using (var response = await PutBlobAsync(
-                       flatTransport,
-                       flat,
-                       "2023-08-03",
-                       "RelativeToNow",
-                       "600000",
-                       "flat"u8.ToArray()).ConfigureAwait(true))
+            using (var response = await PutExpiryBlobAsync(
+                flatTransport, flat, "2023-08-03", "RelativeToNow", "600000", "flat"u8.ToArray())
+                .ConfigureAwait(false))
             {
                 Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
                 Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
             }
-            Assert.False((await flat.ExistsAsync().ConfigureAwait(true)).Value);
-            await flat.UploadAsync(BinaryData.FromString("flat")).ConfigureAwait(true);
+            Assert.False((await flat.ExistsAsync().ConfigureAwait(false)).Value);
+            await flat.UploadAsync(BinaryData.FromString("flat")).ConfigureAwait(false);
             var flatRecord = await flatApplication.Services.GetRequiredService<BlobService>().GetBlobAsync(
                 SavaWebApplicationFactory.AccountName,
                 flatContainer.Name,
@@ -4787,29 +4839,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 versionId: null,
                 snapshot: null,
                 includeDeleted: false,
-                CancellationToken.None).ConfigureAwait(true);
+                CancellationToken.None).ConfigureAwait(false);
             var flatBusinessFailure = await Assert.ThrowsAsync<AzureStorageException>(() =>
                 flatApplication.Services.GetRequiredService<BlobService>().SetExpiryAsync(
                     flatRecord,
                     DateTimeOffset.UtcNow.AddMinutes(10),
-                    CancellationToken.None)).ConfigureAwait(true);
+                    CancellationToken.None)).ConfigureAwait(false);
             Assert.Equal("BlobOperationNotSupported", flatBusinessFailure.ErrorCode);
 
             var flatExpiryUri = AppendQuery(
                 flat.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
                 "comp=expiry");
-            using (var request = new HttpRequestMessage(HttpMethod.Put, flatExpiryUri)
+            using var request = new HttpRequestMessage(HttpMethod.Put, flatExpiryUri)
             {
                 Content = new ByteArrayContent([])
-            })
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
-                request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
-                request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
-                using var response = await flatTransport.SendAsync(request).ConfigureAwait(true);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("BlobOperationNotSupported", GetResponseHeader(response, "x-ms-error-code"));
-            }
+            };
+            request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
+            request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "600000");
+            using var expiryResponse = await flatTransport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, expiryResponse.StatusCode);
+            Assert.Equal("BlobOperationNotSupported", GetResponseHeader(expiryResponse, "x-ms-error-code"));
         }
     }
 
