@@ -70,7 +70,9 @@ public sealed class HierarchicalAclAuthorizationTests
     [Theory]
     [InlineData("GET", "/", "", "", "", true)]
     [InlineData("GET", "/", "one/two/", "files", "metadata", true)]
-    [InlineData("GET", "", "", "", "", false)]
+    [InlineData("GET", "", "", "", "", true)]
+    [InlineData("GET", "", "one/two/", "files", "metadata", true)]
+    [InlineData("GET", ":", "", "", "", false)]
     [InlineData("GET", "/", "one", "", "", false)]
     [InlineData("GET", "/", "/one/", "", "", false)]
     [InlineData("GET", "/", "one//two/", "", "", false)]
@@ -78,7 +80,7 @@ public sealed class HierarchicalAclAuthorizationTests
     [InlineData("GET", "/", "", "", "deleted", false)]
     [InlineData("GET", "/", "", "", "tags", false)]
     [InlineData("POST", "/", "", "", "", false)]
-    public void AclListFallbackRequiresAPlainHierarchicalDirectoryListing(
+    public void AclListFallbackRequiresAPlainDirectoryOrRecursiveListing(
         string method, string delimiter, string prefix, string showOnly, string include, bool expected)
     {
         var request = new DefaultHttpContext().Request;

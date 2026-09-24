@@ -151,8 +151,11 @@ internal static class HierarchicalAclAuthorization
     {
         if (request.ResourceKind != StorageResourceKind.Container ||
             !HttpMethods.IsGet(http.Method) ||
-            !http.Query["comp"].ToString().Equals("list", StringComparison.OrdinalIgnoreCase) ||
-!string.Equals(http.Query["delimiter"].ToString(), "/", StringComparison.Ordinal))
+            !http.Query["comp"].ToString().Equals("list", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var delimiter = http.Query["delimiter"].ToString();
+        if (delimiter.Length > 0 && !string.Equals(delimiter, "/", StringComparison.Ordinal))
             return false;
 
         var prefix = http.Query["prefix"].ToString();
@@ -220,6 +223,41 @@ internal static class HierarchicalAclAuthorization
             !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'r') ||
             !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'x'))
             throw AzureStorageException.AuthorizationFailure();
+    }
+
+    internal static async Task EnsureRecursiveListPageAsync(
+        MetadataStore metadata,
+        HttpRequest http,
+        StorageRequestContext request,
+        BlobListPage page,
+        string objectId,
+        IReadOnlySet<string> groups,
+        CancellationToken cancellationToken)
+    {
+        if (http.Query["delimiter"].ToString().Length > 0)
+            return;
+
+        var checkedDirectories = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in page.Items)
+        {
+            var name = item.Name;
+            var separator = name.IndexOf('/', StringComparison.Ordinal);
+            while (separator > 0)
+            {
+                var path = name[..separator];
+                if (checkedDirectories.Add(path))
+                {
+                    var directory = await metadata.GetBlobAsync(
+                        request.Account, request.Container!, path,
+                        versionId: null, snapshot: null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+                    if (directory is null || !directory.IsDirectory ||
+                        !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'r') ||
+                        !PosixAccessControl.Allows(directory.Acl, directory.Owner, directory.Group, objectId, groups, 'x'))
+                        throw AzureStorageException.AuthorizationFailure();
+                }
+                separator = name.IndexOf('/', separator + 1);
+            }
+        }
     }
 
     internal static bool IsBlobReadOperation(HttpRequest http)
