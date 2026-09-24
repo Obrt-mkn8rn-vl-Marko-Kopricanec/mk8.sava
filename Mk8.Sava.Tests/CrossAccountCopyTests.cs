@@ -95,6 +95,17 @@ public sealed class CrossAccountCopyTests
             .Value.Content.ToString());
         var committed = await stagedDestination.GetBlockListAsync(BlockListTypes.Committed).ConfigureAwait(true);
         Assert.Equal(blockIds, committed.Value.CommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
+
+        var asynchronousDestination = destinationContainer.GetBlockBlobClient("async-staged-copy.bin");
+        var operation = await asynchronousDestination.StartCopyFromUriAsync(stagedSas).ConfigureAwait(true);
+        await operation.WaitForCompletionAsync().ConfigureAwait(true);
+        var asynchronousProperties = (await asynchronousDestination.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(CopyStatus.Success, asynchronousProperties.CopyStatus);
+        Assert.Equal("first-second-third", (await asynchronousDestination.DownloadContentAsync().ConfigureAwait(true))
+            .Value.Content.ToString());
+        var asynchronousBlocks = await asynchronousDestination.GetBlockListAsync(BlockListTypes.Committed)
+            .ConfigureAwait(true);
+        Assert.Equal(blockIds, asynchronousBlocks.Value.CommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
     }
 
     private static BlobServiceClient CreateClient(
