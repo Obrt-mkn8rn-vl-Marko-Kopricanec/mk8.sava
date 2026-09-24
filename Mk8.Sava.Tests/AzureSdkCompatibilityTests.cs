@@ -1804,6 +1804,61 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalRecursiveListingSortsSlashBeforePunctuationAcrossContinuations()
+    {
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.SecondAccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        var service = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var container = service.GetBlobContainerClient($"hns-sort-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        foreach (var name in new[] { "a-file", "a.file", "a0file", "a/child" })
+            await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name));
+
+        var listed = new List<string>();
+        var continuations = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var page in container.GetBlobsAsync().AsPages(pageSizeHint: 1))
+        {
+            listed.Add(Assert.Single(page.Values).Name);
+            Assert.True(listed.Count <= 5, "Recursive HNS listing did not advance its continuation.");
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                Assert.True(continuations.Add(page.ContinuationToken));
+        }
+        Assert.Equal(["a", "a/child", "a-file", "a.file", "a0file"], listed);
+        Assert.Equal(4, continuations.Count);
+
+        var ranged = new List<string>();
+        await foreach (var blob in container.GetBlobsAsync(new GetBlobsOptions { StartFrom = "a.file" }))
+            ranged.Add(blob.Name);
+        Assert.Equal(["a.file", "a0file"], ranged);
+    }
+
+    [Fact]
+    public async Task FlatRecursiveListingKeepsBinarySlashOrderAcrossContinuations()
+    {
+        var container = CreateClient(factory)
+            .GetBlobContainerClient($"flat-sort-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        foreach (var name in new[] { "a-file", "a.file", "a0file", "a/child" })
+            await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name));
+
+        var listed = new List<string>();
+        await foreach (var page in container.GetBlobsAsync().AsPages(pageSizeHint: 1))
+            listed.Add(Assert.Single(page.Values).Name);
+        Assert.Equal(["a-file", "a.file", "a/child", "a0file"], listed);
+
+        var ranged = new List<string>();
+        await foreach (var blob in container.GetBlobsAsync(new GetBlobsOptions { StartFrom = "a.file" }))
+            ranged.Add(blob.Name);
+        Assert.Equal(["a.file", "a/child", "a0file"], ranged);
+    }
+
+    [Fact]
     public async Task HierarchicalNamespacePersistsBearerOwnerAndInheritedGroupAcrossOverwriteAndRestart()
     {
         const string creatorId = "1a26a4bf-1ae9-40de-8834-678601f7f508";

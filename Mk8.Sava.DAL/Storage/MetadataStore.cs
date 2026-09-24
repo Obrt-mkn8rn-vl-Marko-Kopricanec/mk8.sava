@@ -1251,11 +1251,12 @@ public sealed partial class MetadataStore(
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximum);
         ArgumentOutOfRangeException.ThrowIfNegative(legacyOffset);
 
+        var hierarchicalRecursive = hierarchicalNamespace && string.IsNullOrEmpty(delimiter);
         var predicates = BuildBlobListingPredicates(
-            hierarchicalNamespace, showOnly, includeVersions, includeSnapshots,
+            hierarchicalNamespace, hierarchicalRecursive, showOnly, includeVersions, includeSnapshots,
             includeDeleted, endBefore);
 
-        var eligible = BuildEligibleBlobListingSql(predicates, endBefore);
+        var eligible = BuildEligibleBlobListingSql(predicates, endBefore, hierarchicalRecursive);
         var entries = BuildBlobListingEntriesSql(eligible, delimiter, hierarchicalNamespace);
 
         var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
@@ -1272,6 +1273,7 @@ public sealed partial class MetadataStore(
         command.Parameters.AddWithValue("$start_from", startFrom);
         command.Parameters.AddWithValue("$end_before", endBefore);
         command.Parameters.AddWithValue("$delimiter", delimiter);
+        command.Parameters.AddWithValue("$hns_recursive", hierarchicalRecursive ? 1 : 0);
         command.Parameters.AddWithValue(
             "$include_uncommitted",
             includeUncommitted && showOnly is not (BlobListShowOnly.Deleted or BlobListShowOnly.Directories) ? 1 : 0);
@@ -1292,25 +1294,32 @@ public sealed partial class MetadataStore(
         var reader = (await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false));
         await using var readerDisposal = reader.ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            items.Add(reader.GetInt32(2) == 0
-                ? new BlobListEntry(
-                    await reader.IsDBNullAsync(0, cancellationToken).ConfigureAwait(false)
-                        ? null
-                        : Deserialize<BlobRecord>(reader.GetString(0)),
-                    reader.GetString(1))
-                : reader.GetInt32(7) == 1
-                    ? new BlobListEntry(null, null, reader.GetString(1))
-                    : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null));
-        }
+            items.Add(await ReadBlobListEntryAsync(reader, cancellationToken).ConfigureAwait(false));
         var hasMore = items.Count > maximum;
         if (hasMore)
             items.RemoveAt(items.Count - 1);
         return new BlobListPage(items, hasMore);
     }
 
+    private static async Task<BlobListEntry> ReadBlobListEntryAsync(
+        SqliteDataReader reader,
+        CancellationToken cancellationToken)
+    {
+        var name = reader.GetString(1);
+        if (reader.GetInt32(2) == 0)
+        {
+            var blob = await reader.IsDBNullAsync(0, cancellationToken).ConfigureAwait(false)
+                ? null : Deserialize<BlobRecord>(reader.GetString(0));
+            return new BlobListEntry(blob, name);
+        }
+        return reader.GetInt32(7) == 1
+            ? new BlobListEntry(null, null, name)
+            : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null);
+    }
+
     private static List<string> BuildBlobListingPredicates(
         bool hierarchicalNamespace,
+        bool hierarchicalRecursive,
         BlobListShowOnly showOnly,
         bool includeVersions,
         bool includeSnapshots,
@@ -1322,7 +1331,8 @@ public sealed partial class MetadataStore(
             "account = $account",
             "container = $container",
             "name >= $prefix",
-            "name >= $start_from",
+            $"{BlobListingOrderExpression("name", hierarchicalRecursive)} >= " +
+            BlobListingOrderExpression("$start_from", hierarchicalRecursive),
             "substr(name, 1, length($prefix)) = $prefix"
         };
         if (hierarchicalNamespace)
@@ -1355,13 +1365,17 @@ public sealed partial class MetadataStore(
                 predicates.Add("is_deleted = 0");
         }
         if (!string.IsNullOrEmpty(endBefore))
-            predicates.Add("name < $end_before");
+        {
+            predicates.Add($"{BlobListingOrderExpression("name", hierarchicalRecursive)} < " +
+                           BlobListingOrderExpression("$end_before", hierarchicalRecursive));
+        }
         return predicates;
     }
 
     private static string BuildEligibleBlobListingSql(
         IReadOnlyList<string> predicates,
-        string endBefore)
+        string endBefore,
+        bool hierarchicalRecursive)
     {
         const string rankExpression = """
             CASE
@@ -1384,11 +1398,16 @@ public sealed partial class MetadataStore(
             "staged.account = $account",
             "staged.container = $container",
             "staged.blob_name >= $prefix",
-            "staged.blob_name >= $start_from",
+            $"{BlobListingOrderExpression("staged.blob_name", hierarchicalRecursive)} >= " +
+            BlobListingOrderExpression("$start_from", hierarchicalRecursive),
             "substr(staged.blob_name, 1, length($prefix)) = $prefix"
         };
         if (!string.IsNullOrEmpty(endBefore))
-            uncommittedPredicates.Add("staged.blob_name < $end_before");
+        {
+            uncommittedPredicates.Add(
+                $"{BlobListingOrderExpression("staged.blob_name", hierarchicalRecursive)} < " +
+                BlobListingOrderExpression("$end_before", hierarchicalRecursive));
+        }
         var eligibleUncommitted = $"""
             SELECT NULL AS data, staged.blob_name AS name,
                    NULL AS version_id, NULL AS snapshot, '' AS generation_id,
@@ -1413,6 +1432,9 @@ public sealed partial class MetadataStore(
             SELECT * FROM ({eligibleUncommitted})
             """;
     }
+
+    private static string BlobListingOrderExpression(string name, bool hierarchicalRecursive) =>
+        hierarchicalRecursive ? $"replace({name}, '/', char(0))" : name;
 
     private static string BuildBlobListingEntriesSql(
         string eligible,
@@ -1522,14 +1544,24 @@ public sealed partial class MetadataStore(
 
     private static string BuildBlobListingPageSql(string entries) => $"""
         {entries}
+        , ordered_entries AS (
+            SELECT *,
+                   CASE WHEN $hns_recursive = 1 THEN replace(entry_name, '/', char(0))
+                        ELSE entry_name END AS sort_name
+            FROM entries
+        )
         SELECT data, entry_name, entry_type, rank, version_id, snapshot, generation_id,
                is_uncommitted, is_directory
-        FROM entries
+        FROM ordered_entries
         WHERE $has_cursor = 0
-           OR ($name_complete = 1 AND entry_name > $cursor_name)
+           OR ($name_complete = 1 AND sort_name >
+               CASE WHEN $hns_recursive = 1 THEN replace($cursor_name, '/', char(0))
+                    ELSE $cursor_name END)
            OR ($name_complete = 0 AND (
-                entry_name > $cursor_name
-                OR (entry_name = $cursor_name AND (
+                sort_name > CASE WHEN $hns_recursive = 1 THEN replace($cursor_name, '/', char(0))
+                                 ELSE $cursor_name END
+                OR (sort_name = CASE WHEN $hns_recursive = 1 THEN replace($cursor_name, '/', char(0))
+                                     ELSE $cursor_name END AND (
                     entry_type > $cursor_type
                     OR (entry_type = $cursor_type AND entry_type = 1 AND (
                         rank > $cursor_rank
@@ -1547,7 +1579,7 @@ public sealed partial class MetadataStore(
                     ))
                 ))
            ))
-        ORDER BY entry_name COLLATE BINARY,
+        ORDER BY sort_name COLLATE BINARY,
                  entry_type,
                  rank,
                  CASE WHEN rank = 1 THEN version_id END DESC,
