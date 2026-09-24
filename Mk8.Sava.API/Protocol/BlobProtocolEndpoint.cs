@@ -1909,32 +1909,126 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         EnsureNoPendingCopyDestination(current);
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
                          ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-        _ = SanitizeCopySource(copySource);
-        var resolvedSource = ResolveInternalCopySource(http.Request, request, copySource)
-                             ?? throw new AzureStorageException(
-                                 StatusCodes.Status409Conflict,
-                                 "CannotVerifyCopySource",
-                                 "The incremental copy source is not hosted by this Blob service endpoint.");
+        var publicSource = SanitizeCopySource(copySource);
+        var resolvedSource = ResolveInternalCopySource(http.Request, request, copySource);
+        BlobRecord copied;
+        if (resolvedSource is not null)
+        {
+            copied = await BeginInternalIncrementalCopyAsync(
+                http, request, service, containerName, blobName, current,
+                resolvedSource, publicSource, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            copied = await BeginExternalIncrementalCopyAsync(
+                http,
+                request,
+                service,
+                containerName,
+                blobName,
+                current,
+                copySource,
+                publicSource,
+                cancellationToken).ConfigureAwait(false);
+        }
+        AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: false);
+        http.Response.StatusCode = StatusCodes.Status202Accepted;
+        return;
+    }
+
+    private static async Task<BlobRecord> BeginInternalIncrementalCopyAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        ResolvedInternalCopySource resolvedSource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
         var source = await ResolveCopySourceAsync(
-            http,
-            request,
-            service,
-            resolvedSource,
-            cancellationToken).ConfigureAwait(false);
+            http, request, service, resolvedSource, cancellationToken).ConfigureAwait(false);
         EvaluateCopySourceConditions(http.Request, source);
         source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
-        var copied = await service.BeginIncrementalCopyAsync(
+        return await service.BeginIncrementalCopyAsync(
             request.Account,
             containerName,
             blobName,
             source,
             ReadCopyWriteOptions(http.Request, source, current),
-            SanitizeCopySource(copySource),
+            publicSource,
             current,
             cancellationToken).ConfigureAwait(false);
-        AzureResponseWriter.AddBlobCopyHeaders(http.Response, copied, includeVersion: false);
-        http.Response.StatusCode = StatusCodes.Status202Accepted;
-        return;
+    }
+
+    private static async Task<BlobRecord> BeginExternalIncrementalCopyAsync(
+        HttpContext http,
+        StorageRequestContext request,
+        BlobService service,
+        string containerName,
+        string blobName,
+        BlobRecord? current,
+        string copySource,
+        string publicSource,
+        CancellationToken cancellationToken)
+    {
+        if (!Uri.TryCreate(copySource, UriKind.Absolute, out var sourceUri))
+            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+        var sourceQuery = QueryHelpers.ParseQuery(sourceUri.Query);
+        if (!sourceQuery.TryGetValue("snapshot", out var snapshots) || snapshots.Count != 1 ||
+            string.IsNullOrWhiteSpace(snapshots[0]))
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "IncrementalCopySourceMustBeSnapshot",
+                "The source for an incremental copy must be a page blob snapshot.");
+        }
+
+        var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
+        var transfer = await transfers.ReadAsync(
+            http.Request,
+            copySource,
+            sourceRange: null,
+            allowSourceCustomerProvidedKey: false,
+            allowFileRequestIntent: false,
+            long.MaxValue,
+            sourceLengthConflict: false,
+            async source =>
+            {
+                if (source.Kind != BlobKind.PageBlob)
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status409Conflict,
+                        "InvalidSourceBlobType",
+                        "The source blob type is invalid for incremental copy.");
+                }
+                if (source.CreatedAt is not { } createdAt)
+                {
+                    throw new AzureStorageException(
+                        StatusCodes.Status409Conflict,
+                        "CannotVerifyCopySource",
+                        "The source did not return a valid creation time for incremental copy.");
+                }
+                return await service.BeginIncrementalCopyFromStreamAsync(
+                    request.Account,
+                    containerName,
+                    blobName,
+                    source.Content,
+                    source.ContentLength!.Value,
+                    snapshots[0]!,
+                    sourceUri.GetLeftPart(UriPartial.Path),
+                    createdAt,
+                    source.SequenceNumber,
+                    source.PageRanges,
+                    ReadUrlCopyWriteOptions(http.Request, source, copySourceTags: false, current, synchronous: false),
+                    publicSource,
+                    current,
+                    cancellationToken).ConfigureAwait(false);
+            },
+            cancellationToken,
+            preserveSourceShape: true).ConfigureAwait(false);
+        return transfer.Value;
     }
 
     private static void RequireIncrementalCopyVersion(StorageRequestContext request)

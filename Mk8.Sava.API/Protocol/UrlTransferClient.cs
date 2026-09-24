@@ -108,7 +108,8 @@ internal sealed class UrlTransferClient(
                 sourceShape.IsSealed,
                 sourceShape.AppendBlockCount,
                 sourceShape.CommittedBlocks,
-                sourceShape.PageRanges);
+                sourceShape.PageRanges,
+                ReadCreationTime(response));
             return await ConsumeWithChecksumValidationAsync(
                 destinationRequest,
                 sourceInfo,
@@ -898,6 +899,18 @@ internal sealed class UrlTransferClient(
             return values.SingleOrDefault();
         }
         return null;
+    }
+
+    private static DateTimeOffset? ReadCreationTime(HttpResponseMessage response)
+    {
+        var value = ReadSingleHeader(response, "x-ms-creation-time");
+        return DateTimeOffset.TryParse(
+            value,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out var createdAt)
+            ? createdAt
+            : null;
     }
 
     private static string? Join(IEnumerable<string> values)
