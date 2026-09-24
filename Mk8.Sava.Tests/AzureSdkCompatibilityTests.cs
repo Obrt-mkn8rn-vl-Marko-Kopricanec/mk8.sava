@@ -2469,7 +2469,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using var projectedHead = await transport.SendAsync(head).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, projectedHead.StatusCode);
         Assert.Equal("delegated@example.test", GetResponseHeader(projectedHead, "x-ms-owner"));
-        Assert.Equal("creator@example.test", GetResponseHeader(projectedHead, "x-ms-group"));
+        Assert.Equal(creatorId, GetResponseHeader(projectedHead, "x-ms-group"));
 
         using var projectedListRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
         projectedListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
@@ -2479,7 +2479,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var projectedList = System.Xml.Linq.XDocument.Parse(await projectedListResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
         var projectedDirectory = Assert.Single(projectedList.Descendants("BlobPrefix"));
         Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Owner")?.Value);
-        Assert.Equal("creator@example.test", projectedDirectory.Element("Properties")?.Element("Group")?.Value);
+        Assert.Equal(creatorId, projectedDirectory.Element("Properties")?.Element("Group")?.Value);
 
         var recursiveUri = AppendQuery(
             container.GenerateSasUri(BlobContainerSasPermissions.List, DateTimeOffset.UtcNow.AddMinutes(5)),
@@ -2492,7 +2492,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var recursive = System.Xml.Linq.XDocument.Parse(await recursiveResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
         var delegatedEntry = recursive.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, "parent/delegated.txt", StringComparison.Ordinal));
         Assert.Equal("delegated@example.test", delegatedEntry.Element("Properties")?.Element("Owner")?.Value);
-        Assert.Equal("creator@example.test", delegatedEntry.Element("Properties")?.Element("Group")?.Value);
+        Assert.Equal(creatorId, delegatedEntry.Element("Properties")?.Element("Group")?.Value);
     }
 
     [Fact]
@@ -4714,6 +4714,121 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         await AssertHnsUpnHeadShapeAsync(transport, blob);
         await AssertFlatUpnHeadRejectionAsync();
+    }
+
+    [Fact]
+    public async Task HierarchicalUpnProjectsNamedUsersButNeverGroupIdsInAclResponses()
+    {
+        const string ownerId = "49d466d7-7c31-4667-b7c2-403de2db192b";
+        const string groupId = "318453da-034d-4453-aea7-0671bf6b8c26";
+        const string namedUserId = "827392d8-7e13-492b-b8c8-43c033707e3c";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{ownerId}:UserPrincipalName"] = "owner@example.test",
+            [$"Sava:BearerAuthentication:Principals:{namedUserId}:UserPrincipalName"] = "reader@example.test",
+            [$"Sava:BearerAuthentication:Principals:{groupId}:UserPrincipalName"] = "must-not-project@example.test"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application).GetBlobContainerClient($"hns-upn-acl-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("folder/item.bin");
+        await blob.UploadAsync(BinaryData.FromString("unchanged"));
+        await SeedUpnProjectionAclAsync(application, container.Name, ownerId, groupId, namedUserId);
+
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        await AssertUpnProjectedHeadAsync(transport, blob, ownerId, groupId, namedUserId);
+        await AssertUpnProjectedListAsync(transport, container, blob.Name, groupId, namedUserId);
+        Assert.Equal("unchanged", (await blob.DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    private static async Task SeedUpnProjectionAclAsync(
+        SavaWebApplicationFactory application, string containerName,
+        string ownerId, string groupId, string namedUserId)
+    {
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        foreach (var path in new[] { "folder", "folder/item.bin" })
+        {
+            var directory = string.Equals(path, "folder", StringComparison.Ordinal);
+            var acl = directory
+                ? $"user::rwx,user:{namedUserId}:r-x,group::r-x,group:{groupId}:r-x,mask::r-x,other::---," +
+                  $"default:user::rwx,default:user:{namedUserId}:r-x,default:group::r-x," +
+                  $"default:group:{groupId}:r-x,default:mask::r-x,default:other::---"
+                : $"user::rw-,user:{namedUserId}:r--,group::r--,group:{groupId}:r--,mask::r--,other::---";
+            var existing = await metadata.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName, containerName, path,
+                versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None)
+                .ConfigureAwait(false);
+            Assert.NotNull(existing);
+            await metadata.PutBlobRecordAsync(
+                existing with { Owner = ownerId, Group = groupId, AccessAcl = acl },
+                existing.Revision, CancellationToken.None).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertUpnProjectedHeadAsync(
+        HttpClient transport, BlobClient blob, string ownerId, string groupId, string namedUserId)
+    {
+        using var getRequest = new HttpRequestMessage(
+            HttpMethod.Get, blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        getRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        getRequest.Headers.TryAddWithoutValidation("x-ms-upn", "true");
+        using var get = await transport.SendAsync(getRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, get.StatusCode);
+        Assert.Equal("owner@example.test", GetResponseHeader(get, "x-ms-owner"));
+        Assert.Equal(groupId, GetResponseHeader(get, "x-ms-group"));
+        Assert.Contains("user:reader@example.test:r--", GetResponseHeader(get, "x-ms-acl"),
+            StringComparison.Ordinal);
+
+        using var projected = await SendUpnHeadAsync(blob, "2023-11-03", "true", transport)
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, projected.StatusCode);
+        Assert.Equal("owner@example.test", GetResponseHeader(projected, "x-ms-owner"));
+        Assert.Equal(groupId, GetResponseHeader(projected, "x-ms-group"));
+        var acl = GetResponseHeader(projected, "x-ms-acl");
+        Assert.Contains("user:reader@example.test:r--", acl, StringComparison.Ordinal);
+        Assert.Contains($"group:{groupId}:r--", acl, StringComparison.Ordinal);
+        Assert.DoesNotContain("must-not-project@example.test", acl, StringComparison.Ordinal);
+
+        using var raw = await SendUpnHeadAsync(blob, "2023-11-03", "false", transport)
+            .ConfigureAwait(false);
+        Assert.Equal(ownerId, GetResponseHeader(raw, "x-ms-owner"));
+        Assert.Contains($"user:{namedUserId}:r--", GetResponseHeader(raw, "x-ms-acl"),
+            StringComparison.Ordinal);
+    }
+
+    private static async Task AssertUpnProjectedListAsync(
+        HttpClient transport, BlobContainerClient container, string blobName,
+        string groupId, string namedUserId)
+    {
+        using var recursive = await SendUpnListAsync(
+            transport, container, "2023-11-03", "&include=permissions", "true").ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, recursive.StatusCode);
+        var document = System.Xml.Linq.XDocument.Parse(
+            await recursive.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var properties = document.Descendants("Blob").Single(element =>
+            string.Equals(element.Element("Name")?.Value, blobName, StringComparison.Ordinal))
+            .Element("Properties");
+        Assert.Equal("owner@example.test", properties?.Element("Owner")?.Value);
+        Assert.Equal(groupId, properties?.Element("Group")?.Value);
+        Assert.Contains("user:reader@example.test:r--", properties?.Element("Acl")?.Value,
+            StringComparison.Ordinal);
+
+        using var hierarchical = await SendUpnListAsync(
+            transport, container, "2023-11-03", "&include=permissions&delimiter=%2F", "true")
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, hierarchical.StatusCode);
+        var hierarchy = System.Xml.Linq.XDocument.Parse(
+            await hierarchical.Content.ReadAsStringAsync().ConfigureAwait(false));
+        var prefix = hierarchy.Descendants("BlobPrefix").Single().Element("Properties");
+        Assert.Equal("owner@example.test", prefix?.Element("Owner")?.Value);
+        Assert.Equal(groupId, prefix?.Element("Group")?.Value);
+        Assert.Contains($"default:user:reader@example.test:r-x", prefix?.Element("Acl")?.Value,
+            StringComparison.Ordinal);
+        Assert.Contains($"default:group:{groupId}:r-x", prefix?.Element("Acl")?.Value,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(namedUserId, prefix?.Element("Acl")?.Value, StringComparison.Ordinal);
     }
 
     private static async Task<HttpResponseMessage> SendUpnListAsync(
