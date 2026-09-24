@@ -177,6 +177,8 @@ public sealed partial class MetadataStore(
 
     public void Dispose()
     {
+        using var connection = new SqliteConnection(_connectionString);
+        SqliteConnection.ClearPool(connection);
         _writeGate.Dispose();
         GC.SuppressFinalize(this);
     }

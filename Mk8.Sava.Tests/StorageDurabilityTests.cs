@@ -1,9 +1,26 @@
+using Microsoft.Extensions.DependencyInjection;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
 public sealed class StorageDurabilityTests
 {
+    [Fact]
+    public async Task DisposingServiceReleasesMetadataPoolBeforeDeletingItsRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-dispose-root-{Guid.NewGuid():N}");
+        var application = new SavaWebApplicationFactory(root, deleteDataPath: false);
+        await using (application.ConfigureAwait(true))
+        {
+            await application.InitializeAsync().ConfigureAwait(true);
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            _ = await metadata.GetStorageInventoryAsync(CancellationToken.None).ConfigureAwait(true);
+        }
+
+        Directory.Delete(root, recursive: true);
+        Assert.False(Directory.Exists(root));
+    }
+
     [Fact]
     public async Task PublishFilePreservesNoOverwriteAndAtomicReplacementSemantics()
     {

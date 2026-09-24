@@ -112,7 +112,11 @@ public sealed class StorageKeyRotationTests
 
     private static async Task ClearDataKeyFingerprintsAsync(string dataPath)
     {
-        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(dataPath, "metadata.db"),
+            Pooling = false
+        }.ToString());
         await using var disposal = connection.ConfigureAwait(false);
         await connection.OpenAsync().ConfigureAwait(false);
         var clear = connection.CreateCommand();
