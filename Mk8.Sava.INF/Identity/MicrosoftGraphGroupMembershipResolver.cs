@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Net;
 using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
@@ -21,6 +22,8 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         new(["https://graph.microsoft.com/.default"]);
     private const int MaximumResponseBytes = 1024 * 1024;
     private const int MaximumGroups = 11_000;
+    private const int MaximumPagedGroups = 100_000;
+    private const int MaximumPages = 128;
 
     public async Task<HashSet<string>> ResolveAsync(
         ClaimsPrincipal principal,
@@ -69,17 +72,130 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         request.Content = new StringContent("{\"securityEnabledOnly\":true}", Encoding.UTF8, "application/json");
         using var response = await client.SendAsync(
             request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.BadRequest)
+        {
+            using var error = await ReadDocumentAsync(response, cancellationToken).ConfigureAwait(false);
+            if (IsGroupLimitError(error))
+                return await FetchPagedGroupsAsync(objectId, token.Token, cancellationToken).ConfigureAwait(false);
+        }
         if (!response.IsSuccessStatusCode)
         {
             GraphLookupRejected(logger, (int)response.StatusCode);
             throw AzureStorageException.AuthorizationFailure();
         }
 
+        using var document = await ReadDocumentAsync(response, cancellationToken).ConfigureAwait(false);
+        return ParseGroups(document);
+    }
+
+    private async Task<HashSet<string>> FetchPagedGroupsAsync(
+        Guid objectId, string token, CancellationToken cancellationToken)
+    {
+        var kind = await GetDirectoryObjectKindAsync(objectId, token, cancellationToken).ConfigureAwait(false);
+        var path = $"/v1.0/{kind}/{objectId:D}/transitiveMemberOf/microsoft.graph.group";
+        var next = new Uri($"https://graph.microsoft.com{path}?%24select=id%2CsecurityEnabled&%24top=999&%24count=true");
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var groups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var page = 0; page < MaximumPages; page++)
+        {
+            if (!IsSafePageUrl(next, path) || !seen.Add(next.AbsoluteUri))
+                throw AzureStorageException.AuthorizationFailure();
+            using var document = await GetGraphPageAsync(next, token, cancellationToken).ConfigureAwait(false);
+            AddPageGroups(document, groups);
+            if (groups.Count > MaximumPagedGroups)
+                throw AzureStorageException.AuthorizationFailure();
+            if (!document.RootElement.TryGetProperty("@odata.nextLink", out var link))
+                return groups;
+            if (link.ValueKind != JsonValueKind.String ||
+                !Uri.TryCreate(link.GetString(), UriKind.Absolute, out next))
+            {
+                throw AzureStorageException.AuthorizationFailure();
+            }
+        }
+        throw AzureStorageException.AuthorizationFailure();
+    }
+
+    private async Task<string> GetDirectoryObjectKindAsync(
+        Guid objectId, string token, CancellationToken cancellationToken)
+    {
+        var uri = new Uri($"https://graph.microsoft.com/v1.0/directoryObjects/{objectId:D}");
+        using var document = await GetGraphPageAsync(uri, token, cancellationToken, consistency: false)
+            .ConfigureAwait(false);
+        if (!document.RootElement.TryGetProperty("@odata.type", out var type) ||
+            type.ValueKind != JsonValueKind.String)
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        return type.GetString() switch
+        {
+            "#microsoft.graph.user" => "users",
+            "#microsoft.graph.servicePrincipal" => "servicePrincipals",
+            _ => throw AzureStorageException.AuthorizationFailure()
+        };
+    }
+
+    private async Task<JsonDocument> GetGraphPageAsync(
+        Uri uri, string token, CancellationToken cancellationToken, bool consistency = true)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        if (consistency)
+            request.Headers.Add("ConsistencyLevel", "eventual");
+        using var response = await client.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            GraphLookupRejected(logger, (int)response.StatusCode);
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        return await ReadDocumentAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void AddPageGroups(JsonDocument document, HashSet<string> groups)
+    {
+        if (!document.RootElement.TryGetProperty("value", out var values) ||
+            values.ValueKind != JsonValueKind.Array)
+        {
+            throw AzureStorageException.AuthorizationFailure();
+        }
+        foreach (var value in values.EnumerateArray())
+        {
+            if (value.ValueKind != JsonValueKind.Object ||
+                !value.TryGetProperty("id", out var id) ||
+                id.ValueKind != JsonValueKind.String ||
+                !Guid.TryParse(id.GetString(), out var groupId) ||
+                !value.TryGetProperty("securityEnabled", out var securityEnabled) ||
+                securityEnabled.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+            {
+                throw AzureStorageException.AuthorizationFailure();
+            }
+            if (securityEnabled.ValueKind == JsonValueKind.True)
+                groups.Add(groupId.ToString("D"));
+        }
+    }
+
+    private static bool IsSafePageUrl(Uri uri, string path) =>
+        uri.Scheme == Uri.UriSchemeHttps &&
+        uri.Host.Equals("graph.microsoft.com", StringComparison.OrdinalIgnoreCase) &&
+        uri.IsDefaultPort &&
+        uri.UserInfo.Length == 0 &&
+        uri.Fragment.Length == 0 &&
+        uri.AbsolutePath.Equals(path, StringComparison.Ordinal) &&
+        uri.AbsoluteUri.Length <= 4096;
+
+    private static bool IsGroupLimitError(JsonDocument document) =>
+        document.RootElement.TryGetProperty("error", out var error) &&
+        error.ValueKind == JsonValueKind.Object &&
+        error.TryGetProperty("code", out var code) &&
+        code.ValueKind == JsonValueKind.String &&
+        code.GetString() == "Directory_ResultSizeLimitExceeded";
+
+    private static async Task<JsonDocument> ReadDocumentAsync(
+        HttpResponseMessage response, CancellationToken cancellationToken)
+    {
         await response.Content.LoadIntoBufferAsync(MaximumResponseBytes, cancellationToken).ConfigureAwait(false);
         using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-        return ParseGroups(document);
+        return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     private static HashSet<string> ParseGroups(JsonDocument document)
