@@ -3513,15 +3513,23 @@ public sealed partial class MetadataStore(
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
     {
         var connection = new SqliteConnection(_connectionString);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
-        await ExecuteNonQueryAsync(
-            connection,
-            $"PRAGMA journal_size_limit={RetainedWalLimitBytes};",
-            cancellationToken).ConfigureAwait(false);
-        await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken).ConfigureAwait(false);
-        await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken).ConfigureAwait(false);
-        return connection;
+        try
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA synchronous=FULL;", cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(
+                connection,
+                $"PRAGMA journal_size_limit={RetainedWalLimitBytes};",
+                cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA foreign_keys=ON;", cancellationToken).ConfigureAwait(false);
+            await ExecuteNonQueryAsync(connection, "PRAGMA busy_timeout=30000;", cancellationToken).ConfigureAwait(false);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     private static async Task ExecuteNonQueryAsync(SqliteConnection connection, string text, CancellationToken cancellationToken)
