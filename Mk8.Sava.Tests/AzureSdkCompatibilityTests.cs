@@ -12933,120 +12933,132 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     public async Task MaintenanceReclaimsAbandonedStagingAndSurfacesChunkCorruption()
     {
         var blobService = factory.Services.GetRequiredService<BlobService>();
-        var staging = Path.Combine(factory.DataPath, "staging");
-        var abandonedPath = Path.Combine(staging, $"abandoned-{Guid.NewGuid():N}.tmp");
-        var activePath = Path.Combine(staging, $"active-{Guid.NewGuid():N}.tmp");
-        var freshPath = Path.Combine(staging, $"fresh-{Guid.NewGuid():N}.tmp");
-        await File.WriteAllBytesAsync(abandonedPath, "abandoned"u8.ToArray());
-        await File.WriteAllBytesAsync(freshPath, "fresh"u8.ToArray());
-        File.SetLastWriteTimeUtc(abandonedPath, DateTime.UtcNow.AddDays(-2));
-
-        {
-            var active = new FileStream(
-                         activePath,
-                         FileMode.CreateNew,
-                         FileAccess.ReadWrite,
-                         FileShare.None,
-                         bufferSize: 4096,
-                         FileOptions.Asynchronous);
-            await using (active.ConfigureAwait(false))
-            {
-                await active.WriteAsync("active"u8.ToArray());
-                await active.FlushAsync();
-                File.SetLastWriteTimeUtc(activePath, DateTime.UtcNow.AddDays(-2));
-
-                await blobService.RunMaintenanceAsync(CancellationToken.None);
-                Assert.False(File.Exists(abandonedPath));
-                Assert.True(File.Exists(activePath));
-                Assert.True(File.Exists(freshPath));
-            }
-        }
-
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
-        Assert.False(File.Exists(activePath));
-        Assert.True(File.Exists(freshPath));
+        var freshPath = await AssertAbandonedStagingCleanupAsync(factory, blobService);
 
         var service = CreateClient(factory);
         var containerName = $"integrity-{Guid.NewGuid():N}";
         var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
-        var blob = container.GetBlobClient("corrupt.bin");
-        await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(48 * 1024)));
-        var record = await blobService.GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            containerName,
-            blob.Name,
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        var chunk = record.Content.Chunks.First(item => !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
-        var chunkPath = ChunkPath(factory.DataPath, chunk.Id);
-        {
-            var file = new FileStream(
-                         chunkPath,
-                         FileMode.Open,
-                         FileAccess.ReadWrite,
-                         FileShare.None,
-                         bufferSize: 4096,
-                         FileOptions.Asynchronous);
-            await using (file.ConfigureAwait(false))
-            {
-                file.Position = file.Length - 1;
-                var value = file.ReadByte();
-                Assert.NotEqual(-1, value);
-                file.Position--;
-                file.WriteByte((byte)(value ^ 0xff));
-                // Durability tests require a media flush; FlushAsync cannot request one.
-#pragma warning disable CA1849
-                file.Flush(flushToDisk: true);
-#pragma warning restore CA1849
-            }
-        }
+        var (blob, chunkPath) = await CorruptBlobChunkAsync(factory, blobService, container, containerName);
 
         await blobService.RunMaintenanceAsync(CancellationToken.None);
         using var operatorClient = factory.CreateClient();
-        var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute));
+        await AssertCorruptChunkStatusAndRecoveryAsync(blobService, blob, chunkPath, operatorClient);
+        await AssertMissingChunkStatusAndRecoveryAsync(factory, blobService, container, containerName, operatorClient);
+
+        File.Delete(freshPath);
+    }
+
+    private static async Task<string> AssertAbandonedStagingCleanupAsync(
+        SavaWebApplicationFactory application, BlobService blobService)
+    {
+        var staging = Path.Combine(application.DataPath, "staging");
+        var abandonedPath = Path.Combine(staging, $"abandoned-{Guid.NewGuid():N}.tmp");
+        var activePath = Path.Combine(staging, $"active-{Guid.NewGuid():N}.tmp");
+        var freshPath = Path.Combine(staging, $"fresh-{Guid.NewGuid():N}.tmp");
+        await File.WriteAllBytesAsync(abandonedPath, "abandoned"u8.ToArray()).ConfigureAwait(false);
+        await File.WriteAllBytesAsync(freshPath, "fresh"u8.ToArray()).ConfigureAwait(false);
+        File.SetLastWriteTimeUtc(abandonedPath, DateTime.UtcNow.AddDays(-2));
+
+        var active = new FileStream(activePath, FileMode.CreateNew, FileAccess.ReadWrite,
+            FileShare.None, bufferSize: 4096, FileOptions.Asynchronous);
+        await using (active.ConfigureAwait(false))
+        {
+            await active.WriteAsync("active"u8.ToArray()).ConfigureAwait(false);
+            await active.FlushAsync().ConfigureAwait(false);
+            File.SetLastWriteTimeUtc(activePath, DateTime.UtcNow.AddDays(-2));
+
+            await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.False(File.Exists(abandonedPath));
+            Assert.True(File.Exists(activePath));
+            Assert.True(File.Exists(freshPath));
+        }
+
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.False(File.Exists(activePath));
+        Assert.True(File.Exists(freshPath));
+        return freshPath;
+    }
+
+    private static async Task<(BlobClient Blob, string ChunkPath)> CorruptBlobChunkAsync(
+        SavaWebApplicationFactory application, BlobService blobService,
+        BlobContainerClient container, string containerName)
+    {
+        var blob = container.GetBlobClient("corrupt.bin");
+        await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(48 * 1024)))
+            .ConfigureAwait(false);
+        var record = await blobService.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, containerName, blob.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        var chunk = record.Content.Chunks.First(item => !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
+        var chunkPath = ChunkPath(application.DataPath, chunk.Id);
+        var file = new FileStream(chunkPath, FileMode.Open, FileAccess.ReadWrite,
+            FileShare.None, bufferSize: 4096, FileOptions.Asynchronous);
+        await using (file.ConfigureAwait(false))
+        {
+            file.Position = file.Length - 1;
+            var value = file.ReadByte();
+            Assert.NotEqual(-1, value);
+            file.Position--;
+            file.WriteByte((byte)(value ^ 0xff));
+            // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
+            file.Flush(flushToDisk: true);
+#pragma warning restore CA1849
+        }
+        return (blob, chunkPath);
+    }
+
+    private static async Task AssertCorruptChunkStatusAndRecoveryAsync(
+        BlobService blobService, BlobClient blob, string chunkPath, HttpClient operatorClient)
+    {
+        using var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
-        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
+        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
         Assert.Contains("mk8_sava_integrity_corrupt_chunks 1", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_storage_physical_chunk_bytes", metrics, StringComparison.Ordinal);
-        Assert.Contains(
-            $"mk8_sava_storage_allocation_available {(OperatingSystem.IsLinux() ? 1 : 0)}",
-            metrics,
-            StringComparison.Ordinal);
+        Assert.Contains($"mk8_sava_storage_allocation_available {(OperatingSystem.IsLinux() ? 1 : 0)}",
+            metrics, StringComparison.Ordinal);
         if (OperatingSystem.IsLinux())
             Assert.Contains("mk8_sava_storage_allocated_root_bytes", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_http_request_duration_seconds_sum", metrics, StringComparison.Ordinal);
 
-        await blob.DeleteAsync();
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
+        await blob.DeleteAsync().ConfigureAwait(false);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
         Assert.False(File.Exists(chunkPath));
-        var recovered = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute));
+        using var recovered = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
+    }
 
+    private static async Task AssertMissingChunkStatusAndRecoveryAsync(
+        SavaWebApplicationFactory application, BlobService blobService,
+        BlobContainerClient container, string containerName, HttpClient operatorClient)
+    {
         var missing = container.GetBlobClient("missing.bin");
-        await missing.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(40 * 1024)));
+        await missing.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(40 * 1024)))
+            .ConfigureAwait(false);
         var missingRecord = await blobService.GetBlobAsync(
-            SavaWebApplicationFactory.AccountName,
-            containerName,
-            missing.Name,
-            versionId: null,
-            snapshot: null,
-            includeDeleted: false,
-            CancellationToken.None);
-        var missingChunk = missingRecord.Content.Chunks.First(item => !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
-        File.Delete(ChunkPath(factory.DataPath, missingChunk.Id));
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
-        var missingMetrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
+            SavaWebApplicationFactory.AccountName, containerName, missing.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        var missingChunk = missingRecord.Content.Chunks.First(item =>
+            !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
+        File.Delete(ChunkPath(application.DataPath, missingChunk.Id));
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        var missingMetrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
         Assert.Contains("mk8_sava_integrity_missing_chunks 1", missingMetrics, StringComparison.Ordinal);
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, (await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))).StatusCode);
+        using var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
 
-        await missing.DeleteAsync();
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
-        Assert.Equal(HttpStatusCode.OK, (await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))).StatusCode);
-
-        File.Delete(freshPath);
+        await missing.DeleteAsync().ConfigureAwait(false);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        using var recovered = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, recovered.StatusCode);
     }
 
     [Fact]
@@ -13111,6 +13123,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
+    // xUnit1030 requires the test continuation to remain on xUnit's synchronization context.
+#pragma warning disable MA0004
     [Fact]
     public async Task SmallChunksArePackedDeduplicatedCompactedAndBackupSafeAcrossRestart()
     {
@@ -13128,135 +13142,30 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             ["Sava:ChunkPackCompactionMinimumDeadRatio"] = "0.01"
         };
         var initial = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
-        SavaWebApplicationFactory? restarted = null;
         var initialDisposed = false;
         try
         {
-            await initial.InitializeAsync();
-            var service = CreateClient(initial);
-            var containerName = $"packed-{Guid.NewGuid():N}";
-            var container = service.GetBlobContainerClient(containerName);
-            await container.CreateAsync();
-            var firstBytes = RandomNumberGenerator.GetBytes(1024);
-            var secondBytes = RandomNumberGenerator.GetBytes(1536);
-            var first = container.GetBlobClient("first.bin");
-            var duplicate = container.GetBlobClient("duplicate.bin");
-            var second = container.GetBlobClient("second.bin");
-            await first.UploadAsync(BinaryData.FromBytes(firstBytes));
-            await duplicate.UploadAsync(BinaryData.FromBytes(firstBytes));
-            await second.UploadAsync(BinaryData.FromBytes(secondBytes));
-
-            var metadata = initial.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
-            Assert.Empty(EnumerateChunkFiles(dataPath));
-            Assert.Single(EnumeratePackFiles(dataPath));
-            Assert.Equal(firstBytes, (await duplicate.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
-            var range = await second.DownloadContentAsync(new BlobDownloadOptions
-            {
-                Range = new HttpRange(123, 456)
-            }).ConfigureAwait(true);
-            Assert.Equal(secondBytes.AsSpan(123, 456).ToArray(), range.Value.Content.ToArray());
+            await initial.InitializeAsync().ConfigureAwait(true);
+            var scenario = await AssertInitialPackedChunksAsync(initial, dataPath).ConfigureAwait(true);
 
             await initial.DisposeAsync().ConfigureAwait(true);
             initialDisposed = true;
 
-            restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+            var restarted = new SavaWebApplicationFactory(dataPath, configuration, deleteDataPath: false);
+            await using var restartedDisposal = restarted.ConfigureAwait(true);
             await restarted.InitializeAsync().ConfigureAwait(true);
-            var restartedContainer = CreateClient(restarted).GetBlobContainerClient(containerName);
-            first = restartedContainer.GetBlobClient(first.Name);
-            duplicate = restartedContainer.GetBlobClient(duplicate.Name);
-            second = restartedContainer.GetBlobClient(second.Name);
-            Assert.Equal(secondBytes, (await second.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+            var (second, blobs) = await AssertPackedRestartAndCompactionAsync(restarted, dataPath, scenario)
+                .ConfigureAwait(true);
 
-            await first.DeleteAsync().ConfigureAwait(true);
-            await duplicate.DeleteAsync().ConfigureAwait(true);
-            var blobs = restarted.Services.GetRequiredService<BlobService>();
-            var maintenance = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(true);
-            Assert.Equal(1, maintenance.ReclaimedChunks);
-            Assert.Equal(1, maintenance.CompactedChunkPacks);
-            Assert.True(maintenance.PackCompactionBytesSaved > 0);
-            metadata = restarted.Services.GetRequiredService<MetadataStore>();
-            Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(true));
-            Assert.Empty(EnumerateChunkFiles(dataPath));
-            Assert.Single(EnumeratePackFiles(dataPath));
-            Assert.Equal(secondBytes, (await second.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+            await AssertOrphanPackRecoveryAsync(dataPath, blobs).ConfigureAwait(true);
 
-            var orphanPath = Path.Combine(
-                dataPath,
-                "packs",
-                SavaWebApplicationFactory.AccountName,
-                $"orphan-{Guid.NewGuid():N}.pack");
-            await File.WriteAllBytesAsync(orphanPath, RandomNumberGenerator.GetBytes(257)).ConfigureAwait(true);
-            File.SetLastWriteTimeUtc(orphanPath, DateTime.UtcNow.AddMinutes(-1));
-            var recovery = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(true);
-            Assert.Equal(1, recovery.CompactedChunkPacks);
-            Assert.True(recovery.PackCompactionBytesSaved >= 257);
-            Assert.False(File.Exists(orphanPath));
+            await AssertPortablePackedBackupAsync(restarted, backupPath).ConfigureAwait(true);
 
-            var backup = restarted.Services.GetRequiredService<StorageBackupService>();
-            var created = await backup.CreateAsync(backupPath, CancellationToken.None).ConfigureAwait(true);
-            Assert.Equal(1, created.ChunkCount);
-            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(true));
-            Assert.Single(EnumerateChunkFiles(backupPath));
-            Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
-            {
-                var connection = new SqliteConnection(
-                             $"Data Source={Path.Combine(backupPath, "metadata.db")}");
-                await using (connection.ConfigureAwait(false))
-                {
-                    await connection.OpenAsync().ConfigureAwait(true);
-                    var command = connection.CreateCommand();
-                    await using (command.ConfigureAwait(false))
-                    {
-                        command.CommandText =
-                        "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
-                        Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync().ConfigureAwait(true), CultureInfo.InvariantCulture));
-                    }
-                }
-            }
-
-            var packPath = Assert.Single(EnumeratePackFiles(dataPath)).FullName;
-            {
-                var corrupt = new FileStream(
-                             packPath,
-                             FileMode.Open,
-                             FileAccess.ReadWrite,
-                             FileShare.None,
-                             4096,
-                             FileOptions.Asynchronous);
-                await using (corrupt.ConfigureAwait(false))
-                {
-                    var value = corrupt.ReadByte();
-                    Assert.NotEqual(-1, value);
-                    corrupt.Position = 0;
-                    corrupt.WriteByte((byte)(value ^ 0xff));
-                    // Durability tests require a media flush; FlushAsync cannot request one.
-#pragma warning disable CA1849
-                    corrupt.Flush(flushToDisk: true);
-#pragma warning restore CA1849
-                }
-            }
-            var record = await blobs.GetBlobAsync(
-                SavaWebApplicationFactory.AccountName,
-                containerName,
-                second.Name,
-                versionId: null,
-                snapshot: null,
-                includeDeleted: false,
-                CancellationToken.None).ConfigureAwait(true);
-            var chunkId = Assert.Single(record.Content.Chunks).Id;
-            Assert.Equal(
-                ChunkIntegrityStatus.Corrupt,
-                await restarted.Services.GetRequiredService<ChunkStore>()
-                    .VerifyChunkAsync(chunkId, CancellationToken.None).ConfigureAwait(true));
+            await AssertPackedChunkCorruptionAsync(restarted, dataPath, blobs, scenario.ContainerName, second)
+                .ConfigureAwait(true);
         }
         finally
         {
-            // A failure before assignment leaves this nullable factory uninitialized.
-#pragma warning disable CA1508
-            if (restarted is not null)
-#pragma warning restore CA1508
-                await restarted.DisposeAsync().ConfigureAwait(true);
             if (!initialDisposed)
                 await initial.DisposeAsync().ConfigureAwait(true);
             if (Directory.Exists(dataPath))
@@ -13264,6 +13173,129 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             if (Directory.Exists(backupPath))
                 Directory.Delete(backupPath, recursive: true);
         }
+    }
+#pragma warning restore MA0004
+
+    private sealed record PackedChunkScenario(
+        string ContainerName, string FirstName, string DuplicateName, string SecondName, byte[] SecondBytes);
+
+    private static async Task<PackedChunkScenario> AssertInitialPackedChunksAsync(
+        SavaWebApplicationFactory application, string dataPath)
+    {
+        var service = CreateClient(application);
+        var containerName = $"packed-{Guid.NewGuid():N}";
+        var container = service.GetBlobContainerClient(containerName);
+        await container.CreateAsync().ConfigureAwait(false);
+        var firstBytes = RandomNumberGenerator.GetBytes(1024);
+        var secondBytes = RandomNumberGenerator.GetBytes(1536);
+        var first = container.GetBlobClient("first.bin");
+        var duplicate = container.GetBlobClient("duplicate.bin");
+        var second = container.GetBlobClient("second.bin");
+        await first.UploadAsync(BinaryData.FromBytes(firstBytes)).ConfigureAwait(false);
+        await duplicate.UploadAsync(BinaryData.FromBytes(firstBytes)).ConfigureAwait(false);
+        await second.UploadAsync(BinaryData.FromBytes(secondBytes)).ConfigureAwait(false);
+
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        Assert.Equal(2, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+        Assert.Empty(EnumerateChunkFiles(dataPath));
+        Assert.Single(EnumeratePackFiles(dataPath));
+        Assert.Equal(firstBytes,
+            (await duplicate.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var range = await second.DownloadContentAsync(new BlobDownloadOptions
+        {
+            Range = new HttpRange(123, 456)
+        }).ConfigureAwait(false);
+        Assert.Equal(secondBytes.AsSpan(123, 456).ToArray(), range.Value.Content.ToArray());
+        return new PackedChunkScenario(containerName, first.Name, duplicate.Name, second.Name, secondBytes);
+    }
+
+    private static async Task<(BlobClient Second, BlobService Blobs)> AssertPackedRestartAndCompactionAsync(
+        SavaWebApplicationFactory application, string dataPath, PackedChunkScenario scenario)
+    {
+        var restartedContainer = CreateClient(application).GetBlobContainerClient(scenario.ContainerName);
+        var first = restartedContainer.GetBlobClient(scenario.FirstName);
+        var duplicate = restartedContainer.GetBlobClient(scenario.DuplicateName);
+        var second = restartedContainer.GetBlobClient(scenario.SecondName);
+        Assert.Equal(scenario.SecondBytes,
+            (await second.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+
+        await first.DeleteAsync().ConfigureAwait(false);
+        await duplicate.DeleteAsync().ConfigureAwait(false);
+        var blobs = application.Services.GetRequiredService<BlobService>();
+        var maintenance = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, maintenance.ReclaimedChunks);
+        Assert.Equal(1, maintenance.CompactedChunkPacks);
+        Assert.True(maintenance.PackCompactionBytesSaved > 0);
+        var metadata = application.Services.GetRequiredService<MetadataStore>();
+        Assert.Equal(1, await metadata.CountPackedChunksAsync(CancellationToken.None).ConfigureAwait(false));
+        Assert.Empty(EnumerateChunkFiles(dataPath));
+        Assert.Single(EnumeratePackFiles(dataPath));
+        Assert.Equal(scenario.SecondBytes,
+            (await second.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        return (second, blobs);
+    }
+
+    private static async Task AssertOrphanPackRecoveryAsync(string dataPath, BlobService blobs)
+    {
+        var orphanPath = Path.Combine(dataPath, "packs", SavaWebApplicationFactory.AccountName,
+            $"orphan-{Guid.NewGuid():N}.pack");
+        await File.WriteAllBytesAsync(orphanPath, RandomNumberGenerator.GetBytes(257)).ConfigureAwait(false);
+        File.SetLastWriteTimeUtc(orphanPath, DateTime.UtcNow.AddMinutes(-1));
+        var recovery = await blobs.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, recovery.CompactedChunkPacks);
+        Assert.True(recovery.PackCompactionBytesSaved >= 257);
+        Assert.False(File.Exists(orphanPath));
+    }
+
+    private static async Task AssertPortablePackedBackupAsync(
+        SavaWebApplicationFactory application, string backupPath)
+    {
+        var backup = application.Services.GetRequiredService<StorageBackupService>();
+        var created = await backup.CreateAsync(backupPath, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, created.ChunkCount);
+        Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(false));
+        Assert.Single(EnumerateChunkFiles(backupPath));
+        Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
+        var connection = new SqliteConnection($"Data Source={Path.Combine(backupPath, "metadata.db")}");
+        await using (connection.ConfigureAwait(false))
+        {
+            await connection.OpenAsync().ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using (command.ConfigureAwait(false))
+            {
+                command.CommandText =
+                    "SELECT (SELECT COUNT(*) FROM packed_chunks) + (SELECT COUNT(*) FROM chunk_packs);";
+                Assert.Equal(0L,
+                    Convert.ToInt64(await command.ExecuteScalarAsync().ConfigureAwait(false), CultureInfo.InvariantCulture));
+            }
+        }
+    }
+
+    private static async Task AssertPackedChunkCorruptionAsync(
+        SavaWebApplicationFactory application, string dataPath, BlobService blobs,
+        string containerName, BlobClient second)
+    {
+        var packPath = Assert.Single(EnumeratePackFiles(dataPath)).FullName;
+        var corrupt = new FileStream(packPath, FileMode.Open, FileAccess.ReadWrite,
+            FileShare.None, 4096, FileOptions.Asynchronous);
+        await using (corrupt.ConfigureAwait(false))
+        {
+            var value = corrupt.ReadByte();
+            Assert.NotEqual(-1, value);
+            corrupt.Position = 0;
+            corrupt.WriteByte((byte)(value ^ 0xff));
+            // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
+            corrupt.Flush(flushToDisk: true);
+#pragma warning restore CA1849
+        }
+        var record = await blobs.GetBlobAsync(
+            SavaWebApplicationFactory.AccountName, containerName, second.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        var chunkId = Assert.Single(record.Content.Chunks).Id;
+        Assert.Equal(ChunkIntegrityStatus.Corrupt,
+            await application.Services.GetRequiredService<ChunkStore>()
+                .VerifyChunkAsync(chunkId, CancellationToken.None).ConfigureAwait(false));
     }
 
     [Fact]
