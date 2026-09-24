@@ -690,8 +690,25 @@ execute and file-read ACL check used for `suoid`, but only when its signed
 token contains a valid Entra `oid` claim. A `sub` or application ID is not an
 ACL identity. A configured RBAC read grant still authorizes without an ACL
 check. Signed bearer `groups` claims can satisfy stored owning/named-group
-entries; group memberships absent from the token are not resolved. Bearer ACL
-fallback for other operations remains incomplete.
+entries. An Entra token with `hasgroups=true` or a `groups` entry in
+`_claim_names` can resolve its omitted security-group IDs through Microsoft
+Graph when `Sava:BearerAuthentication:GraphGroupResolution:Enabled=true` and
+`Sava:BearerAuthentication:GraphGroupResolution:TenantId` is the token's
+trusted tenant GUID. The service uses `DefaultAzureCredential` to request the
+`https://graph.microsoft.com/.default` scope and calls the fixed
+[`directoryObjects/{oid}/getMemberGroups`](https://learn.microsoft.com/en-us/graph/api/directoryobject-getmembergroups?view=graph-rest-1.0) endpoint with
+`securityEnabledOnly=true`. Grant the service identity the documented Graph
+`Directory.Read.All` application permission with administrator consent; supply
+its credential through the normal Azure identity environment or managed
+identity, never through a Blob request. The token's `_claim_sources` URL is
+ignored, including legacy Azure AD Graph URLs, as [Microsoft recommends](https://learn.microsoft.com/en-us/security/zero-trust/develop/configure-tokens-group-claims-app-roles#group-overages).
+Resolution has a five-second HTTP timeout and a 1 MiB response cap; a missing
+or wrong tenant, disabled resolver, lookup failure, or malformed response
+denies ACL-only access without changing independent RBAC grants. Graph's
+`getMemberGroups` limit is 11,000 IDs; larger memberships still need the
+paged `transitiveMemberOf` fallback before full HNS parity can be claimed.
+Local signed-token, fake-Graph, and SDK-over-HTTP tests cover this path without
+live Azure accounts. Bearer ACL fallback for other operations remains incomplete.
 For HNS List Blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback support `delimiter=/` directory listing and no-delimiter recursive
 listing with either no prefix or a complete directory prefix. The requested

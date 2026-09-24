@@ -1,8 +1,11 @@
 using System.Net;
+using Azure.Core;
+using Azure.Identity;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Identity;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
@@ -60,6 +63,11 @@ builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddSingleton<StorageDataKeyContinuity>();
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
+builder.Services.AddSingleton<TokenCredential, DefaultAzureCredential>();
+builder.Services.AddHttpClient<MicrosoftGraphGroupMembershipResolver>(client =>
+    client.Timeout = TimeSpan.FromSeconds(5));
+builder.Services.AddSingleton<IGroupMembershipResolver>(services =>
+    services.GetRequiredService<MicrosoftGraphGroupMembershipResolver>());
 builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
     .RemoveAllLoggers()
     .ConfigurePrimaryHttpMessageHandler(services =>
