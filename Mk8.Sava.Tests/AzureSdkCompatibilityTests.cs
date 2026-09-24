@@ -7637,137 +7637,149 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
             var leaseId = Guid.NewGuid().ToString();
             var lease = blob.GetBlobLeaseClient(leaseId);
-            var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15));
-            Assert.Equal(leaseId, acquired.Value.LeaseId);
-            var leased = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, leased.LeaseState);
-            Assert.Equal(LeaseStatus.Locked, leased.LeaseStatus);
-            Assert.Equal(LeaseDurationType.Fixed, leased.LeaseDuration);
-
-            await blob.UploadAsync(
-                BinaryData.FromString("authorized overwrite"),
-                new BlobUploadOptions
-                {
-                    Conditions = new BlobRequestConditions { LeaseId = leaseId }
-                });
-            Assert.Equal(
-                Azure.Storage.Blobs.Models.LeaseState.Leased,
-                (await blob.GetPropertiesAsync()).Value.LeaseState);
-
-            await lease.AcquireAsync(TimeSpan.FromSeconds(30));
-            var competing = blob.GetBlobLeaseClient(Guid.NewGuid().ToString());
-            var alreadyLeased = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                competing.AcquireAsync(TimeSpan.FromSeconds(15)));
-            Assert.Equal(409, alreadyLeased.Status);
-            Assert.Equal("LeaseAlreadyPresent", alreadyLeased.ErrorCode);
-
-            clock.Advance(TimeSpan.FromSeconds(31));
-            var expired = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Expired, expired.LeaseState);
-            Assert.Equal(LeaseStatus.Unlocked, expired.LeaseStatus);
-            Assert.Equal(default, expired.LeaseDuration);
-
-            await lease.RenewAsync();
-            Assert.Equal(
-                Azure.Storage.Blobs.Models.LeaseState.Leased,
-                (await blob.GetPropertiesAsync()).Value.LeaseState);
-
-            var changedId = Guid.NewGuid().ToString();
-            var changed = await lease.ChangeAsync(changedId);
-            Assert.Equal(changedId, changed.Value.LeaseId);
-            leaseId = changedId;
-            lease = blob.GetBlobLeaseClient(leaseId);
-
-            var initialBreak = await lease.BreakAsync();
-            Assert.Equal(30, initialBreak.Value.LeaseTime);
-            var breaking = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Breaking, breaking.LeaseState);
-            Assert.Equal(LeaseStatus.Locked, breaking.LeaseStatus);
-            Assert.Equal(default, breaking.LeaseDuration);
-
-            var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["breaking"] = "missing" }));
-            Assert.Equal(412, missing.Status);
-            Assert.Equal("LeaseIdMissing", missing.ErrorCode);
-            await blob.SetMetadataAsync(
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["breaking"] = "authorized" },
-                new BlobRequestConditions { LeaseId = leaseId });
-
-            var unchangedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(60));
-            Assert.Equal(30, unchangedBreak.Value.LeaseTime);
-            var shortenedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(2));
-            Assert.Equal(2, shortenedBreak.Value.LeaseTime);
-            clock.Advance(TimeSpan.FromSeconds(3));
-            var broken = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Broken, broken.LeaseState);
-            Assert.Equal(LeaseStatus.Unlocked, broken.LeaseStatus);
-
-            var brokenRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync());
-            Assert.Equal(409, brokenRenew.Status);
-            Assert.Equal("LeaseIsBrokenAndCannotBeRenewed", brokenRenew.ErrorCode);
-            await lease.ReleaseAsync();
-
-            await lease.AcquireAsync(TimeSpan.FromSeconds(15));
-            clock.Advance(TimeSpan.FromSeconds(16));
-            await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["expired"] = "rewritten" });
-            Assert.Equal(
-                Azure.Storage.Blobs.Models.LeaseState.Available,
-                (await blob.GetPropertiesAsync()).Value.LeaseState);
-            var invalidatedRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync());
-            Assert.Equal(409, invalidatedRenew.Status);
-            Assert.Equal("LeaseIdMismatchWithLeaseOperation", invalidatedRenew.ErrorCode);
-
-            var infiniteId = Guid.NewGuid().ToString();
-            var infinite = blob.GetBlobLeaseClient(infiniteId);
-            await infinite.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration);
-            using var transport = new HttpClient(application.Server.CreateHandler());
-            var leaseUri = AppendQuery(
-                blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-                "comp=lease");
-            using (var invalidBreak = new HttpRequestMessage(HttpMethod.Put, leaseUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                invalidBreak.Headers.Add("x-ms-version", "2025-11-05");
-                invalidBreak.Headers.Add("x-ms-lease-action", "break");
-                invalidBreak.Headers.Add("x-ms-lease-break-period", "61");
-                using var invalidBreakResponse = await transport.SendAsync(invalidBreak);
-                Assert.Equal(HttpStatusCode.BadRequest, invalidBreakResponse.StatusCode);
-                Assert.Equal("InvalidHeaderValue", invalidBreakResponse.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            var immediateBreak = await infinite.BreakAsync();
-            Assert.Equal(0, immediateBreak.Value.LeaseTime);
-            using (var invalidProposed = new HttpRequestMessage(HttpMethod.Put, leaseUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                invalidProposed.Headers.Add("x-ms-version", "2025-11-05");
-                invalidProposed.Headers.Add("x-ms-lease-action", "acquire");
-                invalidProposed.Headers.Add("x-ms-lease-duration", "15");
-                invalidProposed.Headers.Add("x-ms-proposed-lease-id", "not-a-guid");
-                using var invalidProposedResponse = await transport.SendAsync(invalidProposed);
-                Assert.Equal(HttpStatusCode.BadRequest, invalidProposedResponse.StatusCode);
-                Assert.Equal("InvalidHeaderValue", invalidProposedResponse.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            using (var missingDuration = new HttpRequestMessage(HttpMethod.Put, leaseUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                missingDuration.Headers.Add("x-ms-version", "2025-11-05");
-                missingDuration.Headers.Add("x-ms-lease-action", "acquire");
-                using var missingDurationResponse = await transport.SendAsync(missingDuration);
-                Assert.Equal(HttpStatusCode.BadRequest, missingDurationResponse.StatusCode);
-                Assert.Equal("MissingRequiredHeader", missingDurationResponse.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertBlobLeaseAcquisitionAndExpiryAsync(blob, lease, clock, leaseId);
+            await AssertBlobLeaseBreakAndRecoveryAsync(blob, lease, clock);
+            await AssertInfiniteBlobLeaseValidationAsync(blob, application);
         }
         finally
         {
             await application.DisposeAsync();
+        }
+    }
+
+    private static async Task AssertBlobLeaseAcquisitionAndExpiryAsync(
+        BlobClient blob, BlobLeaseClient lease, AdjustableTimeProvider clock, string leaseId)
+    {
+        var acquired = await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        Assert.Equal(leaseId, acquired.Value.LeaseId);
+        var leased = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased, leased.LeaseState);
+        Assert.Equal(LeaseStatus.Locked, leased.LeaseStatus);
+        Assert.Equal(LeaseDurationType.Fixed, leased.LeaseDuration);
+
+        await blob.UploadAsync(
+            BinaryData.FromString("authorized overwrite"),
+            new BlobUploadOptions { Conditions = new BlobRequestConditions { LeaseId = leaseId } }).ConfigureAwait(false);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased,
+            (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LeaseState);
+
+        await lease.AcquireAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+        var competing = blob.GetBlobLeaseClient(Guid.NewGuid().ToString());
+        var alreadyLeased = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            competing.AcquireAsync(TimeSpan.FromSeconds(15))).ConfigureAwait(false);
+        Assert.Equal(409, alreadyLeased.Status);
+        Assert.Equal("LeaseAlreadyPresent", alreadyLeased.ErrorCode);
+
+        clock.Advance(TimeSpan.FromSeconds(31));
+        var expired = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Expired, expired.LeaseState);
+        Assert.Equal(LeaseStatus.Unlocked, expired.LeaseStatus);
+        Assert.Equal(default, expired.LeaseDuration);
+
+        await lease.RenewAsync().ConfigureAwait(false);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Leased,
+            (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LeaseState);
+    }
+
+    private static async Task AssertBlobLeaseBreakAndRecoveryAsync(
+        BlobClient blob, BlobLeaseClient lease, AdjustableTimeProvider clock)
+    {
+        var leaseId = Guid.NewGuid().ToString();
+        var changed = await lease.ChangeAsync(leaseId).ConfigureAwait(false);
+        Assert.Equal(leaseId, changed.Value.LeaseId);
+        lease = blob.GetBlobLeaseClient(leaseId);
+
+        var initialBreak = await lease.BreakAsync().ConfigureAwait(false);
+        Assert.Equal(30, initialBreak.Value.LeaseTime);
+        var breaking = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Breaking, breaking.LeaseState);
+        Assert.Equal(LeaseStatus.Locked, breaking.LeaseStatus);
+        Assert.Equal(default, breaking.LeaseDuration);
+
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["breaking"] = "missing" }))
+            .ConfigureAwait(false);
+        Assert.Equal(412, missing.Status);
+        Assert.Equal("LeaseIdMissing", missing.ErrorCode);
+        await blob.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["breaking"] = "authorized" },
+            new BlobRequestConditions { LeaseId = leaseId }).ConfigureAwait(false);
+
+        var unchangedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+        Assert.Equal(30, unchangedBreak.Value.LeaseTime);
+        var shortenedBreak = await lease.BreakAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        Assert.Equal(2, shortenedBreak.Value.LeaseTime);
+        clock.Advance(TimeSpan.FromSeconds(3));
+        var broken = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Broken, broken.LeaseState);
+        Assert.Equal(LeaseStatus.Unlocked, broken.LeaseStatus);
+
+        var brokenRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(409, brokenRenew.Status);
+        Assert.Equal("LeaseIsBrokenAndCannotBeRenewed", brokenRenew.ErrorCode);
+        await lease.ReleaseAsync().ConfigureAwait(false);
+
+        await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        clock.Advance(TimeSpan.FromSeconds(16));
+        await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["expired"] = "rewritten" })
+            .ConfigureAwait(false);
+        Assert.Equal(Azure.Storage.Blobs.Models.LeaseState.Available,
+            (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.LeaseState);
+        var invalidatedRenew = await Assert.ThrowsAsync<RequestFailedException>(() => lease.RenewAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(409, invalidatedRenew.Status);
+        Assert.Equal("LeaseIdMismatchWithLeaseOperation", invalidatedRenew.ErrorCode);
+    }
+
+    private static async Task AssertInfiniteBlobLeaseValidationAsync(
+        BlobClient blob, SavaWebApplicationFactory application)
+    {
+        var infinite = blob.GetBlobLeaseClient(Guid.NewGuid().ToString());
+        await infinite.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration).ConfigureAwait(false);
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        var leaseUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=lease");
+        using (var invalidBreak = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            invalidBreak.Headers.Add("x-ms-version", "2025-11-05");
+            invalidBreak.Headers.Add("x-ms-lease-action", "break");
+            invalidBreak.Headers.Add("x-ms-lease-break-period", "61");
+            using var response = await transport.SendAsync(invalidBreak).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var immediateBreak = await infinite.BreakAsync().ConfigureAwait(false);
+        Assert.Equal(0, immediateBreak.Value.LeaseTime);
+        using (var invalidProposed = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            invalidProposed.Headers.Add("x-ms-version", "2025-11-05");
+            invalidProposed.Headers.Add("x-ms-lease-action", "acquire");
+            invalidProposed.Headers.Add("x-ms-lease-duration", "15");
+            invalidProposed.Headers.Add("x-ms-proposed-lease-id", "not-a-guid");
+            using var response = await transport.SendAsync(invalidProposed).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var missingDuration = new HttpRequestMessage(HttpMethod.Put, leaseUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            missingDuration.Headers.Add("x-ms-version", "2025-11-05");
+            missingDuration.Headers.Add("x-ms-lease-action", "acquire");
+            using var response = await transport.SendAsync(missingDuration).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
         }
     }
 
@@ -7849,130 +7861,147 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 "comp=snapshot");
 
             using var transport = new HttpClient(application.Server.CreateHandler());
-            using (var unavailable = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                unavailable.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
-                using var response = await transport.SendAsync(unavailable);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
-                Assert.False(response.Headers.Contains("x-ms-version"));
-            }
-
-            clock.Advance(TimeSpan.FromMinutes(1));
-            string inheritedSnapshot;
-            using (var inherit = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                inherit.Headers.TryAddWithoutValidation("x-ms-version", "2013-08-15");
-                using var response = await transport.SendAsync(inherit);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                inheritedSnapshot = response.Headers.GetValues("x-ms-snapshot").Single();
-                Assert.Equal(original.ETag.ToString(), GetResponseHeader(response, "ETag"));
-                Assert.Equal(
-                    original.LastModified.ToString("R", CultureInfo.InvariantCulture),
-                    GetResponseHeader(response, "Last-Modified"));
-            }
-
-            var inherited = blob.WithSnapshot(inheritedSnapshot);
-            var inheritedProperties = (await inherited.GetPropertiesAsync()).Value;
-            Assert.Equal(original.ETag, inheritedProperties.ETag);
-            Assert.Equal(original.LastModified, inheritedProperties.LastModified);
-            Assert.Equal("base", inheritedProperties.Metadata["owner"]);
-            Assert.Equal("base-only", inheritedProperties.Metadata["retained"]);
-            Assert.Equal("snapshot", (await inherited.GetTagsAsync()).Value.Tags["kind"]);
-            using (var oldSnapshotRead = new HttpRequestMessage(
-                       HttpMethod.Head,
-                       inherited.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(10))))
-            {
-                oldSnapshotRead.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
-                using var response = await transport.SendAsync(oldSnapshotRead);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
-                Assert.False(response.Headers.Contains("x-ms-version"));
-            }
-
-            clock.Advance(TimeSpan.FromMinutes(1));
-            string replacedSnapshot;
-            ETag replacedEtag;
-            DateTimeOffset replacedLastModified;
-            using (var replace = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                replace.Headers.TryAddWithoutValidation("x-ms-version", "2013-08-15");
-                replace.Headers.TryAddWithoutValidation("x-ms-meta-owner", "snapshot");
-                using var response = await transport.SendAsync(replace);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                replacedSnapshot = response.Headers.GetValues("x-ms-snapshot").Single();
-                replacedEtag = new ETag(GetResponseHeader(response, "ETag"));
-                replacedLastModified = DateTimeOffset.ParseExact(
-                    GetResponseHeader(response, "Last-Modified"),
-                    "R",
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
-                Assert.NotEqual(original.ETag, replacedEtag);
-                Assert.NotEqual(original.LastModified, replacedLastModified);
-            }
-
-            var replaced = blob.WithSnapshot(replacedSnapshot);
-            var replacedProperties = (await replaced.GetPropertiesAsync()).Value;
-            Assert.Equal(replacedEtag, replacedProperties.ETag);
-            Assert.Equal(replacedLastModified, replacedProperties.LastModified);
-            Assert.Equal("snapshot", replacedProperties.Metadata["owner"]);
-            Assert.False(replacedProperties.Metadata.ContainsKey("retained"));
-            Assert.Equal("snapshot", (await replaced.GetTagsAsync()).Value.Tags["kind"]);
-
-            var unchangedBase = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(original.ETag, unchangedBase.ETag);
-            Assert.Equal(original.LastModified, unchangedBase.LastModified);
-            Assert.Equal("base", unchangedBase.Metadata["owner"]);
-            Assert.Equal("base-only", unchangedBase.Metadata["retained"]);
-
-            var lease = blob.GetBlobLeaseClient();
-            await lease.AcquireAsync(TimeSpan.FromSeconds(15));
-            var createOnlySnapshotUri = AppendQuery(
-                blob.GenerateSasUri(BlobSasPermissions.Create, DateTimeOffset.UtcNow.AddMinutes(10)),
-                "comp=snapshot");
-            using (var createOnly = new HttpRequestMessage(HttpMethod.Put, createOnlySnapshotUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(createOnly);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                Assert.Equal("true", response.Headers.GetValues("x-ms-request-server-encrypted").Single());
-            }
-            using (var wrongLease = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                wrongLease.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                wrongLease.Headers.TryAddWithoutValidation("x-ms-lease-id", Guid.NewGuid().ToString());
-                using var response = await transport.SendAsync(wrongLease);
-                Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
-                Assert.Equal("LeaseIdMismatchWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            await lease.ReleaseAsync();
-
-            var archived = container.GetBlobClient("archived.bin");
-            await archived.UploadAsync(BinaryData.FromString("offline payload"));
-            await archived.SetAccessTierAsync(AccessTier.Archive);
-            var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => archived.CreateSnapshotAsync());
-            Assert.Equal(HttpStatusCode.Conflict, (HttpStatusCode)rejected.Status);
-            Assert.Equal("BlobArchived", rejected.ErrorCode);
+            await AssertInheritedSnapshotContractsAsync(clock, blob, original, snapshotUri, transport);
+            await AssertReplacedSnapshotContractsAsync(clock, blob, original, snapshotUri, transport);
+            await AssertSnapshotLeaseAndArchiveContractsAsync(blob, container, snapshotUri, transport);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static async Task AssertInheritedSnapshotContractsAsync(
+        AdjustableTimeProvider clock, BlobClient blob, BlobProperties original, Uri snapshotUri, HttpClient transport)
+    {
+        using (var unavailable = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            unavailable.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
+            using var response = await transport.SendAsync(unavailable).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+            Assert.False(response.Headers.Contains("x-ms-version"));
+        }
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        string inheritedSnapshot;
+        using (var inherit = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            inherit.Headers.TryAddWithoutValidation("x-ms-version", "2013-08-15");
+            using var response = await transport.SendAsync(inherit).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            inheritedSnapshot = response.Headers.GetValues("x-ms-snapshot").Single();
+            Assert.Equal(original.ETag.ToString(), GetResponseHeader(response, "ETag"));
+            Assert.Equal(
+                original.LastModified.ToString("R", CultureInfo.InvariantCulture),
+                GetResponseHeader(response, "Last-Modified"));
+        }
+
+        var inherited = blob.WithSnapshot(inheritedSnapshot);
+        var inheritedProperties = (await inherited.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(original.ETag, inheritedProperties.ETag);
+        Assert.Equal(original.LastModified, inheritedProperties.LastModified);
+        Assert.Equal("base", inheritedProperties.Metadata["owner"]);
+        Assert.Equal("base-only", inheritedProperties.Metadata["retained"]);
+        Assert.Equal("snapshot", (await inherited.GetTagsAsync().ConfigureAwait(false)).Value.Tags["kind"]);
+        using (var oldSnapshotRead = new HttpRequestMessage(
+                   HttpMethod.Head,
+                   inherited.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(10))))
+        {
+            oldSnapshotRead.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
+            using var response = await transport.SendAsync(oldSnapshotRead).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+            Assert.False(response.Headers.Contains("x-ms-version"));
+        }
+    }
+
+    private static async Task AssertReplacedSnapshotContractsAsync(
+        AdjustableTimeProvider clock, BlobClient blob, BlobProperties original, Uri snapshotUri, HttpClient transport)
+    {
+        clock.Advance(TimeSpan.FromMinutes(1));
+        string replacedSnapshot;
+        ETag replacedEtag;
+        DateTimeOffset replacedLastModified;
+        using (var replace = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            replace.Headers.TryAddWithoutValidation("x-ms-version", "2013-08-15");
+            replace.Headers.TryAddWithoutValidation("x-ms-meta-owner", "snapshot");
+            using var response = await transport.SendAsync(replace).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            replacedSnapshot = response.Headers.GetValues("x-ms-snapshot").Single();
+            replacedEtag = new ETag(GetResponseHeader(response, "ETag"));
+            replacedLastModified = DateTimeOffset.ParseExact(
+                GetResponseHeader(response, "Last-Modified"),
+                "R",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+            Assert.NotEqual(original.ETag, replacedEtag);
+            Assert.NotEqual(original.LastModified, replacedLastModified);
+        }
+
+        var replaced = blob.WithSnapshot(replacedSnapshot);
+        var replacedProperties = (await replaced.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(replacedEtag, replacedProperties.ETag);
+        Assert.Equal(replacedLastModified, replacedProperties.LastModified);
+        Assert.Equal("snapshot", replacedProperties.Metadata["owner"]);
+        Assert.False(replacedProperties.Metadata.ContainsKey("retained"));
+        Assert.Equal("snapshot", (await replaced.GetTagsAsync().ConfigureAwait(false)).Value.Tags["kind"]);
+
+        var unchangedBase = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(original.ETag, unchangedBase.ETag);
+        Assert.Equal(original.LastModified, unchangedBase.LastModified);
+        Assert.Equal("base", unchangedBase.Metadata["owner"]);
+        Assert.Equal("base-only", unchangedBase.Metadata["retained"]);
+    }
+
+    private static async Task AssertSnapshotLeaseAndArchiveContractsAsync(
+        BlobClient blob, BlobContainerClient container, Uri snapshotUri, HttpClient transport)
+    {
+        var lease = blob.GetBlobLeaseClient();
+        await lease.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var createOnlySnapshotUri = AppendQuery(
+            blob.GenerateSasUri(BlobSasPermissions.Create, DateTimeOffset.UtcNow.AddMinutes(10)),
+            "comp=snapshot");
+        using (var createOnly = new HttpRequestMessage(HttpMethod.Put, createOnlySnapshotUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(createOnly).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            Assert.Equal("true", response.Headers.GetValues("x-ms-request-server-encrypted").Single());
+        }
+        using (var wrongLease = new HttpRequestMessage(HttpMethod.Put, snapshotUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            wrongLease.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            wrongLease.Headers.TryAddWithoutValidation("x-ms-lease-id", Guid.NewGuid().ToString());
+            using var response = await transport.SendAsync(wrongLease).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+            Assert.Equal("LeaseIdMismatchWithBlobOperation", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        await lease.ReleaseAsync().ConfigureAwait(false);
+
+        var archived = container.GetBlobClient("archived.bin");
+        await archived.UploadAsync(BinaryData.FromString("offline payload")).ConfigureAwait(false);
+        await archived.SetAccessTierAsync(AccessTier.Archive).ConfigureAwait(false);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => archived.CreateSnapshotAsync())
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, (HttpStatusCode)rejected.Status);
+        Assert.Equal("BlobArchived", rejected.ErrorCode);
     }
 
     [Fact]
@@ -7999,85 +8028,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 "comp=lease");
 
             using var transport = new HttpClient(application.Server.CreateHandler());
-            string legacyLeaseId;
-            using (var acquire = CreateLeaseRequest(blobLeaseUri, "2009-09-19", "acquire"))
-            using (var response = await transport.SendAsync(acquire))
-            {
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                legacyLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
-                Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
-                Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
-            }
-
-            using (var duration = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "acquire", duration: 30))
-            using (var response = await transport.SendAsync(duration))
-            {
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "UnsupportedHeader");
-            }
-
-            using (var change = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "change", legacyLeaseId))
-            using (var response = await transport.SendAsync(change))
-            {
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
-            }
-
-            using (var release = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "release", legacyLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            using (var renew = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "renew", legacyLeaseId))
-            using (var response = await transport.SendAsync(renew))
-            {
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal(legacyLeaseId, response.Headers.GetValues("x-ms-lease-id").Single());
-            }
-            using (var release = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "release", legacyLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            using (var breakLease = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "break"))
-            using (var response = await transport.SendAsync(breakLease))
-            {
-                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-                Assert.Equal("0", response.Headers.GetValues("x-ms-lease-time").Single());
-            }
-
-            using (var missingDuration = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "acquire"))
-            using (var response = await transport.SendAsync(missingDuration))
-            {
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "MissingRequiredHeader");
-            }
-
-            string modernLeaseId;
-            using (var acquire = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "acquire", duration: 15))
-            using (var response = await transport.SendAsync(acquire))
-            {
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                modernLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
-                Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
-                Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
-            }
-            using (var release = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "release", modernLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-
-            using (var acquire = CreateLeaseRequest(blobLeaseUri, "2013-08-15", "acquire", duration: 15))
-            using (var response = await transport.SendAsync(acquire))
-            {
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                modernLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
-                Assert.Equal(initialBlob.ETag.ToString(), GetResponseHeader(response, "ETag"));
-                Assert.Equal(
-                    initialBlob.LastModified.ToString("R", CultureInfo.InvariantCulture),
-                    GetResponseHeader(response, "Last-Modified"));
-            }
-            using (var release = CreateLeaseRequest(blobLeaseUri, "2013-08-15", "release", modernLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var afterBlobLeases = (await blob.GetPropertiesAsync()).Value;
-            Assert.Equal(initialBlob.ETag, afterBlobLeases.ETag);
-            Assert.Equal(initialBlob.LastModified, afterBlobLeases.LastModified);
+            await AssertLegacyBlobLeaseContractAsync(blobLeaseUri, transport);
+            await AssertModernBlobLeaseContractAsync(blob, initialBlob, blobLeaseUri, transport);
 
             var credential = new StorageSharedKeyCredential(
                 SavaWebApplicationFactory.AccountName,
@@ -8095,70 +8047,165 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var containerLeaseUri = AppendQuery(
                 container.Uri,
                 $"restype=container&comp=lease&{accountSasQuery}");
-            using (var unavailable = CreateLeaseRequest(containerLeaseUri, "2011-08-18", "acquire", duration: 15))
-            using (var response = await transport.SendAsync(unavailable))
-            {
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
-            }
-
-            var beforeLegacyContainerLease = (await container.GetPropertiesAsync()).Value;
-            clock.Advance(TimeSpan.FromMinutes(1));
-            string containerLeaseId;
-            using (var acquire = CreateLeaseRequest(containerLeaseUri, "2012-02-12", "acquire", duration: 15))
-            using (var response = await transport.SendAsync(acquire))
-            {
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                containerLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
-                Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
-                Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
-            }
-            var afterLegacyContainerLease = (await container.GetPropertiesAsync()).Value;
-            Assert.NotEqual(beforeLegacyContainerLease.ETag, afterLegacyContainerLease.ETag);
-            Assert.NotEqual(beforeLegacyContainerLease.LastModified, afterLegacyContainerLease.LastModified);
-            using (var release = CreateLeaseRequest(containerLeaseUri, "2012-02-12", "release", containerLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-
-            var beforeModernContainerLease = (await container.GetPropertiesAsync()).Value;
-            clock.Advance(TimeSpan.FromMinutes(1));
-            using (var acquire = CreateLeaseRequest(containerLeaseUri, "2013-08-15", "acquire", duration: 15))
-            using (var response = await transport.SendAsync(acquire))
-            {
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-                containerLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
-                Assert.Equal(beforeModernContainerLease.ETag.ToString(), GetResponseHeader(response, "ETag"));
-                Assert.Equal(
-                    beforeModernContainerLease.LastModified.ToString("R", CultureInfo.InvariantCulture),
-                    GetResponseHeader(response, "Last-Modified"));
-            }
-            var afterModernContainerLease = (await container.GetPropertiesAsync()).Value;
-            Assert.Equal(beforeModernContainerLease.ETag, afterModernContainerLease.ETag);
-            Assert.Equal(beforeModernContainerLease.LastModified, afterModernContainerLease.LastModified);
-            using (var release = CreateLeaseRequest(containerLeaseUri, "2013-08-15", "release", containerLeaseId))
-            using (var response = await transport.SendAsync(release))
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-
-            var aclUri = AppendQuery(
-                container.Uri,
-                "restype=container&comp=acl");
-            using (var acl = new HttpRequestMessage(HttpMethod.Put, aclUri)
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                acl.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
-                acl.Headers.TryAddWithoutValidation("x-ms-blob-public-access", "blob");
-                AddSharedKeyLiteAuthorization(acl);
-                using var response = await transport.SendAsync(acl);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch");
-                Assert.False(response.Headers.Contains("x-ms-version"));
-            }
+            await AssertLegacyContainerLeaseContractAsync(clock, container, containerLeaseUri, transport);
+            await AssertModernContainerLeaseAndLegacyAclAsync(clock, container, containerLeaseUri, transport);
         }
         finally
         {
             await application.DisposeAsync();
+        }
+    }
+
+    private static async Task AssertLegacyBlobLeaseContractAsync(Uri blobLeaseUri, HttpClient transport)
+    {
+        string legacyLeaseId;
+        using (var acquire = CreateLeaseRequest(blobLeaseUri, "2009-09-19", "acquire"))
+        using (var response = await transport.SendAsync(acquire).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            legacyLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
+            Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
+            Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
+        }
+
+        using (var duration = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "acquire", duration: 30))
+        using (var response = await transport.SendAsync(duration).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "UnsupportedHeader").ConfigureAwait(false);
+        }
+
+        using (var change = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "change", legacyLeaseId))
+        using (var response = await transport.SendAsync(change).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+        }
+
+        using (var release = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "release", legacyLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using (var renew = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "renew", legacyLeaseId))
+        using (var response = await transport.SendAsync(renew).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(legacyLeaseId, response.Headers.GetValues("x-ms-lease-id").Single());
+        }
+        using (var release = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "release", legacyLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using (var breakLease = CreateLeaseRequest(blobLeaseUri, "2011-08-18", "break"))
+        using (var response = await transport.SendAsync(breakLease).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+            Assert.Equal("0", response.Headers.GetValues("x-ms-lease-time").Single());
+        }
+    }
+
+    private static async Task AssertModernBlobLeaseContractAsync(
+        BlobClient blob, BlobProperties initialBlob, Uri blobLeaseUri, HttpClient transport)
+    {
+        using (var missingDuration = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "acquire"))
+        using (var response = await transport.SendAsync(missingDuration).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "MissingRequiredHeader").ConfigureAwait(false);
+        }
+
+        string modernLeaseId;
+        using (var acquire = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "acquire", duration: 15))
+        using (var response = await transport.SendAsync(acquire).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            modernLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
+            Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
+            Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
+        }
+        using (var release = CreateLeaseRequest(blobLeaseUri, "2012-02-12", "release", modernLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using (var acquire = CreateLeaseRequest(blobLeaseUri, "2013-08-15", "acquire", duration: 15))
+        using (var response = await transport.SendAsync(acquire).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            modernLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
+            Assert.Equal(initialBlob.ETag.ToString(), GetResponseHeader(response, "ETag"));
+            Assert.Equal(initialBlob.LastModified.ToString("R", CultureInfo.InvariantCulture),
+                GetResponseHeader(response, "Last-Modified"));
+        }
+        using (var release = CreateLeaseRequest(blobLeaseUri, "2013-08-15", "release", modernLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var afterBlobLeases = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(initialBlob.ETag, afterBlobLeases.ETag);
+        Assert.Equal(initialBlob.LastModified, afterBlobLeases.LastModified);
+    }
+
+    private static async Task AssertLegacyContainerLeaseContractAsync(
+        AdjustableTimeProvider clock, BlobContainerClient container, Uri containerLeaseUri, HttpClient transport)
+    {
+        using (var unavailable = CreateLeaseRequest(containerLeaseUri, "2011-08-18", "acquire", duration: 15))
+        using (var response = await transport.SendAsync(unavailable).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+        }
+
+        var before = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        string containerLeaseId;
+        using (var acquire = CreateLeaseRequest(containerLeaseUri, "2012-02-12", "acquire", duration: 15))
+        using (var response = await transport.SendAsync(acquire).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            containerLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
+            Assert.Null(GetResponseHeaderOrDefault(response, "ETag"));
+            Assert.Null(GetResponseHeaderOrDefault(response, "Last-Modified"));
+        }
+        var after = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.NotEqual(before.ETag, after.ETag);
+        Assert.NotEqual(before.LastModified, after.LastModified);
+        using (var release = CreateLeaseRequest(containerLeaseUri, "2012-02-12", "release", containerLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static async Task AssertModernContainerLeaseAndLegacyAclAsync(
+        AdjustableTimeProvider clock, BlobContainerClient container, Uri containerLeaseUri, HttpClient transport)
+    {
+        var before = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        string containerLeaseId;
+        using (var acquire = CreateLeaseRequest(containerLeaseUri, "2013-08-15", "acquire", duration: 15))
+        using (var response = await transport.SendAsync(acquire).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+            containerLeaseId = response.Headers.GetValues("x-ms-lease-id").Single();
+            Assert.Equal(before.ETag.ToString(), GetResponseHeader(response, "ETag"));
+            Assert.Equal(before.LastModified.ToString("R", CultureInfo.InvariantCulture),
+                GetResponseHeader(response, "Last-Modified"));
+        }
+        var after = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(before.ETag, after.ETag);
+        Assert.Equal(before.LastModified, after.LastModified);
+        using (var release = CreateLeaseRequest(containerLeaseUri, "2013-08-15", "release", containerLeaseId))
+        using (var response = await transport.SendAsync(release).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var aclUri = AppendQuery(container.Uri, "restype=container&comp=acl");
+        using (var acl = new HttpRequestMessage(HttpMethod.Put, aclUri)
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            acl.Headers.TryAddWithoutValidation("x-ms-version", "2008-10-27");
+            acl.Headers.TryAddWithoutValidation("x-ms-blob-public-access", "blob");
+            AddSharedKeyLiteAuthorization(acl);
+            using var response = await transport.SendAsync(acl).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+            Assert.False(response.Headers.Contains("x-ms-version"));
         }
     }
 
