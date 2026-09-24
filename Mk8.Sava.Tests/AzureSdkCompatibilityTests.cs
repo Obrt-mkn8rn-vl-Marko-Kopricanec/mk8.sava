@@ -5582,6 +5582,218 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
+    private static async Task<(BlobContainerClient Source, string CommittedName, string StagedName,
+        string BlockId, string DeletedVersion)> CreateRestoreFixtureAsync(BlobServiceClient service, string sourceName)
+    {
+        var source = service.GetBlobContainerClient(sourceName);
+        await source.CreateAsync(
+            PublicAccessType.None,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["purpose"] = "restore" })
+            .ConfigureAwait(false);
+        var committed = source.GetBlobClient("committed.bin");
+        await committed.UploadAsync(
+            BinaryData.FromString("preserved container content"),
+            new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "committed" },
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["kind"] = "restored" }
+            }).ConfigureAwait(false);
+        var staged = source.GetBlockBlobClient("staged.bin");
+        var blockId = Convert.ToBase64String("restore-block"u8);
+        using var payload = BinaryData.FromString("uncommitted content").ToStream();
+        await staged.StageBlockAsync(blockId, payload).ConfigureAwait(false);
+        await source.DeleteAsync().ConfigureAwait(false);
+
+        var deleted = await service.GetBlobContainersAsync(
+                states: BlobContainerStates.Deleted,
+                prefix: sourceName)
+            .SingleAsync().ConfigureAwait(false);
+        Assert.True(deleted.IsDeleted);
+        Assert.False(string.IsNullOrWhiteSpace(deleted.VersionId));
+        return (source, committed.Name, staged.Name, blockId, deleted.VersionId);
+    }
+
+    private static async Task AssertDestinationContainerRestoreAsync(
+        BlobServiceClient service,
+        BlobContainerClient source,
+        string destinationName,
+        string committedName,
+        string stagedName,
+        string blockId,
+        string deletedVersion)
+    {
+#pragma warning disable AZC0015
+        var restore = await service.UndeleteBlobContainerAsync(
+            source.Name, deletedVersion, destinationName, CancellationToken.None).ConfigureAwait(false);
+#pragma warning restore AZC0015
+        Assert.Equal(201, restore.GetRawResponse().Status);
+        Assert.Equal(destinationName, restore.Value.Name);
+        Assert.False(restore.GetRawResponse().Headers.TryGetValue("ETag", out _));
+        Assert.False(restore.GetRawResponse().Headers.TryGetValue("Last-Modified", out _));
+        Assert.True(restore.GetRawResponse().Headers.TryGetValue("Content-Length", out var restoreLength));
+        Assert.Equal("0", restoreLength);
+
+        Assert.False((await source.ExistsAsync().ConfigureAwait(false)).Value);
+        Assert.Empty(await service.GetBlobContainersAsync(
+                states: BlobContainerStates.Deleted,
+                prefix: source.Name)
+            .ToListAsync().ConfigureAwait(false));
+
+        var destination = service.GetBlobContainerClient(destinationName);
+        var destinationProperties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("restore", destinationProperties.Metadata["purpose"]);
+        var restoredBlob = destination.GetBlobClient(committedName);
+        Assert.Equal("preserved container content",
+            (await restoredBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        Assert.Equal("committed", (await restoredBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["state"]);
+        Assert.Equal("restored", (await restoredBlob.GetTagsAsync().ConfigureAwait(false)).Value.Tags["kind"]);
+        var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'restored'").ToListAsync().ConfigureAwait(false);
+        var restoredTag = Assert.Single(tagged, item =>
+            string.Equals(item.BlobName, committedName, StringComparison.Ordinal));
+        Assert.Equal(destinationName, restoredTag.BlobContainerName);
+        var restoredBlocks = (await destination.GetBlockBlobClient(stagedName)
+            .GetBlockListAsync(BlockListTypes.Uncommitted).ConfigureAwait(false)).Value;
+        Assert.Equal(blockId, Assert.Single(restoredBlocks.UncommittedBlocks).Name);
+    }
+
+    private static async Task AssertSameNameContainerRestoreAsync(BlobServiceClient service)
+    {
+        var sameName = service.GetBlobContainerClient($"restore-same-{Guid.NewGuid():N}");
+        await sameName.CreateAsync().ConfigureAwait(false);
+        await sameName.GetBlobClient("same.bin")
+            .UploadAsync(BinaryData.FromString("same-name content")).ConfigureAwait(false);
+        await sameName.DeleteAsync().ConfigureAwait(false);
+        var sameDeleted = await service.GetBlobContainersAsync(
+                states: BlobContainerStates.Deleted,
+                prefix: sameName.Name)
+            .SingleAsync().ConfigureAwait(false);
+        var sameRestore = await service.UndeleteBlobContainerAsync(sameName.Name, sameDeleted.VersionId)
+            .ConfigureAwait(false);
+        Assert.Equal(201, sameRestore.GetRawResponse().Status);
+        Assert.Equal("same-name content",
+            (await sameName.GetBlobClient("same.bin").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+    }
+
+    private static Uri CreateRestoreSasUri(
+        StorageSharedKeyCredential credential,
+        string target,
+        AccountSasPermissions permissions)
+    {
+        var builder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(permissions);
+        return new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/{target}" +
+            $"?restype=container&comp=undelete&{builder.ToSasQueryParameters(credential)}");
+    }
+
+    private static async Task AssertInvalidContainerRestoreRequestsAsync(SavaWebApplicationFactory application)
+    {
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        await AssertMissingRestoreHeadersAsync(transport, credential).ConfigureAwait(false);
+        await AssertRestoreSasPermissionAsync(transport, credential).ConfigureAwait(false);
+    }
+
+    private static async Task AssertMissingRestoreHeadersAsync(
+        HttpClient transport,
+        StorageSharedKeyCredential credential)
+    {
+        using (var missingName = new HttpRequestMessage(
+            HttpMethod.Put,
+            CreateRestoreSasUri(credential, $"missing-name-{Guid.NewGuid():N}", AccountSasPermissions.Write))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            missingName.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            missingName.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
+            using var response = await transport.SendAsync(missingName).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Contains("<HeaderName>x-ms-deleted-container-name</HeaderName>",
+                await response.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+        }
+        using var missingVersion = new HttpRequestMessage(
+            HttpMethod.Put,
+            CreateRestoreSasUri(credential, $"missing-version-{Guid.NewGuid():N}", AccountSasPermissions.Write))
+        {
+            Content = new ByteArrayContent([])
+        };
+        missingVersion.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        missingVersion.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
+        using var missingVersionResponse = await transport.SendAsync(missingVersion).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.BadRequest, missingVersionResponse.StatusCode);
+        Assert.Equal("MissingRequiredHeader", missingVersionResponse.Headers.GetValues("x-ms-error-code").Single());
+    }
+
+    private static async Task AssertRestoreSasPermissionAsync(
+        HttpClient transport,
+        StorageSharedKeyCredential credential)
+    {
+        using var createOnly = new HttpRequestMessage(
+            HttpMethod.Put,
+            CreateRestoreSasUri(credential, $"create-only-{Guid.NewGuid():N}", AccountSasPermissions.Create))
+        {
+            Content = new ByteArrayContent([])
+        };
+        createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
+        createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
+        using var response = await transport.SendAsync(createOnly).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal("AuthorizationPermissionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+    }
+
+    private static async Task AssertContainerRestoreCollisionAsync(BlobServiceClient service)
+    {
+        var collisionSource = service.GetBlobContainerClient($"restore-collision-source-{Guid.NewGuid():N}");
+        var collisionDestination = service.GetBlobContainerClient($"restore-collision-target-{Guid.NewGuid():N}");
+        await collisionSource.CreateAsync().ConfigureAwait(false);
+        await collisionSource.GetBlobClient("retained.bin")
+            .UploadAsync(BinaryData.FromString("retained")).ConfigureAwait(false);
+        await collisionSource.DeleteAsync().ConfigureAwait(false);
+        await collisionDestination.CreateAsync().ConfigureAwait(false);
+        var collisionDeleted = await service.GetBlobContainersAsync(
+                states: BlobContainerStates.Deleted,
+                prefix: collisionSource.Name)
+            .SingleAsync().ConfigureAwait(false);
+#pragma warning disable AZC0015
+        var collision = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            service.UndeleteBlobContainerAsync(
+                collisionSource.Name,
+                collisionDeleted.VersionId,
+                collisionDestination.Name,
+                CancellationToken.None)).ConfigureAwait(false);
+#pragma warning restore AZC0015
+        Assert.Equal(409, collision.Status);
+        Assert.Equal("ContainerAlreadyExists", collision.ErrorCode);
+        Assert.Single(await service.GetBlobContainersAsync(
+                states: BlobContainerStates.Deleted,
+                prefix: collisionSource.Name)
+            .ToListAsync().ConfigureAwait(false));
+    }
+
+    private static async Task AssertConsumedContainerRestoreAsync(
+        BlobServiceClient service,
+        string sourceName,
+        string deletedVersion)
+    {
+        var consumed = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            service.UndeleteBlobContainerAsync(sourceName, deletedVersion)).ConfigureAwait(false);
+        Assert.Equal(404, consumed.Status);
+        Assert.Equal("ContainerNotFound", consumed.ErrorCode);
+    }
+
     private static async Task AssertControlPlanePropertiesExcludedAsync(HttpClient transport, Uri propertiesUri)
     {
         using var get = new HttpRequestMessage(HttpMethod.Get, propertiesUri);
@@ -6386,172 +6598,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             var sourceName = $"restore-source-{Guid.NewGuid():N}";
             var destinationName = $"restore-destination-{Guid.NewGuid():N}";
-            var source = service.GetBlobContainerClient(sourceName);
-            await source.CreateAsync(
-                PublicAccessType.None,
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["purpose"] = "restore" });
-            var committed = source.GetBlobClient("committed.bin");
-            await committed.UploadAsync(
-                BinaryData.FromString("preserved container content"),
-                new BlobUploadOptions
-                {
-                    Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "committed" },
-                    Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["kind"] = "restored" }
-                });
-            var staged = source.GetBlockBlobClient("staged.bin");
-            var blockId = Convert.ToBase64String("restore-block"u8);
-            await staged.StageBlockAsync(blockId, BinaryData.FromString("uncommitted content").ToStream());
-            await source.DeleteAsync();
+            var (source, committedName, stagedName, blockId, deletedVersion) =
+                await CreateRestoreFixtureAsync(service, sourceName);
+            await AssertDestinationContainerRestoreAsync(
+                service, source, destinationName, committedName, stagedName, blockId, deletedVersion);
 
-            var deleted = await service.GetBlobContainersAsync(
-                    states: BlobContainerStates.Deleted,
-                    prefix: sourceName)
-                .SingleAsync();
-            Assert.True(deleted.IsDeleted);
-            Assert.False(string.IsNullOrWhiteSpace(deleted.VersionId));
+            await AssertSameNameContainerRestoreAsync(service);
 
-#pragma warning disable AZC0015
-            var restore = await service.UndeleteBlobContainerAsync(
-                sourceName,
-                deleted.VersionId,
-                destinationName,
-                CancellationToken.None);
-#pragma warning restore AZC0015
-            Assert.Equal(201, restore.GetRawResponse().Status);
-            Assert.Equal(destinationName, restore.Value.Name);
-            Assert.False(restore.GetRawResponse().Headers.TryGetValue("ETag", out _));
-            Assert.False(restore.GetRawResponse().Headers.TryGetValue("Last-Modified", out _));
-            Assert.True(restore.GetRawResponse().Headers.TryGetValue("Content-Length", out var restoreLength));
-            Assert.Equal("0", restoreLength);
+            await AssertInvalidContainerRestoreRequestsAsync(factory);
 
-            Assert.False((await source.ExistsAsync()).Value);
-            Assert.Empty(await service.GetBlobContainersAsync(
-                    states: BlobContainerStates.Deleted,
-                    prefix: sourceName)
-                .ToListAsync());
-
-            var destination = service.GetBlobContainerClient(destinationName);
-            var destinationProperties = (await destination.GetPropertiesAsync()).Value;
-            Assert.Equal("restore", destinationProperties.Metadata["purpose"]);
-            var restoredBlob = destination.GetBlobClient(committed.Name);
-            Assert.Equal("preserved container content", (await restoredBlob.DownloadContentAsync()).Value.Content.ToString());
-            Assert.Equal("committed", (await restoredBlob.GetPropertiesAsync()).Value.Metadata["state"]);
-            Assert.Equal("restored", (await restoredBlob.GetTagsAsync()).Value.Tags["kind"]);
-            var tagged = await service.FindBlobsByTagsAsync("\"kind\" = 'restored'").ToListAsync();
-            var restoredTag = Assert.Single(tagged, item => string.Equals(item.BlobName, committed.Name, StringComparison.Ordinal));
-            Assert.Equal(destinationName, restoredTag.BlobContainerName);
-            var restoredBlocks = (await destination.GetBlockBlobClient(staged.Name)
-                .GetBlockListAsync(BlockListTypes.Uncommitted)).Value;
-            Assert.Equal(blockId, Assert.Single(restoredBlocks.UncommittedBlocks).Name);
-
-            var sameName = service.GetBlobContainerClient($"restore-same-{Guid.NewGuid():N}");
-            await sameName.CreateAsync();
-            await sameName.GetBlobClient("same.bin").UploadAsync(BinaryData.FromString("same-name content"));
-            await sameName.DeleteAsync();
-            var sameDeleted = await service.GetBlobContainersAsync(
-                    states: BlobContainerStates.Deleted,
-                    prefix: sameName.Name)
-                .SingleAsync();
-            var sameRestore = await service.UndeleteBlobContainerAsync(sameName.Name, sameDeleted.VersionId);
-            Assert.Equal(201, sameRestore.GetRawResponse().Status);
-            Assert.Equal("same-name content", (await sameName.GetBlobClient("same.bin").DownloadContentAsync()).Value.Content.ToString());
-
-            var credential = new StorageSharedKeyCredential(
-                SavaWebApplicationFactory.AccountName,
-                SavaWebApplicationFactory.AccountKey);
-            Uri RestoreSasUri(string target, AccountSasPermissions permissions)
-            {
-                var builder = new AccountSasBuilder
-                {
-                    Services = AccountSasServices.Blobs,
-                    ResourceTypes = AccountSasResourceTypes.Container,
-                    StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
-                    ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-                    Protocol = SasProtocol.HttpsAndHttp
-                };
-                builder.SetPermissions(permissions);
-                return new Uri(
-                    $"http://{SavaWebApplicationFactory.AccountName}.localhost/{target}" +
-                    $"?restype=container&comp=undelete&{builder.ToSasQueryParameters(credential)}");
-            }
-
-            using var transport = new HttpClient(factory.Server.CreateHandler());
-            using (var missingName = new HttpRequestMessage(
-                       HttpMethod.Put,
-                       RestoreSasUri($"missing-name-{Guid.NewGuid():N}", AccountSasPermissions.Write))
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                missingName.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                missingName.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
-                using var response = await transport.SendAsync(missingName);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
-                Assert.Contains(
-                    "<HeaderName>x-ms-deleted-container-name</HeaderName>",
-                    await response.Content.ReadAsStringAsync(),
-                    StringComparison.Ordinal);
-            }
-            using (var missingVersion = new HttpRequestMessage(
-                       HttpMethod.Put,
-                       RestoreSasUri($"missing-version-{Guid.NewGuid():N}", AccountSasPermissions.Write))
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                missingVersion.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                missingVersion.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
-                using var response = await transport.SendAsync(missingVersion);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            using (var createOnly = new HttpRequestMessage(
-                       HttpMethod.Put,
-                       RestoreSasUri($"create-only-{Guid.NewGuid():N}", AccountSasPermissions.Create))
-            {
-                Content = new ByteArrayContent([])
-            })
-            {
-                createOnly.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "missing");
-                createOnly.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "missing");
-                using var response = await transport.SendAsync(createOnly);
-                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-                Assert.Equal(
-                    "AuthorizationPermissionMismatch",
-                    response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            var collisionSource = service.GetBlobContainerClient($"restore-collision-source-{Guid.NewGuid():N}");
-            var collisionDestination = service.GetBlobContainerClient($"restore-collision-target-{Guid.NewGuid():N}");
-            await collisionSource.CreateAsync();
-            await collisionSource.GetBlobClient("retained.bin").UploadAsync(BinaryData.FromString("retained"));
-            await collisionSource.DeleteAsync();
-            await collisionDestination.CreateAsync();
-            var collisionDeleted = await service.GetBlobContainersAsync(
-                    states: BlobContainerStates.Deleted,
-                    prefix: collisionSource.Name)
-                .SingleAsync();
-#pragma warning disable AZC0015
-            var collision = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                service.UndeleteBlobContainerAsync(
-                    collisionSource.Name,
-                    collisionDeleted.VersionId,
-                    collisionDestination.Name,
-                    CancellationToken.None));
-#pragma warning restore AZC0015
-            Assert.Equal(409, collision.Status);
-            Assert.Equal("ContainerAlreadyExists", collision.ErrorCode);
-            Assert.Single(await service.GetBlobContainersAsync(
-                    states: BlobContainerStates.Deleted,
-                    prefix: collisionSource.Name)
-                .ToListAsync());
-
-            var consumed = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                service.UndeleteBlobContainerAsync(sourceName, deleted.VersionId));
-            Assert.Equal(404, consumed.Status);
-            Assert.Equal("ContainerNotFound", consumed.ErrorCode);
+            await AssertContainerRestoreCollisionAsync(service);
+            await AssertConsumedContainerRestoreAsync(service, sourceName, deletedVersion);
 
             var inventory = await metadata.GetStorageInventoryAsync(CancellationToken.None);
             Assert.True(inventory.BlobRecordCount >= 3);
