@@ -14898,17 +14898,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = service.GetBlobContainerClient(containerName);
         await container.CreateAsync();
         using var transport = new HttpClient(application.Server.CreateHandler());
-
-        static async Task AssertFeatureVersionMismatchAsync(HttpClient client, HttpRequestMessage request)
-        {
-            using (request)
-            using (var response = await client.SendAsync(request).ConfigureAwait(false))
-            {
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
-            }
-        }
-
         var tagged = container.GetBlobClient("tagged.bin");
         await tagged.UploadAsync(
             BinaryData.FromString("tagged payload"),
@@ -14917,7 +14906,31 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["project"] = "mk8" }
             });
         var taggedSas = tagged.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
+        await AssertTagFeatureVersionsAsync(tagged, taggedSas, container, transport);
+        await AssertOldCreateHeaderVersionsAsync(container, transport);
+        await AssertTierFeatureVersionsAsync(container, transport);
+        await AssertAppendSealFeatureVersionAsync(container, transport);
+        await AssertExpiryFeatureVersionsAsync(container, transport);
+        await AssertImmutabilityFeatureVersionsAsync(container, transport);
+        await AssertUndeleteFeatureVersionAsync(container, transport);
+        await AssertOldVersionReadRejectedAsync(taggedSas, transport);
+        await AssertTagListingResponseVersionsAsync(container, transport);
+        await AssertHistoricalBlobPropertiesAsync(tagged, taggedSas, transport);
+    }
 
+    private static async Task AssertFeatureVersionMismatchAsync(HttpClient client, HttpRequestMessage request)
+    {
+        using (request)
+        using (var response = await client.SendAsync(request).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "FeatureVersionMismatch").ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertTagFeatureVersionsAsync(
+        BlobClient tagged, Uri taggedSas, BlobContainerClient container, HttpClient transport)
+    {
         using (var oldTagWrite = new HttpRequestMessage(
                    HttpMethod.Put,
                    AppendQuery(taggedSas, "comp=tags"))
@@ -14926,13 +14939,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             oldTagWrite.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
-            await AssertFeatureVersionMismatchAsync(transport, oldTagWrite);
+            await AssertFeatureVersionMismatchAsync(transport, oldTagWrite).ConfigureAwait(false);
         }
-        Assert.Equal("mk8", (await tagged.GetTagsAsync()).Value.Tags["project"]);
+        Assert.Equal("mk8", (await tagged.GetTagsAsync().ConfigureAwait(false)).Value.Tags["project"]);
 
         var oldTagRead = new HttpRequestMessage(HttpMethod.Get, AppendQuery(taggedSas, "comp=tags"));
         oldTagRead.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
-        await AssertFeatureVersionMismatchAsync(transport, oldTagRead);
+        await AssertFeatureVersionMismatchAsync(transport, oldTagRead).ConfigureAwait(false);
 
         var oldTaggedCreate = container.GetBlobClient("old-tag-header.bin");
         using (var request = new HttpRequestMessage(
@@ -14945,10 +14958,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
             request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             request.Headers.TryAddWithoutValidation("x-ms-tags", "project=old");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
-        Assert.False((await oldTaggedCreate.ExistsAsync()).Value);
+        Assert.False((await oldTaggedCreate.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertOldCreateHeaderVersionsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var oldTierCreate = container.GetBlobClient("old-tier-header.bin");
         using (var request = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14960,9 +14977,9 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
             request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cool");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
-        Assert.False((await oldTierCreate.ExistsAsync()).Value);
+        Assert.False((await oldTierCreate.ExistsAsync().ConfigureAwait(false)).Value);
 
         var oldImmutableCreate = container.GetBlobClient("old-immutability-header.bin");
         using (var request = new HttpRequestMessage(
@@ -14977,13 +14994,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation(
                 "x-ms-immutability-policy-until-date",
                 DateTimeOffset.UtcNow.AddDays(1).ToString("R", CultureInfo.InvariantCulture));
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
-        Assert.False((await oldImmutableCreate.ExistsAsync()).Value);
+        Assert.False((await oldImmutableCreate.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertTierFeatureVersionsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var tiered = container.GetBlobClient("tiered.bin");
-        await tiered.UploadAsync(BinaryData.FromString("tier payload"));
-        await tiered.SetAccessTierAsync(AccessTier.Cool);
+        await tiered.UploadAsync(BinaryData.FromString("tier payload")).ConfigureAwait(false);
+        await tiered.SetAccessTierAsync(AccessTier.Cool).ConfigureAwait(false);
         var tierUri = AppendQuery(
             tiered.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
             "comp=tier");
@@ -14994,7 +15015,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             request.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
             request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Hot");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
         using (var request = new HttpRequestMessage(HttpMethod.Put, tierUri)
         {
@@ -15003,7 +15024,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-10-02");
             request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cold");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
         using (var request = new HttpRequestMessage(HttpMethod.Put, tierUri)
         {
@@ -15013,32 +15034,40 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2018-11-09");
             request.Headers.TryAddWithoutValidation("x-ms-access-tier", "Archive");
             request.Headers.TryAddWithoutValidation("x-ms-rehydrate-priority", "High");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
-        Assert.Equal(AccessTier.Cool, (await tiered.GetPropertiesAsync()).Value.AccessTier);
+        Assert.Equal(AccessTier.Cool, (await tiered.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
+    }
 
+    private static async Task AssertAppendSealFeatureVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var append = container.GetAppendBlobClient("append.bin");
-        await append.CreateAsync();
+        await append.CreateAsync().ConfigureAwait(false);
         var appendSas = append.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
         var oldSeal = new HttpRequestMessage(HttpMethod.Put, AppendQuery(appendSas, "comp=seal"))
         {
             Content = new ByteArrayContent([])
         };
         oldSeal.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
-        await AssertFeatureVersionMismatchAsync(transport, oldSeal);
-        await append.AppendBlockAsync(BinaryData.FromString("still writable").ToStream());
-        await append.SealAsync();
+        await AssertFeatureVersionMismatchAsync(transport, oldSeal).ConfigureAwait(false);
+        await append.AppendBlockAsync(BinaryData.FromString("still writable").ToStream()).ConfigureAwait(false);
+        await append.SealAsync().ConfigureAwait(false);
 
         using (var oldAppendProperties = new HttpRequestMessage(HttpMethod.Head, appendSas))
         {
             oldAppendProperties.Headers.TryAddWithoutValidation("x-ms-version", "2019-07-07");
-            using var response = await transport.SendAsync(oldAppendProperties);
+            using var response = await transport.SendAsync(oldAppendProperties).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.False(response.Headers.Contains("x-ms-blob-sealed"));
         }
+    }
 
+    private static async Task AssertExpiryFeatureVersionsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var expiring = container.GetBlobClient("expiring.bin");
-        await expiring.UploadAsync(BinaryData.FromString("expiry payload"));
+        await expiring.UploadAsync(BinaryData.FromString("expiry payload")).ConfigureAwait(false);
         var expiryUri = AppendQuery(
             expiring.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5)),
             "comp=expiry");
@@ -15050,7 +15079,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2019-12-12");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "60000");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
         using (var request = new HttpRequestMessage(HttpMethod.Put, expiryUri)
         {
@@ -15060,7 +15089,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "60000");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -15072,13 +15101,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-02-10");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-option", "RelativeToNow");
             request.Headers.TryAddWithoutValidation("x-ms-expiry-time", "60000");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal("BlobOperationNotSupported", response.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
+    private static async Task AssertImmutabilityFeatureVersionsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var mutable = container.GetBlobClient("mutable.bin");
-        await mutable.UploadAsync(BinaryData.FromString("mutable payload"));
+        await mutable.UploadAsync(BinaryData.FromString("mutable payload")).ConfigureAwait(false);
         var mutableSas = mutable.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
         using (var request = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -15091,7 +15124,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation(
                 "x-ms-immutability-policy-until-date",
                 DateTimeOffset.UtcNow.AddDays(1).ToString("R", CultureInfo.InvariantCulture));
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
         using (var request = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -15102,13 +15135,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             request.Headers.TryAddWithoutValidation("x-ms-version", "2020-06-12");
             request.Headers.TryAddWithoutValidation("x-ms-legal-hold", "true");
-            await AssertFeatureVersionMismatchAsync(transport, request);
+            await AssertFeatureVersionMismatchAsync(transport, request).ConfigureAwait(false);
         }
-        await mutable.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "still-mutable" });
+        await mutable.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["state"] = "still-mutable" })
+            .ConfigureAwait(false);
+    }
 
+    private static async Task AssertUndeleteFeatureVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var deleted = container.GetBlobClient("deleted.bin");
-        await deleted.UploadAsync(BinaryData.FromString("deleted payload"));
-        await deleted.DeleteAsync();
+        await deleted.UploadAsync(BinaryData.FromString("deleted payload")).ConfigureAwait(false);
+        await deleted.DeleteAsync().ConfigureAwait(false);
         var oldUndelete = new HttpRequestMessage(
             HttpMethod.Put,
             AppendQuery(
@@ -15118,17 +15156,24 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Content = new ByteArrayContent([])
         };
         oldUndelete.Headers.TryAddWithoutValidation("x-ms-version", "2017-04-17");
-        await AssertFeatureVersionMismatchAsync(transport, oldUndelete);
-        Assert.False((await deleted.ExistsAsync()).Value);
+        await AssertFeatureVersionMismatchAsync(transport, oldUndelete).ConfigureAwait(false);
+        Assert.False((await deleted.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertOldVersionReadRejectedAsync(Uri taggedSas, HttpClient transport)
+    {
         var oldVersionRead = new HttpRequestMessage(
             HttpMethod.Head,
             AppendQuery(
                 taggedSas,
                 "versionid=" + Uri.EscapeDataString("2026-01-01T00:00:00.0000000Z")));
         oldVersionRead.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
-        await AssertFeatureVersionMismatchAsync(transport, oldVersionRead);
+        await AssertFeatureVersionMismatchAsync(transport, oldVersionRead).ConfigureAwait(false);
+    }
 
+    private static async Task AssertTagListingResponseVersionsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var containerSas = container.GenerateSasUri(
             BlobContainerSasPermissions.All,
             DateTimeOffset.UtcNow.AddMinutes(5));
@@ -15136,16 +15181,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             HttpMethod.Get,
             AppendQuery(containerSas, "restype=container&comp=list&include=tags"));
         oldTagList.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
-        await AssertFeatureVersionMismatchAsync(transport, oldTagList);
+        await AssertFeatureVersionMismatchAsync(transport, oldTagList).ConfigureAwait(false);
 
         using (var oldList = new HttpRequestMessage(
                    HttpMethod.Get,
                    AppendQuery(containerSas, "restype=container&comp=list&prefix=tagged.bin")))
         {
             oldList.Headers.TryAddWithoutValidation("x-ms-version", "2015-04-05");
-            using var response = await transport.SendAsync(oldList);
+            using var response = await transport.SendAsync(oldList).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var xml = await response.Content.ReadAsStringAsync();
+            var xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             Assert.DoesNotContain("Creation-Time", xml, StringComparison.Ordinal);
             Assert.DoesNotContain("AccessTier", xml, StringComparison.Ordinal);
             Assert.DoesNotContain("ServerEncrypted", xml, StringComparison.Ordinal);
@@ -15157,23 +15202,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                    AppendQuery(containerSas, "restype=container&comp=list&prefix=tagged.bin&include=tags")))
         {
             currentList.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
-            using var response = await transport.SendAsync(currentList);
+            using var response = await transport.SendAsync(currentList).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            var xml = await response.Content.ReadAsStringAsync();
+            var xml = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
             Assert.Contains("<TagCount>1</TagCount>", xml, StringComparison.Ordinal);
             Assert.Contains("<Key>project</Key>", xml, StringComparison.Ordinal);
         }
+    }
 
+    private static async Task AssertHistoricalBlobPropertiesAsync(
+        BlobClient tagged, Uri taggedSas, HttpClient transport)
+    {
         await tagged.SetImmutabilityPolicyAsync(new BlobImmutabilityPolicy
         {
             ExpiresOn = DateTimeOffset.UtcNow.AddDays(1),
             PolicyMode = BlobImmutabilityPolicyMode.Unlocked
-        });
-        await tagged.SetLegalHoldAsync(true);
+        }).ConfigureAwait(false);
+        await tagged.SetLegalHoldAsync(true).ConfigureAwait(false);
         using (var historicalProperties = new HttpRequestMessage(HttpMethod.Head, taggedSas))
         {
             historicalProperties.Headers.TryAddWithoutValidation("x-ms-version", "2018-03-28");
-            using var response = await transport.SendAsync(historicalProperties);
+            using var response = await transport.SendAsync(historicalProperties).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.True(response.Headers.Contains("x-ms-access-tier"));
             Assert.True(response.Headers.Contains("x-ms-creation-time"));
@@ -15229,42 +15278,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var dataPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-public-policy-{Guid.NewGuid():N}");
         var containerName = $"public-policy-{Guid.NewGuid():N}";
         const string blobName = "content.txt";
-        {
-            var initial = new SavaWebApplicationFactory(
-                         dataPath,
-                         new Dictionary<string, string?>(StringComparer.Ordinal) { ["Sava:AllowAnonymousPublicAccess"] = "true" },
-                         deleteDataPath: false);
-            await using (initial.ConfigureAwait(false))
-            {
-                await initial.InitializeAsync();
-                foreach (var (account, key) in new[]
-                {
-                    (SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
-                    (SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey)
-                })
-                {
-                    var client = CreateClient(initial, account, key);
-                    var container = client.GetBlobContainerClient(containerName);
-                    await container.CreateAsync(
-string.Equals(account, SavaWebApplicationFactory.AccountName
-, StringComparison.Ordinal) ? PublicAccessType.Blob
-                            : PublicAccessType.BlobContainer);
-                    await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account));
-                }
-
-                var secondAccount = CreateClient(
-                    initial,
-                    SavaWebApplicationFactory.SecondAccountName,
-                    SavaWebApplicationFactory.SecondAccountKey);
-                var properties = (await secondAccount.GetPropertiesAsync()).Value;
-                properties.StaticWebsite.Enabled = true;
-                properties.StaticWebsite.IndexDocument = "index.html";
-                await secondAccount.SetPropertiesAsync(properties);
-                await secondAccount.GetBlobContainerClient("$web")
-                    .GetBlobClient("index.html")
-                    .UploadAsync(BinaryData.FromString("website remains public"));
-            }
-        }
+        await ProvisionPublicPolicyFixtureAsync(dataPath, containerName, blobName);
 
         var restarted = new SavaWebApplicationFactory(
             dataPath,
@@ -15278,25 +15292,81 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
         await using var restartedDisposal46 = restarted.ConfigureAwait(false);
         await restarted.InitializeAsync();
         using var anonymous = new HttpClient(restarted.Server.CreateHandler());
+        await AssertAnonymousPublicPolicyAsync(anonymous, containerName, blobName);
+        await AssertAuthenticatedPublicPolicyAsync(restarted, containerName, blobName);
+        await AssertStaticWebsiteExemptionAsync(anonymous);
+    }
+
+    private static async Task ProvisionPublicPolicyFixtureAsync(string dataPath, string containerName, string blobName)
+    {
+        {
+            var initial = new SavaWebApplicationFactory(
+                         dataPath,
+                         new Dictionary<string, string?>(StringComparer.Ordinal) { ["Sava:AllowAnonymousPublicAccess"] = "true" },
+                         deleteDataPath: false);
+            await using (initial.ConfigureAwait(false))
+            {
+                await initial.InitializeAsync().ConfigureAwait(false);
+                foreach (var (account, key) in new[]
+                {
+                    (SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+                    (SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey)
+                })
+                {
+                    var client = CreateClient(initial, account, key);
+                    var container = client.GetBlobContainerClient(containerName);
+                    await container.CreateAsync(string.Equals(account, SavaWebApplicationFactory.AccountName,
+                        StringComparison.Ordinal) ? PublicAccessType.Blob : PublicAccessType.BlobContainer)
+                        .ConfigureAwait(false);
+                    await container.GetBlobClient(blobName).UploadAsync(BinaryData.FromString(account))
+                        .ConfigureAwait(false);
+                }
+
+                var secondAccount = CreateClient(
+                    initial,
+                    SavaWebApplicationFactory.SecondAccountName,
+                    SavaWebApplicationFactory.SecondAccountKey);
+                var properties = (await secondAccount.GetPropertiesAsync().ConfigureAwait(false)).Value;
+                properties.StaticWebsite.Enabled = true;
+                properties.StaticWebsite.IndexDocument = "index.html";
+                await secondAccount.SetPropertiesAsync(properties).ConfigureAwait(false);
+                await secondAccount.GetBlobContainerClient("$web")
+                    .GetBlobClient("index.html")
+                    .UploadAsync(BinaryData.FromString("website remains public")).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static async Task AssertAnonymousPublicPolicyAsync(
+        HttpClient anonymous, string containerName, string blobName)
+    {
         using (var allowed = await anonymous.GetAsync(new Uri(
-                   $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute)))
+                   $"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, allowed.StatusCode);
-            Assert.Equal(SavaWebApplicationFactory.AccountName, await allowed.Content.ReadAsStringAsync());
+            Assert.Equal(SavaWebApplicationFactory.AccountName,
+                await allowed.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
         using (var denied = await anonymous.GetAsync(new Uri(
-                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute)))
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}/{blobName}", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, denied.StatusCode);
-            await AssertVersionedErrorAsync(denied, "PublicAccessNotPermitted");
+            await AssertVersionedErrorAsync(denied, "PublicAccessNotPermitted").ConfigureAwait(false);
         }
         using (var deniedList = await anonymous.GetAsync(new Uri(
-                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list", UriKind.RelativeOrAbsolute)))
+                   $"http://{SavaWebApplicationFactory.SecondAccountName}.localhost/{containerName}?restype=container&comp=list", UriKind.RelativeOrAbsolute))
+                   .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, deniedList.StatusCode);
-            await AssertVersionedErrorAsync(deniedList, "PublicAccessNotPermitted");
+            await AssertVersionedErrorAsync(deniedList, "PublicAccessNotPermitted").ConfigureAwait(false);
         }
+    }
 
+    private static async Task AssertAuthenticatedPublicPolicyAsync(
+        SavaWebApplicationFactory restarted, string containerName, string blobName)
+    {
         var authorized = CreateClient(
             restarted,
             SavaWebApplicationFactory.SecondAccountName,
@@ -15304,9 +15374,10 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
             .GetBlobContainerClient(containerName);
         Assert.Equal(
             SavaWebApplicationFactory.SecondAccountName,
-            (await authorized.GetBlobClient(blobName).DownloadContentAsync()).Value.Content.ToString());
+            (await authorized.GetBlobClient(blobName).DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
         var aclDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            authorized.SetAccessPolicyAsync(PublicAccessType.Blob));
+            authorized.SetAccessPolicyAsync(PublicAccessType.Blob)).ConfigureAwait(false);
         Assert.Equal(409, aclDenied.Status);
         Assert.Equal("PublicAccessNotPermitted", aclDenied.ErrorCode);
         var createDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
@@ -15315,14 +15386,18 @@ string.Equals(account, SavaWebApplicationFactory.AccountName
                 SavaWebApplicationFactory.SecondAccountName,
                 SavaWebApplicationFactory.SecondAccountKey)
                 .GetBlobContainerClient($"denied-public-{Guid.NewGuid():N}")
-                .CreateAsync(PublicAccessType.Blob));
+                .CreateAsync(PublicAccessType.Blob)).ConfigureAwait(false);
         Assert.Equal(409, createDenied.Status);
         Assert.Equal("PublicAccessNotPermitted", createDenied.ErrorCode);
+    }
 
+    private static async Task AssertStaticWebsiteExemptionAsync(HttpClient anonymous)
+    {
         using var website = await anonymous.GetAsync(new Uri(
-            $"http://{SavaWebApplicationFactory.SecondAccountName}.z1.web.local/", UriKind.RelativeOrAbsolute));
+            $"http://{SavaWebApplicationFactory.SecondAccountName}.z1.web.local/", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, website.StatusCode);
-        Assert.Equal("website remains public", await website.Content.ReadAsStringAsync());
+        Assert.Equal("website remains public", await website.Content.ReadAsStringAsync().ConfigureAwait(false));
     }
 
     [Fact]
