@@ -15,4 +15,5 @@ internal sealed record UrlSource(
     bool IsSealed,
     int AppendBlockCount,
     IReadOnlyList<CopySourceBlock> CommittedBlocks,
-    IReadOnlyList<PageRange> PageRanges);
+    IReadOnlyList<PageRange> PageRanges,
+    DateTimeOffset? CreatedAt);

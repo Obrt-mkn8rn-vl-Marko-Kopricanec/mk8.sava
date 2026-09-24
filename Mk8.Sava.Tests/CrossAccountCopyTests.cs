@@ -11,6 +11,94 @@ namespace Mk8.Sava.Tests;
 public sealed class CrossAccountCopyTests
 {
     [Fact]
+    public async Task IncrementalCopyReadsPrivatePageSnapshotInAnotherAccountWithSourceSas()
+    {
+        SavaWebApplicationFactory? application = null;
+        application = new SavaWebApplicationFactory(() =>
+            application?.Server.CreateHandler() ??
+            throw new InvalidOperationException("The source server has not been initialized."));
+        await using var disposal = application.ConfigureAwait(true);
+        await application.InitializeAsync().ConfigureAwait(true);
+
+        var sourceAccount = CreateClient(
+            application,
+            SavaWebApplicationFactory.SecondAccountName,
+            SavaWebApplicationFactory.SecondAccountKey);
+        var destinationAccount = CreateClient(
+            application,
+            SavaWebApplicationFactory.AccountName,
+            SavaWebApplicationFactory.AccountKey);
+        var sourceContainer = sourceAccount.GetBlobContainerClient($"incremental-source-{Guid.NewGuid():N}");
+        var destinationContainer = destinationAccount.GetBlobContainerClient($"incremental-target-{Guid.NewGuid():N}");
+        await sourceContainer.CreateAsync().ConfigureAwait(true);
+        await destinationContainer.CreateAsync().ConfigureAwait(true);
+
+        var source = sourceContainer.GetPageBlobClient("source.vhd");
+        await source.CreateAsync(1024).ConfigureAwait(true);
+        var firstPage = Enumerable.Repeat((byte)0xB5, 512).ToArray();
+        await source.UploadPagesAsync(new MemoryStream(firstPage), 0).ConfigureAwait(true);
+        var sourceSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var sourceSas = source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        using (var sourceTransport = new HttpClient(application.Server.CreateHandler()))
+        {
+            var snapshotSas = new Uri($"{sourceSas}&snapshot={Uri.EscapeDataString(sourceSnapshot)}");
+            using var snapshotRead = await sourceTransport.GetAsync(snapshotSas).ConfigureAwait(true);
+            Assert.Equal(System.Net.HttpStatusCode.OK, snapshotRead.StatusCode);
+            using var pageList = await sourceTransport.GetAsync(new Uri($"{snapshotSas}&comp=pagelist"))
+                .ConfigureAwait(true);
+            Assert.Equal(System.Net.HttpStatusCode.OK, pageList.StatusCode);
+        }
+        var destination = destinationContainer.GetPageBlobClient("backup.vhd");
+
+        var unsigned = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            destination.StartCopyIncrementalAsync(source.Uri, sourceSnapshot)).ConfigureAwait(true);
+        Assert.Equal("CannotVerifyCopySource", unsigned.ErrorCode);
+        Assert.False((await destination.ExistsAsync().ConfigureAwait(true)).Value);
+
+        var operation = await destination.StartCopyIncrementalAsync(sourceSas, sourceSnapshot).ConfigureAwait(true);
+        await operation.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(true);
+        var properties = (await destination.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(CopyStatus.Success, properties.CopyStatus);
+        Assert.True(properties.IsIncrementalCopy);
+        var firstDestinationSnapshot = properties.DestinationSnapshot!;
+        var expected = new byte[1024];
+        firstPage.CopyTo(expected, 0);
+        Assert.Equal(expected, (await destination.WithSnapshot(firstDestinationSnapshot)
+            .DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+
+        await AssertSecondIncrementalCopyAsync(source, destination, firstDestinationSnapshot, firstPage)
+            .ConfigureAwait(true);
+    }
+
+    private static async Task AssertSecondIncrementalCopyAsync(
+        PageBlobClient source,
+        PageBlobClient destination,
+        string firstDestinationSnapshot,
+        byte[] firstPage)
+    {
+        var secondPage = Enumerable.Repeat((byte)0xC6, 512).ToArray();
+        await source.UploadPagesAsync(new MemoryStream(secondPage), 512).ConfigureAwait(true);
+        var secondSourceSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var renewedSas = source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(10));
+        var secondOperation = await destination.StartCopyIncrementalAsync(renewedSas, secondSourceSnapshot)
+            .ConfigureAwait(true);
+        await secondOperation.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(true);
+        var secondProperties = (await destination.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(CopyStatus.Success, secondProperties.CopyStatus);
+        Assert.NotEqual(firstDestinationSnapshot, secondProperties.DestinationSnapshot, StringComparer.Ordinal);
+        var expected = new byte[1024];
+        firstPage.CopyTo(expected, 0);
+        secondPage.CopyTo(expected, 512);
+        Assert.Equal(expected, (await destination.WithSnapshot(secondProperties.DestinationSnapshot!)
+            .DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+        Assert.Equal(firstPage.Concat(new byte[512]).ToArray(),
+            (await destination.WithSnapshot(firstDestinationSnapshot).DownloadContentAsync().ConfigureAwait(true))
+            .Value.Content.ToArray());
+    }
+
+    [Fact]
     public async Task SynchronousCopyFromAnotherAccountUsesSourceSasAndPreservesBlockShape()
     {
         SavaWebApplicationFactory? application = null;

@@ -2027,6 +2027,91 @@ public sealed class BlobService(
 #pragma warning restore CA1054
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(source);
+        var sourceDescriptor = new IncrementalCopySourceDescriptor(
+            source.Kind,
+            source.Snapshot,
+            $"{source.Account}/{source.Container}/{source.Name}",
+            source.CreatedAt,
+            source.SequenceNumber,
+            source.PageRanges);
+        return await BeginIncrementalCopyCoreAsync(
+            account,
+            container,
+            name,
+            sourceDescriptor,
+            options,
+            sourceUri,
+            current,
+            (encryption, token) => PrepareCopyContentAsync(
+                account,
+                source,
+                encryption,
+                preserveCommittedBlocks: false,
+                token),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
+#pragma warning disable CA1054
+    public Task<BlobRecord> BeginIncrementalCopyFromStreamAsync(
+        string account,
+        string container,
+        string name,
+        Stream sourceContent,
+        long sourceLength,
+        string sourceSnapshot,
+        string sourceIdentity,
+        DateTimeOffset sourceCreatedAt,
+        long sourceSequenceNumber,
+        IReadOnlyList<PageRange> sourcePageRanges,
+        BlobWriteOptions options,
+        string sourceUri,
+        BlobRecord? current,
+        CancellationToken cancellationToken)
+    {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(sourceContent);
+        ArgumentNullException.ThrowIfNull(sourcePageRanges);
+        ArgumentNullException.ThrowIfNull(options);
+        var sourceDescriptor = new IncrementalCopySourceDescriptor(
+            BlobKind.PageBlob,
+            sourceSnapshot,
+            sourceIdentity,
+            sourceCreatedAt,
+            sourceSequenceNumber,
+            sourcePageRanges);
+        return BeginIncrementalCopyCoreAsync(
+            account,
+            container,
+            name,
+            sourceDescriptor,
+            options,
+            sourceUri,
+            current,
+            async (encryption, token) =>
+            {
+                var stored = await chunks.StorePinnedAsync(account, encryption, sourceContent, token).ConfigureAwait(false);
+                if (stored.Manifest.Length != sourceLength)
+                {
+                    stored.Dispose();
+                    throw CannotVerifyCopySource("The incremental copy source length did not match its Content-Length value.");
+                }
+                return new PreparedCopyContent(stored.Manifest, [], [stored]);
+            },
+            cancellationToken);
+    }
+
+    private async Task<BlobRecord> BeginIncrementalCopyCoreAsync(
+        string account,
+        string container,
+        string name,
+        IncrementalCopySourceDescriptor source,
+        BlobWriteOptions options,
+        string sourceUri,
+        BlobRecord? current,
+        Func<BlobEncryption, CancellationToken, Task<PreparedCopyContent>> prepareContent,
+        CancellationToken cancellationToken)
+    {
         EnsureFlatNamespace(account);
         ValidateBlobName(name);
         options = await ApplyContainerEncryptionPolicyAsync(
@@ -2035,19 +2120,14 @@ public sealed class BlobService(
             options,
             cancellationToken,
             current).ConfigureAwait(false);
-        var (sourceIdentity, preparedCurrent, encryption) =
+        var (preparedCurrent, encryption) =
             PrepareIncrementalCopyDestination(source, current, options);
         current = preparedCurrent;
-        using var prepared = await PrepareCopyContentAsync(
-            account,
-            source,
-            encryption,
-            preserveCommittedBlocks: false,
-            cancellationToken).ConfigureAwait(false);
+        using var prepared = await prepareContent(encryption, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
         var pending = CreatePendingIncrementalCopy(
             account, container, name, source, options, sourceUri, current,
-            encryption, prepared.Content, sourceIdentity, now);
+            encryption, prepared.Content, now);
 
         if (current is null)
             return await metadata.PublishBlobAsync(
@@ -2064,13 +2144,12 @@ public sealed class BlobService(
         string account,
         string container,
         string name,
-        BlobRecord source,
+        IncrementalCopySourceDescriptor source,
         BlobWriteOptions options,
         string sourceUri,
         BlobRecord? current,
         BlobEncryption encryption,
         ContentManifest preparedContent,
-        string sourceIdentity,
         DateTimeOffset now)
     {
         var copyId = Guid.NewGuid().ToString();
@@ -2091,7 +2170,7 @@ public sealed class BlobService(
                 : current?.LastAccessedAt,
             SequenceNumber = source.SequenceNumber,
             IsIncrementalCopy = true,
-            IncrementalCopySource = sourceIdentity,
+            IncrementalCopySource = source.Identity,
             IncrementalCopySourceCreatedAt = source.CreatedAt,
             PendingCopyContent = preparedContent,
             PendingCopyPageRanges = [.. source.PageRanges],
@@ -2110,8 +2189,8 @@ public sealed class BlobService(
         };
     }
 
-    private (string SourceIdentity, BlobRecord? Current, BlobEncryption Encryption) PrepareIncrementalCopyDestination(
-        BlobRecord source,
+    private (BlobRecord? Current, BlobEncryption Encryption) PrepareIncrementalCopyDestination(
+        IncrementalCopySourceDescriptor source,
         BlobRecord? current,
         BlobWriteOptions options)
     {
@@ -2125,14 +2204,13 @@ public sealed class BlobService(
                 "The source for an incremental copy must be a page blob snapshot.");
         }
 
-        var sourceIdentity = $"{source.Account}/{source.Container}/{source.Name}";
         BlobEncryption encryption;
         if (current is not null)
         {
             EnsureNoPendingCopy(current);
             current = PrepareBlobWrite(current);
             if (!current.IsIncrementalCopy || current.Kind != BlobKind.PageBlob ||
-                !string.Equals(current.IncrementalCopySource, sourceIdentity, StringComparison.Ordinal) ||
+                !string.Equals(current.IncrementalCopySource, source.Identity, StringComparison.Ordinal) ||
                 current.IncrementalCopySourceCreatedAt != source.CreatedAt)
             {
                 throw new AzureStorageException(
@@ -2154,8 +2232,16 @@ public sealed class BlobService(
         {
             encryption = EncryptionOf(options);
         }
-        return (sourceIdentity, current, encryption);
+        return (current, encryption);
     }
+
+    private sealed record IncrementalCopySourceDescriptor(
+        BlobKind Kind,
+        string? Snapshot,
+        string Identity,
+        DateTimeOffset CreatedAt,
+        long SequenceNumber,
+        IReadOnlyList<PageRange> PageRanges);
 
     // Preserve the exact x-ms-copy-source text in the stored copy state.
 #pragma warning disable CA1054

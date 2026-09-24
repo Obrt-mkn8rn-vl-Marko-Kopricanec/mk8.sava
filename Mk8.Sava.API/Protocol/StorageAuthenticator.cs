@@ -1294,8 +1294,7 @@ internal sealed class StorageAuthenticator(
             "c" => request.Container is not null,
             "b" => request.ResourceKind == StorageResourceKind.Blob &&
                    request.Blob is not null &&
-                   (signedVersion < new DateOnly(2018, 11, 9) ||
-                    request.Snapshot is null && request.VersionId is null),
+                   request.VersionId is null,
             "bs" => signedVersion >= new DateOnly(2018, 11, 9) &&
                     request.ResourceKind == StorageResourceKind.Blob &&
                     request.Blob is not null &&
