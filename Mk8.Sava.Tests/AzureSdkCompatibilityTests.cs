@@ -3485,6 +3485,60 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task HierarchicalAclRequiresDirectoryRwxBeforeDeletingAnEmptyDirectory()
+    {
+        const string deleterObjectId = "a40c3cdd-96d9-4393-8dc5-6219bf143f96";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"hns-empty-dir-delete-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var seed = container.GetBlobClient("empty/seed.txt");
+        await seed.UploadAsync(BinaryData.FromString("seed"));
+        await seed.DeleteAsync();
+        var directory = container.GetBlobClient("empty");
+        Assert.True((await directory.ExistsAsync()).Value);
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = $"user::rwx,user:{deleterObjectId}:-wx,group::r-x,mask::rwx,other::---"
+        });
+        var deleter = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, deleterObjectId))
+            .GetBlobContainerClient(container.Name).GetBlobClient(directory.Name);
+        foreach (var permissions in new[] { "--x", "-wx", "r-x", "rw-" })
+        {
+            await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = container.Name,
+                Path = directory.Name,
+                AccessAcl = $"user::rwx,user:{deleterObjectId}:{permissions},group::r-x,mask::rwx,other::---"
+            });
+            var denied = await Assert.ThrowsAsync<RequestFailedException>(() => deleter.DeleteAsync());
+            Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
+            Assert.True((await directory.ExistsAsync()).Value);
+        }
+
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = directory.Name,
+            AccessAcl = $"user::rwx,user:{deleterObjectId}:rwx,group::r-x,mask::rwx,other::---"
+        });
+        await deleter.DeleteAsync();
+        Assert.False((await directory.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task HierarchicalStickyDirectoryRejectsDeletionOfAnotherOwnersChild()
     {
         const string writerObjectId = "e054929f-c734-4e3b-b19b-b810eb24be22";

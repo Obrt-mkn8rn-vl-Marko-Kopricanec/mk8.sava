@@ -731,6 +731,12 @@ For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
 Set Blob Properties, Set Blob Tier, Set Blob Expiry, and Delete Blob through
 write/execute on the immediate parent directory plus execute on ancestors.
+When Delete Blob targets an empty HNS directory, ACL-only authorization also
+requires read, write, and execute on that directory itself, following the
+[documented directory-deletion permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions).
+An SDK test denies deletion when any of those three bits is missing and
+permits it after the full grant. Nonempty directories retain their separate
+`DirectoryIsNotEmpty` rejection.
 When the immediate parent has a sticky bit, ACL-only deletion also requires
 the caller to own the child or that parent, per Microsoft's
 [HNS sticky-bit rule](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#the-sticky-bit-in-data-lake-storage).
