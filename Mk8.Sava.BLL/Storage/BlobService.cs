@@ -1033,11 +1033,15 @@ public sealed class BlobService(
         using (content)
         {
             var now = metadata.GetUtcNow();
+            var pageMutationSequence = checked(current.PageMutationSequence + 1);
             var updated = current with
             {
                 Revision = MetadataStore.NewRevision(),
                 Content = content.Manifest,
                 PageRanges = UpdatePageRanges(current.PageRanges, start, end, clear),
+                PageMutationSequence = pageMutationSequence,
+                PageMutationRanges = UpdatePageMutationRanges(
+                    current.PageMutationRanges ?? [], start, end, pageMutationSequence),
                 ETag = MetadataStore.NewETag(),
                 LastModified = now,
                 LastAccessedAt = IsLastAccessTimeTrackingEnabled(current.Account)
@@ -1110,7 +1114,8 @@ public sealed class BlobService(
             cursor = boundary;
         }
 
-        return new PageRangeDiff(changed, cleared);
+        IncludeRewrittenPages(current, previous.PageMutationSequence, start, end, changed);
+        return new PageRangeDiff(MergePageRanges(changed), cleared);
     }
 
     private void ValidatePageRangeDiff(
@@ -3892,6 +3897,88 @@ public sealed class BlobService(
                 continue;
             }
             merged[^1] = new PageRange(merged[^1].Start, Math.Max(merged[^1].End, range.End));
+        }
+        return merged;
+    }
+
+    private static List<PageMutationRange> UpdatePageMutationRanges(
+        IReadOnlyList<PageMutationRange> current,
+        long start,
+        long end,
+        long sequence)
+    {
+        var updated = new List<PageMutationRange>(current.Count + 2);
+        var inserted = false;
+        foreach (var range in current)
+        {
+            if (range.End < start)
+            {
+                updated.Add(range);
+                continue;
+            }
+            if (range.Start > end)
+            {
+                if (!inserted)
+                {
+                    updated.Add(new PageMutationRange(start, end, sequence));
+                    inserted = true;
+                }
+                updated.Add(range);
+                continue;
+            }
+            if (range.Start < start)
+                updated.Add(range with { End = start - 1 });
+            if (range.End > end)
+            {
+                updated.Add(new PageMutationRange(start, end, sequence));
+                updated.Add(range with { Start = end + 1 });
+                inserted = true;
+            }
+        }
+        if (!inserted)
+            updated.Add(new PageMutationRange(start, end, sequence));
+        return updated;
+    }
+
+    private static void IncludeRewrittenPages(
+        BlobRecord current,
+        long previousSequence,
+        long start,
+        long end,
+        List<PageRange> changed)
+    {
+        var allocatedIndex = 0;
+        foreach (var mutation in current.PageMutationRanges ?? [])
+        {
+            if (mutation.Sequence <= previousSequence || mutation.End < start || mutation.Start > end)
+                continue;
+            var mutationStart = Math.Max(start, mutation.Start);
+            var mutationEnd = Math.Min(end, mutation.End);
+            while (allocatedIndex < current.PageRanges.Count &&
+                   current.PageRanges[allocatedIndex].End < mutationStart)
+                allocatedIndex++;
+            for (var rangeIndex = allocatedIndex; rangeIndex < current.PageRanges.Count; rangeIndex++)
+            {
+                var allocated = current.PageRanges[rangeIndex];
+                if (allocated.Start > mutationEnd)
+                    break;
+                var changedStart = Math.Max(mutationStart, allocated.Start);
+                var changedEnd = Math.Min(mutationEnd, allocated.End);
+                if (changedStart <= changedEnd)
+                    changed.Add(new PageRange(changedStart, changedEnd));
+            }
+        }
+    }
+
+    private static List<PageRange> MergePageRanges(IEnumerable<PageRange> ranges)
+    {
+        var merged = new List<PageRange>();
+        foreach (var range in ranges.OrderBy(item => item.Start))
+        {
+            if (merged.Count == 0 || range.Start > merged[^1].End + 1)
+                merged.Add(range);
+            else
+                merged[^1] = merged[^1] with { End = Math.Max(merged[^1].End, range.End) };
         }
         return merged;
     }

@@ -72,6 +72,10 @@ public sealed record BlobRecord
     public IReadOnlyList<CommittedBlockRecord> CommittedBlocks { get; init; } = [];
     public int AppendBlockCount { get; init; }
     public IReadOnlyList<PageRange> PageRanges { get; init; } = [];
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public long PageMutationSequence { get; init; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<PageMutationRange>? PageMutationRanges { get; init; }
     public IReadOnlyDictionary<string, ObjectReplicationStatusRecord> ObjectReplicationStatuses { get; init; } =
         new Dictionary<string, ObjectReplicationStatusRecord>(StringComparer.Ordinal);
     public string? ObjectReplicationDestinationPolicyId { get; init; }
