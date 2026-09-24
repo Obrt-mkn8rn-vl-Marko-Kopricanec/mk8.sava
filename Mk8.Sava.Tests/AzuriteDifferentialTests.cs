@@ -212,6 +212,42 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task LeasedBaseAndSnapshotsDeleteRequiresMatchingLeaseId()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-snapshot-lease-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseLeasedSnapshotIncludeAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseLeasedSnapshotIncludeAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.Equal(412, expected.MissingLeaseStatus);
+            Assert.Equal("LeaseIdMissing", expected.MissingLeaseCode);
+            Assert.Equal(412, expected.WrongLeaseStatus);
+            Assert.Equal("LeaseIdMismatchWithBlobOperation", expected.WrongLeaseCode);
+            Assert.Equal("leased include payload", expected.BaseBeforeSuccess);
+            Assert.Equal("leased include payload", expected.SnapshotBeforeSuccess);
+            Assert.Equal(202, expected.IncludeStatus);
+            Assert.False(expected.BaseAfterSuccess);
+            Assert.False(expected.SnapshotAfterSuccess);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task ContainerMetadataAccountSasGetAndHeadMatchAzuriteExceptDeniedCode()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1407,6 +1443,35 @@ public sealed class AzuriteDifferentialTests
             baseWithLease.Status, baseAfterDelete);
     }
 
+    private static async Task<LeasedSnapshotIncludeObservation> ExerciseLeasedSnapshotIncludeAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("leased-include.txt");
+        await blob.UploadAsync(BinaryData.FromString("leased include payload")).ConfigureAwait(false);
+        var snapshotId = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var snapshot = blob.WithSnapshot(snapshotId);
+        var leaseId = (await blob.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15))
+            .ConfigureAwait(false)).Value.LeaseId;
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots)).ConfigureAwait(false);
+        var wrong = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(
+                DeleteSnapshotsOption.IncludeSnapshots,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString("D") })).ConfigureAwait(false);
+        var baseBeforeSuccess = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var snapshotBeforeSuccess = (await snapshot.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var include = await blob.DeleteAsync(
+            DeleteSnapshotsOption.IncludeSnapshots, new BlobRequestConditions { LeaseId = leaseId })
+            .ConfigureAwait(false);
+        var baseAfterSuccess = (await blob.ExistsAsync().ConfigureAwait(false)).Value;
+        var snapshotAfterSuccess = (await snapshot.ExistsAsync().ConfigureAwait(false)).Value;
+        return new LeasedSnapshotIncludeObservation(
+            missing.Status, missing.ErrorCode, wrong.Status, wrong.ErrorCode,
+            baseBeforeSuccess, snapshotBeforeSuccess, include.Status,
+            baseAfterSuccess, snapshotAfterSuccess);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -1464,6 +1529,12 @@ public sealed class AzuriteDifferentialTests
         int OnlyWithLeaseStatus, string BaseAfterOnly, bool SnapshotAfterOnly,
         int BaseWithoutLeaseStatus, string? BaseWithoutLeaseCode,
         int BaseWithLeaseStatus, bool BaseAfterDelete);
+
+    private sealed record LeasedSnapshotIncludeObservation(
+        int MissingLeaseStatus, string? MissingLeaseCode,
+        int WrongLeaseStatus, string? WrongLeaseCode,
+        string BaseBeforeSuccess, string SnapshotBeforeSuccess,
+        int IncludeStatus, bool BaseAfterSuccess, bool SnapshotAfterSuccess);
 
     private sealed record ContainerMetadataObservation(
         int GetStatus, int HeadStatus, string Phase,

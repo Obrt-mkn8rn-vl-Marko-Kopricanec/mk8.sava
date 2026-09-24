@@ -7306,6 +7306,38 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task LeasedBaseAndSnapshotsDeletePreservesBothUntilMatchingLeaseIsProvided()
+    {
+        var container = CreateClient(factory)
+            .GetBlobContainerClient($"leased-snapshot-include-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlobClient("leased.bin");
+        await blob.UploadAsync(BinaryData.FromString("retained"));
+        var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+        var snapshot = blob.WithSnapshot(snapshotId);
+        var leaseId = (await blob.GetBlobLeaseClient().AcquireAsync(TimeSpan.FromSeconds(15))).Value.LeaseId;
+
+        var missing = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots));
+        Assert.Equal(412, missing.Status);
+        Assert.Equal("LeaseIdMissing", missing.ErrorCode);
+        var wrong = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(
+                DeleteSnapshotsOption.IncludeSnapshots,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString("D") }));
+        Assert.Equal(412, wrong.Status);
+        Assert.Equal("LeaseIdMismatchWithBlobOperation", wrong.ErrorCode);
+        Assert.Equal("retained", (await blob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("retained", (await snapshot.DownloadContentAsync()).Value.Content.ToString());
+
+        var deleted = await blob.DeleteAsync(
+            DeleteSnapshotsOption.IncludeSnapshots, new BlobRequestConditions { LeaseId = leaseId });
+        Assert.Equal(202, deleted.Status);
+        Assert.False((await blob.ExistsAsync()).Value);
+        Assert.False((await snapshot.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task DeleteBlobUsesExplicitVersionTargetAndDeleteVersionPermission()
     {
         var service = CreateClient(factory);
