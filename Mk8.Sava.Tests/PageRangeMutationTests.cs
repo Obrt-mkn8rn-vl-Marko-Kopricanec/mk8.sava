@@ -1,6 +1,8 @@
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Specialized;
+using Azure.Storage.Sas;
+using System.Net;
 
 namespace Mk8.Sava.Tests;
 
@@ -98,6 +100,52 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
         Assert.Equal(0, entireRange.Offset);
         Assert.Equal(1536, entireRange.Length);
         Assert.Empty(entire.ClearRanges);
+    }
+
+    [Fact]
+    public async Task PageDiffParametersRequireTheirPublishedServiceVersions()
+    {
+        var container = CreateClient(application).GetBlobContainerClient($"version-page-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        var page = container.GetPageBlobClient("disk.vhd");
+        await page.CreateAsync(512).ConfigureAwait(true);
+        var snapshot = (await page.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var pageSas = page.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        using var transport = new HttpClient(application.Server.CreateHandler());
+
+        var previousQuery = new Uri($"{pageSas}&comp=pagelist&prevsnapshot={Uri.EscapeDataString(snapshot)}");
+        await AssertPageDiffVersionAsync(transport, previousQuery, "2014-02-14", null, HttpStatusCode.Conflict)
+            .ConfigureAwait(true);
+        await AssertPageDiffVersionAsync(transport, previousQuery, "2015-07-08", null, HttpStatusCode.OK)
+            .ConfigureAwait(true);
+
+        var pageList = new Uri($"{pageSas}&comp=pagelist");
+        var previousUrl = $"{pageSas}&snapshot={Uri.EscapeDataString(snapshot)}";
+        await AssertPageDiffVersionAsync(transport, pageList, "2018-11-09", previousUrl, HttpStatusCode.Conflict)
+            .ConfigureAwait(true);
+        await AssertPageDiffVersionAsync(transport, pageList, "2019-07-07", previousUrl, HttpStatusCode.OK)
+            .ConfigureAwait(true);
+    }
+
+    private static async Task AssertPageDiffVersionAsync(
+        HttpClient transport,
+        Uri uri,
+        string version,
+        string? previousUrl,
+        HttpStatusCode expectedStatus)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        if (previousUrl is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-previous-snapshot-url", previousUrl);
+        using var response = await transport.SendAsync(request).ConfigureAwait(true);
+        Assert.Equal(expectedStatus, response.StatusCode);
+        if (expectedStatus == HttpStatusCode.Conflict)
+        {
+            var error = System.Xml.Linq.XDocument.Parse(
+                await response.Content.ReadAsStringAsync().ConfigureAwait(true));
+            Assert.Equal("FeatureVersionMismatch", error.Root?.Element("Code")?.Value);
+        }
     }
 
     private static BlobServiceClient CreateClient(SavaWebApplicationFactory factory) => new(

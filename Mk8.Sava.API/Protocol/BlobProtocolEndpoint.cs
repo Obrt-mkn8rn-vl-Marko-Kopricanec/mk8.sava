@@ -2554,7 +2554,12 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         if (previousSnapshot is not null && previousSnapshotUrl is not null)
             throw AzureStorageException.InvalidQuery("prevsnapshot");
         if (previousSnapshotUrl is not null)
+        {
+            RequireFeatureVersion(request, new DateOnly(2019, 7, 7), "Previous snapshot URL");
             previousSnapshot = ParsePreviousSnapshotUrl(previousSnapshotUrl, request.Account, containerName, blobName);
+        }
+        if (previousSnapshot is not null)
+            RequireFeatureVersion(request, new DateOnly(2015, 7, 8), "Get Page Ranges diff");
 
         if (previousSnapshot is null || rangeEnd < rangeStart)
             return (SelectPageRanges(request, blob, rangeValue), []);
