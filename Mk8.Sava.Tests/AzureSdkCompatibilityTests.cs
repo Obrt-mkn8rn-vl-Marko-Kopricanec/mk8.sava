@@ -15772,8 +15772,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     ContentDisposition = "inline"
                 }
             });
-        var properties = await blob.GetPropertiesAsync();
+        var etag = (await blob.GetPropertiesAsync()).Value.ETag;
+        await AssertCsvQueryAndHeadersAsync(blob, etag);
+        await AssertJsonQueryAsync(blob);
+        await AssertArrowQueryAsync(blob);
+        await AssertEmptyArrowQueryAsync(blob);
+        await AssertQueryRejectsAppendBlobAsync(container);
+    }
 
+    private static async Task AssertCsvQueryAndHeadersAsync(BlockBlobClient blob, ETag etag)
+    {
         var progress = new CaptureProgress();
         var csvResponse = await blob.QueryAsync(
             "SELECT _2 FROM BlobStorage WHERE _1 > 250;",
@@ -15781,15 +15789,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 Conditions = new BlobRequestConditions
                 {
-                    IfMatch = properties.Value.ETag,
+                    IfMatch = etag,
                     TagConditions = "\"kind\" = 'query'"
                 },
                 ProgressHandler = progress
-            });
+            }).ConfigureAwait(false);
         using (var reader = new StreamReader(csvResponse.Value.Content))
-            Assert.Equal("400\n", await reader.ReadToEndAsync());
+            Assert.Equal("400\n", await reader.ReadToEndAsync().ConfigureAwait(false));
         Assert.Equal(200, csvResponse.GetRawResponse().Status);
-        Assert.Equal(properties.Value.ETag, csvResponse.Value.Details.ETag);
+        Assert.Equal(etag, csvResponse.Value.Details.ETag);
         var queryHeaders = csvResponse.GetRawResponse().Headers;
         Assert.True(queryHeaders.TryGetValue("x-ms-blob-type", out var queryBlobType));
         Assert.Equal("BlockBlob", queryBlobType);
@@ -15807,7 +15815,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.False(queryHeaders.TryGetValue("x-ms-access-tier", out _));
         Assert.False(queryHeaders.TryGetValue("x-ms-copy-status", out _));
         Assert.Equal([32L, 32L], progress.Values);
+    }
 
+    private static async Task AssertJsonQueryAsync(BlockBlobClient blob)
+    {
         var jsonResponse = await blob.QueryAsync(
             "SELECT _2 FROM BlobStorage WHERE _1 >= 300;",
             new BlobQueryOptions
@@ -15820,10 +15831,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                     RecordSeparator = "\n"
                 },
                 OutputTextConfiguration = new BlobQueryJsonTextOptions { RecordSeparator = "\n" }
-            });
+            }).ConfigureAwait(false);
         using var jsonReader = new StreamReader(jsonResponse.Value.Content);
-        Assert.Equal("{\"_1\":\"400\"}\n", await jsonReader.ReadToEndAsync());
+        Assert.Equal("{\"_1\":\"400\"}\n", await jsonReader.ReadToEndAsync().ConfigureAwait(false));
+    }
 
+    private static async Task AssertArrowQueryAsync(BlockBlobClient blob)
+    {
         var arrowResponse = await blob.QueryAsync(
             "SELECT _1, _2, _3, _4, true, '2026-09-22T12:34:56.789Z' FROM BlobStorage WHERE _1 >= 300;",
             new BlobQueryOptions
@@ -15846,10 +15860,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                         new BlobQueryArrowField { Name = "observed", Type = BlobQueryArrowFieldType.Timestamp }
                     }
                 }
-            });
+            }).ConfigureAwait(false);
         using (var arrowReader = new Apache.Arrow.Ipc.ArrowStreamReader(arrowResponse.Value.Content))
         {
-            using var batch = await arrowReader.ReadNextRecordBatchAsync();
+            using var batch = await arrowReader.ReadNextRecordBatchAsync().ConfigureAwait(false);
             Assert.NotNull(batch);
             Assert.Equal(1, batch.Length);
             Assert.Equal(300L, Assert.IsType<Apache.Arrow.Int64Array>(batch.Column("first", StringComparer.Ordinal)).GetValue(0));
@@ -15860,9 +15874,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(
                 new DateTimeOffset(2026, 9, 22, 12, 34, 56, 789, TimeSpan.Zero),
                 Assert.IsType<Apache.Arrow.TimestampArray>(batch.Column("observed", StringComparer.Ordinal)).GetTimestamp(0));
-            Assert.Null(await arrowReader.ReadNextRecordBatchAsync());
+            Assert.Null(await arrowReader.ReadNextRecordBatchAsync().ConfigureAwait(false));
         }
+    }
 
+    private static async Task AssertEmptyArrowQueryAsync(BlockBlobClient blob)
+    {
         var emptyArrowResponse = await blob.QueryAsync(
             "SELECT _1 FROM BlobStorage WHERE _1 > 999;",
             new BlobQueryOptions
@@ -15874,17 +15891,21 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                         new BlobQueryArrowField { Name = "value", Type = BlobQueryArrowFieldType.Int64 }
                     }
                 }
-            });
+            }).ConfigureAwait(false);
         using (var emptyArrowReader = new Apache.Arrow.Ipc.ArrowStreamReader(emptyArrowResponse.Value.Content))
         {
             Assert.Equal("value", emptyArrowReader.Schema.GetFieldByIndex(0).Name);
-            Assert.Null(await emptyArrowReader.ReadNextRecordBatchAsync());
+            Assert.Null(await emptyArrowReader.ReadNextRecordBatchAsync().ConfigureAwait(false));
         }
+    }
 
+    private static async Task AssertQueryRejectsAppendBlobAsync(BlobContainerClient container)
+    {
         var append = container.GetAppendBlobClient("not-queryable");
-        await append.CreateAsync();
+        await append.CreateAsync().ConfigureAwait(false);
         var invalidType = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            container.GetBlockBlobClient("not-queryable").QueryAsync("SELECT * FROM BlobStorage"));
+            container.GetBlockBlobClient("not-queryable").QueryAsync("SELECT * FROM BlobStorage"))
+            .ConfigureAwait(false);
         Assert.Equal(409, invalidType.Status);
         Assert.Equal("InvalidBlobType", invalidType.ErrorCode);
     }
@@ -16255,10 +16276,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     {
         Directory.CreateDirectory(dataPath);
         var now = DateTimeOffset.UtcNow;
-        var domain = SavaWebApplicationFactory.AccountName;
         var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
         options.Converters.Add(new JsonStringEnumConverter());
-        var container = new ContainerRecord
+        var container = CreateVersionOneContainerRecord(containerName, now);
+        var blob = CreateVersionOneBlobRecord(containerName, now);
+        var block = CreateVersionOneStagedBlockRecord(containerName, now);
+        await WriteVersionOneDatabaseAsync(dataPath, containerName, now, options, container, blob, block)
+            .ConfigureAwait(false);
+    }
+
+    private static ContainerRecord CreateVersionOneContainerRecord(string containerName, DateTimeOffset now)
+    {
+        return new ContainerRecord
         {
             Account = SavaWebApplicationFactory.AccountName,
             Name = containerName,
@@ -16267,7 +16296,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             CreatedAt = now,
             LastModified = now
         };
-        var blob = new BlobRecord
+    }
+
+    private static BlobRecord CreateVersionOneBlobRecord(string containerName, DateTimeOffset now)
+    {
+        var domain = SavaWebApplicationFactory.AccountName;
+        return new BlobRecord
         {
             Account = SavaWebApplicationFactory.AccountName,
             Container = containerName,
@@ -16289,7 +16323,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 ["legacy"] = "indexed"
             }
         };
-        var block = new StagedBlockRecord
+    }
+
+    private static StagedBlockRecord CreateVersionOneStagedBlockRecord(string containerName, DateTimeOffset now)
+    {
+        var domain = SavaWebApplicationFactory.AccountName;
+        return new StagedBlockRecord
         {
             Account = SavaWebApplicationFactory.AccountName,
             Container = containerName,
@@ -16302,15 +16341,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [new ChunkReference(domain + "/$zero", 0, 512)]),
             CreatedAt = now
         };
+    }
 
+    private static async Task WriteVersionOneDatabaseAsync(
+        string dataPath, string containerName, DateTimeOffset now, JsonSerializerOptions options,
+        ContainerRecord container, BlobRecord blob, StagedBlockRecord block)
+    {
         var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
-            var schema = connection.CreateCommand();
-            await using (schema.ConfigureAwait(false))
-            {
-                schema.CommandText = """
+            await CreateVersionOneSchemaAsync(connection).ConfigureAwait(false);
+            await InsertVersionOneRecordsAsync(connection, containerName, now, options, container, blob, block)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async Task CreateVersionOneSchemaAsync(SqliteConnection connection)
+    {
+        var schema = connection.CreateCommand();
+        await using (schema.ConfigureAwait(false))
+        {
+            schema.CommandText = """
                 CREATE TABLE containers (
                     account TEXT NOT NULL,
                     name TEXT NOT NULL,
@@ -16346,12 +16398,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 );
                 PRAGMA user_version=1;
                 """;
-                await schema.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
-            var insert = connection.CreateCommand();
-            await using (insert.ConfigureAwait(false))
-            {
-                insert.CommandText = """
+            await schema.ExecuteNonQueryAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task InsertVersionOneRecordsAsync(
+        SqliteConnection connection, string containerName, DateTimeOffset now, JsonSerializerOptions options,
+        ContainerRecord container, BlobRecord blob, StagedBlockRecord block)
+    {
+        var insert = connection.CreateCommand();
+        await using (insert.ConfigureAwait(false))
+        {
+            insert.CommandText = """
                 INSERT INTO containers(account, name, deleted, modified_ticks, data)
                 VALUES ($account, $name, 0, $modified, $data);
                 INSERT INTO blobs(
@@ -16361,18 +16419,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 INSERT INTO staged_blocks(account, container, blob_name, block_id, created_ticks, data)
                 VALUES ($account, $name, $staged_blob, $block, $modified, $block_data);
                 """;
-                insert.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
-                insert.Parameters.AddWithValue("$name", containerName);
-                insert.Parameters.AddWithValue("$modified", now.UtcTicks);
-                insert.Parameters.AddWithValue("$data", JsonSerializer.Serialize(container, options));
-                insert.Parameters.AddWithValue("$generation", blob.GenerationId);
-                insert.Parameters.AddWithValue("$blob", blob.Name);
-                insert.Parameters.AddWithValue("$blob_data", JsonSerializer.Serialize(blob, options));
-                insert.Parameters.AddWithValue("$staged_blob", block.BlobName);
-                insert.Parameters.AddWithValue("$block", block.BlockId);
-                insert.Parameters.AddWithValue("$block_data", JsonSerializer.Serialize(block, options));
-                await insert.ExecuteNonQueryAsync().ConfigureAwait(false);
-            }
+            insert.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
+            insert.Parameters.AddWithValue("$name", containerName);
+            insert.Parameters.AddWithValue("$modified", now.UtcTicks);
+            insert.Parameters.AddWithValue("$data", JsonSerializer.Serialize(container, options));
+            insert.Parameters.AddWithValue("$generation", blob.GenerationId);
+            insert.Parameters.AddWithValue("$blob", blob.Name);
+            insert.Parameters.AddWithValue("$blob_data", JsonSerializer.Serialize(blob, options));
+            insert.Parameters.AddWithValue("$staged_blob", block.BlobName);
+            insert.Parameters.AddWithValue("$block", block.BlockId);
+            insert.Parameters.AddWithValue("$block_data", JsonSerializer.Serialize(block, options));
+            await insert.ExecuteNonQueryAsync().ConfigureAwait(false);
         }
     }
 
