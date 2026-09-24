@@ -64,6 +64,43 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task BlobHttpPropertyReplacementAndMetadataIsolationMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-properties-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseBlobHttpPropertyReplacementAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseBlobHttpPropertyReplacementAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.Equal(200, expected.SetPropertiesStatus);
+            Assert.Equal(200, expected.SetMetadataStatus);
+            Assert.Equal(412, expected.StaleStatus);
+            Assert.Equal("ConditionNotMet", expected.StaleErrorCode);
+            Assert.True(expected.PropertiesChangedETag);
+            Assert.True(expected.MetadataChangedETag);
+            Assert.Equal("application/octet-stream", expected.ContentType);
+            Assert.Empty(expected.ClearedHttpProperties);
+            Assert.Equal("second", expected.Metadata);
+            Assert.Equal("payload", expected.Content);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SupportedFlatBlobSdkOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -439,6 +476,54 @@ public sealed class AzuriteDifferentialTests
             bangContent,
             percentContent,
             string.Join(',', names));
+    }
+
+    private static async Task<BlobHttpPropertyObservation> ExerciseBlobHttpPropertyReplacementAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("properties.bin");
+        await blob.UploadAsync(BinaryData.FromString("payload"), new BlobUploadOptions
+        {
+            HttpHeaders = new BlobHttpHeaders
+            {
+                ContentType = "text/plain",
+                CacheControl = "max-age=10",
+                ContentEncoding = "gzip",
+                ContentLanguage = "en-US",
+                ContentDisposition = "inline"
+            },
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "initial" }
+        }).ConfigureAwait(false);
+        var original = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("max-age=10", original.CacheControl);
+        Assert.Equal("gzip", original.ContentEncoding);
+        Assert.Equal("en-US", original.ContentLanguage);
+        Assert.Equal("inline", original.ContentDisposition);
+        var replaced = await blob.SetHttpHeadersAsync(
+            new BlobHttpHeaders { ContentType = "application/octet-stream" },
+            new BlobRequestConditions { IfMatch = original.ETag }).ConfigureAwait(false);
+        var afterProperties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("initial", afterProperties.Metadata["phase"]);
+        var metadata = await blob.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "second" },
+            new BlobRequestConditions { IfMatch = afterProperties.ETag }).ConfigureAwait(false);
+        var final = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var stale = await Assert.ThrowsAsync<RequestFailedException>(() => blob.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "rejected" },
+            new BlobRequestConditions { IfMatch = original.ETag })).ConfigureAwait(false);
+        var content = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        return new BlobHttpPropertyObservation(
+            replaced.GetRawResponse().Status,
+            metadata.GetRawResponse().Status,
+            stale.Status,
+            stale.ErrorCode,
+            original.ETag != afterProperties.ETag,
+            afterProperties.ETag != final.ETag,
+            final.ContentType,
+            string.Concat(final.CacheControl, final.ContentEncoding, final.ContentLanguage, final.ContentDisposition),
+            final.Metadata["phase"],
+            content);
     }
 
     private static async Task<AccountInformationObservation> ObserveAccountInformationAsync(
@@ -1017,6 +1102,11 @@ public sealed class AzuriteDifferentialTests
     private sealed record EscapedNameObservation(
         int ExclamationUploadStatus, int LiteralPercentUploadStatus,
         string ExclamationContent, string LiteralPercentContent, string ListedNames);
+
+    private sealed record BlobHttpPropertyObservation(
+        int SetPropertiesStatus, int SetMetadataStatus, int StaleStatus, string? StaleErrorCode,
+        bool PropertiesChangedETag, bool MetadataChangedETag, string ContentType,
+        string ClearedHttpProperties, string Metadata, string Content);
 
     private sealed record StagedBlobObservation(
         int UncommittedBlocks,

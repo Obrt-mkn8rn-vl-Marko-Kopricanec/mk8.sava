@@ -149,6 +149,10 @@ block-blob upload, properties, metadata, full and ranged downloads,
 conditional writes, listing, deletion, and missing-resource errors. Separate
 scenarios compare staged-block commit/order and block lists, snapshots,
 lease-enforced metadata writes, tags, append blobs, and page ranges/clears. The
+HTTP-property replacement scenario compares clearing omitted properties while
+preserving metadata and bytes, then a metadata update and stale-ETag rejection.
+It checks the response statuses and ETag transitions, not the environment-
+specific ETag values or timestamps. The
 container scenario compares metadata, public-access policy, and lease-enforced
 deletion; it enables public access only in its disposable mk8.sava fixture to
 match Azurite's test account, leaving the service's secure default unchanged. The
