@@ -15,18 +15,28 @@ internal static class StorageResourcePath
     public static IReadOnlyList<string> GetSignaturePathCandidates(HttpRequest request)
     {
         var primary = GetEscapedPath(request);
-        if (TryGetRawEscapedPath(request, out _) ||
-            request.Path.Value is not { } decodedPath ||
-            !decodedPath.Contains('%', StringComparison.Ordinal))
+        var candidates = new List<string>(4);
+        AddCandidate(primary);
+        if (!TryGetRawEscapedPath(request, out _) &&
+            request.Path.Value is { } decodedPath &&
+            decodedPath.Contains('%', StringComparison.Ordinal))
         {
-            return [primary];
+            var forcedPercentEscaping = new PathString(decodedPath.Replace("%", "%25", StringComparison.Ordinal))
+                .ToUriComponent();
+            AddCandidate(forcedPercentEscaping);
         }
+        return candidates;
 
-        var forcedPercentEscaping = new PathString(decodedPath.Replace("%", "%25", StringComparison.Ordinal))
-            .ToUriComponent();
-        return string.Equals(primary, forcedPercentEscaping, StringComparison.Ordinal)
-            ? [primary]
-            : [primary, forcedPercentEscaping];
+        void AddCandidate(string path)
+        {
+            if (!candidates.Contains(path, StringComparer.Ordinal))
+                candidates.Add(path);
+            // The SDK signs the encoded URI path, but an HTTP transport can
+            // expose an encoded ! as a literal request-target character.
+            var escapedExclamation = path.Replace("!", "%21", StringComparison.Ordinal);
+            if (!candidates.Contains(escapedExclamation, StringComparer.Ordinal))
+                candidates.Add(escapedExclamation);
+        }
     }
 
     public static string[] DecodeRequestSegments(HttpRequest request)
