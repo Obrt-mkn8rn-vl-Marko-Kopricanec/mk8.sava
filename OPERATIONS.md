@@ -47,7 +47,10 @@ On graceful shutdown, the metadata store clears only its own SQLite connection
 pool. This releases pooled `metadata.db` file handles before a stopped root is
 removed or relocated on Windows, without disabling pooling for live requests.
 Shutdown also disposes any unfinished physical-inventory scan so its directory
-enumerators do not retain handles on a stopped root.
+enumerators do not retain handles on a stopped root. Inventory batch calls,
+completion publication, and shutdown disposal are serialized on the scanner;
+concurrent callers cannot advance or close the same directory enumerator at
+the same time.
 
 Pack compaction publishes its replacement file before switching SQLite's chunk
 locations. If the metadata operation fails or the process exits near commit, it
