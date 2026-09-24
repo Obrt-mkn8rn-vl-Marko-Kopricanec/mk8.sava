@@ -4156,79 +4156,110 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await container.CreateAsync();
         using var transport = new HttpClient(application.Server.CreateHandler());
 
-        static HttpRequestMessage CreatePutRequest(
-            BlobClient blob,
-            string version,
-            string? encryptionContext,
-            string payload)
-        {
-            var request = new HttpRequestMessage(
-                HttpMethod.Put,
-                blob.GenerateSasUri(
-                    BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read,
-                    DateTimeOffset.UtcNow.AddMinutes(5)))
-            {
-                Content = new StringContent(payload, Encoding.UTF8, "application/octet-stream")
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            if (encryptionContext is not null)
-                request.Headers.TryAddWithoutValidation("x-ms-encryption-context", encryptionContext);
-            return request;
-        }
-
-        async Task<HttpResponseMessage> GetPropertiesAsync(BlobBaseClient blob, string version)
-        {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Head,
-                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
-
-        async Task<System.Xml.Linq.XDocument> ListAsync(string version)
-        {
-            var uri = AppendQuery(
-                container.GenerateSasUri(
-                    BlobContainerSasPermissions.List,
-                    DateTimeOffset.UtcNow.AddMinutes(5)),
-                "restype=container&comp=list");
-            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            using var response = await transport.SendAsync(request).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
-        }
-
         const string context = "tenant=alpha;key=v1";
         var blob = container.GetBlobClient("folder/context.bin");
-        using (var put = CreatePutRequest(blob, "2021-08-06", context, "context payload"))
-        using (var response = await transport.SendAsync(put))
-        {
-            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-        }
+        await AssertHnsEncryptionContextReadsAsync(transport, container, blob, context);
 
-        using (var properties = await GetPropertiesAsync(blob, "2021-08-06"))
+        await AssertHnsEncryptionContextCommitAndOverwriteAsync(transport, container, blob);
+
+        await AssertHnsEncryptionContextInvalidWritesAsync(transport, container, blob, context);
+        await AssertFlatEncryptionContextRejectionAsync(context);
+    }
+
+    private static HttpRequestMessage CreateEncryptionContextPutRequest(
+        BlobClient blob,
+        string version,
+        string? encryptionContext,
+        string payload)
+    {
+        var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            blob.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read,
+                DateTimeOffset.UtcNow.AddMinutes(5)))
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/octet-stream")
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        if (encryptionContext is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-encryption-context", encryptionContext);
+        return request;
+    }
+
+    private static async Task<HttpResponseMessage> GetEncryptionContextPropertiesAsync(
+        HttpClient transport,
+        BlobBaseClient blob,
+        string version)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Head,
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    private static async Task<System.Xml.Linq.XDocument> ListEncryptionContextAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        string version)
+    {
+        var uri = AppendQuery(
+            container.GenerateSasUri(
+                BlobContainerSasPermissions.List,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "restype=container&comp=list");
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        return System.Xml.Linq.XDocument.Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+    }
+
+    private static async Task AssertHnsEncryptionContextReadsAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobClient blob,
+        string context)
+    {
+        using (var put = CreateEncryptionContextPutRequest(blob, "2021-08-06", context, "context payload"))
+        using (var response = await transport.SendAsync(put).ConfigureAwait(false))
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+
+        using (var properties = await GetEncryptionContextPropertiesAsync(transport, blob, "2021-08-06")
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, properties.StatusCode);
             Assert.Equal(context, GetResponseHeader(properties, "x-ms-encryption-context"));
         }
-        using (var legacyProperties = await GetPropertiesAsync(blob, "2021-06-08"))
+        using (var legacyProperties = await GetEncryptionContextPropertiesAsync(transport, blob, "2021-06-08")
+            .ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, legacyProperties.StatusCode);
             Assert.Null(GetResponseHeaderOrDefault(legacyProperties, "x-ms-encryption-context"));
         }
 
-        var modernListing = await ListAsync("2021-06-08");
-        var modernEntry = modernListing.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
+        var modernListing = await ListEncryptionContextAsync(transport, container, "2021-06-08")
+            .ConfigureAwait(false);
+        var modernEntry = modernListing.Descendants("Blob").Single(element =>
+            string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
         Assert.Equal(context, modernEntry.Element("Properties")?.Element("EncryptionContext")?.Value);
-        var legacyListing = await ListAsync("2021-04-10");
-        var legacyEntry = legacyListing.Descendants("Blob").Single(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
+        var legacyListing = await ListEncryptionContextAsync(transport, container, "2021-04-10")
+            .ConfigureAwait(false);
+        var legacyEntry = legacyListing.Descendants("Blob").Single(element =>
+            string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal));
         Assert.Null(legacyEntry.Element("Properties")?.Element("EncryptionContext"));
+    }
 
+    private static async Task AssertHnsEncryptionContextCommitAndOverwriteAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobClient blob)
+    {
         var block = container.GetBlockBlobClient("folder/committed.bin");
         var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes("block-0001"));
-        await block.StageBlockAsync(blockId, new MemoryStream(Encoding.UTF8.GetBytes("committed payload")));
+        using var payload = new MemoryStream(Encoding.UTF8.GetBytes("committed payload"));
+        await block.StageBlockAsync(blockId, payload).ConfigureAwait(false);
         var commitUri = AppendQuery(
             block.GenerateSasUri(
                 BlobSasPermissions.Create | BlobSasPermissions.Write | BlobSasPermissions.Read,
@@ -4244,73 +4275,77 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             commit.Headers.TryAddWithoutValidation("x-ms-version", "2021-08-06");
             commit.Headers.TryAddWithoutValidation("x-ms-encryption-context", "commit-context");
-            using var response = await transport.SendAsync(commit);
+            using var response = await transport.SendAsync(commit).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
-        using (var properties = await GetPropertiesAsync(block, "2021-08-06"))
-        {
+        using (var properties = await GetEncryptionContextPropertiesAsync(transport, block, "2021-08-06")
+            .ConfigureAwait(false))
             Assert.Equal("commit-context", GetResponseHeader(properties, "x-ms-encryption-context"));
-        }
 
-        using (var overwrite = CreatePutRequest(blob, "2021-08-06", null, "replacement"))
-        using (var response = await transport.SendAsync(overwrite))
-        {
+        using (var overwrite = CreateEncryptionContextPutRequest(blob, "2021-08-06", null, "replacement"))
+        using (var response = await transport.SendAsync(overwrite).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-        }
-        using (var properties = await GetPropertiesAsync(blob, "2021-08-06"))
-        {
+        using (var properties = await GetEncryptionContextPropertiesAsync(transport, blob, "2021-08-06")
+            .ConfigureAwait(false))
             Assert.Null(GetResponseHeaderOrDefault(properties, "x-ms-encryption-context"));
-        }
+    }
 
-        using (var oversized = CreatePutRequest(blob, "2021-08-06", new string('x', 1025), "rejected"))
-        using (var response = await transport.SendAsync(oversized))
+    private static async Task AssertHnsEncryptionContextInvalidWritesAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobClient blob,
+        string context)
+    {
+        using (var oversized = CreateEncryptionContextPutRequest(blob, "2021-08-06", new string('x', 1025), "rejected"))
+        using (var response = await transport.SendAsync(oversized).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.Equal("replacement", (await blob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("replacement", (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
 
         var legacyTarget = container.GetBlobClient("legacy.bin");
-        using (var legacyPut = CreatePutRequest(legacyTarget, "2021-06-08", context, "rejected"))
-        using (var response = await transport.SendAsync(legacyPut))
+        using (var legacyPut = CreateEncryptionContextPutRequest(legacyTarget, "2021-06-08", context, "rejected"))
+        using (var response = await transport.SendAsync(legacyPut).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal("FeatureVersionMismatch", GetResponseHeader(response, "x-ms-error-code"));
         }
-        Assert.False((await legacyTarget.ExistsAsync()).Value);
+        Assert.False((await legacyTarget.ExistsAsync().ConfigureAwait(false)).Value);
 
         var copyTarget = container.GetBlobClient("copy.bin");
-        using (var copy = new HttpRequestMessage(
+        using var copy = new HttpRequestMessage(
             HttpMethod.Put,
             copyTarget.GenerateSasUri(
                 BlobSasPermissions.Create | BlobSasPermissions.Write,
                 DateTimeOffset.UtcNow.AddMinutes(5)))
         {
             Content = new ByteArrayContent([])
-        })
-        {
-            copy.Headers.TryAddWithoutValidation("x-ms-version", "2021-08-06");
-            copy.Headers.TryAddWithoutValidation(
-                "x-ms-copy-source",
-                blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)).ToString());
-            copy.Headers.TryAddWithoutValidation("x-ms-encryption-context", context);
-            using var response = await transport.SendAsync(copy);
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("UnsupportedHeader", GetResponseHeader(response, "x-ms-error-code"));
-        }
+        };
+        copy.Headers.TryAddWithoutValidation("x-ms-version", "2021-08-06");
+        copy.Headers.TryAddWithoutValidation(
+            "x-ms-copy-source",
+            blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)).ToString());
+        copy.Headers.TryAddWithoutValidation("x-ms-encryption-context", context);
+        using var copyResponse = await transport.SendAsync(copy).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.BadRequest, copyResponse.StatusCode);
+        Assert.Equal("UnsupportedHeader", GetResponseHeader(copyResponse, "x-ms-error-code"));
+    }
 
+    private static async Task AssertFlatEncryptionContextRejectionAsync(string context)
+    {
         var flatApplication = new SavaWebApplicationFactory();
         await using var flatApplicationDisposal21 = flatApplication.ConfigureAwait(false);
         var flatService = CreateClient(flatApplication);
         var flatContainer = flatService.GetBlobContainerClient($"flat-encryption-context-{Guid.NewGuid():N}");
-        await flatContainer.CreateAsync();
+        await flatContainer.CreateAsync().ConfigureAwait(false);
         var flatBlob = flatContainer.GetBlobClient("context.bin");
         using var flatTransport = new HttpClient(flatApplication.Server.CreateHandler());
-        using var flatPut = CreatePutRequest(flatBlob, "2021-08-06", context, "rejected");
-        using var flatResponse = await flatTransport.SendAsync(flatPut);
+        using var flatPut = CreateEncryptionContextPutRequest(flatBlob, "2021-08-06", context, "rejected");
+        using var flatResponse = await flatTransport.SendAsync(flatPut).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.BadRequest, flatResponse.StatusCode);
         Assert.Equal("InvalidHeaderValue", GetResponseHeader(flatResponse, "x-ms-error-code"));
-        Assert.False((await flatBlob.ExistsAsync()).Value);
+        Assert.False((await flatBlob.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
