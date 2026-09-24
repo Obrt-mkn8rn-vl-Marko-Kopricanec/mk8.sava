@@ -140,6 +140,42 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task ContainerMetadataAccountSasGetAndHeadMatchAzuriteExceptDeniedCode()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-container-metadata-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        using var azuriteTransport = new HttpClient();
+        using var localTransport = new HttpClient(application.Server.CreateHandler());
+        try
+        {
+            var expected = await ExerciseContainerMetadataAsync(azuriteContainer, azuriteTransport)
+                .ConfigureAwait(false);
+            var actual = await ExerciseContainerMetadataAsync(localContainer, localTransport)
+                .ConfigureAwait(false);
+            Assert.Equal(403, expected.ServiceSasDeniedStatus);
+            Assert.Equal(403, actual.ServiceSasDeniedStatus);
+            // Both reject service SAS, but Azurite classifies this unsupported operation as a missing permission.
+            Assert.Equal("AuthorizationPermissionMismatch", expected.ServiceSasDeniedCode);
+            Assert.Equal("AuthorizationFailure", actual.ServiceSasDeniedCode);
+            Assert.Equal(expected with { ServiceSasDeniedCode = actual.ServiceSasDeniedCode }, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SupportedFlatBlobSdkOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -622,6 +658,80 @@ public sealed class AzuriteDifferentialTests
         return new BlobMetadataReadObservation(
             (int)getResponse.StatusCode, (int)headResponse.StatusCode,
             (int)conditionalResponse.StatusCode, phase, getBody.Length, headBody.Length);
+    }
+
+    private static async Task<ContainerMetadataObservation> ExerciseContainerMetadataAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        await container.CreateAsync(metadata: new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "initial"
+        }).ConfigureAwait(false);
+        await container.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "updated"
+        }).ConfigureAwait(false);
+        var uri = CreateContainerMetadataAccountSasUri(container);
+        var before = await ObserveContainerMetadataAsync(uri, transport).ConfigureAwait(false);
+        await container.GetBlobClient("child.bin").UploadAsync(BinaryData.FromString("payload"))
+            .ConfigureAwait(false);
+        var after = await ObserveContainerMetadataAsync(uri, transport).ConfigureAwait(false);
+        var serviceSas = container.GenerateSasUri(
+            BlobContainerSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var serviceSasUri = new UriBuilder(serviceSas)
+        {
+            Query = serviceSas.Query.TrimStart('?') + "&restype=container&comp=metadata"
+        }.Uri;
+        using var deniedRequest = new HttpRequestMessage(HttpMethod.Get, serviceSasUri);
+        deniedRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var deniedResponse = await transport.SendAsync(deniedRequest).ConfigureAwait(false);
+        Assert.Equal("updated", before.Phase);
+        Assert.Equal("updated", after.Phase);
+        return new ContainerMetadataObservation(
+            before.GetStatus, before.HeadStatus, before.Phase,
+            before.GetBodyLength, before.HeadBodyLength,
+            string.Equals(before.ETag, after.ETag, StringComparison.Ordinal),
+            (int)deniedResponse.StatusCode,
+            deniedResponse.Headers.TryGetValues("x-ms-error-code", out var codes) ? codes.Single() : null);
+    }
+
+    private static Uri CreateContainerMetadataAccountSasUri(BlobContainerClient container)
+    {
+        var builder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container,
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(5),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(AccountSasPermissions.Read);
+        var credential = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        return new UriBuilder(container.Uri)
+        {
+            Query = "restype=container&comp=metadata&" + builder.ToSasQueryParameters(credential)
+        }.Uri;
+    }
+
+    private static async Task<ContainerMetadataReadObservation> ObserveContainerMetadataAsync(
+        Uri uri, HttpClient transport)
+    {
+        using var get = new HttpRequestMessage(HttpMethod.Get, uri);
+        using var head = new HttpRequestMessage(HttpMethod.Head, uri);
+        get.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        head.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var getResponse = await transport.SendAsync(get).ConfigureAwait(false);
+        using var headResponse = await transport.SendAsync(head).ConfigureAwait(false);
+        var phase = getResponse.Headers.GetValues("x-ms-meta-phase").Single();
+        Assert.Equal(200, (int)getResponse.StatusCode);
+        Assert.Equal(200, (int)headResponse.StatusCode);
+        Assert.Equal(phase, headResponse.Headers.GetValues("x-ms-meta-phase").Single());
+        Assert.Equal(getResponse.Headers.ETag, headResponse.Headers.ETag);
+        return new ContainerMetadataReadObservation(
+            (int)getResponse.StatusCode, (int)headResponse.StatusCode,
+            phase, getResponse.Headers.ETag?.ToString(),
+            (await getResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false)).Length,
+            (await headResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false)).Length);
     }
 
     private static async Task<AccountInformationObservation> ObserveAccountInformationAsync(
@@ -1212,6 +1322,15 @@ public sealed class AzuriteDifferentialTests
     private sealed record BlobMetadataReadObservation(
         int GetStatus, int HeadStatus, int NotModifiedStatus,
         string Phase, int GetBodyLength, int HeadBodyLength);
+
+    private sealed record ContainerMetadataObservation(
+        int GetStatus, int HeadStatus, string Phase,
+        int GetBodyLength, int HeadBodyLength, bool BlobWritePreservedETag,
+        int ServiceSasDeniedStatus, string? ServiceSasDeniedCode);
+
+    private sealed record ContainerMetadataReadObservation(
+        int GetStatus, int HeadStatus, string Phase, string? ETag,
+        int GetBodyLength, int HeadBodyLength);
 
     private sealed record StagedBlobObservation(
         int UncommittedBlocks,
