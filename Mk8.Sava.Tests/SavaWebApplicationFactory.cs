@@ -314,7 +314,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 
     internal static async Task DeleteDataPathAsync(string dataPath)
     {
-        for (var attempt = 0; attempt < 8; attempt++)
+        const int windowsAttempts = 50;
+        for (var attempt = 0; attempt < windowsAttempts; attempt++)
         {
             if (!Directory.Exists(dataPath))
                 return;
@@ -323,10 +324,11 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 Directory.Delete(dataPath, recursive: true);
                 return;
             }
-            catch (IOException) when (OperatingSystem.IsWindows() && attempt < 7)
+            catch (IOException) when (OperatingSystem.IsWindows() && attempt < windowsAttempts - 1)
             {
-                // Windows can release the last SQLite or test-server handle
-                // just after host shutdown. Persistent locks still fail.
+                // A request or SQLite handle can outlive immediate host shutdown.
+                // Re-clear this root's idle pool while Windows releases handles.
+                MetadataStore.ClearPoolForDatabase(Path.Combine(dataPath, "metadata.db"));
                 await Task.Delay(100).ConfigureAwait(false);
             }
         }
