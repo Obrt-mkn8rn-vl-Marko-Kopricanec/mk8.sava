@@ -13633,78 +13633,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             await application.InitializeAsync();
             var metadata = application.Services.GetRequiredService<MetadataStore>();
-            var configuredOptions = application.Services
-                .GetRequiredService<Microsoft.Extensions.Options.IOptions<Mk8.Sava.Configuration.SavaOptions>>()
-                .Value;
-            var legacy = await StorageBackupService.ValidateBackupAsync(
-                legacyBackupPath,
-                configuredOptions,
-                CancellationToken.None);
-            Assert.Equal(1, legacy.BlobRecordCount);
-            Assert.Equal(1, legacy.StagedBlockCount);
-            var inventory = await metadata.GetStorageInventoryAsync(CancellationToken.None);
-            Assert.Equal(1, inventory.BlobRecordCount);
-            Assert.Equal(1, inventory.StagedBlockCount);
-            Assert.Equal(1024, inventory.LogicalBlobBytes);
-            Assert.Equal(512, inventory.LogicalStagedBlockBytes);
-            Assert.Equal(
-                new HashSet<string>([SavaWebApplicationFactory.AccountName + "/$zero"], StringComparer.Ordinal),
-                inventory.ReachableChunkIds);
+            await AssertMigratedLegacyInventoryAsync(application, metadata, legacyBackupPath);
 
             var container = CreateClient(application).GetBlobContainerClient(containerName);
-            Assert.Equal(
-                new byte[1024],
-                (await container.GetPageBlobClient("sparse.bin").DownloadContentAsync()).Value.Content.ToArray());
-            var blocks = await container.GetBlockBlobClient("staged.bin").GetBlockListAsync(BlockListTypes.Uncommitted);
-            var staged = Assert.Single(blocks.Value.UncommittedBlocks);
-            Assert.Equal(Convert.ToBase64String("migrated-block"u8), staged.Name);
-            Assert.Equal(512, staged.SizeLong);
+            await AssertMigratedBlobAndStagedBlockAsync(container);
+            await AssertMigratedSchemaTablesAsync(dataPath);
 
-            {
-                var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
-                await using (connection.ConfigureAwait(false))
-                {
-                    await connection.OpenAsync();
-                    await using var version = connection.CreateCommand();
-                    version.CommandText = "PRAGMA user_version;";
-                    Assert.Equal(
-                        MetadataStore.CurrentSchemaVersion,
-                        Convert.ToInt32(await version.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
-                    await using var references = connection.CreateCommand();
-                    references.CommandText = """
-                        SELECT
-                            (SELECT COUNT(*) FROM blob_chunk_references) +
-                            (SELECT COUNT(*) FROM staged_block_chunk_references);
-                        """;
-                    Assert.Equal(2L, Convert.ToInt64(await references.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
-                    await using var tags = connection.CreateCommand();
-                    tags.CommandText = "SELECT COUNT(*) FROM blob_tags;";
-                    Assert.Equal(1L, Convert.ToInt64(await tags.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
-                }
-            }
-
-            var backup = application.Services.GetRequiredService<StorageBackupService>();
-            var created = await backup.CreateAsync(backupPath, CancellationToken.None);
-            Assert.Equal(1, created.BlobRecordCount);
-            Assert.Equal(1, created.StagedBlockCount);
-            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
-
-            {
-                var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
-                await using (connection.ConfigureAwait(false))
-                {
-                    await connection.OpenAsync();
-                    await using var corruptIndex = connection.CreateCommand();
-                    corruptIndex.CommandText = """
-                        DELETE FROM blob_chunk_references;
-                        DELETE FROM staged_block_chunk_references;
-                        """;
-                    await corruptIndex.ExecuteNonQueryAsync();
-                }
-            }
-            var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
-                backup.CreateAsync(rejectedBackupPath, CancellationToken.None));
-            Assert.Contains("chunk-reference index", mismatch.Message, StringComparison.Ordinal);
+            await AssertMigratedBackupRejectsBrokenIndexAsync(application, dataPath, backupPath, rejectedBackupPath);
         }
         finally
         {
@@ -13718,6 +13653,101 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             if (Directory.Exists(dataPath))
                 Directory.Delete(dataPath, recursive: true);
         }
+    }
+
+    private static async Task AssertMigratedLegacyInventoryAsync(
+        SavaWebApplicationFactory application, MetadataStore metadata, string legacyBackupPath)
+    {
+        var configuredOptions = application.Services
+            .GetRequiredService<Microsoft.Extensions.Options.IOptions<Mk8.Sava.Configuration.SavaOptions>>()
+            .Value;
+        var legacy = await StorageBackupService.ValidateBackupAsync(
+            legacyBackupPath, configuredOptions, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, legacy.BlobRecordCount);
+        Assert.Equal(1, legacy.StagedBlockCount);
+        var inventory = await metadata.GetStorageInventoryAsync(CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, inventory.BlobRecordCount);
+        Assert.Equal(1, inventory.StagedBlockCount);
+        Assert.Equal(1024, inventory.LogicalBlobBytes);
+        Assert.Equal(512, inventory.LogicalStagedBlockBytes);
+        Assert.Equal(new HashSet<string>([SavaWebApplicationFactory.AccountName + "/$zero"],
+            StringComparer.Ordinal), inventory.ReachableChunkIds);
+    }
+
+    private static async Task AssertMigratedBlobAndStagedBlockAsync(BlobContainerClient container)
+    {
+        Assert.Equal(new byte[1024],
+            (await container.GetPageBlobClient("sparse.bin").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToArray());
+        var blocks = await container.GetBlockBlobClient("staged.bin")
+            .GetBlockListAsync(BlockListTypes.Uncommitted).ConfigureAwait(false);
+        var staged = Assert.Single(blocks.Value.UncommittedBlocks);
+        Assert.Equal(Convert.ToBase64String("migrated-block"u8), staged.Name);
+        Assert.Equal(512, staged.SizeLong);
+    }
+
+    private static async Task AssertMigratedSchemaTablesAsync(string dataPath)
+    {
+        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        await using (connection.ConfigureAwait(false))
+        {
+            await connection.OpenAsync().ConfigureAwait(false);
+            var version = connection.CreateCommand();
+            await using (version.ConfigureAwait(false))
+            {
+                version.CommandText = "PRAGMA user_version;";
+                Assert.Equal(MetadataStore.CurrentSchemaVersion,
+                    Convert.ToInt32(await version.ExecuteScalarAsync().ConfigureAwait(false),
+                        CultureInfo.InvariantCulture));
+            }
+            var references = connection.CreateCommand();
+            await using (references.ConfigureAwait(false))
+            {
+                references.CommandText = """
+                    SELECT
+                        (SELECT COUNT(*) FROM blob_chunk_references) +
+                        (SELECT COUNT(*) FROM staged_block_chunk_references);
+                    """;
+                Assert.Equal(2L, Convert.ToInt64(
+                    await references.ExecuteScalarAsync().ConfigureAwait(false), CultureInfo.InvariantCulture));
+            }
+            var tags = connection.CreateCommand();
+            await using (tags.ConfigureAwait(false))
+            {
+                tags.CommandText = "SELECT COUNT(*) FROM blob_tags;";
+                Assert.Equal(1L, Convert.ToInt64(
+                    await tags.ExecuteScalarAsync().ConfigureAwait(false), CultureInfo.InvariantCulture));
+            }
+        }
+    }
+
+    private static async Task AssertMigratedBackupRejectsBrokenIndexAsync(
+        SavaWebApplicationFactory application, string dataPath,
+        string backupPath, string rejectedBackupPath)
+    {
+        var backup = application.Services.GetRequiredService<StorageBackupService>();
+        var created = await backup.CreateAsync(backupPath, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(1, created.BlobRecordCount);
+        Assert.Equal(1, created.StagedBlockCount);
+        Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(false));
+
+        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        await using (connection.ConfigureAwait(false))
+        {
+            await connection.OpenAsync().ConfigureAwait(false);
+            var corruptIndex = connection.CreateCommand();
+            await using (corruptIndex.ConfigureAwait(false))
+            {
+                corruptIndex.CommandText = """
+                    DELETE FROM blob_chunk_references;
+                    DELETE FROM staged_block_chunk_references;
+                    """;
+                await corruptIndex.ExecuteNonQueryAsync().ConfigureAwait(false);
+            }
+        }
+        var mismatch = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            backup.CreateAsync(rejectedBackupPath, CancellationToken.None)).ConfigureAwait(false);
+        Assert.Contains("chunk-reference index", mismatch.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -13816,115 +13846,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             softDelete.DeleteRetentionPolicy.Enabled = true;
             softDelete.DeleteRetentionPolicy.Days = 7;
             await service.SetPropertiesAsync(softDelete);
-            var configured = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                configured with { VersioningEnabled = false },
-                CancellationToken.None);
+            await SetTestVersioningAsync(metadata, enabled: false);
+            await AssertOverwriteRetainsDeletedSnapshotAsync(container);
 
-            var overwritten = container.GetBlockBlobClient("overwritten.txt");
-            await overwritten.UploadAsync(new MemoryStream("before overwrite"u8.ToArray()));
-            await overwritten.UploadAsync(new MemoryStream("after overwrite"u8.ToArray()));
-            Assert.Equal("after overwrite", (await overwritten.DownloadContentAsync()).Value.Content.ToString());
+            await AssertRecreatedBlobKeepsDeletedSnapshotAsync(container);
 
-            var deletedSnapshots = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
-            {
-                States = BlobStates.Deleted | BlobStates.Snapshots,
-                Prefix = overwritten.Name
-            }))
-            {
-                if (item.Deleted && item.Snapshot is not null)
-                    deletedSnapshots.Add(item);
-            }
-            var overwrittenSnapshot = Assert.Single(deletedSnapshots);
-
-            await overwritten.UndeleteAsync();
-            var restoredSnapshot = overwritten.WithSnapshot(overwrittenSnapshot.Snapshot);
-            Assert.Equal("before overwrite", (await restoredSnapshot.DownloadContentAsync()).Value.Content.ToString());
-            Assert.Equal("after overwrite", (await overwritten.DownloadContentAsync()).Value.Content.ToString());
-
-            var recreated = container.GetBlockBlobClient("recreated.txt");
-            await recreated.UploadAsync(new MemoryStream("soft-deleted original"u8.ToArray()));
-            await recreated.DeleteAsync();
-            await recreated.UploadAsync(new MemoryStream("replacement"u8.ToArray()));
-            Assert.Equal("replacement", (await recreated.DownloadContentAsync()).Value.Content.ToString());
-            await recreated.UndeleteAsync();
-
-            BlobItem? recreatedSnapshot = null;
-            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
-            {
-                States = BlobStates.Snapshots,
-                Prefix = recreated.Name
-            }))
-            {
-                if (string.Equals(item.Name, recreated.Name, StringComparison.Ordinal) && item.Snapshot is not null)
-                    recreatedSnapshot = item;
-            }
-            Assert.NotNull(recreatedSnapshot);
-            Assert.Equal(
-                "soft-deleted original",
-                (await recreated.WithSnapshot(recreatedSnapshot!.Snapshot).DownloadContentAsync()).Value.Content.ToString());
-
-            var typeChangedName = "type-changed";
-            var typeChangedAppend = container.GetAppendBlobClient(typeChangedName);
-            await typeChangedAppend.CreateAsync();
-            await typeChangedAppend.AppendBlockAsync(new MemoryStream("append state"u8.ToArray()));
-            await typeChangedAppend.DeleteAsync();
-            var typeChangedBlock = container.GetBlockBlobClient(typeChangedName);
-            await typeChangedBlock.UploadAsync(new MemoryStream("block replacement"u8.ToArray()));
-            var retainedDifferentType = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
-            {
-                States = BlobStates.Deleted | BlobStates.Snapshots,
-                Prefix = typeChangedName
-            }))
-            {
-                if (string.Equals(item.Name, typeChangedName, StringComparison.Ordinal) && item.Deleted)
-                    retainedDifferentType.Add(item);
-            }
-            Assert.Empty(retainedDifferentType);
-
-            configured = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                configured with { VersioningEnabled = true },
-                CancellationToken.None);
-            var versioned = container.GetBlockBlobClient("versioned.txt");
-            await versioned.UploadAsync(new MemoryStream("version one"u8.ToArray()));
-            await versioned.UploadAsync(new MemoryStream("version two"u8.ToArray()));
-            await versioned.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["revision"] = "metadata-write" });
-            var versionedSnapshot = await versioned.CreateSnapshotAsync(
-                new Dictionary<string, string>(StringComparer.Ordinal) { ["snapshot"] = "override" });
-            Assert.False(string.IsNullOrEmpty(versionedSnapshot.Value.VersionId));
-            var snapshotProperties = await versioned.WithSnapshot(versionedSnapshot.Value.Snapshot).GetPropertiesAsync();
-            Assert.Equal("override", snapshotProperties.Value.Metadata["snapshot"]);
-            await versioned.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
-            Assert.False((await versioned.ExistsAsync()).Value);
-
-            var versions = new List<BlobItem>();
-            await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
-            {
-                States = BlobStates.Version,
-                Prefix = versioned.Name
-            }))
-            {
-                if (string.Equals(item.Name, versioned.Name, StringComparison.Ordinal) && item.VersionId is not null)
-                    versions.Add(item);
-            }
-            Assert.Equal(4, versions.Count);
-            Assert.All(versions, item => Assert.False(item.Deleted));
-            Assert.All(versions, item => Assert.False(item.IsLatestVersion));
-            var contents = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var version in versions)
-            {
-                contents.Add((await versioned.WithVersion(version.VersionId).DownloadContentAsync()).Value.Content.ToString());
-            }
-            Assert.Equal(new HashSet<string>(["version one", "version two"], StringComparer.Ordinal), contents);
+            await AssertBlobTypeReplacementDoesNotRetainOtherTypeAsync(container);
+            await SetTestVersioningAsync(metadata, enabled: true);
+            await AssertVersionedDeleteRetainsNoncurrentHistoryAsync(container);
         }
         finally
         {
@@ -13933,6 +13862,132 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 originalProperties,
                 CancellationToken.None);
         }
+    }
+
+    private static async Task SetTestVersioningAsync(MetadataStore metadata, bool enabled)
+    {
+        var configured = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName, CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName, configured with { VersioningEnabled = enabled },
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private static async Task AssertOverwriteRetainsDeletedSnapshotAsync(BlobContainerClient container)
+    {
+        var overwritten = container.GetBlockBlobClient("overwritten.txt");
+        await overwritten.UploadAsync(new MemoryStream("before overwrite"u8.ToArray())).ConfigureAwait(false);
+        await overwritten.UploadAsync(new MemoryStream("after overwrite"u8.ToArray())).ConfigureAwait(false);
+        Assert.Equal("after overwrite",
+            (await overwritten.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+
+        var deletedSnapshots = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Deleted | BlobStates.Snapshots,
+            Prefix = overwritten.Name
+        }).ConfigureAwait(false))
+        {
+            if (item.Deleted && item.Snapshot is not null)
+                deletedSnapshots.Add(item);
+        }
+        var overwrittenSnapshot = Assert.Single(deletedSnapshots);
+        await overwritten.UndeleteAsync().ConfigureAwait(false);
+        var restoredSnapshot = overwritten.WithSnapshot(overwrittenSnapshot.Snapshot);
+        Assert.Equal("before overwrite",
+            (await restoredSnapshot.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        Assert.Equal("after overwrite",
+            (await overwritten.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+    }
+
+    private static async Task AssertRecreatedBlobKeepsDeletedSnapshotAsync(BlobContainerClient container)
+    {
+        var recreated = container.GetBlockBlobClient("recreated.txt");
+        await recreated.UploadAsync(new MemoryStream("soft-deleted original"u8.ToArray())).ConfigureAwait(false);
+        await recreated.DeleteAsync().ConfigureAwait(false);
+        await recreated.UploadAsync(new MemoryStream("replacement"u8.ToArray())).ConfigureAwait(false);
+        Assert.Equal("replacement",
+            (await recreated.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        await recreated.UndeleteAsync().ConfigureAwait(false);
+
+        BlobItem? recreatedSnapshot = null;
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Snapshots,
+            Prefix = recreated.Name
+        }).ConfigureAwait(false))
+        {
+            if (string.Equals(item.Name, recreated.Name, StringComparison.Ordinal) && item.Snapshot is not null)
+                recreatedSnapshot = item;
+        }
+        Assert.NotNull(recreatedSnapshot);
+        Assert.Equal("soft-deleted original",
+            (await recreated.WithSnapshot(recreatedSnapshot!.Snapshot).DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+    }
+
+    private static async Task AssertBlobTypeReplacementDoesNotRetainOtherTypeAsync(BlobContainerClient container)
+    {
+        const string typeChangedName = "type-changed";
+        var typeChangedAppend = container.GetAppendBlobClient(typeChangedName);
+        await typeChangedAppend.CreateAsync().ConfigureAwait(false);
+        await typeChangedAppend.AppendBlockAsync(new MemoryStream("append state"u8.ToArray()))
+            .ConfigureAwait(false);
+        await typeChangedAppend.DeleteAsync().ConfigureAwait(false);
+        var typeChangedBlock = container.GetBlockBlobClient(typeChangedName);
+        await typeChangedBlock.UploadAsync(new MemoryStream("block replacement"u8.ToArray()))
+            .ConfigureAwait(false);
+        var retainedDifferentType = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Deleted | BlobStates.Snapshots,
+            Prefix = typeChangedName
+        }).ConfigureAwait(false))
+        {
+            if (string.Equals(item.Name, typeChangedName, StringComparison.Ordinal) && item.Deleted)
+                retainedDifferentType.Add(item);
+        }
+        Assert.Empty(retainedDifferentType);
+    }
+
+    private static async Task AssertVersionedDeleteRetainsNoncurrentHistoryAsync(BlobContainerClient container)
+    {
+        var versioned = container.GetBlockBlobClient("versioned.txt");
+        await versioned.UploadAsync(new MemoryStream("version one"u8.ToArray())).ConfigureAwait(false);
+        await versioned.UploadAsync(new MemoryStream("version two"u8.ToArray())).ConfigureAwait(false);
+        await versioned.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["revision"] = "metadata-write" })
+            .ConfigureAwait(false);
+        var versionedSnapshot = await versioned.CreateSnapshotAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["snapshot"] = "override" })
+            .ConfigureAwait(false);
+        Assert.False(string.IsNullOrEmpty(versionedSnapshot.Value.VersionId));
+        var snapshotProperties = await versioned.WithSnapshot(versionedSnapshot.Value.Snapshot)
+            .GetPropertiesAsync().ConfigureAwait(false);
+        Assert.Equal("override", snapshotProperties.Value.Metadata["snapshot"]);
+        await versioned.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(false);
+        Assert.False((await versioned.ExistsAsync().ConfigureAwait(false)).Value);
+
+        var versions = new List<BlobItem>();
+        await foreach (var item in container.GetBlobsAsync(new GetBlobsOptions
+        {
+            States = BlobStates.Version,
+            Prefix = versioned.Name
+        }).ConfigureAwait(false))
+        {
+            if (string.Equals(item.Name, versioned.Name, StringComparison.Ordinal) && item.VersionId is not null)
+                versions.Add(item);
+        }
+        Assert.Equal(4, versions.Count);
+        Assert.All(versions, item => Assert.False(item.Deleted));
+        Assert.All(versions, item => Assert.False(item.IsLatestVersion));
+        var contents = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var version in versions)
+        {
+            contents.Add((await versioned.WithVersion(version.VersionId).DownloadContentAsync()
+                .ConfigureAwait(false)).Value.Content.ToString());
+        }
+        Assert.Equal(new HashSet<string>(["version one", "version two"], StringComparer.Ordinal), contents);
     }
 
     [Fact]
