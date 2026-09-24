@@ -789,8 +789,15 @@ Properties accept it only from service version 2023-11-03. The value must be a
 Boolean and the header is rejected for flat-namespace accounts. Configure
 `Sava:BearerAuthentication:Principals:<object-id>:UserPrincipalName` for each
 user whose object ID should be projected when `x-ms-upn=true`; unknown object
-IDs and `$superuser` remain unchanged. The mapping is evaluated when a response
-is written, so changing a configured name does not rewrite stored paths.
+IDs and `$superuser` remain unchanged. Projection applies to the owner and
+named-user access/default ACL entries in Get Blob, Get Blob Properties, and
+List Blobs responses; group IDs are never translated. Configure UPNs only for
+actual user objects, not application objects. The
+mapping is evaluated when a response is written, so changing a configured
+name does not rewrite stored ACLs or authorization decisions. This configured
+mapping does not resolve arbitrary Entra identities on demand.
+See the [List Blobs `x-ms-upn` contract](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs#request-headers)
+for the user/group distinction.
 For HNS List Blobs, a file in an intermediate component of `prefix` is a path
 conflict, not an empty successful enumeration. The flat namespace still permits
 independent blobs named `file` and `file/child`. This follows the published

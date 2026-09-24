@@ -14,11 +14,11 @@ internal static partial class AzureResponseWriter
     private const string LegacyBlobMarkerPrefix = "mk8s1.";
     private const string BlobMarkerPrefix = "mk8s2.";
 
-    private static string ProjectHnsIdentity(HttpContext context, string objectId)
+    private static string ProjectHnsUserIdentity(HttpContext context, string objectId)
     {
         if (!bool.TryParse(context.Request.Headers["x-ms-upn"], out var projectUpn) ||
             !projectUpn ||
-string.Equals(objectId, "$superuser", StringComparison.Ordinal))
+            string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             return objectId;
 
         var principals = context.RequestServices
@@ -27,6 +27,31 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
                !string.IsNullOrWhiteSpace(principal.UserPrincipalName)
             ? principal.UserPrincipalName
             : objectId;
+    }
+
+    private static string ProjectHnsAcl(HttpContext context, string acl)
+    {
+        if (!bool.TryParse(context.Request.Headers["x-ms-upn"], out var projectUpn) || !projectUpn)
+            return acl;
+
+        return string.Join(',', acl.Split(',').Select(entry => ProjectHnsAclEntry(context, entry)));
+    }
+
+    private static string ProjectHnsAclEntry(HttpContext context, string entry)
+    {
+        var prefix = entry.StartsWith("default:user:", StringComparison.Ordinal)
+            ? "default:user:" : "user:";
+        if (!entry.StartsWith(prefix, StringComparison.Ordinal))
+            return entry;
+        var userStart = prefix.Length;
+        var separator = entry.IndexOf(':', userStart);
+        if (separator <= userStart)
+            return entry;
+        var objectId = entry[userStart..separator];
+        var projected = ProjectHnsUserIdentity(context, objectId);
+        return string.Equals(projected, objectId, StringComparison.Ordinal)
+            ? entry
+            : string.Concat(entry.AsSpan(0, userStart), projected, entry.AsSpan(separator));
     }
 
     public static async Task WriteXmlAsync(HttpContext context, Action<XmlWriter> write, CancellationToken cancellationToken)
@@ -347,10 +372,10 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
                 writer.WriteElementString("Etag", FormatEntityTag(request, directory.ETag));
                 if (includes.Contains("permissions"))
                 {
-                    writer.WriteElementString("Owner", ProjectHnsIdentity(context, directory.Owner));
-                    writer.WriteElementString("Group", ProjectHnsIdentity(context, directory.Group));
+                    writer.WriteElementString("Owner", ProjectHnsUserIdentity(context, directory.Owner));
+                    writer.WriteElementString("Group", directory.Group);
                     writer.WriteElementString("Permissions", directory.Permissions);
-                    writer.WriteElementString("Acl", directory.Acl);
+                    writer.WriteElementString("Acl", ProjectHnsAcl(context, directory.Acl));
                 }
             }
             if (IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
@@ -459,10 +484,10 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
         writer.WriteElementString("Etag", FormatEntityTag(request, blob.ETag));
         if (hierarchicalNamespace && includes.Contains("permissions"))
         {
-            writer.WriteElementString("Owner", ProjectHnsIdentity(context, blob.Owner));
-            writer.WriteElementString("Group", ProjectHnsIdentity(context, blob.Group));
+            writer.WriteElementString("Owner", ProjectHnsUserIdentity(context, blob.Owner));
+            writer.WriteElementString("Group", blob.Group);
             writer.WriteElementString("Permissions", blob.Permissions);
-            writer.WriteElementString("Acl", blob.Acl);
+            writer.WriteElementString("Acl", ProjectHnsAcl(context, blob.Acl));
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
             writer.WriteElementString("ResourceType", blob.IsDirectory ? "directory" : "file");
@@ -933,15 +958,15 @@ string.Equals(objectId, "$superuser", StringComparison.Ordinal))
             response.Headers["x-ms-creation-time"] = blob.CreatedAt.ToString("R", CultureInfo.InvariantCulture);
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 6, 12)))
         {
-            response.Headers["x-ms-owner"] = ProjectHnsIdentity(response.HttpContext, blob.Owner);
-            response.Headers["x-ms-group"] = ProjectHnsIdentity(response.HttpContext, blob.Group);
+            response.Headers["x-ms-owner"] = ProjectHnsUserIdentity(response.HttpContext, blob.Owner);
+            response.Headers["x-ms-group"] = blob.Group;
             response.Headers["x-ms-permissions"] = blob.Permissions;
         }
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2020, 10, 2)))
             response.Headers["x-ms-resource-type"] = blob.IsDirectory ? "directory" : "file";
         if (hierarchicalNamespace && IsServiceVersionAtLeast(request, new DateOnly(2023, 11, 3)))
         {
-            response.Headers["x-ms-acl"] = blob.Acl;
+            response.Headers["x-ms-acl"] = ProjectHnsAcl(response.HttpContext, blob.Acl);
         }
         response.Headers["x-ms-blob-type"] = BlobType(blob.Kind);
         if (IsServiceVersionAtLeast(request, new DateOnly(2015, 12, 11)))
