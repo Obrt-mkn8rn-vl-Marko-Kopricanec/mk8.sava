@@ -254,6 +254,15 @@ and 202 with the active ID. The failed requests preserve exact base and
 snapshot bytes; the successful request removes both. An ordinary local SDK
 test checks the same lifecycle without Azurite. These responses follow the
 [Delete Blob lease rules](https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob#request-headers).
+A twenty-first scenario compares current and snapshot committed block lists
+after a later commit and staged upload. It also checks that omitting
+`blocklisttype` returns the committed list. Mk8.sava additionally checks
+an older blob version through the official SDK. Pinned Azurite 3.35.0
+incorrectly exposes the current uncommitted block on a snapshot and ignores
+a stale `If-Match` on Get Block List. The differential records those two
+exceptions; mk8.sava returns an empty snapshot uncommitted list and 412
+`ConditionNotMet`, following the
+[published Get Block List contract](https://learn.microsoft.com/en-us/rest/api/storageservices/get-block-list).
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
