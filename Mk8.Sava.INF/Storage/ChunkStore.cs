@@ -33,16 +33,27 @@ public sealed class ChunkStore : IDisposable
     private readonly Dictionary<string, int> _pins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
+    private readonly Lock _physicalInventoryGate = new();
     private string? _orphanPackCursor;
     private StoragePhysicalInventoryScanner? _physicalInventoryScanner;
 
-    internal bool IsPhysicalUsageScanInProgress => _physicalInventoryScanner is not null;
+    internal bool IsPhysicalUsageScanInProgress
+    {
+        get
+        {
+            lock (_physicalInventoryGate)
+                return _physicalInventoryScanner is not null;
+        }
+    }
     internal int PhysicalUsageScanStepsLastPass { get; private set; }
 
     public void Dispose()
     {
-        _physicalInventoryScanner?.Dispose();
-        _physicalInventoryScanner = null;
+        lock (_physicalInventoryGate)
+        {
+            _physicalInventoryScanner?.Dispose();
+            _physicalInventoryScanner = null;
+        }
         GC.SuppressFinalize(this);
     }
 
@@ -980,24 +991,27 @@ public sealed class ChunkStore : IDisposable
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumEntries);
 
-        var scanner = _physicalInventoryScanner ??= new StoragePhysicalInventoryScanner(_paths);
-        try
+        lock (_physicalInventoryGate)
         {
-            var complete = scanner.Advance(maximumEntries);
-            PhysicalUsageScanStepsLastPass = scanner.LastPassSteps;
-            if (!complete)
-                return null;
+            var scanner = _physicalInventoryScanner ??= new StoragePhysicalInventoryScanner(_paths);
+            try
+            {
+                var complete = scanner.Advance(maximumEntries);
+                PhysicalUsageScanStepsLastPass = scanner.LastPassSteps;
+                if (!complete)
+                    return null;
 
-            var result = scanner.ToPhysicalUsage(_metadata.CountPackedChunks());
-            scanner.Dispose();
-            _physicalInventoryScanner = null;
-            return result;
-        }
-        catch
-        {
-            scanner.Dispose();
-            _physicalInventoryScanner = null;
-            throw;
+                var result = scanner.ToPhysicalUsage(_metadata.CountPackedChunks());
+                scanner.Dispose();
+                _physicalInventoryScanner = null;
+                return result;
+            }
+            catch
+            {
+                scanner.Dispose();
+                _physicalInventoryScanner = null;
+                throw;
+            }
         }
     }
 

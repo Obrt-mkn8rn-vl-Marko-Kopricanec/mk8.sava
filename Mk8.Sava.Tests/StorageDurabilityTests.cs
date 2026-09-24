@@ -25,7 +25,13 @@ public sealed class StorageDurabilityTests
     public async Task DisposingServiceClosesAnIncompletePhysicalInventoryScan()
     {
         var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-dispose-scan-{Guid.NewGuid():N}");
-        var application = new SavaWebApplicationFactory(root, deleteDataPath: false);
+        var application = new SavaWebApplicationFactory(
+            root,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: null,
+            deleteDataPath: false,
+            disableMaintenance: true);
         ChunkStore chunks;
         await using (application.ConfigureAwait(true))
         {
@@ -38,6 +44,44 @@ public sealed class StorageDurabilityTests
         Assert.False(chunks.IsPhysicalUsageScanInProgress);
         Directory.Delete(root, recursive: true);
         Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
+    public async Task ConcurrentPhysicalInventoryBatchesPublishOnlyCompleteSamples()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-concurrent-scan-{Guid.NewGuid():N}");
+        var application = new SavaWebApplicationFactory(
+            root,
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: null,
+            deleteDataPath: true,
+            disableMaintenance: true);
+        await using var disposal = application.ConfigureAwait(true);
+        await application.InitializeAsync().ConfigureAwait(true);
+        var paths = application.Services.GetRequiredService<StoragePaths>();
+        for (var index = 0; index < 64; index++)
+        {
+            var path = Path.Combine(paths.Staging,
+                $"inventory-{index:D3}.tmp");
+            await File.WriteAllTextAsync(path, "x").ConfigureAwait(true);
+        }
+
+        var chunks = application.Services.GetRequiredService<ChunkStore>();
+        var completedSamples = 0;
+        var workers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        {
+            for (var pass = 0; pass < 256; pass++)
+            {
+                var usage = chunks.ScanPhysicalUsageBatch(maximumEntries: 1);
+                if (usage is null)
+                    continue;
+                Assert.Equal(64L, usage.StagingBytes);
+                Interlocked.Increment(ref completedSamples);
+            }
+        })).ToArray();
+        await Task.WhenAll(workers).ConfigureAwait(true);
+        Assert.True(Volatile.Read(ref completedSamples) > 0);
     }
 
     [Fact]
