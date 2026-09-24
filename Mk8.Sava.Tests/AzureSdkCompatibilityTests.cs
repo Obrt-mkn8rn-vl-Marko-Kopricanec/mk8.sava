@@ -12434,136 +12434,180 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var keyedProperties = (await keyedBlob.GetPropertiesAsync()).Value;
         Assert.Equal(expectedHash, keyedProperties.EncryptionKeySha256);
         Assert.Equal(content, (await keyedBlob.DownloadContentAsync()).Value.Content.ToArray());
+        await AssertCustomerKeyHistoricalTierRejectsAsync(factory, containerName, keyedBlob);
+        await AssertCustomerKeyCurrentTierAllowsAsync(normalService, containerName, keyedBlob);
 
-        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        await AssertCustomerKeyDenialsAsync(factory, normalService, containerName, wrongKey);
+
+        const string scope = "records-scope";
+        var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, scope);
+        var chunksAfterScoped = await AssertEncryptionScopeMetadataAsync(
+            factory, normalService, scopedService, containerName, content, scope);
+
+        await AssertEncryptionScopeSpecializedOperationsAsync(normalService, scopedService, containerName);
+        await AssertEncryptionListingAndPhysicalIsolationAsync(
+            factory, normalService, containerName, expectedHash, scope,
+            chunksBefore, chunksAfterKeyed, chunksAfterScoped, key);
+    }
+
+    private static async Task AssertCustomerKeyHistoricalTierRejectsAsync(
+        SavaWebApplicationFactory application, string containerName, BlobClient keyedBlob)
+    {
+        using (var transport = new HttpClient(application.Server.CreateHandler()))
         using (var oldTierRequest = new HttpRequestMessage(
                    HttpMethod.Put,
-                   AppendQuery(
-                       keyedBlob.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-                       "comp=tier"))
+                   AppendQuery(keyedBlob.GenerateSasUri(
+                           BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)), "comp=tier"))
         {
             Content = new ByteArrayContent([])
         })
         {
             oldTierRequest.Headers.TryAddWithoutValidation("x-ms-version", "2021-12-02");
             oldTierRequest.Headers.TryAddWithoutValidation("x-ms-access-tier", "Cool");
-            using var oldTierResponse = await transport.SendAsync(oldTierRequest);
+            using var oldTierResponse = await transport.SendAsync(oldTierRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldTierResponse.StatusCode);
-            Assert.Equal(
-                "BlobUsesCustomerSpecifiedEncryption",
+            Assert.Equal("BlobUsesCustomerSpecifiedEncryption",
                 oldTierResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
 
         var oldEndpoint = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost");
         var oldOptions = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2021_12_02)
         {
-            Transport = new HttpClientTransport(factory.Server.CreateHandler()),
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         };
-        var oldService = new BlobServiceClient(
-            oldEndpoint,
+        var oldService = new BlobServiceClient(oldEndpoint,
             new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
             oldOptions);
         var oldBatchClient = oldService.GetBlobBatchClient();
         using (var oldBatch = oldBatchClient.CreateBatch())
         {
             var rejectedTier = oldBatch.SetBlobAccessTier(containerName, keyedBlob.Name, AccessTier.Cool);
-            var batchResponse = await oldBatchClient.SubmitBatchAsync(oldBatch, throwOnAnyFailure: false);
+            var batchResponse = await oldBatchClient.SubmitBatchAsync(oldBatch, throwOnAnyFailure: false)
+                .ConfigureAwait(false);
             Assert.Equal(StatusCodes.Status202Accepted, batchResponse.Status);
             Assert.Equal(StatusCodes.Status409Conflict, rejectedTier.Status);
             Assert.True(rejectedTier.Headers.TryGetValue("x-ms-error-code", out var errorCode));
             Assert.Equal("BlobUsesCustomerSpecifiedEncryption", errorCode);
         }
-        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
+    }
 
-        var keyedTier = await keyedBlob.SetAccessTierAsync(AccessTier.Cool);
+    private static async Task AssertCustomerKeyCurrentTierAllowsAsync(
+        BlobServiceClient normalService, string containerName, BlobClient keyedBlob)
+    {
+        var keyedTier = await keyedBlob.SetAccessTierAsync(AccessTier.Cool).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status200OK, keyedTier.Status);
-        Assert.Equal(AccessTier.Cool, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+        Assert.Equal(AccessTier.Cool, (await keyedBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
 
         var batchClient = normalService.GetBlobBatchClient();
         using (var batch = batchClient.CreateBatch())
         {
             var tiered = batch.SetBlobAccessTier(containerName, keyedBlob.Name, AccessTier.Hot);
-            var batchResponse = await batchClient.SubmitBatchAsync(batch, throwOnAnyFailure: false);
+            var batchResponse = await batchClient.SubmitBatchAsync(batch, throwOnAnyFailure: false)
+                .ConfigureAwait(false);
             Assert.Equal(StatusCodes.Status202Accepted, batchResponse.Status);
             Assert.Equal(StatusCodes.Status200OK, tiered.Status);
         }
-        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync()).Value.AccessTier);
+        Assert.Equal(AccessTier.Hot, (await keyedBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.AccessTier);
+    }
 
+    private static async Task AssertCustomerKeyDenialsAsync(
+        SavaWebApplicationFactory application, BlobServiceClient normalService,
+        string containerName, byte[] wrongKey)
+    {
         var missingKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            normalService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").GetPropertiesAsync());
+            normalService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").GetPropertiesAsync())
+            .ConfigureAwait(false);
         Assert.Equal(409, missingKey.Status);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingKey.ErrorCode);
-        var wrongKeyService = CreateEncryptedClient(factory, new CustomerProvidedKey(wrongKey), encryptionScope: null);
+        var wrongKeyService = CreateEncryptedClient(application,
+            new CustomerProvidedKey(wrongKey), encryptionScope: null);
         var mismatchedKey = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            wrongKeyService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").DownloadContentAsync());
+            wrongKeyService.GetBlobContainerClient(containerName).GetBlobClient("keyed.bin").DownloadContentAsync())
+            .ConfigureAwait(false);
         Assert.Equal(409, mismatchedKey.Status);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", mismatchedKey.ErrorCode);
+    }
 
-        const string scope = "records-scope";
-        var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, scope);
+    private static async Task<int> AssertEncryptionScopeMetadataAsync(
+        SavaWebApplicationFactory application, BlobServiceClient normalService,
+        BlobServiceClient scopedService, string containerName, byte[] content, string scope)
+    {
         var scopedBlob = scopedService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin");
-        await scopedBlob.UploadAsync(BinaryData.FromBytes(content));
-        var chunksAfterScoped = Directory.GetFiles(Path.Combine(factory.DataPath, "chunks"), "*.chunk", SearchOption.AllDirectories).Length;
-        var scopedProperties = (await scopedBlob.GetPropertiesAsync()).Value;
+        await scopedBlob.UploadAsync(BinaryData.FromBytes(content)).ConfigureAwait(false);
+        var chunksAfterScoped = Directory.GetFiles(Path.Combine(application.DataPath, "chunks"),
+            "*.chunk", SearchOption.AllDirectories).Length;
+        var scopedProperties = (await scopedBlob.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(scope, scopedProperties.EncryptionScope);
-        Assert.Equal(content, (await normalService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin").DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(content, (await normalService.GetBlobContainerClient(containerName)
+            .GetBlobClient("scoped.bin").DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
         var missingScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            normalService.GetBlobContainerClient(containerName)
-                .GetBlobClient("scoped.bin")
-                .SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "missing" }));
+            normalService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin")
+                .SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "missing" }))
+            .ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status409Conflict, missingScope.Status);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingScope.ErrorCode);
-        var wrongScopeService = CreateEncryptedClient(factory, customerProvidedKey: null, "wrong-scope");
+        var wrongScopeService = CreateEncryptedClient(application, customerProvidedKey: null, "wrong-scope");
         var wrongScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            wrongScopeService.GetBlobContainerClient(containerName)
-                .GetBlobClient("scoped.bin")
-                .SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "wrong" }));
+            wrongScopeService.GetBlobContainerClient(containerName).GetBlobClient("scoped.bin")
+                .SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "wrong" }))
+            .ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status409Conflict, wrongScope.Status);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", wrongScope.ErrorCode);
-        await scopedBlob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "matched" });
+        await scopedBlob.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "matched" }).ConfigureAwait(false);
+        return chunksAfterScoped;
+    }
 
+    private static async Task AssertEncryptionScopeSpecializedOperationsAsync(
+        BlobServiceClient normalService, BlobServiceClient scopedService, string containerName)
+    {
         var scopedAppend = scopedService.GetBlobContainerClient(containerName).GetAppendBlobClient("scoped-append.bin");
-        await scopedAppend.CreateAsync();
+        await scopedAppend.CreateAsync().ConfigureAwait(false);
         var missingAppendScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            normalService.GetBlobContainerClient(containerName)
-                .GetAppendBlobClient(scopedAppend.Name)
-                .AppendBlockAsync(BinaryData.FromString("must fail").ToStream()));
+            normalService.GetBlobContainerClient(containerName).GetAppendBlobClient(scopedAppend.Name)
+                .AppendBlockAsync(BinaryData.FromString("must fail").ToStream())).ConfigureAwait(false);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingAppendScope.ErrorCode);
-        await scopedAppend.AppendBlockAsync(BinaryData.FromString("matched append").ToStream());
+        await scopedAppend.AppendBlockAsync(BinaryData.FromString("matched append").ToStream()).ConfigureAwait(false);
 
         var scopedPage = scopedService.GetBlobContainerClient(containerName).GetPageBlobClient("scoped-page.bin");
-        await scopedPage.CreateAsync(512);
+        await scopedPage.CreateAsync(512).ConfigureAwait(false);
         var missingPageScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            normalService.GetBlobContainerClient(containerName)
-                .GetPageBlobClient(scopedPage.Name)
-                .UploadPagesAsync(new MemoryStream(new byte[512]), 0));
+            normalService.GetBlobContainerClient(containerName).GetPageBlobClient(scopedPage.Name)
+                .UploadPagesAsync(new MemoryStream(new byte[512]), 0)).ConfigureAwait(false);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingPageScope.ErrorCode);
-        await scopedPage.UploadPagesAsync(new MemoryStream(new byte[512]), 0);
+        await scopedPage.UploadPagesAsync(new MemoryStream(new byte[512]), 0).ConfigureAwait(false);
 
         var scopedBlock = scopedService.GetBlobContainerClient(containerName).GetBlockBlobClient("scoped-block.bin");
-        await scopedBlock.UploadAsync(BinaryData.FromString("initial block").ToStream());
+        await scopedBlock.UploadAsync(BinaryData.FromString("initial block").ToStream()).ConfigureAwait(false);
         var missingBlockScope = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            normalService.GetBlobContainerClient(containerName)
-                .GetBlockBlobClient(scopedBlock.Name)
-                .StageBlockAsync(
-                    Convert.ToBase64String("scope-block"u8),
-                    BinaryData.FromString("must fail").ToStream()));
+            normalService.GetBlobContainerClient(containerName).GetBlockBlobClient(scopedBlock.Name)
+                .StageBlockAsync(Convert.ToBase64String("scope-block"u8),
+                    BinaryData.FromString("must fail").ToStream())).ConfigureAwait(false);
         Assert.Equal("BlobUsesCustomerSpecifiedEncryption", missingBlockScope.ErrorCode);
+    }
 
+    private static async Task AssertEncryptionListingAndPhysicalIsolationAsync(
+        SavaWebApplicationFactory application, BlobServiceClient normalService, string containerName,
+        string expectedHash, string scope, int chunksBefore, int chunksAfterKeyed, int chunksAfterScoped, byte[] key)
+    {
         var listed = new List<BlobItem>();
         await foreach (var item in normalService.GetBlobContainerClient(containerName).GetBlobsAsync(
-                           new GetBlobsOptions { Traits = BlobTraits.Metadata }))
+                           new GetBlobsOptions { Traits = BlobTraits.Metadata }).ConfigureAwait(false))
             listed.Add(item);
         var listedKeyed = Assert.Single(listed, item => string.Equals(item.Name, "keyed.bin", StringComparison.Ordinal));
         Assert.Equal(expectedHash, listedKeyed.Properties.CustomerProvidedKeySha256);
         Assert.Empty(listedKeyed.Metadata);
-        Assert.Equal(scope, Assert.Single(listed, item => string.Equals(item.Name, "scoped.bin", StringComparison.Ordinal)).Properties.EncryptionScope);
+        Assert.Equal(scope, Assert.Single(listed,
+            item => string.Equals(item.Name, "scoped.bin", StringComparison.Ordinal)).Properties.EncryptionScope);
         Assert.True(chunksAfterKeyed > chunksBefore);
         Assert.True(chunksAfterScoped > chunksAfterKeyed);
-        var metadataBytes = await File.ReadAllBytesAsync(Path.Combine(factory.DataPath, "metadata.db"));
-        Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes), StringComparison.Ordinal);
+        var metadataBytes = await File.ReadAllBytesAsync(Path.Combine(application.DataPath, "metadata.db"))
+            .ConfigureAwait(false);
+        Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes),
+            StringComparison.Ordinal);
     }
 
     [Fact]
@@ -12580,13 +12624,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 DefaultEncryptionScope = defaultScope,
                 PreventEncryptionScopeOverride = true
             });
+        await AssertContainerScopePolicyPropertiesAsync(service, container, defaultScope);
 
-        var containerProperties = (await container.GetPropertiesAsync()).Value;
+        await AssertDefaultScopeBlobAndTierRulesAsync(container, defaultScope);
+
+        await AssertDefaultScopeSpecializedWritesAsync(factory, container, defaultScope);
+
+        var otherScopeService = CreateEncryptedClient(factory, customerProvidedKey: null, "other-scope");
+        await AssertContainerScopeOverrideRulesAsync(service, container, otherScopeService, defaultScope);
+
+        await AssertContainerScopeInvalidCreateRequestsAsync(factory, service, defaultScope);
+    }
+
+    private static async Task AssertContainerScopePolicyPropertiesAsync(
+        BlobServiceClient service, BlobContainerClient container, string defaultScope)
+    {
+        var containerProperties = (await container.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(defaultScope, containerProperties.DefaultEncryptionScope);
         Assert.True(containerProperties.PreventEncryptionScopeOverride);
 
         BlobContainerItem? listedContainer = null;
-        await foreach (var item in service.GetBlobContainersAsync(prefix: container.Name))
+        await foreach (var item in service.GetBlobContainersAsync(prefix: container.Name).ConfigureAwait(false))
         {
             if (string.Equals(item.Name, container.Name, StringComparison.Ordinal))
                 listedContainer = item;
@@ -12594,72 +12652,87 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.NotNull(listedContainer);
         Assert.Equal(defaultScope, listedContainer.Properties.DefaultEncryptionScope);
         Assert.True(listedContainer.Properties.PreventEncryptionScopeOverride);
+    }
 
+    private static async Task AssertDefaultScopeBlobAndTierRulesAsync(
+        BlobContainerClient container, string defaultScope)
+    {
         var defaultBlob = container.GetBlobClient("default.bin");
-        await defaultBlob.UploadAsync(BinaryData.FromString("default encryption scope"));
-        Assert.Equal(defaultScope, (await defaultBlob.GetPropertiesAsync()).Value.EncryptionScope);
-        await defaultBlob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "container-default" });
-        var defaultSnapshot = await defaultBlob.CreateSnapshotAsync();
-        Assert.Equal(
-            defaultScope,
-            (await defaultBlob.WithSnapshot(defaultSnapshot.Value.Snapshot).GetPropertiesAsync()).Value.EncryptionScope);
+        await defaultBlob.UploadAsync(BinaryData.FromString("default encryption scope")).ConfigureAwait(false);
+        Assert.Equal(defaultScope, (await defaultBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
+        await defaultBlob.SetMetadataAsync(
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["scope"] = "container-default" })
+            .ConfigureAwait(false);
+        var defaultSnapshot = await defaultBlob.CreateSnapshotAsync().ConfigureAwait(false);
+        Assert.Equal(defaultScope,
+            (await defaultBlob.WithSnapshot(defaultSnapshot.Value.Snapshot).GetPropertiesAsync().ConfigureAwait(false))
+            .Value.EncryptionScope);
         var tierChange = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            defaultBlob.SetAccessTierAsync(AccessTier.Cool));
+            defaultBlob.SetAccessTierAsync(AccessTier.Cool)).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status409Conflict, tierChange.Status);
         Assert.Equal("BlobOperationNotSupported", tierChange.ErrorCode);
         var explicitTier = await Assert.ThrowsAsync<RequestFailedException>(() =>
             container.GetBlobClient("explicit-tier.bin").UploadAsync(
                 BinaryData.FromString("scope with explicit tier"),
-                new BlobUploadOptions { AccessTier = AccessTier.Cool }));
+                new BlobUploadOptions { AccessTier = AccessTier.Cool })).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status409Conflict, explicitTier.Status);
         Assert.Equal("BlobOperationNotSupported", explicitTier.ErrorCode);
+    }
 
+    private static async Task AssertDefaultScopeSpecializedWritesAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, string defaultScope)
+    {
         var block = container.GetBlockBlobClient("staged.bin");
         var blockId = Convert.ToBase64String("block-0001"u8);
-        var staged = await block.StageBlockAsync(blockId, BinaryData.FromString("staged scope").ToStream());
+        var staged = await block.StageBlockAsync(blockId, BinaryData.FromString("staged scope").ToStream())
+            .ConfigureAwait(false);
         Assert.Equal(defaultScope, staged.Value.EncryptionScope);
-        await block.CommitBlockListAsync([blockId]);
-        Assert.Equal(defaultScope, (await block.GetPropertiesAsync()).Value.EncryptionScope);
+        await block.CommitBlockListAsync([blockId]).ConfigureAwait(false);
+        Assert.Equal(defaultScope, (await block.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
 
         var append = container.GetAppendBlobClient("append.bin");
-        await append.CreateAsync();
-        await append.AppendBlockAsync(BinaryData.FromString("append scope").ToStream());
-        Assert.Equal(defaultScope, (await append.GetPropertiesAsync()).Value.EncryptionScope);
+        await append.CreateAsync().ConfigureAwait(false);
+        await append.AppendBlockAsync(BinaryData.FromString("append scope").ToStream()).ConfigureAwait(false);
+        Assert.Equal(defaultScope, (await append.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
 
         var page = container.GetPageBlobClient("page.bin");
-        await page.CreateAsync(512);
-        await page.UploadPagesAsync(new MemoryStream(new byte[512]), 0);
-        Assert.Equal(defaultScope, (await page.GetPropertiesAsync()).Value.EncryptionScope);
+        await page.CreateAsync(512).ConfigureAwait(false);
+        await page.UploadPagesAsync(new MemoryStream(new byte[512]), 0).ConfigureAwait(false);
+        Assert.Equal(defaultScope, (await page.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
 
-        var scopedService = CreateEncryptedClient(factory, customerProvidedKey: null, defaultScope);
+        var scopedService = CreateEncryptedClient(application, customerProvidedKey: null, defaultScope);
         var matchingBlob = scopedService.GetBlobContainerClient(container.Name).GetBlobClient("matching.bin");
-        await matchingBlob.UploadAsync(BinaryData.FromString("matching encryption scope"));
-        Assert.Equal(defaultScope, (await matchingBlob.GetPropertiesAsync()).Value.EncryptionScope);
+        await matchingBlob.UploadAsync(BinaryData.FromString("matching encryption scope")).ConfigureAwait(false);
+        Assert.Equal(defaultScope, (await matchingBlob.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
+    }
 
-        var otherScopeService = CreateEncryptedClient(factory, customerProvidedKey: null, "other-scope");
+    private static async Task AssertContainerScopeOverrideRulesAsync(
+        BlobServiceClient service, BlobContainerClient container,
+        BlobServiceClient otherScopeService, string defaultScope)
+    {
         var rejected = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            otherScopeService.GetBlobContainerClient(container.Name)
-                .GetBlobClient("rejected.bin")
-                .UploadAsync(BinaryData.FromString("rejected encryption scope")));
+            otherScopeService.GetBlobContainerClient(container.Name).GetBlobClient("rejected.bin")
+                .UploadAsync(BinaryData.FromString("rejected encryption scope"))).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, rejected.Status);
         Assert.Equal("RequestForbiddenByContainerEncryptionPolicy", rejected.ErrorCode);
 
         var permissive = service.GetBlobContainerClient($"scope-override-{Guid.NewGuid():N}");
-        await permissive.CreateAsync(
-            PublicAccessType.None,
-            metadata: null,
+        await permissive.CreateAsync(PublicAccessType.None, metadata: null,
             new BlobContainerEncryptionScopeOptions
             {
                 DefaultEncryptionScope = defaultScope,
                 PreventEncryptionScopeOverride = false
-            });
+            }).ConfigureAwait(false);
         var overridden = otherScopeService.GetBlobContainerClient(permissive.Name).GetBlobClient("override.bin");
-        await overridden.UploadAsync(BinaryData.FromString("overridden encryption scope"));
-        Assert.Equal("other-scope", (await overridden.GetPropertiesAsync()).Value.EncryptionScope);
+        await overridden.UploadAsync(BinaryData.FromString("overridden encryption scope")).ConfigureAwait(false);
+        Assert.Equal("other-scope", (await overridden.GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
+    }
 
+    private static async Task AssertContainerScopeInvalidCreateRequestsAsync(
+        SavaWebApplicationFactory application, BlobServiceClient service, string defaultScope)
+    {
         var credential = new StorageSharedKeyCredential(
-            SavaWebApplicationFactory.AccountName,
-            SavaWebApplicationFactory.AccountKey);
+            SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
         var accountSas = new AccountSasBuilder
         {
             Services = AccountSasServices.Blobs,
@@ -12671,7 +12744,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var sas = accountSas.ToSasQueryParameters(credential);
         Uri RawContainerUri(string name) => new(
             $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}?restype=container&{sas}");
-        using var transport = new HttpClient(factory.Server.CreateHandler());
+        using var transport = new HttpClient(application.Server.CreateHandler());
 
         var oldName = $"scope-old-{Guid.NewGuid():N}";
         using (var oldVersion = new HttpRequestMessage(HttpMethod.Put, RawContainerUri(oldName))
@@ -12682,7 +12755,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldVersion.Headers.TryAddWithoutValidation("x-ms-version", "2019-02-02");
             oldVersion.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
             oldVersion.Headers.TryAddWithoutValidation("x-ms-deny-encryption-scope-override", "true");
-            using var response = await transport.SendAsync(oldVersion);
+            using var response = await transport.SendAsync(oldVersion).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
             Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -12695,7 +12768,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             incomplete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             incomplete.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
-            using var response = await transport.SendAsync(incomplete);
+            using var response = await transport.SendAsync(incomplete).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -12709,7 +12782,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             body.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             body.Headers.TryAddWithoutValidation("x-ms-default-encryption-scope", defaultScope);
             body.Headers.TryAddWithoutValidation("x-ms-deny-encryption-scope-override", "true");
-            using var response = await transport.SendAsync(body);
+            using var response = await transport.SendAsync(body).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
