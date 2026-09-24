@@ -15415,16 +15415,27 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var after = properties.LastModified.AddMinutes(1).ToString("R", CultureInfo.InvariantCulture);
         var blobUri = blob.GenerateSasUri(BlobSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(5));
         using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertModernReadConditionPriorityAsync(blobUri, transport, etag, before, same);
+        await AssertHistoricalReadConditionsAsync(blobUri, transport, etag, before, same);
+        var metadataUri = AppendQuery(blobUri, "comp=metadata");
+        etag = await AssertMetadataConditionPriorityAsync(blob, metadataUri, transport, before, after);
+        await AssertRejectedMetadataConditionCombinationsAsync(blob, metadataUri, transport, etag, before);
+        await AssertContainerConditionSemanticsAsync(container, transport, after);
+        await AssertUnconditionalBlockAndTagReadsAsync(blobUri, transport);
+    }
 
-        static void AddVersion(HttpRequestMessage request, string version = "2023-11-03") =>
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+    private static void AddVersion(HttpRequestMessage request, string version = "2023-11-03") =>
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
 
+    private static async Task AssertModernReadConditionPriorityAsync(
+        Uri blobUri, HttpClient transport, string etag, string before, string same)
+    {
         using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-None-Match", etag);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
@@ -15433,7 +15444,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-None-Match", etag);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", same);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
             Assert.Equal("ConditionNotMet", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -15443,7 +15454,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
             request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
             Assert.Equal("ConditionNotMet", response.Headers.GetValues("x-ms-error-code").Single());
         }
@@ -15452,15 +15463,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", $"\"missing\", {etag}");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
+    }
 
+    private static async Task AssertHistoricalReadConditionsAsync(
+        Uri blobUri, HttpClient transport, string etag, string before, string same)
+    {
         using (var request = new HttpRequestMessage(HttpMethod.Get, blobUri))
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", [same, before]);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal(
                 "MultipleConditionHeadersNotSupported",
@@ -15472,11 +15487,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             AddVersion(request, "2012-02-12");
             request.Headers.TryAddWithoutValidation("If-None-Match", etag);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.NotModified, response.StatusCode);
         }
+    }
 
-        var metadataUri = AppendQuery(blobUri, "comp=metadata");
+    private static async Task<string> AssertMetadataConditionPriorityAsync(
+        BlobClient blob, Uri metadataUri, HttpClient transport, string before, string after)
+    {
         using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
         {
             Content = new ByteArrayContent([])
@@ -15486,12 +15504,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("If-None-Match", "\"missing\"");
             request.Headers.TryAddWithoutValidation("If-Modified-Since", after);
             request.Headers.TryAddWithoutValidation("x-ms-meta-state", "none-match-priority");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        properties = (await blob.GetPropertiesAsync()).Value;
-        etag = properties.ETag.ToString();
+        var properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var etag = properties.ETag.ToString();
         using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
         {
             Content = new ByteArrayContent([])
@@ -15501,12 +15519,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("If-Match", etag);
             request.Headers.TryAddWithoutValidation("If-Unmodified-Since", before);
             request.Headers.TryAddWithoutValidation("x-ms-meta-state", "match-priority");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        properties = (await blob.GetPropertiesAsync()).Value;
-        etag = properties.ETag.ToString();
+        properties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        return properties.ETag.ToString();
+    }
+
+    private static async Task AssertRejectedMetadataConditionCombinationsAsync(
+        BlobClient blob, Uri metadataUri, HttpClient transport, string etag, string before)
+    {
         using (var request = new HttpRequestMessage(HttpMethod.Put, metadataUri)
         {
             Content = new ByteArrayContent([])
@@ -15516,7 +15539,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("If-Match", etag);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", before);
             request.Headers.TryAddWithoutValidation("x-ms-meta-state", "must-not-apply");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal(
                 "MultipleConditionHeadersNotSupported",
@@ -15530,14 +15553,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", $"{etag}, \"missing\"");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal(
                 "MultipleConditionHeadersNotSupported",
                 response.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.Equal("match-priority", (await blob.GetPropertiesAsync()).Value.Metadata["state"]);
+        Assert.Equal("match-priority", (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["state"]);
+    }
 
+    private static async Task AssertContainerConditionSemanticsAsync(
+        BlobContainerClient container, HttpClient transport, string after)
+    {
         var accountSas = new AccountSasBuilder
         {
             Services = AccountSasServices.Blobs,
@@ -15559,17 +15586,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Modified-Since", after);
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
+    }
 
+    private static async Task AssertUnconditionalBlockAndTagReadsAsync(Uri blobUri, HttpClient transport)
+    {
         using (var request = new HttpRequestMessage(
                    HttpMethod.Get,
                    AppendQuery(blobUri, "comp=blocklist&blocklisttype=all")))
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
@@ -15577,7 +15607,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
-            using var response = await transport.SendAsync(request);
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
     }
@@ -15619,10 +15649,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var sas = sasBuilder.ToSasQueryParameters(credential);
         var uri = new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}/{blobName}?{sas}");
         using var client = new HttpClient(factory.Server.CreateHandler());
+        await AssertAllowedCorsOriginsAsync(client, uri);
+        await AssertCorsPreflightResponsesAsync(client, uri);
+        await AssertCorsConditionalResponseAsync(client, uri, etag);
+        await AssertInvalidCorsRuleRejectedAsync(service);
+    }
 
+    private static async Task AssertAllowedCorsOriginsAsync(HttpClient client, Uri uri)
+    {
         using var corsRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         corsRequest.Headers.Add("Origin", "https://client.example");
-        using var corsResponse = await client.SendAsync(corsRequest);
+        using var corsResponse = await client.SendAsync(corsRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, corsResponse.StatusCode);
         Assert.Equal("https://client.example", corsResponse.Headers.GetValues("Access-Control-Allow-Origin").Single());
         Assert.Contains("ETag", corsResponse.Headers.GetValues("Access-Control-Expose-Headers").Single(),
@@ -15631,7 +15668,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         using var wildcardRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         wildcardRequest.Headers.Add("Origin", "https://nested.app.trusted.example");
-        using var wildcardResponse = await client.SendAsync(wildcardRequest);
+        using var wildcardResponse = await client.SendAsync(wildcardRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, wildcardResponse.StatusCode);
         Assert.Equal(
             "https://nested.app.trusted.example",
@@ -15640,17 +15677,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         using var caseMismatchRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         caseMismatchRequest.Headers.Add("Origin", "https://CLIENT.example");
-        using var caseMismatchResponse = await client.SendAsync(caseMismatchRequest);
+        using var caseMismatchResponse = await client.SendAsync(caseMismatchRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, caseMismatchResponse.StatusCode);
         Assert.False(caseMismatchResponse.Headers.Contains("Access-Control-Allow-Origin"));
         Assert.Contains("Origin", caseMismatchResponse.Headers.Vary, StringComparer.Ordinal);
+    }
 
+    private static async Task AssertCorsPreflightResponsesAsync(HttpClient client, Uri uri)
+    {
         using var preflightRequest = new HttpRequestMessage(HttpMethod.Options, uri);
         preflightRequest.Headers.Add("Origin", "https://app.trusted.example");
         preflightRequest.Headers.Add("Access-Control-Request-Method", "HEAD");
         preflightRequest.Headers.Add("Access-Control-Request-Headers", "x-client-header");
         preflightRequest.Headers.TryAddWithoutValidation("Authorization", "SharedKey deliberately-invalid");
-        using var preflightResponse = await client.SendAsync(preflightRequest);
+        using var preflightResponse = await client.SendAsync(preflightRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, preflightResponse.StatusCode);
         Assert.Equal(
             "https://app.trusted.example",
@@ -15659,12 +15699,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal("HEAD", preflightResponse.Headers.GetValues("Access-Control-Allow-Methods").Single());
         Assert.False(preflightResponse.Headers.Contains("Access-Control-Expose-Headers"));
         Assert.Equal(0, preflightResponse.Content.Headers.ContentLength);
-        Assert.Empty(await preflightResponse.Content.ReadAsByteArrayAsync());
+        Assert.Empty(await preflightResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false));
 
         using var missingOriginRequest = new HttpRequestMessage(HttpMethod.Options, uri);
         missingOriginRequest.Headers.Add("Access-Control-Request-Method", "HEAD");
         missingOriginRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer deliberately-invalid");
-        using var missingOriginResponse = await client.SendAsync(missingOriginRequest);
+        using var missingOriginResponse = await client.SendAsync(missingOriginRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.BadRequest, missingOriginResponse.StatusCode);
         Assert.Equal(
             "InvalidHeaderValue",
@@ -15673,20 +15713,26 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using var lowerCaseMethodRequest = new HttpRequestMessage(HttpMethod.Options, uri);
         lowerCaseMethodRequest.Headers.Add("Origin", "https://app.trusted.example");
         lowerCaseMethodRequest.Headers.Add("Access-Control-Request-Method", "head");
-        using var lowerCaseMethodResponse = await client.SendAsync(lowerCaseMethodRequest);
+        using var lowerCaseMethodResponse = await client.SendAsync(lowerCaseMethodRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.Forbidden, lowerCaseMethodResponse.StatusCode);
         Assert.Equal(
             "CorsPreflightFailure",
             lowerCaseMethodResponse.Headers.GetValues("x-ms-error-code").Single());
+    }
 
+    private static async Task AssertCorsConditionalResponseAsync(HttpClient client, Uri uri, ETag etag)
+    {
         using var conditionalRequest = new HttpRequestMessage(HttpMethod.Get, uri);
         conditionalRequest.Headers.IfNoneMatch.Add(new System.Net.Http.Headers.EntityTagHeaderValue(etag.ToString()));
-        using var conditionalResponse = await client.SendAsync(conditionalRequest);
+        using var conditionalResponse = await client.SendAsync(conditionalRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.NotModified, conditionalResponse.StatusCode);
         Assert.Equal("ConditionNotMet", conditionalResponse.Headers.GetValues("x-ms-error-code").Single());
-        Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync());
+        Assert.Empty(await conditionalResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false));
+    }
 
-        var invalid = (await service.GetPropertiesAsync()).Value;
+    private static async Task AssertInvalidCorsRuleRejectedAsync(BlobServiceClient service)
+    {
+        var invalid = (await service.GetPropertiesAsync().ConfigureAwait(false)).Value;
         invalid.Cors.Clear();
         invalid.Cors.Add(new BlobCorsRule
         {
@@ -15696,12 +15742,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             ExposedHeaders = string.Empty,
             MaxAgeInSeconds = 1
         });
-        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => service.SetPropertiesAsync(invalid));
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => service.SetPropertiesAsync(invalid))
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.BadRequest, (HttpStatusCode)rejected.Status);
         Assert.Equal("InvalidXmlDocument", rejected.ErrorCode);
         Assert.Equal(
             "https://client.example,https://*.trusted.example",
-            Assert.Single((await service.GetPropertiesAsync()).Value.Cors).AllowedOrigins);
+            Assert.Single((await service.GetPropertiesAsync().ConfigureAwait(false)).Value.Cors).AllowedOrigins);
     }
 
     [Fact]
