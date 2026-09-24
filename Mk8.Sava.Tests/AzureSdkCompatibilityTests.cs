@@ -9779,88 +9779,105 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             SavaWebApplicationFactory.AccountKey);
         using var transport = new HttpClient(factory.Server.CreateHandler());
 
-        Uri CreateServiceSasContainerUri(string name)
-        {
-            var builder = new BlobSasBuilder
-            {
-                BlobContainerName = name,
-                Resource = "c",
-                StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
-                ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-                Protocol = SasProtocol.HttpsAndHttp
-            };
-            builder.SetPermissions(BlobContainerSasPermissions.All);
-            return new Uri(
-                $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}" +
-                $"?restype=container&{builder.ToSasQueryParameters(credential)}");
-        }
+        await AssertServiceSasExistingContainerDeniedAsync(container, transport);
+        await AssertServiceSasCreateRestoreDeniedAsync(service, credential, transport);
+        await AssertServiceSasListAllowedAsync(container, transport);
+        await AssertAccountSasContainerOperationsAllowedAsync(service, container, credential, transport);
+        await AssertAccountSasContainerScopeMismatchesAsync(service, credential, transport);
+        await AssertAccountSasContainerLeasePermissionsAsync(service, container, credential, transport);
+    }
 
-        Uri CreateAccountSasContainerUri(
-            string name,
-            AccountSasPermissions permissions,
-            AccountSasServices services,
-            AccountSasResourceTypes resourceTypes,
-            string? component = null)
+    private static Uri BuildServiceSasContainerUri(
+        BlobServiceClient service, StorageSharedKeyCredential credential, string name)
+    {
+        var builder = new BlobSasBuilder
         {
-            var builder = new AccountSasBuilder
-            {
-                Services = services,
-                ResourceTypes = resourceTypes,
-                StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
-                ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-                Protocol = SasProtocol.HttpsAndHttp
-            };
-            builder.SetPermissions(permissions);
-            var query = $"restype=container&{builder.ToSasQueryParameters(credential)}";
-            if (component is not null)
-                query = $"{query}&comp={component}";
-            return new Uri($"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}?{query}");
-        }
+            BlobContainerName = name,
+            Resource = "c",
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(BlobContainerSasPermissions.All);
+        return new Uri(
+            $"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}" +
+            $"?restype=container&{builder.ToSasQueryParameters(credential)}");
+    }
 
-        async Task AssertRejectedServiceSasAsync(HttpRequestMessage request)
+    private static Uri BuildAccountSasContainerUri(
+        BlobServiceClient service,
+        StorageSharedKeyCredential credential,
+        string name,
+        AccountSasPermissions permissions,
+        AccountSasServices services,
+        AccountSasResourceTypes resourceTypes,
+        string? component = null)
+    {
+        var builder = new AccountSasBuilder
         {
-            using (request)
-            {
-                if (!request.Headers.Contains("x-ms-version"))
-                    request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(request).ConfigureAwait(false);
-                Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-                Assert.Equal(
-                    "AuthorizationFailure",
-                    response.Headers.GetValues("x-ms-error-code").Single());
-            }
-        }
+            Services = services,
+            ResourceTypes = resourceTypes,
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp
+        };
+        builder.SetPermissions(permissions);
+        var query = $"restype=container&{builder.ToSasQueryParameters(credential)}";
+        if (component is not null)
+            query = $"{query}&comp={component}";
+        return new Uri($"{service.Uri.AbsoluteUri.TrimEnd('/')}/{name}?{query}");
+    }
 
+    private static async Task AssertServiceSasOwnerRequestRejectedAsync(
+        HttpClient transport, HttpRequestMessage request)
+    {
+        using (request)
+        {
+            if (!request.Headers.Contains("x-ms-version"))
+                request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    private static async Task AssertServiceSasExistingContainerDeniedAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var serviceSasUri = container.GenerateSasUri(
             BlobContainerSasPermissions.All,
             DateTimeOffset.UtcNow.AddMinutes(10));
-        await AssertRejectedServiceSasAsync(new HttpRequestMessage(
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, new HttpRequestMessage(
             HttpMethod.Head,
-            AppendQuery(serviceSasUri, "restype=container")));
-        await AssertRejectedServiceSasAsync(new HttpRequestMessage(
+            AppendQuery(serviceSasUri, "restype=container"))).ConfigureAwait(false);
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, new HttpRequestMessage(
             HttpMethod.Get,
-            AppendQuery(serviceSasUri, "restype=container&comp=metadata")));
-        await AssertRejectedServiceSasAsync(new HttpRequestMessage(
+            AppendQuery(serviceSasUri, "restype=container&comp=metadata"))).ConfigureAwait(false);
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, new HttpRequestMessage(
             HttpMethod.Put,
             AppendQuery(serviceSasUri, "restype=container&comp=metadata"))
         {
             Content = new ByteArrayContent([])
-        });
-        await AssertRejectedServiceSasAsync(CreateLeaseRequest(
+        }).ConfigureAwait(false);
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, CreateLeaseRequest(
             AppendQuery(serviceSasUri, "restype=container&comp=lease"),
             "2023-11-03",
             "acquire",
-            duration: 15));
-        await AssertRejectedServiceSasAsync(new HttpRequestMessage(
+            duration: 15)).ConfigureAwait(false);
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, new HttpRequestMessage(
             HttpMethod.Delete,
-            AppendQuery(serviceSasUri, "restype=container")));
+            AppendQuery(serviceSasUri, "restype=container"))).ConfigureAwait(false);
+    }
 
+    private static async Task AssertServiceSasCreateRestoreDeniedAsync(
+        BlobServiceClient service, StorageSharedKeyCredential credential, HttpClient transport)
+    {
         var deniedTargetName = $"service-sas-create-{Guid.NewGuid():N}";
-        var deniedTargetUri = CreateServiceSasContainerUri(deniedTargetName);
-        await AssertRejectedServiceSasAsync(new HttpRequestMessage(HttpMethod.Put, deniedTargetUri)
+        var deniedTargetUri = BuildServiceSasContainerUri(service, credential, deniedTargetName);
+        await AssertServiceSasOwnerRequestRejectedAsync(transport, new HttpRequestMessage(HttpMethod.Put, deniedTargetUri)
         {
             Content = new ByteArrayContent([])
-        });
+        }).ConfigureAwait(false);
         using (var restore = new HttpRequestMessage(
                    HttpMethod.Put,
                    AppendQuery(deniedTargetUri, "comp=undelete"))
@@ -9870,123 +9887,127 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             restore.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", "deleted-source");
             restore.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", "01D8B4E2CFD1A4B00000000000000000");
-            await AssertRejectedServiceSasAsync(restore);
+            await AssertServiceSasOwnerRequestRejectedAsync(transport, restore).ConfigureAwait(false);
         }
+    }
 
-        using (var list = new HttpRequestMessage(
-                   HttpMethod.Get,
-                   AppendQuery(serviceSasUri, "restype=container&comp=list")))
-        {
-            list.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(list);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Contains("<Name>listed.txt</Name>", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
-        }
+    private static async Task AssertServiceSasListAllowedAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        var serviceSasUri = container.GenerateSasUri(
+            BlobContainerSasPermissions.All, DateTimeOffset.UtcNow.AddMinutes(10));
+        using var list = new HttpRequestMessage(
+            HttpMethod.Get,
+            AppendQuery(serviceSasUri, "restype=container&comp=list"));
+        list.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var response = await transport.SendAsync(list).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Contains("<Name>listed.txt</Name>",
+            await response.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+    }
 
-        var accountCreatedName = $"account-sas-create-{Guid.NewGuid():N}";
-        var accountCreateUri = CreateAccountSasContainerUri(
-            accountCreatedName,
-            AccountSasPermissions.Create,
-            AccountSasServices.Blobs,
-            AccountSasResourceTypes.Container);
-        using (var create = new HttpRequestMessage(HttpMethod.Put, accountCreateUri)
+    private static async Task AssertAccountSasContainerOperationsAllowedAsync(
+        BlobServiceClient service,
+        BlobContainerClient container,
+        StorageSharedKeyCredential credential,
+        HttpClient transport)
+    {
+        var createdName = $"account-sas-create-{Guid.NewGuid():N}";
+        var createUri = BuildAccountSasContainerUri(service, credential, createdName,
+            AccountSasPermissions.Create, AccountSasServices.Blobs, AccountSasResourceTypes.Container);
+        using (var create = new HttpRequestMessage(HttpMethod.Put, createUri)
         {
             Content = new ByteArrayContent([])
         })
         {
             create.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(create);
+            using var response = await transport.SendAsync(create).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, response.StatusCode);
         }
 
-        var accountReadUri = CreateAccountSasContainerUri(
-            container.Name,
-            AccountSasPermissions.Read,
-            AccountSasServices.Blobs,
-            AccountSasResourceTypes.Container);
-        using (var properties = new HttpRequestMessage(HttpMethod.Head, accountReadUri))
+        var readUri = BuildAccountSasContainerUri(service, credential, container.Name,
+            AccountSasPermissions.Read, AccountSasServices.Blobs, AccountSasResourceTypes.Container);
+        using (var properties = new HttpRequestMessage(HttpMethod.Head, readUri))
         {
             properties.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(properties);
+            using var response = await transport.SendAsync(properties).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
 
-        var accountMetadataUri = CreateAccountSasContainerUri(
-            container.Name,
-            AccountSasPermissions.Write,
-            AccountSasServices.Blobs,
-            AccountSasResourceTypes.Container,
-            "metadata");
-        using (var setMetadata = new HttpRequestMessage(HttpMethod.Put, accountMetadataUri)
+        var metadataUri = BuildAccountSasContainerUri(service, credential, container.Name,
+            AccountSasPermissions.Write, AccountSasServices.Blobs, AccountSasResourceTypes.Container, "metadata");
+        using (var setMetadata = new HttpRequestMessage(HttpMethod.Put, metadataUri)
         {
             Content = new ByteArrayContent([])
         })
         {
             setMetadata.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             setMetadata.Headers.TryAddWithoutValidation("x-ms-meta-authorized", "account-sas");
-            using var response = await transport.SendAsync(setMetadata);
+            using var response = await transport.SendAsync(setMetadata).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         }
-        Assert.Equal("account-sas", (await container.GetPropertiesAsync()).Value.Metadata["authorized"]);
+        Assert.Equal("account-sas",
+            (await container.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["authorized"]);
+    }
 
-        var wrongResourceUri = CreateAccountSasContainerUri(
-            $"wrong-resource-{Guid.NewGuid():N}",
-            AccountSasPermissions.Create,
-            AccountSasServices.Blobs,
-            AccountSasResourceTypes.Service);
+    private static async Task AssertAccountSasContainerScopeMismatchesAsync(
+        BlobServiceClient service, StorageSharedKeyCredential credential, HttpClient transport)
+    {
+        var wrongResourceUri = BuildAccountSasContainerUri(service, credential,
+            $"wrong-resource-{Guid.NewGuid():N}", AccountSasPermissions.Create,
+            AccountSasServices.Blobs, AccountSasResourceTypes.Service);
         using (var wrongResource = new HttpRequestMessage(HttpMethod.Put, wrongResourceUri)
         {
             Content = new ByteArrayContent([])
         })
         {
             wrongResource.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(wrongResource);
+            using var response = await transport.SendAsync(wrongResource).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal(
-                "AuthorizationResourceTypeMismatch",
+            Assert.Equal("AuthorizationResourceTypeMismatch",
                 response.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        var wrongServiceUri = CreateAccountSasContainerUri(
-            $"wrong-service-{Guid.NewGuid():N}",
-            AccountSasPermissions.Create,
-            AccountSasServices.Queues,
-            AccountSasResourceTypes.Container);
+        var wrongServiceUri = BuildAccountSasContainerUri(service, credential,
+            $"wrong-service-{Guid.NewGuid():N}", AccountSasPermissions.Create,
+            AccountSasServices.Queues, AccountSasResourceTypes.Container);
         using (var wrongService = new HttpRequestMessage(HttpMethod.Put, wrongServiceUri)
         {
             Content = new ByteArrayContent([])
         })
         {
             wrongService.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(wrongService);
+            using var response = await transport.SendAsync(wrongService).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal(
-                "AuthorizationServiceMismatch",
+            Assert.Equal("AuthorizationServiceMismatch",
                 response.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
+    private static async Task AssertAccountSasContainerLeasePermissionsAsync(
+        BlobServiceClient service,
+        BlobContainerClient container,
+        StorageSharedKeyCredential credential,
+        HttpClient transport)
+    {
         var leaseClient = container.GetBlobLeaseClient();
-        await leaseClient.AcquireAsync(TimeSpan.FromSeconds(15));
-        var deleteLeaseUri = CreateAccountSasContainerUri(
-            container.Name,
-            AccountSasPermissions.Delete,
-            AccountSasServices.Blobs,
-            AccountSasResourceTypes.Container,
-            "lease");
+        await leaseClient.AcquireAsync(TimeSpan.FromSeconds(15)).ConfigureAwait(false);
+        var deleteLeaseUri = BuildAccountSasContainerUri(service, credential,
+            container.Name, AccountSasPermissions.Delete, AccountSasServices.Blobs,
+            AccountSasResourceTypes.Container, "lease");
         using (var deniedAcquire = CreateLeaseRequest(
                    deleteLeaseUri,
                    "2017-07-29",
                    "acquire",
                    duration: 15))
-        using (var response = await transport.SendAsync(deniedAcquire))
+        using (var response = await transport.SendAsync(deniedAcquire).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal(
-                "AuthorizationPermissionMismatch",
+            Assert.Equal("AuthorizationPermissionMismatch",
                 response.Headers.GetValues("x-ms-error-code").Single());
         }
         using (var breakLease = CreateLeaseRequest(deleteLeaseUri, "2017-07-29", "break"))
-        using (var response = await transport.SendAsync(breakLease))
+        using (var response = await transport.SendAsync(breakLease).ConfigureAwait(false))
             Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
     }
 
