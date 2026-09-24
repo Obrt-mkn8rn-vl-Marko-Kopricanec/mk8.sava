@@ -9021,70 +9021,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expiresAt = DateTimeOffset.UtcNow.AddMinutes(10);
         var key = (await delegator.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresAt) { StartsOn = startsAt })).Value;
-        var signedStart = startsAt.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var signedExpiry = expiresAt.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var keyStart = key.SignedStartsOn.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        const string signedVersion = "2026-04-06";
-        const string signedHeaders = "x-dynamic-first,x-dynamic-second";
-        const string signedQuery = "operation,day%2Cid";
-        const string canonicalizedHeaders =
-            "x-dynamic-first:123,789\nx-dynamic-second:456\n";
-        const string canonicalizedQuery = "\noperation=update\nday,id=mon123";
-        var canonicalResource =
-            $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
-        var stringToSign = string.Join(
-            '\n',
-            "r",
-            signedStart,
-            signedExpiry,
-            canonicalResource,
-            key.SignedObjectId,
-            key.SignedTenantId,
-            keyStart,
-            keyExpiry,
-            key.SignedService,
-            key.SignedVersion,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            "https,http",
-            signedVersion,
-            "b",
-            string.Empty,
-            string.Empty,
-            canonicalizedHeaders,
-            canonicalizedQuery,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty);
-        using var hmac = new HMACSHA256(Convert.FromBase64String(key.Value));
-        var signature = Convert.ToBase64String(
-            hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
-        var query =
-            $"sp=r&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
-            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
-            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
-            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
-            "&spr=https%2Chttp" +
-            $"&sv={signedVersion}&sr=b&srh={signedHeaders}&srq={signedQuery}" +
-            "&operation=update&day%2Cid=mon123" +
-            $"&sig={Uri.EscapeDataString(signature)}";
-        var uri = new Uri(
-            $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
+        var uri = CreateDynamicUserDelegationSasUri(container, blob, key, startsAt, expiresAt);
         using var transport = new HttpClient(factory.Server.CreateHandler());
 
         static HttpRequestMessage CreateRequest(Uri target, string firstHeader)
@@ -9116,6 +9053,81 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
+    private static Uri CreateDynamicUserDelegationSasUri(
+        BlobContainerClient container,
+        BlobClient blob,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsAt,
+        DateTimeOffset expiresAt)
+    {
+        var signedStart = startsAt.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var signedExpiry = expiresAt.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        const string signedVersion = "2026-04-06";
+        const string signedHeaders = "x-dynamic-first,x-dynamic-second";
+        const string signedQuery = "operation,day%2Cid";
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
+        var signature = SignDynamicUserDelegationSas(
+            key, signedStart, signedExpiry, keyStart, keyExpiry, canonicalResource, signedVersion);
+        var query =
+            $"sp=r&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
+            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
+            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
+            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
+            "&spr=https%2Chttp" +
+            $"&sv={signedVersion}&sr=b&srh={signedHeaders}&srq={signedQuery}" +
+            "&operation=update&day%2Cid=mon123" +
+            $"&sig={Uri.EscapeDataString(signature)}";
+        return new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
+    }
+
+    private static string SignDynamicUserDelegationSas(
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        string signedStart,
+        string signedExpiry,
+        string keyStart,
+        string keyExpiry,
+        string canonicalResource,
+        string signedVersion)
+    {
+        const string canonicalizedHeaders = "x-dynamic-first:123,789\nx-dynamic-second:456\n";
+        const string canonicalizedQuery = "\noperation=update\nday,id=mon123";
+        var stringToSign = string.Join(
+            '\n',
+            "r",
+            signedStart,
+            signedExpiry,
+            canonicalResource,
+            key.SignedObjectId,
+            key.SignedTenantId,
+            keyStart,
+            keyExpiry,
+            key.SignedService,
+            key.SignedVersion,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            "https,http",
+            signedVersion,
+            "b",
+            string.Empty,
+            string.Empty,
+            canonicalizedHeaders,
+            canonicalizedQuery,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty);
+        using var hmac = new HMACSHA256(Convert.FromBase64String(key.Value));
+        return Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
+    }
+
     [Fact]
     public async Task UserBoundDelegationSasRequiresTheSignedBearerIdentityAndTenant()
     {
@@ -9134,22 +9146,115 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expiresAt = DateTimeOffset.UtcNow.AddMinutes(10);
         var key = (await delegator.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresAt) { StartsOn = startsAt })).Value;
-        var signedStart = startsAt.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var signedExpiry = expiresAt.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var keyStart = key.SignedStartsOn.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
-        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString(
-            "yyyy-MM-dd'T'HH:mm:ss'Z'",
-            CultureInfo.InvariantCulture);
         var delegatedUserObjectId = Guid.NewGuid().ToString();
         const string signedVersion = "2025-07-05";
-        var canonicalResource =
-            $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
+        var sasUri = CreateUserBoundDelegationSasUri(
+            container, blob, key, startsAt, expiresAt, delegatedUserObjectId, signedVersion);
+        var directUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}");
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertUserBoundSasRequestsAsync(
+            transport, directUri, sasUri, delegatedUserObjectId, signedVersion);
+    }
+
+    private static async Task AssertUserBoundSasRequestsAsync(
+        HttpClient transport,
+        Uri directUri,
+        Uri sasUri,
+        string delegatedUserObjectId,
+        string signedVersion)
+    {
+        static HttpRequestMessage CreateRequest(Uri target, string token, string version)
+        {
+            var request = new HttpRequestMessage(HttpMethod.Get, target);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.TryAddWithoutValidation("x-ms-version", version);
+            return request;
+        }
+
+        var targetToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            delegatedUserObjectId,
+            SavaWebApplicationFactory.TenantId);
+        using (var directRequest = CreateRequest(directUri, targetToken, signedVersion))
+        using (var response = await transport.SendAsync(directRequest).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var validRequest = CreateRequest(sasUri, targetToken, signedVersion))
+        using (var response = await transport.SendAsync(validRequest).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("user-bound payload", await response.Content.ReadAsStringAsync().ConfigureAwait(false));
+        }
+
+        var wrongObjectToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            Guid.NewGuid().ToString(),
+            SavaWebApplicationFactory.TenantId);
+        using (var wrongObjectRequest = CreateRequest(sasUri, wrongObjectToken, signedVersion))
+        using (var response = await transport.SendAsync(wrongObjectRequest).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var wrongTenantToken = CreateJwt(
+            SavaWebApplicationFactory.AccountKey,
+            delegatedUserObjectId,
+            Guid.NewGuid().ToString());
+        using (var wrongTenantRequest = CreateRequest(sasUri, wrongTenantToken, signedVersion))
+        using (var response = await transport.SendAsync(wrongTenantRequest).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var response = await transport.GetAsync(sasUri).ConfigureAwait(false))
+        {
+            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    private static Uri CreateUserBoundDelegationSasUri(
+        BlobContainerClient container,
+        BlobClient blob,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsAt,
+        DateTimeOffset expiresAt,
+        string delegatedUserObjectId,
+        string signedVersion)
+    {
+        var signedStart = startsAt.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var signedExpiry = expiresAt.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyStart = key.SignedStartsOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var keyExpiry = key.SignedExpiresOn.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
+        var signature = SignUserBoundDelegationSas(
+            key, signedStart, signedExpiry, keyStart, keyExpiry, canonicalResource, delegatedUserObjectId, signedVersion);
+        var query =
+            $"sp=r&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
+            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
+            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
+            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
+            $"&sduoid={delegatedUserObjectId}&spr=https%2Chttp" +
+            $"&sv={signedVersion}&sr=b&sig={Uri.EscapeDataString(signature)}";
+        return new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
+    }
+
+    private static string SignUserBoundDelegationSas(
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        string signedStart,
+        string signedExpiry,
+        string keyStart,
+        string keyExpiry,
+        string canonicalResource,
+        string delegatedUserObjectId,
+        string signedVersion)
+    {
         var stringToSign = string.Join(
             '\n',
             "r",
@@ -9179,100 +9284,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             string.Empty,
             string.Empty);
         using var hmac = new HMACSHA256(Convert.FromBase64String(key.Value));
-        var signature = Convert.ToBase64String(
-            hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
-        var query =
-            $"sp=r&st={Uri.EscapeDataString(signedStart)}&se={Uri.EscapeDataString(signedExpiry)}" +
-            $"&skoid={key.SignedObjectId}&sktid={key.SignedTenantId}" +
-            $"&skt={Uri.EscapeDataString(keyStart)}&ske={Uri.EscapeDataString(keyExpiry)}" +
-            $"&sks={key.SignedService}&skv={key.SignedVersion}" +
-            $"&sduoid={delegatedUserObjectId}&spr=https%2Chttp" +
-            $"&sv={signedVersion}&sr=b&sig={Uri.EscapeDataString(signature)}";
-        var sasUri = new Uri(
-            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
-        var directUri = new Uri(
-            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}");
-        using var transport = new HttpClient(factory.Server.CreateHandler());
-
-        static HttpRequestMessage CreateRequest(Uri target, string token)
-        {
-            var request = new HttpRequestMessage(HttpMethod.Get, target);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            request.Headers.TryAddWithoutValidation("x-ms-version", signedVersion);
-            return request;
-        }
-
-        var targetToken = CreateJwt(
-            SavaWebApplicationFactory.AccountKey,
-            delegatedUserObjectId,
-            SavaWebApplicationFactory.TenantId);
-        using (var directRequest = CreateRequest(directUri, targetToken))
-        using (var response = await transport.SendAsync(directRequest))
-        {
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
-        }
-        using (var validRequest = CreateRequest(sasUri, targetToken))
-        using (var response = await transport.SendAsync(validRequest))
-        {
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Equal("user-bound payload", await response.Content.ReadAsStringAsync());
-        }
-
-        var wrongObjectToken = CreateJwt(
-            SavaWebApplicationFactory.AccountKey,
-            Guid.NewGuid().ToString(),
-            SavaWebApplicationFactory.TenantId);
-        using (var wrongObjectRequest = CreateRequest(sasUri, wrongObjectToken))
-        using (var response = await transport.SendAsync(wrongObjectRequest))
-        {
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
-        }
-
-        var wrongTenantToken = CreateJwt(
-            SavaWebApplicationFactory.AccountKey,
-            delegatedUserObjectId,
-            Guid.NewGuid().ToString());
-        using (var wrongTenantRequest = CreateRequest(sasUri, wrongTenantToken))
-        using (var response = await transport.SendAsync(wrongTenantRequest))
-        {
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
-        }
-
-        using (var response = await transport.GetAsync(sasUri))
-        {
-            Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
-            Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
-        }
+        return Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
     }
 
     [Fact]
     public async Task UserBoundSasAccountPolicyLogsOrBlocksUnboundTokens()
     {
-        {
-            var logApplication = new SavaWebApplicationFactory(
-                         new Dictionary<string, string?>(StringComparer.Ordinal)
-                         {
-                             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
-                                 "true"
-                         });
-            await using (logApplication.ConfigureAwait(false))
-            {
-                var owner = CreateClient(logApplication);
-                var container = owner.GetBlobContainerClient($"user-bound-log-{Guid.NewGuid():N}");
-                await container.CreateAsync();
-                var blob = container.GetBlobClient("allowed.txt");
-                await blob.UploadAsync(BinaryData.FromString("log-only policy"));
-                var unboundServiceSas = CreateBlobClient(
-                    logApplication,
-                    HttpsSasUri(blob, BlobSasPermissions.Read));
-                Assert.Equal(
-                    "log-only policy",
-                    (await unboundServiceSas.DownloadContentAsync()).Value.Content.ToString());
-            }
-        }
+        await AssertUserBoundSasLogPolicyAsync();
 
         var blockApplication = new SavaWebApplicationFactory(
             new Dictionary<string, string?>(StringComparer.Ordinal)
@@ -9289,16 +9307,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blockBlob = blockContainer.GetBlobClient("protected.txt");
         await blockBlob.UploadAsync(BinaryData.FromString("bound policy payload"));
 
-        static void AssertAuthorizationFailure(RequestFailedException exception)
-        {
-            Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
-            Assert.Equal("AuthorizationFailure", exception.ErrorCode);
-        }
-
         var serviceSas = CreateBlobClient(
             blockApplication,
             HttpsSasUri(blockBlob, BlobSasPermissions.Read));
-        AssertAuthorizationFailure(
+        AssertUserBoundAuthorizationFailure(
             await Assert.ThrowsAsync<RequestFailedException>(() => serviceSas.DownloadContentAsync()));
 
         var delegatorToken = CreateJwt(
@@ -9310,54 +9322,101 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10);
         var key = (await delegator.GetUserDelegationKeyAsync(
             new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn })).Value;
-        var unboundBuilder = new BlobSasBuilder
+        await AssertUnboundUserDelegationBlockedAsync(
+            blockApplication, blockContainer, blockBlob, key, startsOn, expiresOn);
+        await AssertBoundUserDelegationAcceptedAsync(
+            blockApplication, blockContainer, blockBlob, key, startsOn, expiresOn);
+    }
+
+    private static async Task AssertUserBoundSasLogPolicyAsync()
+    {
+        var application = new SavaWebApplicationFactory(
+            new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:RequireUserBoundUserDelegationSas"] =
+                    "true"
+            });
+        await using (application.ConfigureAwait(false))
         {
-            BlobContainerName = blockContainer.Name,
-            BlobName = blockBlob.Name,
+            var owner = CreateClient(application);
+            var container = owner.GetBlobContainerClient($"user-bound-log-{Guid.NewGuid():N}");
+            await container.CreateAsync().ConfigureAwait(false);
+            var blob = container.GetBlobClient("allowed.txt");
+            await blob.UploadAsync(BinaryData.FromString("log-only policy")).ConfigureAwait(false);
+            var unboundServiceSas = CreateBlobClient(application, HttpsSasUri(blob, BlobSasPermissions.Read));
+            Assert.Equal("log-only policy",
+                (await unboundServiceSas.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        }
+    }
+
+    private static void AssertUserBoundAuthorizationFailure(RequestFailedException exception)
+    {
+        Assert.Equal(StatusCodes.Status403Forbidden, exception.Status);
+        Assert.Equal("AuthorizationFailure", exception.ErrorCode);
+    }
+
+    private static async Task AssertUnboundUserDelegationBlockedAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient blob,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
             Resource = "b",
             StartsOn = startsOn,
             ExpiresOn = expiresOn,
             Protocol = SasProtocol.HttpsAndHttp
         };
-        unboundBuilder.SetPermissions(BlobSasPermissions.Read);
-        var unboundSas = CreateBlobClient(
-            blockApplication,
+        builder.SetPermissions(BlobSasPermissions.Read);
+        var sas = CreateBlobClient(
+            application,
             new Uri(
                 $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
-                $"{blockContainer.Name}/{blockBlob.Name}?" +
-                unboundBuilder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName)));
-        AssertAuthorizationFailure(
-            await Assert.ThrowsAsync<RequestFailedException>(() => unboundSas.DownloadContentAsync()));
+                $"{container.Name}/{blob.Name}?" +
+                builder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName)));
+        AssertUserBoundAuthorizationFailure(
+            await Assert.ThrowsAsync<RequestFailedException>(() => sas.DownloadContentAsync()).ConfigureAwait(false));
+    }
 
+    private static async Task AssertBoundUserDelegationAcceptedAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient blob,
+        Azure.Storage.Blobs.Models.UserDelegationKey key,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
         var delegatedUserObjectId = Guid.NewGuid().ToString();
-        var boundBuilder = new BlobSasBuilder
+        var builder = new BlobSasBuilder
         {
-            BlobContainerName = blockContainer.Name,
-            BlobName = blockBlob.Name,
+            BlobContainerName = container.Name,
+            BlobName = blob.Name,
             Resource = "b",
             StartsOn = startsOn,
             ExpiresOn = expiresOn,
             Protocol = SasProtocol.HttpsAndHttp,
             DelegatedUserObjectId = delegatedUserObjectId
         };
-        boundBuilder.SetPermissions(BlobSasPermissions.Read);
-        var boundSas = boundBuilder.ToSasQueryParameters(
-            key,
-            SavaWebApplicationFactory.AccountName);
+        builder.SetPermissions(BlobSasPermissions.Read);
+        var boundSas = builder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName);
         var boundUri = new Uri(
-            $"https://{SavaWebApplicationFactory.AccountName}.localhost/" +
-            $"{blockContainer.Name}/{blockBlob.Name}?{boundSas}");
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{boundSas}");
         var delegatedUserToken = CreateJwt(
             SavaWebApplicationFactory.AccountKey,
             delegatedUserObjectId,
             SavaWebApplicationFactory.TenantId);
-        using var transport = new HttpClient(blockApplication.Server.CreateHandler());
+        using var transport = new HttpClient(application.Server.CreateHandler());
         using var request = new HttpRequestMessage(HttpMethod.Get, boundUri);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", delegatedUserToken);
         request.Headers.TryAddWithoutValidation("x-ms-version", "2025-07-05");
-        using var response = await transport.SendAsync(request);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        Assert.Equal("bound policy payload", await response.Content.ReadAsStringAsync());
+        Assert.Equal("bound policy payload", await response.Content.ReadAsStringAsync().ConfigureAwait(false));
     }
 
     [Fact]
