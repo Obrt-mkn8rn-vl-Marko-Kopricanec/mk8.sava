@@ -263,7 +263,7 @@ public sealed class StorageSpaceEfficiencyTests
             if (OperatingSystem.IsLinux() && Directory.Exists(link))
                 Directory.Delete(link);
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
             if (Directory.Exists(externalPath))
                 Directory.Delete(externalPath, recursive: true);
         }

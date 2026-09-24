@@ -201,7 +201,7 @@ public sealed class ObjectReplicationTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 

@@ -309,18 +309,18 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         _metadataStore?.Dispose();
         _storagePaths?.Dispose();
         if (_deleteDataPath)
-            await DeleteDataPathAsync().ConfigureAwait(false);
+            await DeleteDataPathAsync(DataPath).ConfigureAwait(false);
     }
 
-    private async Task DeleteDataPathAsync()
+    internal static async Task DeleteDataPathAsync(string dataPath)
     {
         for (var attempt = 0; attempt < 8; attempt++)
         {
-            if (!Directory.Exists(DataPath))
+            if (!Directory.Exists(dataPath))
                 return;
             try
             {
-                Directory.Delete(DataPath, recursive: true);
+                Directory.Delete(dataPath, recursive: true);
                 return;
             }
             catch (IOException) when (OperatingSystem.IsWindows() && attempt < 7)

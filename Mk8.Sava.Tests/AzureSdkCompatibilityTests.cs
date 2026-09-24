@@ -2316,7 +2316,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 
@@ -4158,7 +4158,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             File.Delete(manifestPath);
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 
@@ -13499,7 +13499,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             if (!initialDisposed)
                 await initial.DisposeAsync().ConfigureAwait(true);
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
             if (Directory.Exists(backupPath))
                 Directory.Delete(backupPath, recursive: true);
         }
@@ -13981,7 +13981,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             if (Directory.Exists(rejectedBackupPath))
                 Directory.Delete(rejectedBackupPath, recursive: true);
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 

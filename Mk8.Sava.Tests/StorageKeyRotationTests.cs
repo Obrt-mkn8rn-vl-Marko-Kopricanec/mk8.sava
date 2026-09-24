@@ -70,9 +70,9 @@ public sealed class StorageKeyRotationTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
             if (Directory.Exists(foreignPath))
-                Directory.Delete(foreignPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(foreignPath).ConfigureAwait(true);
         }
     }
 
@@ -176,7 +176,7 @@ public sealed class StorageKeyRotationTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 
@@ -285,7 +285,7 @@ public sealed class StorageKeyRotationTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
     }
 
@@ -324,7 +324,7 @@ public sealed class StorageKeyRotationTests
         finally
         {
             if (Directory.Exists(dataPath))
-                Directory.Delete(dataPath, recursive: true);
+                await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
             if (Directory.Exists(backupPath))
                 Directory.Delete(backupPath, recursive: true);
         }
