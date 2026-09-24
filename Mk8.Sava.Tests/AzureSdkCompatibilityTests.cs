@@ -14042,6 +14042,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var content = new byte[4 * 1024 * 1024 + 257];
         for (var index = 0; index < content.Length; index++)
             content[index] = (byte)(index % 239);
+        await AssertCrc64BlobDownloadsAsync(container, content);
+        await AssertCrc64EmptyDownloadAsync(container);
+        await AssertCrc64StagedBlockAsync(container);
+        await AssertCrc64AppendBlockAsync(container);
+        await AssertCrc64PageBlobAsync(container);
+
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertInvalidStructuredCrc64BeforePublicationAsync(container, transport);
+        await AssertInvalidTransactionalCrc64BeforePublicationAsync(container, transport);
+        await AssertCrc64RawRangeAsync(container, transport, content);
+    }
+
+    private static async Task AssertCrc64BlobDownloadsAsync(BlobContainerClient container, byte[] content)
+    {
         var valid = container.GetBlobClient("valid.bin");
         await valid.UploadAsync(new MemoryStream(content), new BlobUploadOptions
         {
@@ -14049,15 +14063,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
             }
-        });
-        Assert.Equal(content, (await valid.DownloadContentAsync()).Value.Content.ToArray());
+        }).ConfigureAwait(false);
+        Assert.Equal(content, (await valid.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
         var validatedDownload = await valid.DownloadContentAsync(new BlobDownloadOptions
         {
             TransferValidation = new DownloadTransferValidationOptions
             {
                 ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(content, validatedDownload.Value.Content.ToArray());
         var validatedRange = await valid.DownloadContentAsync(new BlobDownloadOptions
         {
@@ -14066,9 +14080,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Equal(content.AsSpan(4 * 1024 * 1024 - 127, 384).ToArray(), validatedRange.Value.Content.ToArray());
+    }
 
+    private static async Task AssertCrc64EmptyDownloadAsync(BlobContainerClient container)
+    {
         var empty = container.GetBlobClient("empty.bin");
         await empty.UploadAsync(new MemoryStream([]), new BlobUploadOptions
         {
@@ -14076,16 +14093,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             {
                 ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
             }
-        });
+        }).ConfigureAwait(false);
         var validatedEmptyDownload = await empty.DownloadContentAsync(new BlobDownloadOptions
         {
             TransferValidation = new DownloadTransferValidationOptions
             {
                 ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
             }
-        });
+        }).ConfigureAwait(false);
         Assert.Empty(validatedEmptyDownload.Value.Content.ToArray());
+    }
 
+    private static async Task AssertCrc64StagedBlockAsync(BlobContainerClient container)
+    {
         var stagedContent = "structured staged block"u8.ToArray();
         var blockId = Convert.ToBase64String("block-0001"u8);
         var blockBlob = container.GetBlockBlobClient("staged.bin");
@@ -14098,13 +14118,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 {
                     ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
                 }
-            });
-        await blockBlob.CommitBlockListAsync([blockId]);
-        Assert.Equal(stagedContent, (await blockBlob.DownloadContentAsync()).Value.Content.ToArray());
+            }).ConfigureAwait(false);
+        await blockBlob.CommitBlockListAsync([blockId]).ConfigureAwait(false);
+        Assert.Equal(stagedContent,
+            (await blockBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertCrc64AppendBlockAsync(BlobContainerClient container)
+    {
         var appendContent = "structured append block"u8.ToArray();
         var appendBlob = container.GetAppendBlobClient("append.bin");
-        await appendBlob.CreateAsync();
+        await appendBlob.CreateAsync().ConfigureAwait(false);
         await appendBlob.AppendBlockAsync(
             new MemoryStream(appendContent),
             new AppendBlobAppendBlockOptions
@@ -14113,12 +14137,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 {
                     ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
                 }
-            });
-        Assert.Equal(appendContent, (await appendBlob.DownloadContentAsync()).Value.Content.ToArray());
+            }).ConfigureAwait(false);
+        Assert.Equal(appendContent,
+            (await appendBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertCrc64PageBlobAsync(BlobContainerClient container)
+    {
         var pageContent = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
         var pageBlob = container.GetPageBlobClient("page.bin");
-        await pageBlob.CreateAsync(pageContent.Length);
+        await pageBlob.CreateAsync(pageContent.Length).ConfigureAwait(false);
         await pageBlob.UploadPagesAsync(
             new MemoryStream(pageContent),
             0,
@@ -14128,14 +14156,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 {
                     ChecksumAlgorithm = StorageChecksumAlgorithm.StorageCrc64
                 }
-            });
-        Assert.Equal(pageContent, (await pageBlob.DownloadContentAsync()).Value.Content.ToArray());
+            }).ConfigureAwait(false);
+        Assert.Equal(pageContent,
+            (await pageBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertInvalidStructuredCrc64BeforePublicationAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var invalid = container.GetBlobClient("invalid.bin");
         var invalidContent = "structured checksum mismatch"u8.ToArray();
         var invalidStructuredBody = EncodeStructuredBody(invalidContent);
         invalidStructuredBody[^1] ^= 0x01;
-        using var transport = new HttpClient(factory.Server.CreateHandler());
         using (var structuredRequest = new HttpRequestMessage(
                    HttpMethod.Put,
                    invalid.GenerateSasUri(
@@ -14153,12 +14185,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             structuredRequest.Headers.TryAddWithoutValidation(
                 "x-ms-structured-content-length",
                 invalidContent.Length.ToString(CultureInfo.InvariantCulture));
-            using var structuredResponse = await transport.SendAsync(structuredRequest);
+            using var structuredResponse = await transport.SendAsync(structuredRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, structuredResponse.StatusCode);
             Assert.Equal("Crc64Mismatch", structuredResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await invalid.ExistsAsync()).Value);
+        Assert.False((await invalid.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertInvalidTransactionalCrc64BeforePublicationAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        var invalidContent = "structured checksum mismatch"u8.ToArray();
         var invalidTransactional = container.GetBlobClient("invalid-transactional.bin");
         using (var transactionalRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14174,23 +14211,28 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             transactionalRequest.Headers.TryAddWithoutValidation(
                 "x-ms-content-crc64",
                 Convert.ToBase64String(new byte[8]));
-            using var transactionalResponse = await transport.SendAsync(transactionalRequest);
+            using var transactionalResponse = await transport.SendAsync(transactionalRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, transactionalResponse.StatusCode);
             Assert.Equal("Crc64Mismatch", transactionalResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await invalidTransactional.ExistsAsync()).Value);
+        Assert.False((await invalidTransactional.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertCrc64RawRangeAsync(
+        BlobContainerClient container, HttpClient transport, byte[] content)
+    {
         const int rawRangeStart = 731;
         const int rawRangeLength = 2048;
         using var rangeRequest = new HttpRequestMessage(
             HttpMethod.Get,
-            valid.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
+            container.GetBlobClient("valid.bin").GenerateSasUri(
+                BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5)));
         rangeRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
         rangeRequest.Headers.TryAddWithoutValidation("x-ms-range", $"bytes={rawRangeStart}-{rawRangeStart + rawRangeLength - 1}");
         rangeRequest.Headers.TryAddWithoutValidation("x-ms-range-get-content-crc64", "true");
-        using var rangeResponse = await transport.SendAsync(rangeRequest);
+        using var rangeResponse = await transport.SendAsync(rangeRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.PartialContent, rangeResponse.StatusCode);
-        var rangeBytes = await rangeResponse.Content.ReadAsByteArrayAsync();
+        var rangeBytes = await rangeResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
         Assert.Equal(content.AsSpan(rawRangeStart, rawRangeLength).ToArray(), rangeBytes);
         var rangeCrc64 = new Mk8.Sava.Protocol.StorageCrc64();
         rangeCrc64.Append(rangeBytes);
@@ -14205,10 +14247,20 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var service = CreateClient(factory);
         var container = service.GetBlobContainerClient($"control-integrity-{Guid.NewGuid():N}");
         await container.CreateAsync();
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertBlockListChecksumBeforeCommitAsync(container, transport);
+        await AssertCrc64FeatureVersionAsync(container, transport);
+        await AssertStructuredBodyFeatureVersionAsync(container, transport);
+        await AssertCreateOnlyPermissionVersionAsync(container, transport);
+    }
+
+    private static async Task AssertBlockListChecksumBeforeCommitAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var blockBlob = container.GetBlockBlobClient("committed.bin");
         var blockId = Convert.ToBase64String("control-block-0001"u8);
         var blockContent = "validated block-list payload"u8.ToArray();
-        await blockBlob.StageBlockAsync(blockId, new MemoryStream(blockContent));
+        await blockBlob.StageBlockAsync(blockId, new MemoryStream(blockContent)).ConfigureAwait(false);
 
         var blockList = Encoding.UTF8.GetBytes(
             $"<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList><Latest>{blockId}</Latest></BlockList>");
@@ -14219,7 +14271,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             blockBlob.GenerateSasUri(
                 BlobSasPermissions.Create | BlobSasPermissions.Write,
                 DateTimeOffset.UtcNow.AddMinutes(5)) + "&comp=blocklist");
-        using var transport = new HttpClient(factory.Server.CreateHandler());
 
         using (var corruptRequest = new HttpRequestMessage(HttpMethod.Put, blockListUri)
         {
@@ -14228,11 +14279,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             corruptRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
             corruptRequest.Headers.TryAddWithoutValidation("x-ms-content-crc64", Convert.ToBase64String(new byte[8]));
-            using var corruptResponse = await transport.SendAsync(corruptRequest);
+            using var corruptResponse = await transport.SendAsync(corruptRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, corruptResponse.StatusCode);
             Assert.Equal("Crc64Mismatch", corruptResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await blockBlob.ExistsAsync()).Value);
+        Assert.False((await blockBlob.ExistsAsync().ConfigureAwait(false)).Value);
 
         using (var validRequest = new HttpRequestMessage(HttpMethod.Put, blockListUri)
         {
@@ -14241,15 +14292,19 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             validRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
             validRequest.Headers.TryAddWithoutValidation("x-ms-content-crc64", expectedCrc64);
-            using var validResponse = await transport.SendAsync(validRequest);
+            using var validResponse = await transport.SendAsync(validRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, validResponse.StatusCode);
             Assert.Equal(expectedCrc64, validResponse.Headers.GetValues("x-ms-content-crc64").Single());
         }
-        Assert.Equal(blockContent, (await blockBlob.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(blockContent,
+            (await blockBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertCrc64FeatureVersionAsync(BlobContainerClient container, HttpClient transport)
+    {
         var oldCrcBlob = container.GetBlobClient("old-crc.bin");
         var oldCrcContent = "version-gated-crc"u8.ToArray();
-        crc64 = new Mk8.Sava.Protocol.StorageCrc64();
+        var crc64 = new Mk8.Sava.Protocol.StorageCrc64();
         crc64.Append(oldCrcContent);
         using (var oldCrcRequest = new HttpRequestMessage(
                    HttpMethod.Put,
@@ -14263,12 +14318,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldCrcRequest.Headers.TryAddWithoutValidation("x-ms-version", "2018-11-09");
             oldCrcRequest.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
             oldCrcRequest.Headers.TryAddWithoutValidation("x-ms-content-crc64", Convert.ToBase64String(crc64.GetHash()));
-            using var oldCrcResponse = await transport.SendAsync(oldCrcRequest);
+            using var oldCrcResponse = await transport.SendAsync(oldCrcRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldCrcResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldCrcResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await oldCrcBlob.ExistsAsync()).Value);
+        Assert.False((await oldCrcBlob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertStructuredBodyFeatureVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var oldStructuredBlob = container.GetBlobClient("old-structured.bin");
         var structuredContent = "version-gated-structured-body"u8.ToArray();
         var encodedStructuredContent = EncodeStructuredBody(structuredContent);
@@ -14287,12 +14346,16 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             oldStructuredRequest.Headers.TryAddWithoutValidation(
                 "x-ms-structured-content-length",
                 structuredContent.Length.ToString(CultureInfo.InvariantCulture));
-            using var oldStructuredResponse = await transport.SendAsync(oldStructuredRequest);
+            using var oldStructuredResponse = await transport.SendAsync(oldStructuredRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Conflict, oldStructuredResponse.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldStructuredResponse.Headers.GetValues("x-ms-error-code").Single());
         }
-        Assert.False((await oldStructuredBlob.ExistsAsync()).Value);
+        Assert.False((await oldStructuredBlob.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertCreateOnlyPermissionVersionAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
         var createOnlyBlob = container.GetBlockBlobClient("create-only.bin");
         var createOnlySas = createOnlyBlob.GenerateSasUri(
             BlobSasPermissions.Create,
@@ -14306,7 +14369,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             oldCreatePermissionRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-02-06");
-            using var oldCreatePermissionResponse = await transport.SendAsync(oldCreatePermissionRequest);
+            using var oldCreatePermissionResponse = await transport.SendAsync(oldCreatePermissionRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, oldCreatePermissionResponse.StatusCode);
         }
 
@@ -14316,7 +14380,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             createPermissionRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-04-06");
-            using var createPermissionResponse = await transport.SendAsync(createPermissionRequest);
+            using var createPermissionResponse = await transport.SendAsync(createPermissionRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, createPermissionResponse.StatusCode);
         }
 
@@ -14330,7 +14395,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             createPermissionCommitRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-04-06");
-            using var createPermissionCommitResponse = await transport.SendAsync(createPermissionCommitRequest);
+            using var createPermissionCommitResponse = await transport.SendAsync(createPermissionCommitRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Created, createPermissionCommitResponse.StatusCode);
         }
 
@@ -14340,7 +14406,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         })
         {
             existingBlobCreateRequest.Headers.TryAddWithoutValidation("x-ms-version", "2026-04-06");
-            using var existingBlobCreateResponse = await transport.SendAsync(existingBlobCreateRequest);
+            using var existingBlobCreateResponse = await transport.SendAsync(existingBlobCreateRequest)
+                .ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.Forbidden, existingBlobCreateResponse.StatusCode);
         }
     }
