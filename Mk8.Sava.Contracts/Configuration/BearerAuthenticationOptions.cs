@@ -14,4 +14,5 @@ public sealed class BearerAuthenticationOptions
         new Dictionary<string, BearerPrincipalAccess>(StringComparer.Ordinal);
     public IDictionary<string, string> RolePermissions { get; init; } =
         new Dictionary<string, string>(StringComparer.Ordinal);
+    public GraphGroupResolutionOptions GraphGroupResolution { get; init; } = new();
 }

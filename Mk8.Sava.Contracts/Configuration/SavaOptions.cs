@@ -569,6 +569,14 @@ public sealed class SavaOptions : IValidatableObject
 
     private IEnumerable<ValidationResult> ValidateBearer()
     {
+        if (BearerAuthentication.GraphGroupResolution.Enabled &&
+            (!BearerAuthentication.Enabled ||
+             !Guid.TryParse(BearerAuthentication.GraphGroupResolution.TenantId, out _)))
+        {
+            yield return new ValidationResult(
+                "Graph group resolution requires enabled bearer authentication and a valid tenant ID.",
+                [nameof(BearerAuthentication)]);
+        }
         if (BearerAuthentication.Enabled)
         {
             if (BearerAuthentication.ValidAudiences.Count == 0)

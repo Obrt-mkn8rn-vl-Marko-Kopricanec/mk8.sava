@@ -1,9 +1,11 @@
+using Azure.Core;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
+using Mk8.Sava.Identity;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 
@@ -15,6 +17,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 #pragma warning restore CA1515
 {
     private readonly Func<HttpMessageHandler>? _urlTransferHandlerFactory;
+    private readonly Func<HttpMessageHandler>? _graphHandlerFactory;
+    private readonly TokenCredential? _graphCredential;
     private readonly IReadOnlyDictionary<string, string?>? _configurationOverrides;
     private readonly TimeProvider? _timeProvider;
     private readonly IStorageFaultInjector? _faultInjector;
@@ -88,6 +92,21 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     }
 
     internal SavaWebApplicationFactory(
+        IReadOnlyDictionary<string, string?> configurationOverrides,
+        Func<HttpMessageHandler> graphHandlerFactory,
+        TokenCredential graphCredential)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            null,
+            configurationOverrides,
+            null,
+            true)
+    {
+        _graphHandlerFactory = graphHandlerFactory;
+        _graphCredential = graphCredential;
+    }
+
+    internal SavaWebApplicationFactory(
         TimeProvider timeProvider,
         IReadOnlyDictionary<string, string?> configurationOverrides)
         : this(
@@ -144,6 +163,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                 services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
                     .ConfigurePrimaryHttpMessageHandler(_urlTransferHandlerFactory));
         }
+        ConfigureGraphResolverServices(builder);
         if (_timeProvider is not null)
         {
             builder.ConfigureServices(services =>
@@ -181,6 +201,19 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
                     services.Remove(registration);
             });
         }
+    }
+
+    private void ConfigureGraphResolverServices(IWebHostBuilder builder)
+    {
+        if (_graphHandlerFactory is null || _graphCredential is null)
+            return;
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<TokenCredential>();
+            services.AddSingleton(_graphCredential);
+            services.AddHttpClient<MicrosoftGraphGroupMembershipResolver>()
+                .ConfigurePrimaryHttpMessageHandler(_graphHandlerFactory);
+        });
     }
 
     private Dictionary<string, string?> CreateBaseConfiguration() => new(StringComparer.Ordinal)

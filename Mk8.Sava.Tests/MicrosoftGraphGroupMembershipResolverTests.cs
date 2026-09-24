@@ -1,0 +1,275 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Net;
+using System.Security.Claims;
+using System.Text;
+using Azure;
+using Azure.Core;
+using Azure.Core.Pipeline;
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using Mk8.Sava.Configuration;
+using Mk8.Sava.Identity;
+using Mk8.Sava.Protocol;
+using Mk8.Sava.Storage;
+
+namespace Mk8.Sava.Tests;
+
+public sealed class MicrosoftGraphGroupMembershipResolverTests
+{
+    private const string ReaderObjectId = "dd2af586-602b-4b90-9e7d-f32ffac9c88e";
+    private const string ReaderGroupId = "69c6e8bb-a8f4-4fc9-a022-8149b983621a";
+
+    [Fact]
+    public async Task DirectSignedGroupsDoNotCallGraph()
+    {
+        using var handler = new GraphHandler(_ => throw new InvalidOperationException("Graph must not be called."));
+        var credential = new GraphCredential();
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, credential);
+        var principal = Principal(new Claim("groups", ReaderGroupId), new Claim("groups", "not-a-guid"));
+
+        var groups = await resolver.ResolveAsync(principal, ReaderObjectId, CancellationToken.None);
+
+        Assert.Equal([ReaderGroupId], groups);
+        Assert.Equal(0, handler.Calls);
+        Assert.Equal(0, credential.Calls);
+    }
+
+    [Theory]
+    [InlineData("hasgroups")]
+    [InlineData("_claim_names")]
+    public async Task OverageUsesTenantPinnedGraphAndIgnoresClaimSourceUrl(string indicator)
+    {
+        using var handler = new GraphHandler(request =>
+        {
+            Assert.Equal(HttpMethod.Post, request.Method);
+            Assert.Equal(
+                $"https://graph.microsoft.com/v1.0/directoryObjects/{ReaderObjectId}/getMemberGroups",
+                request.RequestUri?.ToString());
+            Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
+            Assert.Equal("graph-test-token", request.Headers.Authorization?.Parameter);
+            return JsonResponse(HttpStatusCode.OK, $"{{\"value\":[\"{ReaderGroupId}\"]}}");
+        });
+        var credential = new GraphCredential();
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, credential);
+        var claims = string.Equals(indicator, "hasgroups", StringComparison.Ordinal)
+            ? new[] { new Claim("hasgroups", "true") }
+            : new[]
+            {
+                new Claim("_claim_names", "{\"groups\":\"src1\"}"),
+                new Claim("_claim_sources", "{\"src1\":{\"endpoint\":\"http://127.0.0.1/private\"}}")
+            };
+
+        var groups = await resolver.ResolveAsync(Principal(claims), ReaderObjectId, CancellationToken.None);
+
+        Assert.Equal([ReaderGroupId], groups);
+        Assert.Equal(1, handler.Calls);
+        Assert.Equal(1, credential.Calls);
+        Assert.NotNull(credential.Scopes);
+        Assert.Equal(["https://graph.microsoft.com/.default"], credential.Scopes);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Forbidden, "{\"error\":\"forbidden\"}")]
+    [InlineData(HttpStatusCode.OK, "{\"value\":[\"not-a-guid\"]}")]
+    [InlineData(HttpStatusCode.OK, "{\"value\":null}")]
+    [InlineData(HttpStatusCode.OK, "not-json")]
+    public async Task FailedOrMalformedGraphLookupNeverGrantsGroups(HttpStatusCode status, string body)
+    {
+        using var handler = new GraphHandler(_ => JsonResponse(status, body));
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, new GraphCredential());
+
+        var error = await Assert.ThrowsAsync<AzureStorageException>(() => resolver.ResolveAsync(
+            Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None));
+
+        Assert.Equal("AuthorizationFailure", error.ErrorCode);
+    }
+
+    [Fact]
+    public async Task OversizedGraphResponseFailsClosed()
+    {
+        using var handler = new GraphHandler(_ => JsonResponse(
+            HttpStatusCode.OK, new string('x', 1024 * 1024 + 1)));
+        using var client = new HttpClient(handler);
+        var resolver = CreateResolver(client, new GraphCredential());
+
+        var error = await Assert.ThrowsAsync<AzureStorageException>(() => resolver.ResolveAsync(
+            Principal(new Claim("hasgroups", "true")), ReaderObjectId, CancellationToken.None));
+
+        Assert.Equal("AuthorizationFailure", error.ErrorCode);
+    }
+
+    [Fact]
+    public async Task WrongTenantAndDisabledResolutionNeverCallGraph()
+    {
+        using var handler = new GraphHandler(_ => throw new InvalidOperationException("Graph must not be called."));
+        var credential = new GraphCredential();
+        using var client = new HttpClient(handler);
+        var wrongTenant = CreateResolver(client, credential);
+        var disabled = CreateResolver(client, credential, enabled: false);
+        var principal = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("oid", ReaderObjectId),
+                new Claim("tid", Guid.NewGuid().ToString("D")),
+                new Claim("hasgroups", "true")
+            ], "test"));
+
+        var wrongTenantError = await Assert.ThrowsAsync<AzureStorageException>(() => wrongTenant.ResolveAsync(
+            principal, ReaderObjectId, CancellationToken.None));
+        var disabledError = await Assert.ThrowsAsync<AzureStorageException>(() => disabled.ResolveAsync(
+            principal, ReaderObjectId, CancellationToken.None));
+
+        Assert.Equal("AuthorizationFailure", wrongTenantError.ErrorCode);
+        Assert.Equal("AuthorizationFailure", disabledError.ErrorCode);
+        Assert.Equal(0, handler.Calls);
+        Assert.Equal(0, credential.Calls);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HnsBlobReadUsesResolvedOverageGroupThroughBearerAclFallback(bool distributedClaim)
+    {
+        using var handler = new GraphHandler(_ => JsonResponse(
+            HttpStatusCode.OK, $"{{\"value\":[\"{ReaderGroupId}\"]}}"));
+        var credential = new GraphCredential();
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            ["Sava:BearerAuthentication:GraphGroupResolution:Enabled"] = "true",
+            ["Sava:BearerAuthentication:GraphGroupResolution:TenantId"] = SavaWebApplicationFactory.TenantId
+        };
+        var application = new SavaWebApplicationFactory(configuration, () => handler, credential);
+        await using var applicationDisposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var containerName = $"hns-group-overage-{Guid.NewGuid():N}";
+        var endpoint = new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost");
+        var sharedKey = new StorageSharedKeyCredential(
+            SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        var transport = new HttpClientTransport(application.Server.CreateHandler());
+        var writer = new BlobServiceClient(endpoint, sharedKey, new BlobClientOptions
+        {
+            Transport = transport,
+            Retry = { MaxRetries = 0 }
+        });
+        var container = writer.GetBlobContainerClient(containerName);
+        await container.CreateAsync();
+        await container.GetBlobClient("group.txt").UploadAsync(BinaryData.FromString("group-only"));
+        await application.Services.GetRequiredService<MetadataStore>().ApplyHierarchicalAclEntriesAsync(
+        [
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = containerName,
+                Path = string.Empty,
+                AccessAcl = $"user::rwx,group::---,group:{ReaderGroupId}:--x,mask::r-x,other::---"
+            },
+            new HierarchicalAclManifestEntry
+            {
+                Account = SavaWebApplicationFactory.AccountName,
+                Container = containerName,
+                Path = "group.txt",
+                AccessAcl = $"user::rw-,group::---,group:{ReaderGroupId}:r--,mask::r--,other::---"
+            }
+        ], CancellationToken.None);
+
+        var token = CreateOverageJwt(distributedClaim);
+        var reader = new BlobServiceClient(endpoint, new GraphCredential(token), new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
+            Retry = { MaxRetries = 0 }
+        });
+        var downloaded = await reader.GetBlobContainerClient(containerName)
+            .GetBlobClient("group.txt").DownloadContentAsync();
+
+        Assert.Equal("group-only", downloaded.Value.Content.ToString());
+        Assert.Equal(1, handler.Calls);
+    }
+
+    private static MicrosoftGraphGroupMembershipResolver CreateResolver(
+        HttpClient client, GraphCredential credential, bool enabled = true)
+    {
+        var options = Options.Create(new SavaOptions
+        {
+            BearerAuthentication = new BearerAuthenticationOptions
+            {
+                Enabled = true,
+                GraphGroupResolution = new GraphGroupResolutionOptions
+                {
+                    Enabled = enabled,
+                    TenantId = SavaWebApplicationFactory.TenantId
+                }
+            }
+        });
+        return new MicrosoftGraphGroupMembershipResolver(
+            options, credential, client, NullLogger<MicrosoftGraphGroupMembershipResolver>.Instance);
+    }
+
+    private static ClaimsPrincipal Principal(params Claim[] extraClaims) => new(new ClaimsIdentity(
+        [new Claim("oid", ReaderObjectId), new Claim("tid", SavaWebApplicationFactory.TenantId), .. extraClaims],
+        "test"));
+
+    private static string CreateOverageJwt(bool distributedClaim)
+    {
+        var key = new SymmetricSecurityKey(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey))
+        {
+            KeyId = "test-key"
+        };
+        Claim overage = distributedClaim
+            ? new("_claim_names", "{\"groups\":\"src1\"}")
+            : new("hasgroups", "true");
+        var token = new JwtSecurityToken(
+            issuer: "https://issuer.mk8.test",
+            audience: "https://storage.azure.com/",
+            claims:
+            [
+                new Claim("oid", ReaderObjectId),
+                new Claim("tid", SavaWebApplicationFactory.TenantId),
+                overage
+            ],
+            notBefore: DateTime.UtcNow.AddMinutes(-1),
+            expires: DateTime.UtcNow.AddMinutes(10),
+            signingCredentials: new SigningCredentials(key, SecurityAlgorithms.HmacSha256));
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
+    private static HttpResponseMessage JsonResponse(HttpStatusCode status, string body) => new(status)
+    {
+        Content = new StringContent(body, Encoding.UTF8, "application/json")
+    };
+
+    private sealed class GraphHandler(Func<HttpRequestMessage, HttpResponseMessage> response) : HttpMessageHandler
+    {
+        public int Calls { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Calls++;
+            return Task.FromResult(response(request));
+        }
+    }
+
+    private sealed class GraphCredential(string token = "graph-test-token") : TokenCredential
+    {
+        public int Calls { get; private set; }
+        public string[]? Scopes { get; private set; }
+
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+        {
+            Calls++;
+            Scopes = requestContext.Scopes;
+            return new AccessToken(token, DateTimeOffset.UtcNow.AddMinutes(10));
+        }
+
+        public override ValueTask<AccessToken> GetTokenAsync(
+            TokenRequestContext requestContext, CancellationToken cancellationToken) =>
+            ValueTask.FromResult(GetToken(requestContext, cancellationToken));
+    }
+}

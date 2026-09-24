@@ -6,6 +6,7 @@ using System.Text;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Identity;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -13,6 +14,7 @@ namespace Mk8.Sava.Protocol;
 internal sealed class StorageAuthenticator(
     IOptions<SavaOptions> options,
     MetadataStore metadata,
+    IGroupMembershipResolver groupMembershipResolver,
     ILogger<StorageAuthenticator> logger)
 {
     public const string BearerScheme = "StorageBearer";
@@ -296,7 +298,8 @@ internal sealed class StorageAuthenticator(
                 context.Request,
                 request,
                 objectId,
-                GetAclGroups(principal),
+                await groupMembershipResolver.ResolveAsync(principal, objectId, context.RequestAborted)
+                    .ConfigureAwait(false),
                 "r",
                 context.RequestAborted).ConfigureAwait(false);
             granted.Add('r');
@@ -308,11 +311,6 @@ internal sealed class StorageAuthenticator(
             return (false, null);
         }
     }
-
-    private static HashSet<string> GetAclGroups(ClaimsPrincipal principal) => principal.FindAll("groups")
-        .Select(claim => claim.Value)
-        .Where(value => Guid.TryParse(value, out _))
-        .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
     private async Task<(bool Checked, HashSet<string>? Groups)> TryGrantAclListAsync(
         HttpContext context,
@@ -331,7 +329,8 @@ internal sealed class StorageAuthenticator(
             return (false, null);
         try
         {
-            var groups = GetAclGroups(principal);
+            var groups = await groupMembershipResolver.ResolveAsync(principal, objectId, context.RequestAborted)
+                .ConfigureAwait(false);
             await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
                 metadata,
                 context.Request,
@@ -369,7 +368,8 @@ internal sealed class StorageAuthenticator(
             return (false, null);
         try
         {
-            var groups = GetAclGroups(principal);
+            var groups = await groupMembershipResolver.ResolveAsync(principal, objectId, context.RequestAborted)
+                .ConfigureAwait(false);
             await HierarchicalAclAuthorization.EnsureParentMutationAsync(
                 metadata,
                 context.Request,
@@ -406,7 +406,8 @@ internal sealed class StorageAuthenticator(
             return (false, null, null);
         try
         {
-            var groups = GetAclGroups(principal);
+            var groups = await groupMembershipResolver.ResolveAsync(principal, objectId, context.RequestAborted)
+                .ConfigureAwait(false);
             var generationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
                 metadata,
                 context.Request,
