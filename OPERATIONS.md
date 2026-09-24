@@ -207,6 +207,13 @@ The official SDK signs the encoded URI path; if a transport exposes `%21` as a
 literal `!` in the request target, Shared Key verification also tries that
 narrow encoded spelling. It does not decode `%2521` into the same name. This
 follows the [Shared Key canonicalized-resource rule](https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key#constructing-the-canonicalized-resource-string).
+An eighteenth scenario compares snapshot deletion through the SDK. Both
+services return 409 `SnapshotsPresent` when deleting a base blob without a
+mode, 400 `InvalidOperation` when `x-ms-delete-snapshots` targets an individual
+snapshot, and 202 for `only` and `include`; the test checks that each mode
+preserves or removes the base and snapshots as specified by the
+[Delete Blob contract](https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob)
+and its [error catalog](https://learn.microsoft.com/en-us/rest/api/storageservices/blob-service-error-codes).
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

@@ -7157,7 +7157,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             scopedToSnapshot.Headers.TryAddWithoutValidation("x-ms-delete-snapshots", "include");
             using var response = await transport.SendAsync(scopedToSnapshot).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Equal("InvalidOperation", response.Headers.GetValues("x-ms-error-code").Single());
         }
     }
 
