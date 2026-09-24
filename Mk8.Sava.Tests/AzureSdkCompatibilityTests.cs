@@ -10413,80 +10413,86 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             "?restype=service&comp=userdelegationkey");
         var httpUri = new UriBuilder(httpsUri) { Scheme = Uri.UriSchemeHttp, Port = -1 }.Uri;
         using var transport = new HttpClient(factory.Server.CreateHandler());
+        await AssertUserDelegationKeyVersionAndXmlErrorsAsync(
+            transport, token, httpsUri, httpUri, baseBody, delegatedBody, startsAt, expiresAt);
+        await AssertUserDelegationKeyTenantPolicyAsync(
+            transport, token, httpsUri, baseBody, delegatedBody, delegatedTenant);
+    }
 
-        async Task<HttpResponseMessage> SendAsync(
-            HttpClient client,
-            Uri uri,
-            string version,
-            string body)
+    private static async Task<HttpResponseMessage> SendUserDelegationKeyRequestAsync(
+        HttpClient client, Uri uri, string version, string body, string token)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, uri)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Post, uri)
-            {
-                Content = new StringContent(body, Encoding.UTF8, "application/xml")
-            };
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            return await client.SendAsync(request).ConfigureAwait(false);
-        }
+            Content = new StringContent(body, Encoding.UTF8, "application/xml")
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await client.SendAsync(request).ConfigureAwait(false);
+    }
 
-        using (var oldVersion = await SendAsync(transport, httpsUri, "2018-03-28", baseBody))
+    private static async Task AssertUserDelegationKeyVersionAndXmlErrorsAsync(
+        HttpClient transport, string token, Uri httpsUri, Uri httpUri,
+        string baseBody, string delegatedBody, string startsAt, string expiresAt)
+    {
+        using (var oldVersion = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2018-03-28", baseBody, token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, oldVersion.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldVersion.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var insecure = await SendAsync(transport, httpUri, "2025-07-05", baseBody))
+        using (var insecure = await SendUserDelegationKeyRequestAsync(
+                   transport, httpUri, "2025-07-05", baseBody, token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, insecure.StatusCode);
             Assert.Equal("InvalidRequest", insecure.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var prematureDelegation = await SendAsync(
-                   transport,
-                   httpsUri,
-                   "2023-11-03",
-                   delegatedBody))
+        using (var prematureDelegation = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2023-11-03", delegatedBody, token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, prematureDelegation.StatusCode);
             Assert.Equal("FeatureVersionMismatch", prematureDelegation.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var unknownElement = await SendAsync(
-                   transport,
-                   httpsUri,
-                   "2025-07-05",
-                   $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry><Unknown /></KeyInfo>"))
+        using (var unknownElement = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2025-07-05",
+                   $"<KeyInfo><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry><Unknown /></KeyInfo>",
+                   token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, unknownElement.StatusCode);
             Assert.Equal("InvalidXmlDocument", unknownElement.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var duplicateElement = await SendAsync(
-                   transport,
-                   httpsUri,
-                   "2025-07-05",
-                   $"<KeyInfo><Start>{startsAt}</Start><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry></KeyInfo>"))
+        using (var duplicateElement = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2025-07-05",
+                   $"<KeyInfo><Start>{startsAt}</Start><Start>{startsAt}</Start><Expiry>{expiresAt}</Expiry></KeyInfo>",
+                   token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.BadRequest, duplicateElement.StatusCode);
             Assert.Equal("InvalidXmlDocument", duplicateElement.Headers.GetValues("x-ms-error-code").Single());
         }
+    }
 
-        using (var accepted = await SendAsync(transport, httpsUri, "2025-07-05", baseBody))
+    private static async Task AssertUserDelegationKeyTenantPolicyAsync(
+        HttpClient transport, string token, Uri httpsUri,
+        string baseBody, string delegatedBody, string delegatedTenant)
+    {
+        using (var accepted = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2025-07-05", baseBody, token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await accepted.Content.ReadAsStringAsync());
+            var document = System.Xml.Linq.XDocument.Parse(
+                await accepted.Content.ReadAsStringAsync().ConfigureAwait(false));
             Assert.Empty(document.Root!.Elements("SignedDelegatedUserTid"));
         }
 
-        using (var deniedCrossTenant = await SendAsync(
-                   transport,
-                   httpsUri,
-                   "2025-07-05",
-                   delegatedBody))
+        using (var deniedCrossTenant = await SendUserDelegationKeyRequestAsync(
+                   transport, httpsUri, "2025-07-05", delegatedBody, token).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Forbidden, deniedCrossTenant.StatusCode);
-            Assert.Equal(
-                "AuthorizationFailure",
+            Assert.Equal("AuthorizationFailure",
                 deniedCrossTenant.Headers.GetValues("x-ms-error-code").Single());
         }
 
@@ -10496,20 +10502,15 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:AllowCrossTenantDelegationSas"] =
                     "true"
             });
-        await using var crossTenantApplicationDisposal33 = crossTenantApplication.ConfigureAwait(false);
+        await using var disposal = crossTenantApplication.ConfigureAwait(false);
         using var crossTenantTransport = new HttpClient(crossTenantApplication.Server.CreateHandler());
-        using (var accepted = await SendAsync(
-                   crossTenantTransport,
-                   httpsUri,
-                   "2025-07-05",
-                   delegatedBody))
-        {
-            Assert.Equal(HttpStatusCode.OK, accepted.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await accepted.Content.ReadAsStringAsync());
-            Assert.Equal(
-                delegatedTenant,
-                Assert.Single(document.Root!.Elements("SignedDelegatedUserTid")).Value);
-        }
+        using var crossTenantAccepted = await SendUserDelegationKeyRequestAsync(
+            crossTenantTransport, httpsUri, "2025-07-05", delegatedBody, token).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, crossTenantAccepted.StatusCode);
+        var crossTenantDocument = System.Xml.Linq.XDocument.Parse(
+            await crossTenantAccepted.Content.ReadAsStringAsync().ConfigureAwait(false));
+        Assert.Equal(delegatedTenant,
+            Assert.Single(crossTenantDocument.Root!.Elements("SignedDelegatedUserTid")).Value);
     }
 
     [Fact]
