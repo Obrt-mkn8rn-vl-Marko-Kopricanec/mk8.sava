@@ -101,6 +101,45 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task BlobMetadataGetHeadAndSnapshotMatchAzuriteExceptDocumentedBody()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-metadata-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        using var azuriteTransport = new HttpClient();
+        using var localTransport = new HttpClient(application.Server.CreateHandler());
+        try
+        {
+            var expected = await ExerciseBlobMetadataAsync(azuriteContainer, azuriteTransport)
+                .ConfigureAwait(false);
+            var actual = await ExerciseBlobMetadataAsync(localContainer, localTransport).ConfigureAwait(false);
+            // Get Blob Metadata has no response body; Azurite incorrectly returns blob bytes for GET.
+            Assert.Equal(7, expected.Current.GetBodyLength);
+            Assert.Equal(7, expected.Snapshot.GetBodyLength);
+            Assert.Equal(0, actual.Current.GetBodyLength);
+            Assert.Equal(0, actual.Snapshot.GetBodyLength);
+            Assert.Equal(expected with
+            {
+                Current = expected.Current with { GetBodyLength = 0 },
+                Snapshot = expected.Snapshot with { GetBodyLength = 0 }
+            }, actual);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SupportedFlatBlobSdkOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -524,6 +563,65 @@ public sealed class AzuriteDifferentialTests
             string.Concat(final.CacheControl, final.ContentEncoding, final.ContentLanguage, final.ContentDisposition),
             final.Metadata["phase"],
             content);
+    }
+
+    private static async Task<BlobMetadataObservation> ExerciseBlobMetadataAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("metadata.bin");
+        await blob.UploadAsync(BinaryData.FromString("payload"), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "initial" }
+        }).ConfigureAwait(false);
+        var snapshot = (await blob.CreateSnapshotAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "snapshot"
+        }).ConfigureAwait(false)).Value.Snapshot;
+        await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "current"
+        }).ConfigureAwait(false);
+
+        var current = await ObserveBlobMetadataAsync(blob, transport).ConfigureAwait(false);
+        var historical = await ObserveBlobMetadataAsync(blob.WithSnapshot(snapshot), transport)
+            .ConfigureAwait(false);
+        Assert.Equal("current", current.Phase);
+        Assert.Equal("snapshot", historical.Phase);
+        return new BlobMetadataObservation(current, historical);
+    }
+
+    private static async Task<BlobMetadataReadObservation> ObserveBlobMetadataAsync(
+        BlobClient blob, HttpClient transport)
+    {
+        var sasUri = blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var metadataUri = new UriBuilder(sasUri)
+        {
+            Query = sasUri.Query.TrimStart('?') + "&comp=metadata"
+        }.Uri;
+        using var get = new HttpRequestMessage(HttpMethod.Get, metadataUri);
+        using var head = new HttpRequestMessage(HttpMethod.Head, metadataUri);
+        get.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        head.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var getResponse = await transport.SendAsync(get).ConfigureAwait(false);
+        using var headResponse = await transport.SendAsync(head).ConfigureAwait(false);
+        using var conditional = new HttpRequestMessage(HttpMethod.Get, metadataUri);
+        conditional.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        conditional.Headers.TryAddWithoutValidation("If-None-Match",
+            getResponse.Headers.ETag?.ToString()
+            ?? throw new InvalidOperationException("Get Blob Metadata omitted its ETag."));
+        using var conditionalResponse = await transport.SendAsync(conditional).ConfigureAwait(false);
+        var getBody = await getResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        var headBody = await headResponse.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        var phase = getResponse.Headers.GetValues("x-ms-meta-phase").Single();
+        Assert.Equal(200, (int)getResponse.StatusCode);
+        Assert.Equal(200, (int)headResponse.StatusCode);
+        Assert.Equal(304, (int)conditionalResponse.StatusCode);
+        Assert.Equal(phase, headResponse.Headers.GetValues("x-ms-meta-phase").Single());
+        Assert.Equal(getResponse.Headers.ETag, headResponse.Headers.ETag);
+        return new BlobMetadataReadObservation(
+            (int)getResponse.StatusCode, (int)headResponse.StatusCode,
+            (int)conditionalResponse.StatusCode, phase, getBody.Length, headBody.Length);
     }
 
     private static async Task<AccountInformationObservation> ObserveAccountInformationAsync(
@@ -1107,6 +1205,13 @@ public sealed class AzuriteDifferentialTests
         int SetPropertiesStatus, int SetMetadataStatus, int StaleStatus, string? StaleErrorCode,
         bool PropertiesChangedETag, bool MetadataChangedETag, string ContentType,
         string ClearedHttpProperties, string Metadata, string Content);
+
+    private sealed record BlobMetadataObservation(
+        BlobMetadataReadObservation Current, BlobMetadataReadObservation Snapshot);
+
+    private sealed record BlobMetadataReadObservation(
+        int GetStatus, int HeadStatus, int NotModifiedStatus,
+        string Phase, int GetBodyLength, int HeadBodyLength);
 
     private sealed record StagedBlobObservation(
         int UncommittedBlocks,
