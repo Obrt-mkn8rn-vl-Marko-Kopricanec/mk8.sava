@@ -569,6 +569,12 @@ public sealed class SavaOptions : IValidatableObject
 
     private IEnumerable<ValidationResult> ValidateBearer()
     {
+        if (!Enum.IsDefined(BearerAuthentication.GraphGroupResolution.Cloud))
+        {
+            yield return new ValidationResult(
+                "Graph group resolution must use a supported Microsoft Graph cloud.",
+                [nameof(BearerAuthentication)]);
+        }
         if (BearerAuthentication.GraphGroupResolution.Enabled &&
             (!BearerAuthentication.Enabled ||
              !Guid.TryParse(BearerAuthentication.GraphGroupResolution.TenantId, out _)))

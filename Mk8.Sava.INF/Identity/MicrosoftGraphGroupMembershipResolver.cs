@@ -18,8 +18,6 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
     HttpClient client,
     ILogger<MicrosoftGraphGroupMembershipResolver> logger) : IGroupMembershipResolver
 {
-    private static readonly TokenRequestContext GraphTokenRequest =
-        new(["https://graph.microsoft.com/.default"]);
     private const int MaximumResponseBytes = 1024 * 1024;
     private const int MaximumGroups = 11_000;
     private const int MaximumPagedGroups = 100_000;
@@ -41,6 +39,7 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
 
         var configuration = options.Value.BearerAuthentication.GraphGroupResolution;
         if (!configuration.Enabled ||
+            !Enum.IsDefined(configuration.Cloud) ||
             !Guid.TryParse(objectId, out var objectGuid) ||
             !Guid.TryParse(configuration.TenantId, out var configuredTenant) ||
             !Guid.TryParse(principal.FindFirst("tid")?.Value, out var tokenTenant) ||
@@ -51,7 +50,8 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
 
         try
         {
-            return await FetchGroupsAsync(objectGuid, cancellationToken).ConfigureAwait(false);
+            return await FetchGroupsAsync(objectGuid, configuration.GraphEndpoint, cancellationToken)
+                .ConfigureAwait(false);
         }
         catch (Exception error) when (error is AuthenticationFailedException or CredentialUnavailableException or
                                       HttpRequestException or JsonException or InvalidOperationException or TaskCanceledException &&
@@ -62,12 +62,14 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         }
     }
 
-    private async Task<HashSet<string>> FetchGroupsAsync(Guid objectId, CancellationToken cancellationToken)
+    private async Task<HashSet<string>> FetchGroupsAsync(
+        Guid objectId, Uri graphEndpoint, CancellationToken cancellationToken)
     {
-        var token = await credential.GetTokenAsync(GraphTokenRequest, cancellationToken).ConfigureAwait(false);
+        var tokenRequest = new TokenRequestContext([$"{graphEndpoint.GetLeftPart(UriPartial.Authority)}/.default"]);
+        var token = await credential.GetTokenAsync(tokenRequest, cancellationToken).ConfigureAwait(false);
         using var request = new HttpRequestMessage(
             HttpMethod.Post,
-            $"https://graph.microsoft.com/v1.0/directoryObjects/{objectId:D}/getMemberGroups");
+            new Uri(graphEndpoint, $"/v1.0/directoryObjects/{objectId:D}/getMemberGroups"));
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
         request.Content = new StringContent("{\"securityEnabledOnly\":true}", Encoding.UTF8, "application/json");
         using var response = await client.SendAsync(
@@ -76,7 +78,8 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         {
             using var error = await ReadDocumentAsync(response, cancellationToken).ConfigureAwait(false);
             if (IsGroupLimitError(error))
-                return await FetchPagedGroupsAsync(objectId, token.Token, cancellationToken).ConfigureAwait(false);
+                return await FetchPagedGroupsAsync(objectId, token.Token, graphEndpoint, cancellationToken)
+                    .ConfigureAwait(false);
         }
         if (!response.IsSuccessStatusCode)
         {
@@ -89,16 +92,17 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
     }
 
     private async Task<HashSet<string>> FetchPagedGroupsAsync(
-        Guid objectId, string token, CancellationToken cancellationToken)
+        Guid objectId, string token, Uri graphEndpoint, CancellationToken cancellationToken)
     {
-        var kind = await GetDirectoryObjectKindAsync(objectId, token, cancellationToken).ConfigureAwait(false);
+        var kind = await GetDirectoryObjectKindAsync(objectId, token, graphEndpoint, cancellationToken)
+            .ConfigureAwait(false);
         var path = $"/v1.0/{kind}/{objectId:D}/transitiveMemberOf/microsoft.graph.group";
-        var next = new Uri($"https://graph.microsoft.com{path}?%24select=id%2CsecurityEnabled&%24top=999&%24count=true");
+        var next = new Uri(graphEndpoint, $"{path}?%24select=id%2CsecurityEnabled&%24top=999&%24count=true");
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var groups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         for (var page = 0; page < MaximumPages; page++)
         {
-            if (!IsSafePageUrl(next, path) || !seen.Add(next.AbsoluteUri))
+            if (!IsSafePageUrl(next, path, graphEndpoint) || !seen.Add(next.AbsoluteUri))
                 throw AzureStorageException.AuthorizationFailure();
             using var document = await GetGraphPageAsync(next, token, cancellationToken).ConfigureAwait(false);
             AddPageGroups(document, groups);
@@ -116,9 +120,9 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
     }
 
     private async Task<string> GetDirectoryObjectKindAsync(
-        Guid objectId, string token, CancellationToken cancellationToken)
+        Guid objectId, string token, Uri graphEndpoint, CancellationToken cancellationToken)
     {
-        var uri = new Uri($"https://graph.microsoft.com/v1.0/directoryObjects/{objectId:D}");
+        var uri = new Uri(graphEndpoint, $"/v1.0/directoryObjects/{objectId:D}");
         using var document = await GetGraphPageAsync(uri, token, cancellationToken, consistency: false)
             .ConfigureAwait(false);
         if (!document.RootElement.TryGetProperty("@odata.type", out var type) ||
@@ -174,9 +178,9 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         }
     }
 
-    private static bool IsSafePageUrl(Uri uri, string path) =>
-        uri.Scheme == Uri.UriSchemeHttps &&
-        uri.Host.Equals("graph.microsoft.com", StringComparison.OrdinalIgnoreCase) &&
+    private static bool IsSafePageUrl(Uri uri, string path, Uri graphEndpoint) =>
+        string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal) &&
+        uri.Host.Equals(graphEndpoint.Host, StringComparison.OrdinalIgnoreCase) &&
         uri.IsDefaultPort &&
         uri.UserInfo.Length == 0 &&
         uri.Fragment.Length == 0 &&
@@ -188,7 +192,7 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
         error.ValueKind == JsonValueKind.Object &&
         error.TryGetProperty("code", out var code) &&
         code.ValueKind == JsonValueKind.String &&
-        code.GetString() == "Directory_ResultSizeLimitExceeded";
+        string.Equals(code.GetString(), "Directory_ResultSizeLimitExceeded", StringComparison.Ordinal);
 
     private static async Task<JsonDocument> ReadDocumentAsync(
         HttpResponseMessage response, CancellationToken cancellationToken)
