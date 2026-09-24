@@ -2628,6 +2628,31 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId))
             .GetBlobContainerClient(container.Name);
         await AssertAuthorizedDirectoryListingAsync(reader);
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "hidden",
+            AccessAcl = visibleAcl
+        });
+        await AssertAuthorizedRecursiveListingAsync(reader);
+    }
+
+    private static async Task AssertAuthorizedRecursiveListingAsync(BlobContainerClient reader)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var names = new List<string>();
+        await foreach (var page in reader.GetBlobsAsync().AsPages(pageSizeHint: 1)
+                           .WithCancellation(timeout.Token).ConfigureAwait(false))
+        {
+            Assert.Single(page.Values);
+            names.Add(page.Values[0].Name);
+            Assert.True(names.Count <= 6,
+                $"Recursive ACL listing did not advance: {string.Join(',', names)}; marker={page.ContinuationToken}");
+        }
+        Assert.Equal(
+            ["hidden", "hidden/secret.txt", "visible", "visible/one.txt", "visible/two.txt"],
+            names);
     }
 
     private static async Task AssertAuthorizedDirectoryListingAsync(BlobContainerClient reader)
@@ -2724,6 +2749,25 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var sas = BuildSignedDirectoryListSas(key, startsOn, expiresOn, container.Name, readerObjectId);
 
         await AssertSignedDirectoryListingAsync(application, container.Name, sas, readerObjectId);
+        await ApplyAclManifestAsync(application, new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "visible",
+            AccessAcl = $"user::rwx,user:{readerObjectId}:--x,group::r-x,mask::r-x,other::---"
+        });
+        await AssertSignedRecursiveListDeniedAsync(application, container.Name, sas);
+    }
+
+    private static async Task AssertSignedRecursiveListDeniedAsync(
+        SavaWebApplicationFactory application, string containerName, string sas)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using var response = await transport.GetAsync(new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}" +
+            $"?restype=container&comp=list&{sas}", UriKind.RelativeOrAbsolute)).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal("AuthorizationFailure", response.Headers.GetValues("x-ms-error-code").Single());
     }
 
     private static string BuildSignedDirectoryListSas(
@@ -2779,11 +2823,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.OK, nested.StatusCode);
             Assert.Contains("<Name>visible/item.txt</Name>", await nested.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
         }
-        using (var unsupported = await transport.GetAsync(new Uri(
+        using (var recursive = await transport.GetAsync(new Uri(
                    $"{endpoint}?restype=container&comp=list&{sas}", UriKind.RelativeOrAbsolute)).ConfigureAwait(false))
         {
-            Assert.Equal(HttpStatusCode.Forbidden, unsupported.StatusCode);
-            Assert.Equal("AuthorizationFailure", unsupported.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Equal(HttpStatusCode.OK, recursive.StatusCode);
+            var body = await recursive.Content.ReadAsStringAsync().ConfigureAwait(false);
+            Assert.Contains("<Name>visible</Name>", body, StringComparison.Ordinal);
+            Assert.Contains("<Name>visible/item.txt</Name>", body, StringComparison.Ordinal);
         }
         using (var tampered = await transport.GetAsync(new Uri(
                    $"{endpoint}?restype=container&comp=list&delimiter=%2F&" +

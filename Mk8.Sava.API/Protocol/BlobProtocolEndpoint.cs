@@ -839,13 +839,22 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     {
         if (request.Authorization.AclListChecked)
         {
+            var metadata = http.RequestServices.GetRequiredService<MetadataStore>();
             await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                http.RequestServices.GetRequiredService<MetadataStore>(),
+                metadata,
                 http.Request,
                 request,
                 request.Authorization.AclListObjectId!,
                 request.Authorization.AclListGroups!,
                 request.Authorization.Permissions,
+                cancellationToken).ConfigureAwait(false);
+            await HierarchicalAclAuthorization.EnsureRecursiveListPageAsync(
+                metadata,
+                http.Request,
+                request,
+                blobs,
+                request.Authorization.AclListObjectId!,
+                request.Authorization.AclListGroups!,
                 cancellationToken).ConfigureAwait(false);
         }
         ValidateListedBlobTypes(request, blobs);

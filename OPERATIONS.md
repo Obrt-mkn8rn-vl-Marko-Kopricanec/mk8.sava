@@ -692,6 +692,17 @@ ACL identity. A configured RBAC read grant still authorizes without an ACL
 check. Signed bearer `groups` claims can satisfy stored owning/named-group
 entries; group memberships absent from the token are not resolved. Bearer ACL
 fallback for other operations remains incomplete.
+For HNS List Blobs, bearer `oid` and signed user-delegation `suoid` ACL
+fallback support `delimiter=/` directory listing and no-delimiter recursive
+listing with either no prefix or a complete directory prefix. The requested
+directory requires read and execute, with execute on its ancestors. Before a
+recursive page is returned, every directory traversed by its entries must
+also grant read and execute; an inaccessible descendant fails that page with
+403 rather than exposing its contents. Mixed-access recursive response and
+continuation behavior is not established as Azure-identical; other ACL-only
+listing shapes remain fail-closed. This local rule follows the documented
+[HNS directory listing permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions)
+and is covered for bearer and signed `suoid` requests without a live account.
 For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
 Set Blob Properties, Set Blob Tier, Set Blob Expiry, and Delete Blob through
