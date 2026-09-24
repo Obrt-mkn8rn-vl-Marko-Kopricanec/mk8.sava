@@ -1733,40 +1733,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             SavaWebApplicationFactory.SecondAccountName,
             SavaWebApplicationFactory.SecondAccountKey);
         var metadata = application.Services.GetRequiredService<MetadataStore>();
-        var properties = await metadata.GetServicePropertiesAsync(
-            SavaWebApplicationFactory.SecondAccountName,
-            CancellationToken.None);
-        await metadata.PutServicePropertiesAsync(
-            SavaWebApplicationFactory.SecondAccountName,
-            properties with
-            {
-                BlobSoftDeleteEnabled = true,
-                BlobSoftDeleteRetentionDays = 7,
-                VersioningEnabled = true
-            },
-            CancellationToken.None);
-
         var container = service.GetBlobContainerClient($"hns-delete-{Guid.NewGuid():N}");
-        await container.CreateAsync();
-        var blob = container.GetBlobClient("folder/repeated.txt");
-        await blob.UploadAsync(BinaryData.FromString("first"));
-        await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true);
-
-        var family = await metadata.ListBlobFamilyAsync(
-            SavaWebApplicationFactory.SecondAccountName,
-            container.Name,
-            blob.Name,
-            includeDeleted: true,
-            CancellationToken.None);
-        var current = Assert.Single(family);
-        Assert.True(current.IsCurrent);
-        Assert.Null(current.VersionId);
-        Assert.False(current.IsDeleted);
-
-        await blob.DeleteAsync();
-        await blob.UploadAsync(BinaryData.FromString("third"));
-        await blob.DeleteAsync();
-        await blob.UploadAsync(BinaryData.FromString("active"));
+        var blob = await CreateHnsSoftDeletedGenerationsAsync(metadata, container);
 
         var credential = new StorageSharedKeyCredential(
             SavaWebApplicationFactory.SecondAccountName,
@@ -1781,15 +1749,60 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         };
         sasBuilder.SetPermissions(AccountSasPermissions.List | AccountSasPermissions.Write);
         var sas = sasBuilder.ToSasQueryParameters(credential);
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        var deletionIds = await AssertHnsDeletedListingAsync(transport, container, blob, sas);
+        await AssertHnsSelectedGenerationRestoredAsync(
+            transport, container, blob, sas, deletionIds[0], metadata);
+    }
+
+    private static async Task AssertHnsSelectedGenerationRestoredAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        BlobClient blob,
+        SasQueryParameters sas,
+        ulong deletionId,
+        MetadataStore metadata)
+    {
+        var restored = container.GetBlobClient("restored/selected.txt");
+        using (var undelete = new HttpRequestMessage(
+                   HttpMethod.Put,
+                   AppendQuery(restored.Uri, $"comp=undelete&{sas}"))
+        {
+            Content = new ByteArrayContent([])
+        })
+        {
+            undelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            undelete.Headers.TryAddWithoutValidation(
+                "x-ms-undelete-source",
+                $"{Uri.EscapeDataString(blob.Name)}?deletionid={deletionId.ToString(CultureInfo.InvariantCulture)}");
+            using var response = await transport.SendAsync(undelete).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+        var restoredText = (await restored.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        Assert.Contains(restoredText, RestoredTexts, StringComparer.Ordinal);
+        Assert.Equal("active", (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+
+        var family = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            container.Name,
+            blob.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Single(family, item => item.IsDeleted);
+    }
+
+    private static async Task<ulong[]> AssertHnsDeletedListingAsync(
+        HttpClient transport, BlobContainerClient container, BlobClient blob, SasQueryParameters sas)
+    {
         var listUri = AppendQuery(
             container.Uri,
             $"restype=container&comp=list&showonly=deleted&{sas}");
-        using var transport = new HttpClient(application.Server.CreateHandler());
         using var listRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
         listRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-        using var listResponse = await transport.SendAsync(listRequest);
+        using var listResponse = await transport.SendAsync(listRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, listResponse.StatusCode);
-        var document = System.Xml.Linq.XDocument.Parse(await listResponse.Content.ReadAsStringAsync());
+        var document = System.Xml.Linq.XDocument.Parse(
+            await listResponse.Content.ReadAsStringAsync().ConfigureAwait(false));
         var deleted = document.Descendants("Blob")
             .Where(element => string.Equals(element.Element("Name")?.Value, blob.Name, StringComparison.Ordinal))
             .ToArray();
@@ -1804,53 +1817,61 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.All(deleted, element => Assert.Null(element.Element("Snapshot")));
         Assert.All(deleted, element => Assert.Null(element.Element("VersionId")));
 
-        using (var invalidMix = new HttpRequestMessage(
-                   HttpMethod.Get,
-                   AppendQuery(listUri, "include=deleted")))
+        using (var invalidMix = new HttpRequestMessage(HttpMethod.Get, AppendQuery(listUri, "include=deleted")))
         {
             invalidMix.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var response = await transport.SendAsync(invalidMix);
+            using var response = await transport.SendAsync(invalidMix).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
             Assert.Equal("InvalidQueryParameterValue", response.Headers.GetValues("x-ms-error-code").Single());
         }
 
-        using (var arrow = new HttpRequestMessage(HttpMethod.Get, AppendQuery(
-                   container.Uri,
-                   $"restype=container&comp=list&{sas}")))
-        {
-            arrow.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
-            arrow.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
-            using var response = await transport.SendAsync(arrow);
-            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-            Assert.Equal("BlobOperationNotSupported", response.Headers.GetValues("x-ms-error-code").Single());
-        }
+        using var arrow = new HttpRequestMessage(HttpMethod.Get, AppendQuery(
+            container.Uri, $"restype=container&comp=list&{sas}"));
+        arrow.Headers.TryAddWithoutValidation("x-ms-version", "2026-06-06");
+        arrow.Headers.TryAddWithoutValidation("Accept", AzureResponseWriter.ArrowStreamContentType);
+        using var arrowResponse = await transport.SendAsync(arrow).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, arrowResponse.StatusCode);
+        Assert.Equal("BlobOperationNotSupported", arrowResponse.Headers.GetValues("x-ms-error-code").Single());
+        return deletionIds;
+    }
 
-        var restored = container.GetBlobClient("restored/selected.txt");
-        using (var undelete = new HttpRequestMessage(
-                   HttpMethod.Put,
-                   AppendQuery(restored.Uri, $"comp=undelete&{sas}"))
-        {
-            Content = new ByteArrayContent([])
-        })
-        {
-            undelete.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            undelete.Headers.TryAddWithoutValidation(
-                "x-ms-undelete-source",
-                $"{Uri.EscapeDataString(blob.Name)}?deletionid={deletionIds[0].ToString(CultureInfo.InvariantCulture)}");
-            using var response = await transport.SendAsync(undelete);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-        }
-        var restoredText = (await restored.DownloadContentAsync()).Value.Content.ToString();
-        Assert.Contains(restoredText, RestoredTexts, StringComparer.Ordinal);
-        Assert.Equal("active", (await blob.DownloadContentAsync()).Value.Content.ToString());
+    private static async Task<BlobClient> CreateHnsSoftDeletedGenerationsAsync(
+        MetadataStore metadata, BlobContainerClient container)
+    {
+        var properties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.SecondAccountName,
+            properties with
+            {
+                BlobSoftDeleteEnabled = true,
+                BlobSoftDeleteRetentionDays = 7,
+                VersioningEnabled = true
+            },
+            CancellationToken.None).ConfigureAwait(false);
 
-        family = await metadata.ListBlobFamilyAsync(
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("folder/repeated.txt");
+        await blob.UploadAsync(BinaryData.FromString("first")).ConfigureAwait(false);
+        await blob.UploadAsync(BinaryData.FromString("second"), overwrite: true).ConfigureAwait(false);
+
+        var family = await metadata.ListBlobFamilyAsync(
             SavaWebApplicationFactory.SecondAccountName,
             container.Name,
             blob.Name,
             includeDeleted: true,
-            CancellationToken.None);
-        Assert.Single(family, item => item.IsDeleted);
+            CancellationToken.None).ConfigureAwait(false);
+        var current = Assert.Single(family);
+        Assert.True(current.IsCurrent);
+        Assert.Null(current.VersionId);
+        Assert.False(current.IsDeleted);
+
+        await blob.DeleteAsync().ConfigureAwait(false);
+        await blob.UploadAsync(BinaryData.FromString("third")).ConfigureAwait(false);
+        await blob.DeleteAsync().ConfigureAwait(false);
+        await blob.UploadAsync(BinaryData.FromString("active")).ConfigureAwait(false);
+        return blob;
     }
 
     [Fact]
