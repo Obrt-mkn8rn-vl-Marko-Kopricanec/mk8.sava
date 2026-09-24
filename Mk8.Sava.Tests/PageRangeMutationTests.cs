@@ -202,18 +202,18 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
         var listUri = new Uri($"{pageSas}&comp=pagelist&prevsnapshot={Uri.EscapeDataString(snapshot)}");
         using var transport = new HttpClient(application.Server.CreateHandler());
         var unpaged = await ReadPageListAsync(transport, listUri, "2023-11-03").ConfigureAwait(true);
-        Assert.Equal(new[] { "PageRange:0", "ClearRange:512", "PageRange:1024", "ClearRange:1536" },
-            DescribePageRanges(unpaged));
+        Assert.Equal("PageRange:0,ClearRange:512,PageRange:1024,ClearRange:1536",
+            string.Join(',', DescribePageRanges(unpaged)));
 
         var firstPage = await ReadPageListAsync(
             transport, new Uri($"{listUri}&maxresults=3"), "2023-11-03").ConfigureAwait(true);
-        Assert.Equal(new[] { "PageRange:0", "ClearRange:512", "PageRange:1024" },
-            DescribePageRanges(firstPage));
+        Assert.Equal("PageRange:0,ClearRange:512,PageRange:1024",
+            string.Join(',', DescribePageRanges(firstPage)));
         Assert.Equal("3", firstPage.Root?.Element("NextMarker")?.Value);
 
         var lastPage = await ReadPageListAsync(
             transport, new Uri($"{listUri}&maxresults=3&marker=3"), "2023-11-03").ConfigureAwait(true);
-        Assert.Equal(new[] { "ClearRange:1536" }, DescribePageRanges(lastPage));
+        Assert.Equal("ClearRange:1536", Assert.Single(DescribePageRanges(lastPage)));
         Assert.Equal(string.Empty, lastPage.Root?.Element("NextMarker")?.Value);
 
         await AssertPageListStatusAsync(
@@ -221,7 +221,7 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
             .ConfigureAwait(true);
         var firstVersionedPage = await ReadPageListAsync(
             transport, new Uri($"{listUri}&maxresults=1"), "2020-10-02").ConfigureAwait(true);
-        Assert.Equal(new[] { "PageRange:0" }, DescribePageRanges(firstVersionedPage));
+        Assert.Equal("PageRange:0", Assert.Single(DescribePageRanges(firstVersionedPage)));
         Assert.Equal("1", firstVersionedPage.Root?.Element("NextMarker")?.Value);
         await AssertPageListStatusAsync(
             transport, new Uri($"{listUri}&maxresults=0"), "2023-11-03", HttpStatusCode.BadRequest)
@@ -262,7 +262,7 @@ public sealed class PageRangeMutationTests(SavaWebApplicationFactory application
 
         var lastPage = await ReadPageListAsync(
             transport, new Uri($"{listUri}&marker=10000"), "2020-10-02").ConfigureAwait(true);
-        Assert.Equal(new[] { "PageRange:10240000" }, DescribePageRanges(lastPage));
+        Assert.Equal("PageRange:10240000", Assert.Single(DescribePageRanges(lastPage)));
         Assert.Equal(string.Empty, lastPage.Root?.Element("NextMarker")?.Value);
     }
 

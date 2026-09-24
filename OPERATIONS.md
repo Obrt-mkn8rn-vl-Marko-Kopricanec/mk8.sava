@@ -111,6 +111,15 @@ does not cover every SQLite commit, filesystem, Windows, or power-loss boundary.
 
 ## Continuous offline validation
 
+Before pushing, use the same strict analyzer level as hosted CI; a plain
+`dotnet build` uses a smaller analyzer set and is not equivalent:
+
+```bash
+dotnet restore Mk8.Sava.slnx -p:Mk8StrictAnalyzers=true
+dotnet build Mk8.Sava.slnx --no-restore -c Release -p:Mk8StrictAnalyzers=true -m:1
+dotnet test Mk8.Sava.slnx --no-build --no-restore -c Release --filter "Category!=LiveAzure&Category!=Azurite"
+```
+
 The [offline conformance workflow](.github/workflows/offline-conformance.yml)
 builds with strict analyzers and runs the .NET SDK/REST suite on Linux and
 Windows 2025 hosted runners. Its Linux job also verifies formatting, runs the
