@@ -569,7 +569,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var directConnectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = Path.Combine(application.DataPath, "metadata.db"),
-                ForeignKeys = true
+                ForeignKeys = true,
+                Pooling = false
             }.ToString();
             {
                 var connection = new SqliteConnection(directConnectionString);
@@ -7573,7 +7574,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var directConnectionString = new SqliteConnectionStringBuilder
         {
             DataSource = Path.Combine(application.DataPath, "metadata.db"),
-            ForeignKeys = true
+            ForeignKeys = true,
+            Pooling = false
         }.ToString();
         await ExecuteRawBlobRecordCommandAsync(
             directConnectionString, container, unrelated.Name, corrupt: true).ConfigureAwait(false);
@@ -13564,7 +13566,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(false));
         Assert.Single(EnumerateChunkFiles(backupPath));
         Assert.False(Directory.Exists(Path.Combine(backupPath, "packs")));
-        var connection = new SqliteConnection($"Data Source={Path.Combine(backupPath, "metadata.db")}");
+        var connection = CreateUnpooledSqliteConnection(backupPath);
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
@@ -13996,7 +13998,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
     private static async Task AssertMigratedSchemaTablesAsync(string dataPath)
     {
-        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        var connection = CreateUnpooledSqliteConnection(dataPath);
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
@@ -14039,7 +14041,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.Equal(1, created.StagedBlockCount);
         Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(false));
 
-        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        var connection = CreateUnpooledSqliteConnection(dataPath);
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
@@ -16652,11 +16654,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         };
     }
 
+    private static SqliteConnection CreateUnpooledSqliteConnection(string dataPath) =>
+        new(new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(dataPath, "metadata.db"),
+            Pooling = false
+        }.ToString());
+
     private static async Task WriteVersionOneDatabaseAsync(
         string dataPath, string containerName, DateTimeOffset now, JsonSerializerOptions options,
         ContainerRecord container, BlobRecord blob, StagedBlockRecord block)
     {
-        var connection = new SqliteConnection($"Data Source={Path.Combine(dataPath, "metadata.db")}");
+        var connection = CreateUnpooledSqliteConnection(dataPath);
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);

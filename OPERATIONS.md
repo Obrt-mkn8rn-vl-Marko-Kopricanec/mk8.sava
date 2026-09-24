@@ -43,6 +43,9 @@ operating-system lock, so the next instance can reopen the root and recover.
 Do not use a filesystem that does not reliably propagate exclusive file locks
 between hosts for a shared data root; multi-writer shared-root deployment is
 not supported.
+On graceful shutdown, the metadata store clears only its own SQLite connection
+pool. This releases pooled `metadata.db` file handles before a stopped root is
+removed or relocated on Windows, without disabling pooling for live requests.
 
 Pack compaction publishes its replacement file before switching SQLite's chunk
 locations. If the metadata operation fails or the process exits near commit, it
