@@ -1,6 +1,10 @@
 namespace Mk8.Sava.Storage;
 
-internal sealed record BlobListEntry(BlobRecord? Blob, string? Prefix, string? UncommittedBlobName = null)
+internal sealed record BlobListEntry(
+    BlobRecord? Blob,
+    string? Prefix,
+    string? UncommittedBlobName = null,
+    int? SortRank = null)
 {
     public bool IsUncommitted => UncommittedBlobName is not null;
 
@@ -19,7 +23,7 @@ internal sealed record BlobListEntry(BlobRecord? Blob, string? Prefix, string? U
                 blob.Name,
                 false,
                 false,
-                blob switch
+                SortRank ?? blob switch
                 {
                     { IsCurrent: true } => 0,
                     { VersionId: not null } => 1,

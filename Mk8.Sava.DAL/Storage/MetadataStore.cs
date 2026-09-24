@@ -1275,7 +1275,7 @@ public sealed partial class MetadataStore(
             hierarchicalNamespace, hierarchicalRecursive, showOnly, includeVersions, includeSnapshots,
             includeDeleted, endBefore);
 
-        var eligible = BuildEligibleBlobListingSql(predicates, endBefore, hierarchicalRecursive);
+        var eligible = BuildEligibleBlobListingSql(predicates, endBefore, hierarchicalRecursive, includeSnapshots);
         var entries = BuildBlobListingEntriesSql(eligible, delimiter, hierarchicalNamespace);
 
         var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
@@ -1329,11 +1329,12 @@ public sealed partial class MetadataStore(
         {
             var blob = await reader.IsDBNullAsync(0, cancellationToken).ConfigureAwait(false)
                 ? null : Deserialize<BlobRecord>(reader.GetString(0));
-            return new BlobListEntry(blob, name);
+            return new BlobListEntry(blob, name, SortRank: reader.GetInt32(3));
         }
         return reader.GetInt32(7) == 1
             ? new BlobListEntry(null, null, name)
-            : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null);
+            : new BlobListEntry(Deserialize<BlobRecord>(reader.GetString(0)), null,
+                SortRank: reader.GetInt32(3));
     }
 
     private static List<string> BuildBlobListingPredicates(
@@ -1394,11 +1395,13 @@ public sealed partial class MetadataStore(
     private static string BuildEligibleBlobListingSql(
         IReadOnlyList<string> predicates,
         string endBefore,
-        bool hierarchicalRecursive)
+        bool hierarchicalRecursive,
+        bool includeSnapshots)
     {
-        const string rankExpression = """
+        var currentRank = includeSnapshots ? 4 : 0;
+        var rankExpression = $"""
             CASE
-                WHEN is_current = 1 THEN 0
+                WHEN is_current = 1 THEN {currentRank}
                 WHEN version_id IS NOT NULL THEN 1
                 WHEN snapshot IS NULL THEN 2
                 ELSE 3

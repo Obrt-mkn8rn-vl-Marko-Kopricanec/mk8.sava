@@ -1338,7 +1338,7 @@ internal static partial class AzureResponseWriter
         }
         if (cursor.Rank == -1)
             return cursor.GenerationId.Length == 0 && cursor.OrderedId.Length == 0;
-        return cursor.Rank is >= 0 and <= 3 &&
+        return cursor.Rank is >= 0 and <= 4 &&
                cursor.GenerationId.Length > 0 &&
                (cursor.Rank is not (1 or 3) || cursor.OrderedId.Length > 0);
     }

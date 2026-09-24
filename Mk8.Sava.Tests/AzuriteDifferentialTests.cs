@@ -551,6 +551,41 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task SnapshotListingMatchesAzuriteExceptOneItemPaginationBug()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-snapshot-list-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseSnapshotListingAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseSnapshotListingAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected.Unpaged, actual.Unpaged);
+            Assert.Equal(actual.Unpaged, actual.Pages);
+            Assert.Equal("folder/a.bin:snapshot:old:3|folder/a.bin:current:new:3|folder/b.bin:current:none:4",
+                actual.Pages);
+            Assert.Equal(2, actual.ContinuationCount);
+            // Azurite 3.35.0 skips the current blob when one-item paging encounters
+            // a snapshot of the same name. The REST contract includes both objects.
+            Assert.Equal("folder/a.bin:snapshot:old:3|folder/b.bin:current:none:4", expected.Pages);
+            Assert.Equal(1, expected.ContinuationCount);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task StoredAccessPolicySasReadAndWriteDenialMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1405,6 +1440,50 @@ public sealed class AzuriteDifferentialTests
             string.Join('|', hierarchyPages), hierarchyContinuations);
     }
 
+    private static async Task<SnapshotListingObservation> ExerciseSnapshotListingAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("folder/a.bin");
+        await blob.UploadAsync(BinaryData.FromString("old"), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "old" }
+        }).ConfigureAwait(false);
+        await blob.CreateSnapshotAsync().ConfigureAwait(false);
+        await blob.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "new"
+        }).ConfigureAwait(false);
+        await container.GetBlobClient("folder/b.bin").UploadAsync(BinaryData.FromString("next"))
+            .ConfigureAwait(false);
+
+        var options = new GetBlobsOptions
+        {
+            Prefix = "folder/",
+            Traits = BlobTraits.Metadata,
+            States = BlobStates.Snapshots
+        };
+        var unpaged = new List<string>();
+        await foreach (var item in container.GetBlobsAsync(options).ConfigureAwait(false))
+            unpaged.Add(DescribeSnapshotListItem(item));
+        var pages = new List<string>();
+        var continuationCount = 0;
+        await foreach (var page in container.GetBlobsAsync(options).AsPages(pageSizeHint: 1).ConfigureAwait(false))
+        {
+            pages.Add(string.Join(',', page.Values.Select(DescribeSnapshotListItem)));
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+                continuationCount++;
+        }
+        return new SnapshotListingObservation(string.Join('|', unpaged), string.Join('|', pages), continuationCount);
+    }
+
+    private static string DescribeSnapshotListItem(BlobItem item)
+    {
+        var phase = item.Metadata is not null && item.Metadata.TryGetValue("phase", out var value)
+            ? value
+            : "none";
+        return $"{item.Name}:{(item.Snapshot is null ? "current" : "snapshot")}:{phase}:{item.Properties.ContentLength}";
+    }
+
     private static async Task<StoredPolicySasObservation> ExerciseStoredPolicySasAsync(
         BlobContainerClient container, Func<Uri, BlobClient> createSasClient)
     {
@@ -1737,6 +1816,8 @@ public sealed class AzuriteDifferentialTests
     private sealed record BlobListingObservation(
         string FlatPages, int FlatContinuations,
         string HierarchyPages, int HierarchyContinuations);
+
+    private sealed record SnapshotListingObservation(string Unpaged, string Pages, int ContinuationCount);
 
     private sealed record StoredPolicySasObservation(
         string Identifier, string Permissions, string ReadBytes,
