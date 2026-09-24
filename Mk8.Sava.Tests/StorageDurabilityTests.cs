@@ -22,6 +22,37 @@ public sealed class StorageDurabilityTests
     }
 
     [Fact]
+    public async Task DisposingServiceClosesAnIncompletePhysicalInventoryScan()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-dispose-scan-{Guid.NewGuid():N}");
+        var application = new SavaWebApplicationFactory(root, deleteDataPath: false);
+        ChunkStore chunks;
+        await using (application.ConfigureAwait(true))
+        {
+            await application.InitializeAsync().ConfigureAwait(true);
+            chunks = application.Services.GetRequiredService<ChunkStore>();
+            Assert.Null(chunks.ScanPhysicalUsageBatch(maximumEntries: 1));
+            Assert.True(chunks.IsPhysicalUsageScanInProgress);
+        }
+
+        Assert.False(chunks.IsPhysicalUsageScanInProgress);
+        Directory.Delete(root, recursive: true);
+        Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
+    public async Task XunitFixtureDisposalRemovesItsTemporaryRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-fixture-dispose-{Guid.NewGuid():N}");
+        var application = new SavaWebApplicationFactory(root, deleteDataPath: true);
+        await using var disposal = application.ConfigureAwait(true);
+        await application.InitializeAsync().ConfigureAwait(true);
+
+        await ((IAsyncLifetime)application).DisposeAsync().ConfigureAwait(true);
+        Assert.False(Directory.Exists(root));
+    }
+
+    [Fact]
     public async Task PublishFilePreservesNoOverwriteAndAtomicReplacementSemantics()
     {
         var root = Path.Combine(Path.GetTempPath(), $"mk8-sava-publish-file-{Guid.NewGuid():N}");

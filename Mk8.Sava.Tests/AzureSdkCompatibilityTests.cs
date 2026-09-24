@@ -7294,7 +7294,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots));
         Assert.Equal(412, missingSnapshotLease.Status);
         Assert.Equal("LeaseIdMissing", missingSnapshotLease.ErrorCode);
+        var wrongSnapshotLease = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots,
+                new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString("D") }));
+        Assert.Equal(412, wrongSnapshotLease.Status);
+        Assert.Equal("LeaseIdMismatchWithBlobOperation", wrongSnapshotLease.ErrorCode);
         Assert.True((await snapshot.ExistsAsync()).Value);
+        Assert.Equal("retained", (await snapshot.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("retained", (await blob.DownloadContentAsync()).Value.Content.ToString());
         Assert.Equal(202, (await blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots, condition)).Status);
         Assert.False((await snapshot.ExistsAsync()).Value);
         Assert.Equal("retained", (await blob.DownloadContentAsync()).Value.Content.ToString());
@@ -12914,10 +12921,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             item => string.Equals(item.Name, "scoped.bin", StringComparison.Ordinal)).Properties.EncryptionScope);
         Assert.True(chunksAfterKeyed > chunksBefore);
         Assert.True(chunksAfterScoped > chunksAfterKeyed);
-        var metadataBytes = await File.ReadAllBytesAsync(Path.Combine(application.DataPath, "metadata.db"))
-            .ConfigureAwait(false);
-        Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes),
-            StringComparison.Ordinal);
+        var snapshotPath = Path.Combine(
+            Path.GetTempPath(), $"mk8-sava-encryption-metadata-{Guid.NewGuid():N}.db");
+        try
+        {
+            var metadata = application.Services.GetRequiredService<MetadataStore>();
+            var chunks = application.Services.GetRequiredService<ChunkStore>();
+            using var snapshot = await metadata.CreateBackupSnapshotAsync(
+                snapshotPath, chunks.PinChunkIds, CancellationToken.None).ConfigureAwait(false);
+            var metadataBytes = await File.ReadAllBytesAsync(snapshotPath).ConfigureAwait(false);
+            Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes),
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (File.Exists(snapshotPath))
+                File.Delete(snapshotPath);
+        }
     }
 
     [Fact]

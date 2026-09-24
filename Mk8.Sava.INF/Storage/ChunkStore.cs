@@ -10,7 +10,7 @@ using Mk8.Sava.Configuration;
 
 namespace Mk8.Sava.Storage;
 
-public sealed class ChunkStore
+public sealed class ChunkStore : IDisposable
 {
     private const ulong Magic = 0x324B4E5548433853UL; // S8CHUNK2
     private const byte EncryptionVersion = 1;
@@ -38,6 +38,13 @@ public sealed class ChunkStore
 
     internal bool IsPhysicalUsageScanInProgress => _physicalInventoryScanner is not null;
     internal int PhysicalUsageScanStepsLastPass { get; private set; }
+
+    public void Dispose()
+    {
+        _physicalInventoryScanner?.Dispose();
+        _physicalInventoryScanner = null;
+        GC.SuppressFinalize(this);
+    }
 
     public ChunkStore(
         StoragePaths paths,
