@@ -630,7 +630,9 @@ internal sealed class UrlTransferClient(
                     {
                         throw CannotVerifyCopySource("The source committed block list length is invalid.");
                     }
-                    if (blockLength != contentLength)
+                    // Put Blob creates content without an explicit committed block
+                    // list. Preserve that empty list across Copy Blob From URL.
+                    if (blocks.Count > 0 && blockLength != contentLength)
                         throw CannotVerifyCopySource("The source committed block list does not match its content length.");
                     return new UrlSourceShape(0, false, 0, blocks, []);
                 }

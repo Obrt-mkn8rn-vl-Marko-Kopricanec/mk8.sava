@@ -26,6 +26,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private readonly bool _disableMaintenance;
     private readonly bool _deleteDataPath;
     private StoragePaths? _storagePaths;
+    private MetadataStore? _metadataStore;
+    private ChunkStore? _chunkStore;
 
     public const string AccountName = "devstoreaccount1";
     public const string AccountKey = "Eby8vdM02xNOcqFeqCnf2WmjO1GwSW3eF4J6tq/K1SZFPTOtr/KBHBeksoGMGwBNPajQKDaZhQ==";
@@ -260,6 +262,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     {
         _ = Server;
         _storagePaths = Services.GetRequiredService<StoragePaths>();
+        _metadataStore = Services.GetRequiredService<MetadataStore>();
+        _chunkStore = Services.GetRequiredService<ChunkStore>();
         return Task.CompletedTask;
     }
 
@@ -269,7 +273,9 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     {
         await base.DisposeAsync().ConfigureAwait(false);
         // The test root is removed immediately below; explicitly release its
-        // lease even if a host implementation defers singleton disposal.
+        // scanner, SQLite pool, and lease even if a host defers singleton disposal.
+        _chunkStore?.Dispose();
+        _metadataStore?.Dispose();
         _storagePaths?.Dispose();
         if (_deleteDataPath && Directory.Exists(DataPath))
             Directory.Delete(DataPath, recursive: true);
