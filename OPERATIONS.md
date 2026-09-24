@@ -197,6 +197,12 @@ emulator's SKU as the target deployment configuration. A separate local
 versioned request checks that `x-ms-is-hns-enabled` is absent before
 `2019-07-07`, as the [published account-information contract](https://learn.microsoft.com/en-us/rest/api/storageservices/get-account-information)
 requires.
+A fourteenth scenario compares SDK uploads, exact downloads, and listing for
+`a!file` and the distinct literal-percent name `a%21file`. Both services agree.
+The official SDK signs the encoded URI path; if a transport exposes `%21` as a
+literal `!` in the request target, Shared Key verification also tries that
+narrow encoded spelling. It does not decode `%2521` into the same name. This
+follows the [Shared Key canonicalized-resource rule](https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-shared-key#constructing-the-canonicalized-resource-string).
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

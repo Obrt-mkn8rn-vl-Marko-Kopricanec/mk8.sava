@@ -36,6 +36,34 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task EscapedExclamationAndLiteralPercentBlobNamesMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-escaped-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseEscapedNamesAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseEscapedNamesAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.Equal("a!file,a%21file", expected.ListedNames);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SupportedFlatBlobSdkOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -392,6 +420,26 @@ public sealed class AzuriteDifferentialTests
 
     private static BlobClientOptions CreateOptions() =>
         new(BlobClientOptions.ServiceVersion.V2023_11_03) { Retry = { MaxRetries = 0 } };
+
+    private static async Task<EscapedNameObservation> ExerciseEscapedNamesAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var bang = container.GetBlobClient("a!file");
+        var percent = container.GetBlobClient("a%21file");
+        var bangUpload = await bang.UploadAsync(BinaryData.FromString("exclamation")).ConfigureAwait(false);
+        var percentUpload = await percent.UploadAsync(BinaryData.FromString("literal percent")).ConfigureAwait(false);
+        var bangContent = (await bang.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var percentContent = (await percent.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var names = new List<string>();
+        await foreach (var blob in container.GetBlobsAsync().ConfigureAwait(false))
+            names.Add(blob.Name);
+        return new EscapedNameObservation(
+            bangUpload.GetRawResponse().Status,
+            percentUpload.GetRawResponse().Status,
+            bangContent,
+            percentContent,
+            string.Join(',', names));
+    }
 
     private static async Task<AccountInformationObservation> ObserveAccountInformationAsync(
         BlobServiceClient service, string missingName)
@@ -965,6 +1013,10 @@ public sealed class AzuriteDifferentialTests
     private sealed record AccountInformationObservation(
         int ServiceStatus, int ContainerStatus, int BlobStatus,
         SkuName SkuName, AccountKind AccountKind, bool IsHierarchicalNamespaceEnabled);
+
+    private sealed record EscapedNameObservation(
+        int ExclamationUploadStatus, int LiteralPercentUploadStatus,
+        string ExclamationContent, string LiteralPercentContent, string ListedNames);
 
     private sealed record StagedBlobObservation(
         int UncommittedBlocks,

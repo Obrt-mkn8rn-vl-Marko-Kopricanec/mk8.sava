@@ -421,10 +421,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         {
             ["a/b"] = "ordinary separator",
             ["a//b"] = "empty segment",
+            ["a!file"] = "exclamation mark",
             ["%41"] = "literal escape",
             ["A"] = "decoded character",
             ["reserved ?#% ü.bin"] = "reserved and unicode"
         };
+        Assert.Equal($"/{container.Name}/a%21file", container.GetBlobClient("a!file").Uri.AbsolutePath);
 
         foreach (var pair in expected)
             await container.GetBlobClient(pair.Key).UploadAsync(BinaryData.FromString(pair.Value));
@@ -1817,7 +1819,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             SavaWebApplicationFactory.SecondAccountKey);
         var container = service.GetBlobContainerClient($"hns-sort-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        foreach (var name in new[] { "a-file", "a.file", "a0file", "a/child" })
+        foreach (var name in new[] { "a!file", "a-file", "a.file", "a0file", "a/child" })
             await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name));
 
         var listed = new List<string>();
@@ -1825,12 +1827,12 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         await foreach (var page in container.GetBlobsAsync().AsPages(pageSizeHint: 1))
         {
             listed.Add(Assert.Single(page.Values).Name);
-            Assert.True(listed.Count <= 5, "Recursive HNS listing did not advance its continuation.");
+            Assert.True(listed.Count <= 6, "Recursive HNS listing did not advance its continuation.");
             if (!string.IsNullOrEmpty(page.ContinuationToken))
                 Assert.True(continuations.Add(page.ContinuationToken));
         }
-        Assert.Equal(["a", "a/child", "a-file", "a.file", "a0file"], listed);
-        Assert.Equal(4, continuations.Count);
+        Assert.Equal(["a", "a/child", "a!file", "a-file", "a.file", "a0file"], listed);
+        Assert.Equal(5, continuations.Count);
 
         var ranged = new List<string>();
         await foreach (var blob in container.GetBlobsAsync(new GetBlobsOptions { StartFrom = "a.file" }))
@@ -1844,13 +1846,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var container = CreateClient(factory)
             .GetBlobContainerClient($"flat-sort-{Guid.NewGuid():N}");
         await container.CreateAsync();
-        foreach (var name in new[] { "a-file", "a.file", "a0file", "a/child" })
+        foreach (var name in new[] { "a!file", "a-file", "a.file", "a0file", "a/child" })
             await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name));
 
         var listed = new List<string>();
         await foreach (var page in container.GetBlobsAsync().AsPages(pageSizeHint: 1))
             listed.Add(Assert.Single(page.Values).Name);
-        Assert.Equal(["a-file", "a.file", "a/child", "a0file"], listed);
+        Assert.Equal(["a!file", "a-file", "a.file", "a/child", "a0file"], listed);
 
         var ranged = new List<string>();
         await foreach (var blob in container.GetBlobsAsync(new GetBlobsOptions { StartFrom = "a.file" }))
