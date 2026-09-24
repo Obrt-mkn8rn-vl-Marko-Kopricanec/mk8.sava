@@ -11,6 +11,57 @@ namespace Mk8.Sava.Tests;
 public sealed class CrossAccountCopyTests
 {
     [Fact]
+    public async Task LocalCrossAccountIncrementalCopyRejectsRecreatedSourceUnderFixedClock()
+    {
+        var clock = new FixedTimeProvider(DateTimeOffset.UtcNow);
+        var application = new SavaWebApplicationFactory(clock, new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:AsyncCopyCompletionDelay"] = "00:00:00"
+        });
+        await using var disposal = application.ConfigureAwait(true);
+        var sourceAccount = CreatePathClient(
+            application, SavaWebApplicationFactory.SecondAccountName, SavaWebApplicationFactory.SecondAccountKey);
+        var destinationAccount = CreatePathClient(
+            application, SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey);
+        var sourceContainer = sourceAccount.GetBlobContainerClient($"same-origin-source-{Guid.NewGuid():N}");
+        var destinationContainer = destinationAccount.GetBlobContainerClient($"same-origin-target-{Guid.NewGuid():N}");
+        await sourceContainer.CreateAsync().ConfigureAwait(true);
+        await destinationContainer.CreateAsync().ConfigureAwait(true);
+        var source = sourceContainer.GetPageBlobClient("source.vhd");
+        var destination = destinationContainer.GetPageBlobClient("backup.vhd");
+        await source.CreateAsync(512).ConfigureAwait(true);
+        var original = Enumerable.Repeat((byte)0xA5, 512).ToArray();
+        await source.UploadPagesAsync(new MemoryStream(original), 0).ConfigureAwait(true);
+        var firstSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var sourceSas = source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var invalidSas = new Uri(sourceSas.AbsoluteUri.Replace("sig=", "sig=0", StringComparison.Ordinal));
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+            await destination.StartCopyIncrementalAsync(invalidSas, firstSnapshot).ConfigureAwait(true))
+            .ConfigureAwait(true);
+        Assert.Equal(403, denied.Status);
+        Assert.False((await destination.ExistsAsync().ConfigureAwait(true)).Value);
+
+        var firstCopy = await destination.StartCopyIncrementalAsync(sourceSas, firstSnapshot).ConfigureAwait(true);
+        await firstCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(true);
+        var destinationSnapshot = (await destination.GetPropertiesAsync().ConfigureAwait(true)).Value.DestinationSnapshot!;
+        Assert.Equal(original, (await destination.WithSnapshot(destinationSnapshot)
+            .DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+
+        await source.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(true);
+        await source.CreateAsync(512).ConfigureAwait(true);
+        var replacementSnapshot = (await source.CreateSnapshotAsync().ConfigureAwait(true)).Value.Snapshot;
+        var replacementSas = source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var error = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+            await destination.StartCopyIncrementalAsync(replacementSas, replacementSnapshot).ConfigureAwait(true))
+            .ConfigureAwait(true);
+        Assert.Equal(409, error.Status);
+        Assert.Equal("IncrementalCopyBlobMismatch", error.ErrorCode);
+        Assert.Equal(original, (await destination.WithSnapshot(destinationSnapshot)
+            .DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToArray());
+    }
+
+    [Fact]
     public async Task IncrementalCopyReadsPrivatePageSnapshotInAnotherAccountWithSourceSas()
     {
         SavaWebApplicationFactory? application = null;
@@ -205,4 +256,19 @@ public sealed class CrossAccountCopyTests
             Transport = new HttpClientTransport(application.Server.CreateHandler()),
             Retry = { MaxRetries = 0 }
         });
+
+    private static BlobServiceClient CreatePathClient(
+        SavaWebApplicationFactory application, string accountName, string accountKey) => new(
+        new Uri($"http://127.0.0.1:10000/{accountName}"),
+        new StorageSharedKeyCredential(accountName, accountKey),
+        new BlobClientOptions
+        {
+            Transport = new HttpClientTransport(application.Server.CreateHandler()),
+            Retry = { MaxRetries = 0 }
+        });
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
+    }
 }
