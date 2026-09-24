@@ -1101,7 +1101,8 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         CancellationToken cancellationToken)
     {
         var hasExplicitSnapshotOrVersion = resolved.Snapshot is not null || resolved.VersionId is not null;
-        var deleteSnapshots = ReadDeleteSnapshotsOption(request, hasExplicitSnapshotOrVersion);
+        var deleteSnapshots = ReadDeleteSnapshotsOption(
+            request, resolved.Snapshot is not null, resolved.VersionId is not null);
         Require(context, permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
         EvaluateWriteConditions(request, blob);
         EnsureLease(request, blob.Lease, "blob");
@@ -2535,7 +2536,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         CancellationToken cancellationToken)
     {
         var hasExplicitSnapshotOrVersion = snapshot is not null || versionId is not null;
-        var deleteSnapshots = ReadDeleteSnapshotsOption(http.Request, hasExplicitSnapshotOrVersion);
+        var deleteSnapshots = ReadDeleteSnapshotsOption(
+            http.Request, snapshot is not null, versionId is not null);
         Require(request, permanentDelete ? 'y' : versionId is not null ? 'x' : 'd');
         EvaluateWriteConditions(http.Request, blob);
         BlobConditionEvaluator.EvaluateAccessTierDeleteConditions(
@@ -4657,7 +4659,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static BlobDeleteSnapshotsOption ReadDeleteSnapshotsOption(
         HttpRequest request,
-        bool hasExplicitSnapshotOrVersion)
+        bool hasExplicitSnapshot,
+        bool hasExplicitVersion)
     {
         const string headerName = "x-ms-delete-snapshots";
         var value = ProtocolParsing.First(request.Headers, headerName);
@@ -4667,7 +4670,12 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         RequireBlobSnapshots(
             context,
             request.HttpContext.RequestServices.GetRequiredService<BlobService>());
-        if (hasExplicitSnapshotOrVersion)
+        if (hasExplicitSnapshot)
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "InvalidOperation",
+                "Invalid operation against a blob snapshot.");
+        if (hasExplicitVersion)
             throw AzureStorageException.InvalidHeader(headerName, value);
         return value switch
         {

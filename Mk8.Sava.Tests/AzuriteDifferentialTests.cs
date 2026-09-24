@@ -140,6 +140,42 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task SnapshotDeletionModesMatchAzuriteAndPublishedDeleteContract()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-snapshot-delete-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseSnapshotDeletionModesAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseSnapshotDeletionModesAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.Equal(409, expected.MissingModeStatus);
+            Assert.Equal("SnapshotsPresent", expected.MissingModeCode);
+            Assert.Equal(400, expected.SnapshotWithModeStatus);
+            Assert.Equal(202, expected.OnlyStatus);
+            Assert.Equal(202, expected.IncludeStatus);
+            Assert.Equal("payload", expected.BaseAfterOnly);
+            Assert.False(expected.FirstSnapshotAfterOnly);
+            Assert.False(expected.BaseAfterInclude);
+            Assert.False(expected.SecondSnapshotAfterInclude);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task ContainerMetadataAccountSasGetAndHeadMatchAzuriteExceptDeniedCode()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1278,6 +1314,35 @@ public sealed class AzuriteDifferentialTests
         return ((int)response.StatusCode, errorCode);
     }
 
+    private static async Task<SnapshotDeleteObservation> ExerciseSnapshotDeletionModesAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("snapshot-delete.txt");
+        await blob.UploadAsync(BinaryData.FromString("payload")).ConfigureAwait(false);
+        var firstSnapshot = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var first = blob.WithSnapshot(firstSnapshot);
+        var missingMode = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DeleteAsync())
+            .ConfigureAwait(false);
+        var snapshotWithMode = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            first.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots)).ConfigureAwait(false);
+        var baseBefore = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var snapshotBefore = (await first.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var only = await blob.DeleteAsync(DeleteSnapshotsOption.OnlySnapshots).ConfigureAwait(false);
+        var firstAfterOnly = (await first.ExistsAsync().ConfigureAwait(false)).Value;
+        var baseAfterOnly = (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString();
+        var secondSnapshot = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var second = blob.WithSnapshot(secondSnapshot);
+        var include = await blob.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(false);
+        var baseAfterInclude = (await blob.ExistsAsync().ConfigureAwait(false)).Value;
+        var secondAfterInclude = (await second.ExistsAsync().ConfigureAwait(false)).Value;
+        return new SnapshotDeleteObservation(
+            missingMode.Status, missingMode.ErrorCode,
+            snapshotWithMode.Status, snapshotWithMode.ErrorCode,
+            baseBefore, snapshotBefore, only.Status, firstAfterOnly,
+            baseAfterOnly, include.Status, baseAfterInclude, secondAfterInclude);
+    }
+
     private static async Task DeleteIfExistsAsync(BlobContainerClient container)
     {
         try
@@ -1322,6 +1387,13 @@ public sealed class AzuriteDifferentialTests
     private sealed record BlobMetadataReadObservation(
         int GetStatus, int HeadStatus, int NotModifiedStatus,
         string Phase, int GetBodyLength, int HeadBodyLength);
+
+    private sealed record SnapshotDeleteObservation(
+        int MissingModeStatus, string? MissingModeCode,
+        int SnapshotWithModeStatus, string? SnapshotWithModeCode,
+        string BaseBefore, string SnapshotBefore, int OnlyStatus,
+        bool FirstSnapshotAfterOnly, string BaseAfterOnly,
+        int IncludeStatus, bool BaseAfterInclude, bool SecondSnapshotAfterInclude);
 
     private sealed record ContainerMetadataObservation(
         int GetStatus, int HeadStatus, string Phase,
