@@ -5439,126 +5439,13 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 SavaWebApplicationFactory.AccountName,
                 original with { DefaultServiceVersion = null },
                 CancellationToken.None);
+            await AssertInvalidServiceVersionSelectionsAsync(transport, blobUri, servicePropertiesUri, metadata);
 
-            using (var unsupported = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                unsupported.Headers.TryAddWithoutValidation("x-ms-version", "9999-01-01");
-                using var response = await transport.SendAsync(unsupported);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertDefaultServiceVersionAsync(transport, blobUri, servicePropertiesUri);
 
-            using (var missing = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                AddSharedKeyLiteAuthorization(missing);
-                using var response = await transport.SendAsync(missing);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                await AssertVersionedErrorAsync(response, "MissingRequiredHeader");
-            }
+            await AssertSasServiceVersionSelectionAsync(transport, blob);
 
-            using (var invalidDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
-            {
-                Content = new StringContent(
-                    "<StorageServiceProperties><DefaultServiceVersion>9999-01-01</DefaultServiceVersion></StorageServiceProperties>",
-                    Encoding.UTF8,
-                    "application/xml")
-            })
-            {
-                invalidDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(invalidDefault);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidXmlDocument", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            Assert.Null((await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None)).DefaultServiceVersion);
-
-            using (var setDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
-            {
-                Content = new StringContent(
-                    "<StorageServiceProperties><DefaultServiceVersion>2018-03-28</DefaultServiceVersion></StorageServiceProperties>",
-                    Encoding.UTF8,
-                    "application/xml")
-            })
-            {
-                setDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-                using var response = await transport.SendAsync(setDefault);
-                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-            }
-
-            using (var defaulted = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                AddSharedKeyLiteAuthorization(defaulted);
-                using var response = await transport.SendAsync(defaulted);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal("2018-03-28", response.Headers.GetValues("x-ms-version").Single());
-                Assert.True(response.Headers.Contains("x-ms-creation-time"));
-                Assert.False(response.Headers.Contains("x-ms-legal-hold"));
-            }
-
-            var sasUri = blob.GenerateSasUri(
-                BlobSasPermissions.Read,
-                DateTimeOffset.UtcNow.AddMinutes(10));
-            var signedVersion = ReadQueryParameter(sasUri, "sv");
-            using (var signedVersionRequest = new HttpRequestMessage(HttpMethod.Head, sasUri))
-            {
-                using var response = await transport.SendAsync(signedVersionRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal(signedVersion, response.Headers.GetValues("x-ms-version").Single());
-                Assert.True(response.Headers.Contains("x-ms-legal-hold"));
-            }
-
-            using (var apiVersionRequest = new HttpRequestMessage(
-                       HttpMethod.Head,
-                       AppendQuery(sasUri, "api-version=2012-02-12")))
-            {
-                using var response = await transport.SendAsync(apiVersionRequest);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal("2012-02-12", response.Headers.GetValues("x-ms-version").Single());
-                Assert.False(response.Headers.Contains("x-ms-creation-time"));
-                Assert.True(response.Headers.Contains("Accept-Ranges"));
-            }
-
-            var bearerToken = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
-            using (var missingBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                missingBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                using var response = await transport.SendAsync(missingBearerVersion);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            using (var oldBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                oldBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                oldBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
-                using var response = await transport.SendAsync(oldBearerVersion);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            using (var supportedBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                supportedBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                supportedBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-11-09");
-                using var response = await transport.SendAsync(supportedBearerVersion);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal("2017-11-09", response.Headers.GetValues("x-ms-version").Single());
-            }
-            using (var currentBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                currentBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                currentBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2026-12-06");
-                using var response = await transport.SendAsync(currentBearerVersion);
-                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-                Assert.Equal("2026-12-06", response.Headers.GetValues("x-ms-version").Single());
-            }
-            using (var unknownFutureVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
-            {
-                unknownFutureVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
-                unknownFutureVersion.Headers.TryAddWithoutValidation("x-ms-version", "2027-01-01");
-                using var response = await transport.SendAsync(unknownFutureVersion);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertBearerServiceVersionSelectionAsync(transport, blobUri);
         }
         finally
         {
@@ -5567,6 +5454,139 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 original,
                 CancellationToken.None);
         }
+    }
+
+    private static async Task AssertInvalidServiceVersionSelectionsAsync(
+        HttpClient transport,
+        Uri blobUri,
+        Uri servicePropertiesUri,
+        MetadataStore metadata)
+    {
+        using (var unsupported = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            unsupported.Headers.TryAddWithoutValidation("x-ms-version", "9999-01-01");
+            using var response = await transport.SendAsync(unsupported).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        using (var missing = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            AddSharedKeyLiteAuthorization(missing);
+            using var response = await transport.SendAsync(missing).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            await AssertVersionedErrorAsync(response, "MissingRequiredHeader").ConfigureAwait(false);
+        }
+
+        using (var invalidDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
+        {
+            Content = new StringContent(
+                "<StorageServiceProperties><DefaultServiceVersion>9999-01-01</DefaultServiceVersion></StorageServiceProperties>",
+                Encoding.UTF8,
+                "application/xml")
+        })
+        {
+            invalidDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(invalidDefault).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidXmlDocument", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.Null((await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None).ConfigureAwait(false)).DefaultServiceVersion);
+    }
+
+    private static async Task AssertDefaultServiceVersionAsync(
+        HttpClient transport,
+        Uri blobUri,
+        Uri servicePropertiesUri)
+    {
+        using (var setDefault = new HttpRequestMessage(HttpMethod.Put, servicePropertiesUri)
+        {
+            Content = new StringContent(
+                "<StorageServiceProperties><DefaultServiceVersion>2018-03-28</DefaultServiceVersion></StorageServiceProperties>",
+                Encoding.UTF8,
+                "application/xml")
+        })
+        {
+            setDefault.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+            using var response = await transport.SendAsync(setDefault).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        }
+
+        using var defaulted = new HttpRequestMessage(HttpMethod.Head, blobUri);
+        AddSharedKeyLiteAuthorization(defaulted);
+        using var defaultedResponse = await transport.SendAsync(defaulted).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, defaultedResponse.StatusCode);
+        Assert.Equal("2018-03-28", defaultedResponse.Headers.GetValues("x-ms-version").Single());
+        Assert.True(defaultedResponse.Headers.Contains("x-ms-creation-time"));
+        Assert.False(defaultedResponse.Headers.Contains("x-ms-legal-hold"));
+    }
+
+    private static async Task AssertSasServiceVersionSelectionAsync(HttpClient transport, BlobClient blob)
+    {
+        var sasUri = blob.GenerateSasUri(
+            BlobSasPermissions.Read,
+            DateTimeOffset.UtcNow.AddMinutes(10));
+        var signedVersion = ReadQueryParameter(sasUri, "sv");
+        using (var signedVersionRequest = new HttpRequestMessage(HttpMethod.Head, sasUri))
+        {
+            using var response = await transport.SendAsync(signedVersionRequest).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(signedVersion, response.Headers.GetValues("x-ms-version").Single());
+            Assert.True(response.Headers.Contains("x-ms-legal-hold"));
+        }
+
+        using var apiVersionRequest = new HttpRequestMessage(
+            HttpMethod.Head,
+            AppendQuery(sasUri, "api-version=2012-02-12"));
+        using var apiVersionResponse = await transport.SendAsync(apiVersionRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, apiVersionResponse.StatusCode);
+        Assert.Equal("2012-02-12", apiVersionResponse.Headers.GetValues("x-ms-version").Single());
+        Assert.False(apiVersionResponse.Headers.Contains("x-ms-creation-time"));
+        Assert.True(apiVersionResponse.Headers.Contains("Accept-Ranges"));
+    }
+
+    private static async Task AssertBearerServiceVersionSelectionAsync(HttpClient transport, Uri blobUri)
+    {
+        var bearerToken = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
+        using (var missingBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            missingBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            using var response = await transport.SendAsync(missingBearerVersion).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var oldBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            oldBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            oldBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-07-29");
+            using var response = await transport.SendAsync(oldBearerVersion).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var supportedBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            supportedBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            supportedBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2017-11-09");
+            using var response = await transport.SendAsync(supportedBearerVersion).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("2017-11-09", response.Headers.GetValues("x-ms-version").Single());
+        }
+        using (var currentBearerVersion = new HttpRequestMessage(HttpMethod.Head, blobUri))
+        {
+            currentBearerVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+            currentBearerVersion.Headers.TryAddWithoutValidation("x-ms-version", "2026-12-06");
+            using var response = await transport.SendAsync(currentBearerVersion).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("2026-12-06", response.Headers.GetValues("x-ms-version").Single());
+        }
+        using var unknownFutureVersion = new HttpRequestMessage(HttpMethod.Head, blobUri);
+        unknownFutureVersion.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearerToken);
+        unknownFutureVersion.Headers.TryAddWithoutValidation("x-ms-version", "2027-01-01");
+        using var futureResponse = await transport.SendAsync(unknownFutureVersion).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.BadRequest, futureResponse.StatusCode);
+        Assert.Equal("InvalidHeaderValue", futureResponse.Headers.GetValues("x-ms-error-code").Single());
     }
 
     [Fact]
@@ -5582,224 +5602,262 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             BlobSasPermissions.Read,
             DateTimeOffset.UtcNow.AddMinutes(5));
         using var transport = new HttpClient(factory.Server.CreateHandler());
+        var (legacyEtag, modernEtag) = await AssertHistoricalEtagsAsync(transport, blobSas);
+        await AssertHistoricalMatchConditionsAsync(transport, blobSas, content, legacyEtag, modernEtag);
 
-        async Task<HttpResponseMessage> SendBlobAsync(
-            HttpMethod method,
-            string version,
-            Action<HttpRequestMessage>? configure = null)
-        {
-            using var request = new HttpRequestMessage(method, blobSas);
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            configure?.Invoke(request);
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
+        await AssertHistoricalRangeShapesAsync(transport, blobSas, content.Length);
 
-        static string Header(HttpResponseMessage response, string name)
-        {
-            if (response.Headers.TryGetValues(name, out var responseValues))
-                return responseValues.Single();
-            Assert.True(response.Content.Headers.TryGetValues(name, out var contentValues), $"Missing response header: {name}");
-            return contentValues.Single();
-        }
+        await AssertHistoricalChecksumShapesAsync(transport, blobSas, content);
 
-        using var legacyHead = await SendBlobAsync(HttpMethod.Head, "2009-09-19");
+        await AssertHistoricalPageRangesAsync(transport, container);
+
+        await AssertHistoricalListingEtagsAsync(transport, container, legacyEtag, modernEtag);
+    }
+
+    private static async Task<HttpResponseMessage> SendHistoricalBlobAsync(
+        HttpClient transport,
+        Uri blobSas,
+        HttpMethod method,
+        string version,
+        Action<HttpRequestMessage>? configure = null)
+    {
+        using var request = new HttpRequestMessage(method, blobSas);
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        configure?.Invoke(request);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    private static string HistoricalHeader(HttpResponseMessage response, string name)
+    {
+        if (response.Headers.TryGetValues(name, out var responseValues))
+            return responseValues.Single();
+        Assert.True(response.Content.Headers.TryGetValues(name, out var contentValues),
+            $"Missing response header: {name}");
+        return contentValues.Single();
+    }
+
+    private static async Task<(string LegacyEtag, string ModernEtag)> AssertHistoricalEtagsAsync(
+        HttpClient transport,
+        Uri blobSas)
+    {
+        using var legacyHead = await SendHistoricalBlobAsync(transport, blobSas, HttpMethod.Head, "2009-09-19")
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, legacyHead.StatusCode);
-        var legacyEtag = Header(legacyHead, "ETag");
+        var legacyEtag = HistoricalHeader(legacyHead, "ETag");
         Assert.StartsWith("0x", legacyEtag, StringComparison.Ordinal);
         Assert.DoesNotContain('"', legacyEtag);
         Assert.False(legacyHead.Headers.Contains("Accept-Ranges"));
 
-        using var modernHead = await SendBlobAsync(HttpMethod.Head, "2011-08-18");
+        using var modernHead = await SendHistoricalBlobAsync(transport, blobSas, HttpMethod.Head, "2011-08-18")
+            .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.OK, modernHead.StatusCode);
-        var modernEtag = Header(modernHead, "ETag");
+        var modernEtag = HistoricalHeader(modernHead, "ETag");
         Assert.Equal($"\"{legacyEtag}\"", modernEtag);
-        Assert.Equal("bytes", Header(modernHead, "Accept-Ranges"));
+        Assert.Equal("bytes", HistoricalHeader(modernHead, "Accept-Ranges"));
+        return (legacyEtag, modernEtag);
+    }
 
-        using (var legacyMatch = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2009-09-19",
-                   request => request.Headers.TryAddWithoutValidation("If-Match", legacyEtag)))
+    private static async Task AssertHistoricalMatchConditionsAsync(
+        HttpClient transport,
+        Uri blobSas,
+        byte[] content,
+        string legacyEtag,
+        string modernEtag)
+    {
+        using (var legacyMatch = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2009-09-19",
+            request => request.Headers.TryAddWithoutValidation("If-Match", legacyEtag)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, legacyMatch.StatusCode);
-            Assert.Equal(content, await legacyMatch.Content.ReadAsByteArrayAsync());
+            Assert.Equal(content, await legacyMatch.Content.ReadAsByteArrayAsync().ConfigureAwait(false));
         }
-        using (var legacyQuotedMatch = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2009-09-19",
-                   request => request.Headers.TryAddWithoutValidation("If-Match", modernEtag)))
+        using (var legacyQuotedMatch = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2009-09-19",
+            request => request.Headers.TryAddWithoutValidation("If-Match", modernEtag)).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PreconditionFailed, legacyQuotedMatch.StatusCode);
-            await AssertVersionedErrorAsync(legacyQuotedMatch, "ConditionNotMet");
+            await AssertVersionedErrorAsync(legacyQuotedMatch, "ConditionNotMet").ConfigureAwait(false);
         }
-        using (var modernUnquotedMatch = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2011-08-18",
-                   request => request.Headers.TryAddWithoutValidation("If-Match", legacyEtag)))
-        {
-            Assert.Equal(HttpStatusCode.OK, modernUnquotedMatch.StatusCode);
-        }
+        using var modernUnquotedMatch = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2011-08-18",
+            request => request.Headers.TryAddWithoutValidation("If-Match", legacyEtag)).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, modernUnquotedMatch.StatusCode);
+    }
 
-        using (var legacyBoundedRange = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2009-09-19",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")))
+    private static async Task AssertHistoricalRangeShapesAsync(HttpClient transport, Uri blobSas, int contentLength)
+    {
+        using (var legacyBoundedRange = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2009-09-19",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PartialContent, legacyBoundedRange.StatusCode);
-            Assert.Equal("234", await legacyBoundedRange.Content.ReadAsStringAsync());
+            Assert.Equal("234", await legacyBoundedRange.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
-        using (var legacyOpenRange = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2009-09-19",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-")))
+        using (var legacyOpenRange = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2009-09-19",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, legacyOpenRange.StatusCode);
-            await AssertVersionedErrorAsync(legacyOpenRange, "InvalidRange");
+            await AssertVersionedErrorAsync(legacyOpenRange, "InvalidRange").ConfigureAwait(false);
         }
-        using (var modernOpenRange = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2011-08-18",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-")))
+        using (var modernOpenRange = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2011-08-18",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PartialContent, modernOpenRange.StatusCode);
-            Assert.Equal("23456789", await modernOpenRange.Content.ReadAsStringAsync());
+            Assert.Equal("23456789", await modernOpenRange.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
-        using (var unsupportedSuffixRange = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2023-11-03",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=-3")))
+        using (var unsupportedSuffixRange = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2023-11-03",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=-3")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, unsupportedSuffixRange.StatusCode);
             Assert.Equal("InvalidRange", unsupportedSuffixRange.Headers.GetValues("x-ms-error-code").Single());
         }
-        using (var rangedHead = await SendBlobAsync(
-                   HttpMethod.Head,
-                   "2023-11-03",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")))
-        {
-            Assert.Equal(HttpStatusCode.OK, rangedHead.StatusCode);
-            Assert.Equal(content.Length, rangedHead.Content.Headers.ContentLength);
-            Assert.Null(rangedHead.Content.Headers.ContentRange);
-        }
+        using var rangedHead = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Head, "2023-11-03",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, rangedHead.StatusCode);
+        Assert.Equal(contentLength, rangedHead.Content.Headers.ContentLength);
+        Assert.Null(rangedHead.Content.Headers.ContentRange);
+    }
 
+    private static async Task AssertHistoricalChecksumShapesAsync(HttpClient transport, Uri blobSas, byte[] content)
+    {
         var wholeMd5 = Convert.ToBase64String(AzureProtocolChecksum.Md5(content));
-        using (var oldRangeMd5Shape = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2015-12-11",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")))
+        using (var oldRangeMd5Shape = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2015-12-11",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PartialContent, oldRangeMd5Shape.StatusCode);
             Assert.False(oldRangeMd5Shape.Content.Headers.Contains("Content-MD5"));
             Assert.False(oldRangeMd5Shape.Headers.Contains("x-ms-blob-content-md5"));
         }
-        using (var rangedMd5Shape = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2016-05-31",
-                   request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")))
+        using (var rangedMd5Shape = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2016-05-31",
+            request => request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4")).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PartialContent, rangedMd5Shape.StatusCode);
             Assert.False(rangedMd5Shape.Content.Headers.Contains("Content-MD5"));
-            Assert.Equal(wholeMd5, Header(rangedMd5Shape, "x-ms-blob-content-md5"));
+            Assert.Equal(wholeMd5, HistoricalHeader(rangedMd5Shape, "x-ms-blob-content-md5"));
         }
-        using (var transactionalMd5 = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2016-05-31",
-                   request =>
-                   {
-                       request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4");
-                       request.Headers.TryAddWithoutValidation("x-ms-range-get-content-md5", "true");
-                   }))
+        using (var transactionalMd5 = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2016-05-31",
+            request =>
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4");
+                request.Headers.TryAddWithoutValidation("x-ms-range-get-content-md5", "true");
+            }).ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.PartialContent, transactionalMd5.StatusCode);
-            Assert.Equal(
-                Convert.ToBase64String(AzureProtocolChecksum.Md5(content.AsSpan(2, 3))),
-                Header(transactionalMd5, "Content-MD5"));
-            Assert.Equal(wholeMd5, Header(transactionalMd5, "x-ms-blob-content-md5"));
+            Assert.Equal(Convert.ToBase64String(AzureProtocolChecksum.Md5(content.AsSpan(2, 3))),
+                HistoricalHeader(transactionalMd5, "Content-MD5"));
+            Assert.Equal(wholeMd5, HistoricalHeader(transactionalMd5, "x-ms-blob-content-md5"));
         }
-        using (var oldCrc64 = await SendBlobAsync(
-                   HttpMethod.Get,
-                   "2018-11-09",
-                   request =>
-                   {
-                       request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4");
-                       request.Headers.TryAddWithoutValidation("x-ms-range-get-content-crc64", "true");
-                   }))
-        {
-            Assert.Equal(HttpStatusCode.Conflict, oldCrc64.StatusCode);
-            Assert.Equal("FeatureVersionMismatch", oldCrc64.Headers.GetValues("x-ms-error-code").Single());
-        }
+        using var oldCrc64 = await SendHistoricalBlobAsync(
+            transport, blobSas, HttpMethod.Get, "2018-11-09",
+            request =>
+            {
+                request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=2-4");
+                request.Headers.TryAddWithoutValidation("x-ms-range-get-content-crc64", "true");
+            }).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Conflict, oldCrc64.StatusCode);
+        Assert.Equal("FeatureVersionMismatch", oldCrc64.Headers.GetValues("x-ms-error-code").Single());
+    }
 
+    private static async Task AssertInvalidHistoricalPageRangeAsync(HttpClient transport, Uri pageSas, string range)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Put,
+            AppendQuery(pageSas, "comp=page"))
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        request.Headers.TryAddWithoutValidation("x-ms-page-write", "clear");
+        request.Headers.TryAddWithoutValidation("x-ms-range", range);
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, response.StatusCode);
+        Assert.Equal("InvalidPageRange", response.Headers.GetValues("x-ms-error-code").Single());
+    }
+
+    private static async Task<HttpResponseMessage> GetHistoricalPageRangesAsync(
+        HttpClient transport,
+        Uri pageSas,
+        string version,
+        string query)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Get,
+            AppendQuery(pageSas, $"comp=pagelist&{query}"));
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
+    private static async Task AssertHistoricalPageRangesAsync(HttpClient transport, BlobContainerClient container)
+    {
         var page = container.GetPageBlobClient("strict-range.vhd");
-        await page.CreateAsync(512);
+        await page.CreateAsync(512).ConfigureAwait(false);
         var pageSas = page.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(5));
-        async Task AssertInvalidPageRangeAsync(string range)
-        {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Put,
-                AppendQuery(pageSas, "comp=page"))
-            {
-                Content = new ByteArrayContent([])
-            };
-            request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            request.Headers.TryAddWithoutValidation("x-ms-page-write", "clear");
-            request.Headers.TryAddWithoutValidation("x-ms-range", range);
-            using var response = await transport.SendAsync(request).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.RequestedRangeNotSatisfiable, response.StatusCode);
-            Assert.Equal("InvalidPageRange", response.Headers.GetValues("x-ms-error-code").Single());
-        }
-        await AssertInvalidPageRangeAsync("bytes=0-");
-        await AssertInvalidPageRangeAsync("bytes=0-1023");
-        await AssertInvalidPageRangeAsync("bytes=1-511");
-        Assert.All((await page.DownloadContentAsync()).Value.Content.ToArray(), value => Assert.Equal(0, value));
+        await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=0-").ConfigureAwait(false);
+        await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=0-1023").ConfigureAwait(false);
+        await AssertInvalidHistoricalPageRangeAsync(transport, pageSas, "bytes=1-511").ConfigureAwait(false);
+        Assert.All((await page.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray(),
+            value => Assert.Equal(0, value));
 
-        await page.ResizeAsync(2560);
+        await page.ResizeAsync(2560).ConfigureAwait(false);
         foreach (var offset in new long[] { 0, 1024, 2048 })
         {
-            await page.UploadPagesAsync(
-                new MemoryStream(Enumerable.Repeat((byte)(offset / 512 + 1), 512).ToArray()),
-                offset);
+            using var payload = new MemoryStream(Enumerable.Repeat((byte)(offset / 512 + 1), 512).ToArray());
+            await page.UploadPagesAsync(payload, offset).ConfigureAwait(false);
         }
+        await AssertHistoricalPagedPageRangesAsync(transport, pageSas).ConfigureAwait(false);
+    }
 
-        async Task<HttpResponseMessage> GetPageRangesAsync(string version, string query)
-        {
-            using var request = new HttpRequestMessage(
-                HttpMethod.Get,
-                AppendQuery(pageSas, $"comp=pagelist&{query}"));
-            request.Headers.TryAddWithoutValidation("x-ms-version", version);
-            return await transport.SendAsync(request).ConfigureAwait(false);
-        }
-
-        using (var oldPagedRanges = await GetPageRangesAsync("2020-08-04", "maxresults=1"))
+    private static async Task AssertHistoricalPagedPageRangesAsync(HttpClient transport, Uri pageSas)
+    {
+        using (var oldPagedRanges = await GetHistoricalPageRangesAsync(
+            transport, pageSas, "2020-08-04", "maxresults=1").ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.Conflict, oldPagedRanges.StatusCode);
             Assert.Equal("FeatureVersionMismatch", oldPagedRanges.Headers.GetValues("x-ms-error-code").Single());
         }
-        using (var clampedRanges = await GetPageRangesAsync("2020-10-02", "maxresults=10001"))
+        using (var clampedRanges = await GetHistoricalPageRangesAsync(
+            transport, pageSas, "2020-10-02", "maxresults=10001").ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, clampedRanges.StatusCode);
-            var xml = await clampedRanges.Content.ReadAsStringAsync();
+            var xml = await clampedRanges.Content.ReadAsStringAsync().ConfigureAwait(false);
             Assert.Equal(3, xml.Split("<PageRange>", StringSplitOptions.None).Length - 1);
             Assert.Contains("<NextMarker />", xml, StringComparison.Ordinal);
         }
         string marker;
-        using (var firstRangePage = await GetPageRangesAsync("2020-10-02", "maxresults=1"))
+        using (var firstRangePage = await GetHistoricalPageRangesAsync(
+            transport, pageSas, "2020-10-02", "maxresults=1").ConfigureAwait(false))
         {
             Assert.Equal(HttpStatusCode.OK, firstRangePage.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await firstRangePage.Content.ReadAsStringAsync());
+            var document = System.Xml.Linq.XDocument.Parse(
+                await firstRangePage.Content.ReadAsStringAsync().ConfigureAwait(false));
             Assert.Single(document.Root!.Elements("PageRange"));
             marker = Assert.IsType<string>(document.Root.Element("NextMarker")?.Value);
             Assert.NotEmpty(marker);
         }
-        using (var secondRangePage = await GetPageRangesAsync(
-                   "2020-10-02",
-                   $"maxresults=1&marker={Uri.EscapeDataString(marker)}"))
-        {
-            Assert.Equal(HttpStatusCode.OK, secondRangePage.StatusCode);
-            var document = System.Xml.Linq.XDocument.Parse(await secondRangePage.Content.ReadAsStringAsync());
-            Assert.Single(document.Root!.Elements("PageRange"));
-        }
+        using var secondRangePage = await GetHistoricalPageRangesAsync(
+            transport, pageSas, "2020-10-02", $"maxresults=1&marker={Uri.EscapeDataString(marker)}")
+            .ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, secondRangePage.StatusCode);
+        var secondDocument = System.Xml.Linq.XDocument.Parse(
+            await secondRangePage.Content.ReadAsStringAsync().ConfigureAwait(false));
+        Assert.Single(secondDocument.Root!.Elements("PageRange"));
+    }
 
+    private static async Task AssertHistoricalListingEtagsAsync(
+        HttpClient transport,
+        BlobContainerClient container,
+        string legacyEtag,
+        string modernEtag)
+    {
         var listSas = container.GenerateSasUri(
             BlobContainerSasPermissions.Read | BlobContainerSasPermissions.List,
             DateTimeOffset.UtcNow.AddMinutes(5));
@@ -5807,17 +5865,17 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         using (var legacyListRequest = new HttpRequestMessage(HttpMethod.Get, listUri))
         {
             legacyListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2009-09-19");
-            using var response = await transport.SendAsync(legacyListRequest);
+            using var response = await transport.SendAsync(legacyListRequest).ConfigureAwait(false);
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Contains($"<Etag>{legacyEtag}</Etag>", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+            Assert.Contains($"<Etag>{legacyEtag}</Etag>",
+                await response.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
         }
-        using (var modernListRequest = new HttpRequestMessage(HttpMethod.Get, listUri))
-        {
-            modernListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2011-08-18");
-            using var response = await transport.SendAsync(modernListRequest);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-            Assert.Contains($"<Etag>{modernEtag}</Etag>", await response.Content.ReadAsStringAsync(), StringComparison.Ordinal);
-        }
+        using var modernListRequest = new HttpRequestMessage(HttpMethod.Get, listUri);
+        modernListRequest.Headers.TryAddWithoutValidation("x-ms-version", "2011-08-18");
+        using var modernResponse = await transport.SendAsync(modernListRequest).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.OK, modernResponse.StatusCode);
+        Assert.Contains($"<Etag>{modernEtag}</Etag>",
+            await modernResponse.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
     }
 
     [Fact]
