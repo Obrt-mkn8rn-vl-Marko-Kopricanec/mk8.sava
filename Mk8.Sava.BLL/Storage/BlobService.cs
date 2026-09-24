@@ -1128,6 +1128,7 @@ public sealed class BlobService(
         if (current.Kind != BlobKind.PageBlob || previous.Kind != BlobKind.PageBlob)
             throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidBlobType", "The blob type is invalid for this operation.");
         if (current.CreatedAt != previous.CreatedAt ||
+            !SamePageBlobIncarnation(current.PageBlobIncarnationId, previous.PageBlobIncarnationId) ||
             !string.Equals(current.Content.Domain, previous.Content.Domain, StringComparison.Ordinal))
         {
             throw new AzureStorageException(
@@ -2038,7 +2039,8 @@ public sealed class BlobService(
             $"{source.Account}/{source.Container}/{source.Name}",
             source.CreatedAt,
             source.SequenceNumber,
-            source.PageRanges);
+            source.PageRanges,
+            source.PageBlobIncarnationId);
         return await BeginIncrementalCopyCoreAsync(
             account,
             container,
@@ -2084,7 +2086,8 @@ public sealed class BlobService(
             sourceIdentity,
             sourceCreatedAt,
             sourceSequenceNumber,
-            sourcePageRanges);
+            sourcePageRanges,
+            null);
         return BeginIncrementalCopyCoreAsync(
             account,
             container,
@@ -2177,6 +2180,7 @@ public sealed class BlobService(
             IsIncrementalCopy = true,
             IncrementalCopySource = source.Identity,
             IncrementalCopySourceCreatedAt = source.CreatedAt,
+            IncrementalCopySourceIncarnationId = source.PageBlobIncarnationId,
             PendingCopyContent = preparedContent,
             PendingCopyPageRanges = [.. source.PageRanges],
             Copy = new CopyState
@@ -2216,7 +2220,9 @@ public sealed class BlobService(
             current = PrepareBlobWrite(current);
             if (!current.IsIncrementalCopy || current.Kind != BlobKind.PageBlob ||
                 !string.Equals(current.IncrementalCopySource, source.Identity, StringComparison.Ordinal) ||
-                current.IncrementalCopySourceCreatedAt != source.CreatedAt)
+                current.IncrementalCopySourceCreatedAt != source.CreatedAt ||
+                !SamePageBlobIncarnation(
+                    current.IncrementalCopySourceIncarnationId, source.PageBlobIncarnationId))
             {
                 throw new AzureStorageException(
                     StatusCodes.Status409Conflict,
@@ -2240,13 +2246,17 @@ public sealed class BlobService(
         return (current, encryption);
     }
 
+    private static bool SamePageBlobIncarnation(string? first, string? second) =>
+        first is null || second is null || string.Equals(first, second, StringComparison.Ordinal);
+
     private sealed record IncrementalCopySourceDescriptor(
         BlobKind Kind,
         string? Snapshot,
         string Identity,
         DateTimeOffset CreatedAt,
         long SequenceNumber,
-        IReadOnlyList<PageRange> PageRanges);
+        IReadOnlyList<PageRange> PageRanges,
+        string? PageBlobIncarnationId);
 
     // Preserve the exact x-ms-copy-source text in the stored copy state.
 #pragma warning disable CA1054
@@ -3691,30 +3701,7 @@ public sealed class BlobService(
         BlobWriteOptions options,
         DateTimeOffset now)
     {
-        if (options.ImmutabilityLocked && !options.ImmutabilityUntil.HasValue || options.ImmutabilityUntil <= now)
-        {
-            throw AzureStorageException.InvalidHeader(
-                "x-ms-immutability-policy-until-date",
-                options.ImmutabilityUntil?.ToString("R", CultureInfo.InvariantCulture));
-        }
-        if (options.AccessTier is not null &&
-            options.AccessTier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
-        {
-            throw AzureStorageException.InvalidHeader("x-ms-access-tier", options.AccessTier);
-        }
-        if (options.EncryptionScope is not null && options.AccessTierSpecified)
-            throw EncryptionScopeTierChangeNotSupported();
-        if (options.ExpiresAt.HasValue)
-        {
-            if (!IsHierarchicalNamespaceEnabled(account))
-                throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
-            if (options.ExpiresAt <= now)
-            {
-                throw AzureStorageException.InvalidHeader(
-                    "x-ms-expiry-time",
-                    options.ExpiresAt.Value.ToString("R", CultureInfo.InvariantCulture));
-            }
-        }
+        ValidateNewBlobOptions(account, options, now);
 
         return new BlobRecord
         {
@@ -3726,6 +3713,7 @@ public sealed class BlobService(
             IsCurrent = true,
             Kind = kind,
             Content = content,
+            PageBlobIncarnationId = kind == BlobKind.PageBlob ? Guid.NewGuid().ToString("N") : null,
             ETag = MetadataStore.NewETag(),
             CreatedAt = now,
             LastModified = now,
@@ -3750,6 +3738,34 @@ public sealed class BlobService(
             CustomerProvidedKeySha256 = options.CustomerProvidedKeySha256,
             SmartTierLastAccessedAt = string.Equals(options.AccessTier, "Smart", StringComparison.Ordinal) ? now : null
         };
+    }
+
+    private void ValidateNewBlobOptions(string account, BlobWriteOptions options, DateTimeOffset now)
+    {
+        if (options.ImmutabilityLocked && !options.ImmutabilityUntil.HasValue || options.ImmutabilityUntil <= now)
+        {
+            throw AzureStorageException.InvalidHeader(
+                "x-ms-immutability-policy-until-date",
+                options.ImmutabilityUntil?.ToString("R", CultureInfo.InvariantCulture));
+        }
+        if (options.AccessTier is not null &&
+            options.AccessTier is not ("Hot" or "Cool" or "Cold" or "Smart" or "Archive"))
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-access-tier", options.AccessTier);
+        }
+        if (options.EncryptionScope is not null && options.AccessTierSpecified)
+            throw EncryptionScopeTierChangeNotSupported();
+        if (options.ExpiresAt.HasValue)
+        {
+            if (!IsHierarchicalNamespaceEnabled(account))
+                throw AzureStorageException.InvalidHeader("x-ms-expiry-option");
+            if (options.ExpiresAt <= now)
+            {
+                throw AzureStorageException.InvalidHeader(
+                    "x-ms-expiry-time",
+                    options.ExpiresAt.Value.ToString("R", CultureInfo.InvariantCulture));
+            }
+        }
     }
 
     private void ValidateEncryptionContext(string account, BlobWriteOptions options)
