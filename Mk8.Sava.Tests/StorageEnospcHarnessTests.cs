@@ -103,6 +103,92 @@ public sealed class StorageEnospcHarnessTests
     }
 
     [Fact]
+    public async Task ExhaustedFilesystemDoesNotAcknowledgeFailedBlobDeletion()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
+        if (string.IsNullOrWhiteSpace(configuredPath))
+            return;
+
+        var mountRoot = ValidateMountRoot(configuredPath);
+        var dataPath = Path.Combine(mountRoot, "delete-data");
+        var fillerPath = Path.Combine(mountRoot, "delete-filler.bin");
+        var stableBytes = RandomNumberGenerator.GetBytes(32 * 1024);
+        var targetBytes = RandomNumberGenerator.GetBytes(32 * 1024);
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+
+        await AssertFailedDeletePreservesBlobsAsync(
+            dataPath, fillerPath, configuration, stableBytes, targetBytes).ConfigureAwait(true);
+        await AssertFailedDeleteRecoversAsync(
+            dataPath, configuration, stableBytes, targetBytes).ConfigureAwait(true);
+    }
+
+    private static async Task AssertFailedDeletePreservesBlobsAsync(
+        string dataPath,
+        string fillerPath,
+        Dictionary<string, string?> configuration,
+        byte[] stableBytes,
+        byte[] targetBytes)
+    {
+        var first = CreateHarness(dataPath, configuration);
+        try
+        {
+            await first.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(first).GetBlobContainerClient("enospc-delete");
+            await container.CreateAsync().ConfigureAwait(false);
+            var stable = container.GetBlobClient("stable.bin");
+            var target = container.GetBlobClient("target.bin");
+            await stable.UploadAsync(BinaryData.FromBytes(stableBytes)).ConfigureAwait(false);
+            await target.UploadAsync(BinaryData.FromBytes(targetBytes)).ConfigureAwait(false);
+
+            FillUntilNoSpace(fillerPath, releaseBytes: 0);
+            try
+            {
+                var failure = await Assert.ThrowsAsync<RequestFailedException>(
+                    () => target.DeleteAsync()).ConfigureAwait(false);
+                Assert.Equal(500, failure.Status);
+            }
+            finally
+            {
+                File.Delete(fillerPath);
+            }
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            Assert.Equal(targetBytes, (await target.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await first.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task AssertFailedDeleteRecoversAsync(
+        string dataPath,
+        Dictionary<string, string?> configuration,
+        byte[] stableBytes,
+        byte[] targetBytes)
+    {
+        var restarted = CreateHarness(dataPath, configuration);
+        try
+        {
+            await restarted.InitializeAsync().ConfigureAwait(false);
+            var container = CreateClient(restarted).GetBlobContainerClient("enospc-delete");
+            var stable = container.GetBlobClient("stable.bin");
+            var target = container.GetBlobClient("target.bin");
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            Assert.Equal(targetBytes, (await target.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+            await target.DeleteAsync().ConfigureAwait(false);
+            Assert.False((await target.ExistsAsync().ConfigureAwait(false)).Value);
+            Assert.Equal(stableBytes, (await stable.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        }
+        finally
+        {
+            await restarted.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    [Fact]
     public async Task ExhaustedFilesystemRollsBackFailedContainerMetadataCommit()
     {
         var configuredPath = Environment.GetEnvironmentVariable(DataPathVariable);
