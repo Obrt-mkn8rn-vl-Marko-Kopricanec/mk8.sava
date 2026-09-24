@@ -267,13 +267,14 @@ a stale `If-Match` on Get Block List. The differential records those two
 exceptions; mk8.sava returns an empty snapshot uncommitted list and 412
 `ConditionNotMet`, following the
 [published Get Block List contract](https://learn.microsoft.com/en-us/rest/api/storageservices/get-block-list).
-A twenty-second scenario lists a snapshotted blob and a second blob with
+A twenty-second scenario lists a twice-snapshotted blob and a second blob with
 metadata through the official SDK, both unpaged and with one-item pages.
-Mk8.sava and Azurite agree that the snapshot precedes the current blob in
-the unpaged result. Mk8.sava returns all three entries through continuation
-tokens; Azurite 3.35.0 skips the current blob when its snapshot shares a
-page boundary. The test records this emulator limitation explicitly rather
-than dropping a blob to match it. The [List Blobs contract](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs)
+Both include the snapshots and current blob without paging, but mk8.sava
+lists snapshots oldest-to-newest while Azurite 3.35.0 reverses them.
+Mk8.sava returns all four entries through one-item continuation tokens;
+Azurite loses the older snapshot and current blob when crossing the same-
+name page boundary. The test records these emulator limitations explicitly.
+The [List Blobs contract](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs)
 includes snapshots when requested and specifies oldest-to-newest snapshot
 order and opaque continuation markers.
 The script configures Azurite with the test account key used by mk8.sava and
