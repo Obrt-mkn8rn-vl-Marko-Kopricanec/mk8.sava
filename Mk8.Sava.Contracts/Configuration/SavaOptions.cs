@@ -158,39 +158,47 @@ public sealed class SavaOptions : IValidatableObject
                     $"AccountCapabilities for '{accountName}' combines change feed with hierarchical namespace, which Azure does not support.",
                     [nameof(AccountCapabilities)]);
             }
-            var versionLevelImmutability = capabilities.ImmutableStorageWithVersioningEnabled ||
-                                           capabilities.ImmutableStorageWithVersioningContainers.Count > 0;
-            if (versionLevelImmutability && !capabilities.VersioningEnabled)
-            {
-                yield return new ValidationResult(
-                    $"AccountCapabilities for '{accountName}' enables immutable storage with versioning without blob versioning.",
-                    [nameof(AccountCapabilities)]);
-            }
-            if (versionLevelImmutability && capabilities.HierarchicalNamespaceEnabled)
-            {
-                yield return new ValidationResult(
-                    $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and hierarchical namespace.",
-                    [nameof(AccountCapabilities)]);
-            }
-            if (versionLevelImmutability && capabilities.LastAccessTimeTrackingEnabled)
-            {
-                yield return new ValidationResult(
-                    $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and last-access-time tracking.",
-                    [nameof(AccountCapabilities)]);
-            }
-            if (capabilities.ImmutableStorageWithVersioningContainers.Any(string.IsNullOrWhiteSpace))
-            {
-                yield return new ValidationResult(
-                    $"AccountCapabilities for '{accountName}' contains a blank immutable-storage container name.",
-                    [nameof(AccountCapabilities)]);
-            }
-            if (capabilities.SasExpirationPeriod is { } sasExpirationPeriod &&
-                sasExpirationPeriod <= TimeSpan.Zero)
-            {
-                yield return new ValidationResult(
-                    $"AccountCapabilities for '{accountName}' has a non-positive SAS expiration period.",
-                    [nameof(AccountCapabilities)]);
-            }
+            foreach (var error in ValidateImmutabilityAndExpiration(accountName, capabilities))
+                yield return error;
+        }
+    }
+
+    private static IEnumerable<ValidationResult> ValidateImmutabilityAndExpiration(
+        string accountName,
+        StorageAccountCapabilities capabilities)
+    {
+        var versionLevelImmutability = capabilities.ImmutableStorageWithVersioningEnabled ||
+                                       capabilities.ImmutableStorageWithVersioningContainers.Count > 0;
+        if (versionLevelImmutability && !capabilities.VersioningEnabled)
+        {
+            yield return new ValidationResult(
+                $"AccountCapabilities for '{accountName}' enables immutable storage with versioning without blob versioning.",
+                [nameof(AccountCapabilities)]);
+        }
+        if (versionLevelImmutability && capabilities.HierarchicalNamespaceEnabled)
+        {
+            yield return new ValidationResult(
+                $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and hierarchical namespace.",
+                [nameof(AccountCapabilities)]);
+        }
+        if (versionLevelImmutability && capabilities.LastAccessTimeTrackingEnabled)
+        {
+            yield return new ValidationResult(
+                $"AccountCapabilities for '{accountName}' combines immutable storage with versioning and last-access-time tracking.",
+                [nameof(AccountCapabilities)]);
+        }
+        if (capabilities.ImmutableStorageWithVersioningContainers.Any(string.IsNullOrWhiteSpace))
+        {
+            yield return new ValidationResult(
+                $"AccountCapabilities for '{accountName}' contains a blank immutable-storage container name.",
+                [nameof(AccountCapabilities)]);
+        }
+        if (capabilities.SasExpirationPeriod is { } sasExpirationPeriod &&
+            sasExpirationPeriod <= TimeSpan.Zero)
+        {
+            yield return new ValidationResult(
+                $"AccountCapabilities for '{accountName}' has a non-positive SAS expiration period.",
+                [nameof(AccountCapabilities)]);
         }
     }
 

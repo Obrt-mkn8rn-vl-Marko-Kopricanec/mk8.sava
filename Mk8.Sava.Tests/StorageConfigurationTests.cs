@@ -132,4 +132,37 @@ public sealed class StorageConfigurationTests
             error.MemberNames.Contains(nameof(SavaOptions.AccountCapabilities), StringComparer.Ordinal) &&
             error.ErrorMessage!.Contains("hierarchical namespace", StringComparison.Ordinal));
     }
+
+    [Fact]
+    public void ImmutabilityAndExpirationCapabilityErrorsRetainTheirOrder()
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
+            },
+            AccountCapabilities = new Dictionary<string, StorageAccountCapabilities>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = new()
+                {
+                    HierarchicalNamespaceEnabled = true,
+                    LastAccessTimeTrackingEnabled = true,
+                    ImmutableStorageWithVersioningEnabled = true,
+                    ImmutableStorageWithVersioningContainers = new HashSet<string>(StringComparer.Ordinal) { "" },
+                    SasExpirationPeriod = TimeSpan.Zero
+                }
+            }
+        };
+
+        var errors = options.Validate(new ValidationContext(options))
+            .Where(error => error.MemberNames.Contains(nameof(SavaOptions.AccountCapabilities), StringComparer.Ordinal))
+            .ToArray();
+        Assert.Collection(errors,
+            error => Assert.Contains("without blob versioning", error.ErrorMessage, StringComparison.Ordinal),
+            error => Assert.Contains("hierarchical namespace", error.ErrorMessage, StringComparison.Ordinal),
+            error => Assert.Contains("last-access-time tracking", error.ErrorMessage, StringComparison.Ordinal),
+            error => Assert.Contains("blank immutable-storage", error.ErrorMessage, StringComparison.Ordinal),
+            error => Assert.Contains("non-positive SAS expiration", error.ErrorMessage, StringComparison.Ordinal));
+    }
 }
