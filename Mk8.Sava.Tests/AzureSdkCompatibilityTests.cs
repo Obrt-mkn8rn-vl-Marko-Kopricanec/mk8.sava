@@ -7862,6 +7862,50 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
+    public async Task SnapshotAndVersionBlockListsDoNotReadCurrentBlocksOrStaging()
+    {
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:VersioningEnabled"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application)
+            .GetBlobContainerClient($"block-history-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var blob = container.GetBlockBlobClient("history.bin");
+        var firstId = Convert.ToBase64String("0001"u8);
+        var secondId = Convert.ToBase64String("0002"u8);
+        var thirdId = Convert.ToBase64String("0003"u8);
+        var stagedId = Convert.ToBase64String("0004"u8);
+        await blob.StageBlockAsync(firstId, new MemoryStream("first"u8.ToArray(), writable: false));
+        await blob.StageBlockAsync(secondId, new MemoryStream("second"u8.ToArray(), writable: false));
+        var firstVersionId = (await blob.CommitBlockListAsync([secondId, firstId])).Value.VersionId;
+        Assert.False(string.IsNullOrEmpty(firstVersionId));
+        var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
+        await blob.StageBlockAsync(thirdId, new MemoryStream("third"u8.ToArray(), writable: false));
+        await blob.CommitBlockListAsync([thirdId]);
+        await blob.StageBlockAsync(stagedId, new MemoryStream("staged"u8.ToArray(), writable: false));
+
+        var current = (await blob.GetBlockListAsync(BlockListTypes.All)).Value;
+        Assert.Equal([thirdId], current.CommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
+        Assert.Equal([stagedId], current.UncommittedBlocks.Select(block => block.Name), StringComparer.Ordinal);
+
+        var snapshot = (await blob.WithSnapshot(snapshotId).GetBlockListAsync(BlockListTypes.All)).Value;
+        var version = (await blob.WithVersion(firstVersionId).GetBlockListAsync(BlockListTypes.All)).Value;
+        foreach (var historical in new[] { snapshot, version })
+        {
+            Assert.Equal([secondId, firstId], historical.CommittedBlocks.Select(block => block.Name),
+                StringComparer.Ordinal);
+            Assert.Empty(historical.UncommittedBlocks);
+        }
+        Assert.Equal("secondfirst",
+            (await blob.WithSnapshot(snapshotId).DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("secondfirst",
+            (await blob.WithVersion(firstVersionId).DownloadContentAsync()).Value.Content.ToString());
+    }
+
+    [Fact]
     public async Task AppendCountAndLeaseStateMatchSdkExpectations()
     {
         var service = CreateClient(factory);
@@ -15752,7 +15796,7 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         etag = await AssertMetadataConditionPriorityAsync(blob, metadataUri, transport, before, after);
         await AssertRejectedMetadataConditionCombinationsAsync(blob, metadataUri, transport, etag, before);
         await AssertContainerConditionSemanticsAsync(container, transport, after);
-        await AssertUnconditionalBlockAndTagReadsAsync(blobUri, transport);
+        await AssertConditionalBlockListAndUnconditionalTagReadsAsync(blobUri, transport);
     }
 
     private static void AddVersion(HttpRequestMessage request, string version = "2023-11-03") =>
@@ -15922,7 +15966,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
-    private static async Task AssertUnconditionalBlockAndTagReadsAsync(Uri blobUri, HttpClient transport)
+    private static async Task AssertConditionalBlockListAndUnconditionalTagReadsAsync(
+        Uri blobUri, HttpClient transport)
     {
         using (var request = new HttpRequestMessage(
                    HttpMethod.Get,
@@ -15931,7 +15976,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             AddVersion(request);
             request.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
             using var response = await transport.SendAsync(request).ConfigureAwait(false);
-            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal(HttpStatusCode.PreconditionFailed, response.StatusCode);
+            Assert.Equal("ConditionNotMet", response.Headers.GetValues("x-ms-error-code").Single());
         }
 
         using (var request = new HttpRequestMessage(HttpMethod.Get, AppendQuery(blobUri, "comp=tags")))

@@ -342,6 +342,52 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task SnapshotBlockListsAndOmittedListTypeMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-block-history-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            using var azuriteTransport = new HttpClient();
+            using var localTransport = new HttpClient(application.Server.CreateHandler());
+            var expected = await ObserveSnapshotBlockListsAsync(azuriteContainer, azuriteTransport)
+                .ConfigureAwait(false);
+            var actual = await ObserveSnapshotBlockListsAsync(localContainer, localTransport)
+                .ConfigureAwait(false);
+            // Azurite 3.35.0 attaches live uncommitted blocks to snapshots and ignores
+            // If-Match. The published Get Block List contract requires neither behavior.
+            Assert.Equal("MDAwNA==", expected.SnapshotUncommitted);
+            Assert.Equal(200, expected.StaleIfMatchStatus);
+            Assert.Null(expected.StaleIfMatchCode);
+            Assert.Equal(expected with
+            {
+                SnapshotUncommitted = string.Empty,
+                StaleIfMatchStatus = 412,
+                StaleIfMatchCode = "ConditionNotMet"
+            }, actual);
+            Assert.Equal("MDAwMg==,MDAwMQ==", expected.SnapshotCommitted);
+            Assert.Equal("MDAwMw==", expected.CurrentCommitted);
+            Assert.Equal("MDAwNA==", expected.CurrentUncommitted);
+            Assert.Equal(string.Empty, actual.SnapshotUncommitted);
+            Assert.False(expected.OmittedTypeIncludesUncommitted);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task AppendAndPageBlobOperationsMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -969,6 +1015,60 @@ public sealed class AzuriteDifferentialTests
             content, snapshotContent, rejected.Status, rejected.ErrorCode, tags["phase"]);
     }
 
+    private static async Task<BlockListSnapshotObservation> ObserveSnapshotBlockListsAsync(
+        BlobContainerClient container,
+        HttpClient transport)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlockBlobClient("history.bin");
+        var firstId = Convert.ToBase64String("0001"u8);
+        var secondId = Convert.ToBase64String("0002"u8);
+        var thirdId = Convert.ToBase64String("0003"u8);
+        var fourthId = Convert.ToBase64String("0004"u8);
+        await blob.StageBlockAsync(firstId, new MemoryStream("first"u8.ToArray(), writable: false))
+            .ConfigureAwait(false);
+        await blob.StageBlockAsync(secondId, new MemoryStream("second"u8.ToArray(), writable: false))
+            .ConfigureAwait(false);
+        await blob.CommitBlockListAsync([secondId, firstId]).ConfigureAwait(false);
+        var snapshot = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        await blob.StageBlockAsync(thirdId, new MemoryStream("third"u8.ToArray(), writable: false))
+            .ConfigureAwait(false);
+        await blob.CommitBlockListAsync([thirdId]).ConfigureAwait(false);
+        await blob.StageBlockAsync(fourthId, new MemoryStream("fourth"u8.ToArray(), writable: false))
+            .ConfigureAwait(false);
+
+        var current = (await blob.GetBlockListAsync(BlockListTypes.All).ConfigureAwait(false)).Value;
+        var historical = (await blob.WithSnapshot(snapshot).GetBlockListAsync(BlockListTypes.All)
+            .ConfigureAwait(false)).Value;
+        var sasUri = blob.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var defaultRequestUri = new UriBuilder(sasUri)
+        {
+            Query = sasUri.Query.TrimStart('?') + "&comp=blocklist"
+        }.Uri;
+        using var response = await transport.GetAsync(defaultRequestUri).ConfigureAwait(false);
+        var defaultBody = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        var conditionalUri = new UriBuilder(sasUri)
+        {
+            Query = sasUri.Query.TrimStart('?') + "&comp=blocklist&blocklisttype=committed"
+        }.Uri;
+        using var conditionalRequest = new HttpRequestMessage(HttpMethod.Get, conditionalUri);
+        conditionalRequest.Headers.TryAddWithoutValidation("If-Match", "\"missing\"");
+        using var conditionalResponse = await transport.SendAsync(conditionalRequest).ConfigureAwait(false);
+        var conditionCode = conditionalResponse.Headers.TryGetValues("x-ms-error-code", out var errorCodes)
+            ? errorCodes.Single()
+            : null;
+
+        return new BlockListSnapshotObservation(
+            string.Join(',', current.CommittedBlocks.Select(block => block.Name)),
+            string.Join(',', current.UncommittedBlocks.Select(block => block.Name)),
+            string.Join(',', historical.CommittedBlocks.Select(block => block.Name)),
+            string.Join(',', historical.UncommittedBlocks.Select(block => block.Name)),
+            (int)response.StatusCode,
+            defaultBody.Contains("<UncommittedBlocks>", StringComparison.Ordinal),
+            (int)conditionalResponse.StatusCode,
+            conditionCode);
+    }
+
     private static async Task<AppendPageObservation> ExerciseAppendAndPageAsync(BlobContainerClient container)
     {
         await container.CreateAsync().ConfigureAwait(false);
@@ -1567,6 +1667,16 @@ public sealed class AzuriteDifferentialTests
         int MissingLeaseStatus,
         string? MissingLeaseCode,
         string Tag);
+
+    private sealed record BlockListSnapshotObservation(
+        string CurrentCommitted,
+        string CurrentUncommitted,
+        string SnapshotCommitted,
+        string SnapshotUncommitted,
+        int OmittedTypeStatus,
+        bool OmittedTypeIncludesUncommitted,
+        int StaleIfMatchStatus,
+        string? StaleIfMatchCode);
 
     private sealed record AppendPageObservation(
         int AppendCreateStatus,

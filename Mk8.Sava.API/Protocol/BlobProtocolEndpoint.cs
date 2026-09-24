@@ -1396,7 +1396,9 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         }
         if (HttpMethods.IsGet(http.Request.Method) && string.Equals(route.Comp, "blocklist", StringComparison.Ordinal))
         {
-            await HandleBlobGetBlockListRouteAsync(http, request, service, route.ContainerName, route.BlobName, cancellationToken).ConfigureAwait(false);
+            await HandleBlobGetBlockListRouteAsync(
+                http, request, service, route.ContainerName, route.BlobName,
+                route.VersionId, route.Snapshot, cancellationToken).ConfigureAwait(false);
             return true;
         }
         if (HttpMethods.IsPut(http.Request.Method) && string.Equals(route.Comp, "undelete", StringComparison.Ordinal))
@@ -2052,26 +2054,57 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         BlobService service,
         string containerName,
         string blobName,
+        string? versionId,
+        string? snapshot,
         CancellationToken cancellationToken)
     {
         Require(request, 'r');
-        var current = await TryGetCurrentBlobAsync(service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
-        ValidateBlobTypeVersion(request, current?.Kind);
-        if (current is null)
+        var historical = versionId is not null || snapshot is not null;
+        var selected = historical
+            ? await service.GetBlobAsync(
+                request.Account, containerName, blobName, versionId, snapshot,
+                includeDeleted: false, cancellationToken).ConfigureAwait(false)
+            : await TryGetCurrentBlobAsync(
+                service, request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
+        if (request.Authorization.AclReadChecked)
+        {
+            if (selected is null)
+                throw AzureStorageException.AuthorizationFailure();
+            HierarchicalAclAuthorization.EnsureAuthorizedGeneration(
+                request.Authorization, selected.GenerationId);
+        }
+        ValidateBlobTypeVersion(request, selected?.Kind);
+        if (selected is not null && selected.Kind != BlobKind.BlockBlob)
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest, "InvalidBlobType",
+                "Get Block List is supported only for block blobs.");
+        if (selected is null)
             EvaluateTagCondition(http.Request, null, "x-ms-if-tags", source: false);
         else
-            EvaluateTagCondition(http.Request, current, "x-ms-if-tags", source: false);
+            EvaluateReadConditions(http.Request, selected);
         ValidateOptionalLease(
             http.Request,
-            current?.Lease ?? LeaseRecord.Available,
+            selected?.Lease ?? LeaseRecord.Available,
             "blob");
-        var staged = await service.ListStagedBlocksAsync(request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
-        if (current is null && staged.Count == 0)
+        IReadOnlyList<StagedBlockRecord> staged = historical
+            ? []
+            : await service.ListStagedBlocksAsync(
+                request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
+        if (selected is null && staged.Count == 0)
             throw AzureStorageException.BlobNotFound();
-        var listType = http.Request.Query["blocklisttype"].ToString().ToRequiredLowerInvariant();
+        var listType = http.Request.Query["blocklisttype"].ToString();
+        listType = listType.Length == 0 ? "committed" : listType.ToRequiredLowerInvariant();
         if (listType is not ("all" or "committed" or "uncommitted"))
             throw AzureStorageException.InvalidQuery("blocklisttype");
-        await AzureResponseWriter.WriteBlockListAsync(http, current, staged, listType, cancellationToken).ConfigureAwait(false);
+        if (selected is not null)
+        {
+            http.Response.Headers["x-ms-blob-content-length"] =
+                selected.Content.Length.ToString(CultureInfo.InvariantCulture);
+            if (selected.CommittedBlocks.Count > 0)
+                AzureResponseWriter.AddBlobEntityHeaders(http.Response, selected);
+        }
+        await AzureResponseWriter.WriteBlockListAsync(
+            http, selected, staged, listType, cancellationToken).ConfigureAwait(false);
         return;
     }
 
