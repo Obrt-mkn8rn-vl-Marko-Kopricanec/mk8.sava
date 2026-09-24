@@ -556,21 +556,6 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await firstContainer.CreateAsync();
             await secondContainer.CreateAsync();
 
-            async Task UploadTaggedAsync(BlobContainerClient container, string name, string project, string rank)
-            {
-                await container.GetBlobClient(name).UploadAsync(
-                    BinaryData.FromString(name),
-                    new BlobUploadOptions
-                    {
-                        Tags = new Dictionary<string, string>(StringComparer.Ordinal)
-                        {
-                            ["project"] = project,
-                            ["rank"] = rank,
-                            ["unselected"] = "not returned"
-                        }
-                    }).ConfigureAwait(false);
-            }
-
             await UploadTaggedAsync(firstContainer, "a", token, "010");
             await UploadTaggedAsync(firstContainer, "b", token, "050");
             await UploadTaggedAsync(firstContainer, "c", token, "150");
@@ -578,62 +563,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             await UploadTaggedAsync(secondContainer, "e", "another-project", "020");
 
             var expression = $"\"project\" = '{token}' AND rank >= '010' AND rank < '100'";
-            var matches = new List<TaggedBlobItem>();
-            var markers = new HashSet<string>(StringComparer.Ordinal);
-            await foreach (var page in service.FindBlobsByTagsAsync(expression).AsPages(pageSizeHint: 1))
-            {
-                Assert.Single(page.Values);
-                matches.Add(page.Values[0]);
-                if (!string.IsNullOrEmpty(page.ContinuationToken))
-                {
-                    Assert.StartsWith("mk8t1.", page.ContinuationToken, StringComparison.Ordinal);
-                    Assert.True(markers.Add(page.ContinuationToken));
-                }
-            }
-            Assert.Equal(
-                [
-                    $"{firstContainer.Name}/a",
-                    $"{firstContainer.Name}/b",
-                    $"{secondContainer.Name}/d"
-                ],
-                matches.Select(item => $"{item.BlobContainerName}/{item.BlobName}"), StringComparer.Ordinal);
-            Assert.Equal(2, markers.Count);
-            Assert.All(matches, item =>
-            {
-                Assert.Equal(2, item.Tags.Count);
-                Assert.Equal(token, item.Tags["project"]);
-                Assert.False(item.Tags.ContainsKey("unselected"));
-            });
-
-            var scoped = new List<string>();
-            await foreach (var item in firstContainer.FindBlobsByTagsAsync($"\"project\" = '{token}'"))
-                scoped.Add(item.BlobName);
-            Assert.Equal(["a", "b", "c"], scoped);
-
-            await firstContainer.GetBlobClient("b").SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal)
-            {
-                ["project"] = "changed",
-                ["rank"] = "050"
-            });
-            var afterUpdate = new List<string>();
-            await foreach (var item in service.FindBlobsByTagsAsync(expression))
-                afterUpdate.Add($"{item.BlobContainerName}/{item.BlobName}");
-            Assert.Equal([$"{firstContainer.Name}/a", $"{secondContainer.Name}/d"], afterUpdate);
-
-            var invalidExpression = await Assert.ThrowsAsync<RequestFailedException>(async () =>
-            {
-                await foreach (var _ in service.FindBlobsByTagsAsync(
-                                   $"\"project\" > '{token}' AND \"project\" >= '{token}'").ConfigureAwait(false))
-                {
-                }
-            });
-            Assert.Equal(400, invalidExpression.Status);
-
-            var invalidTag = await Assert.ThrowsAsync<RequestFailedException>(() =>
-                firstContainer.GetBlobClient("a").SetTagsAsync(
-                    new Dictionary<string, string>(StringComparer.Ordinal) { ["bad?"] = "value" }));
-            Assert.Equal(400, invalidTag.Status);
-            Assert.Equal("InvalidTag", invalidTag.ErrorCode);
+            await AssertIndexedTagQueryPagesAsync(service, firstContainer, secondContainer, token, expression);
+            await AssertTagUpdateAndValidationAsync(service, firstContainer, secondContainer, token, expression);
 
             var directConnectionString = new SqliteConnectionStringBuilder
             {
@@ -661,6 +592,97 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             if (Directory.Exists(rejectedBackupPath))
                 Directory.Delete(rejectedBackupPath, recursive: true);
         }
+    }
+
+    private static async Task UploadTaggedAsync(
+        BlobContainerClient container, string name, string project, string rank)
+    {
+        await container.GetBlobClient(name).UploadAsync(
+            BinaryData.FromString(name),
+            new BlobUploadOptions
+            {
+                Tags = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["project"] = project,
+                    ["rank"] = rank,
+                    ["unselected"] = "not returned"
+                }
+            }).ConfigureAwait(false);
+    }
+
+    private static async Task AssertIndexedTagQueryPagesAsync(
+        BlobServiceClient service,
+        BlobContainerClient firstContainer,
+        BlobContainerClient secondContainer,
+        string token,
+        string expression)
+    {
+        var matches = new List<TaggedBlobItem>();
+        var markers = new HashSet<string>(StringComparer.Ordinal);
+        await foreach (var page in service.FindBlobsByTagsAsync(expression).AsPages(pageSizeHint: 1)
+                           .ConfigureAwait(false))
+        {
+            Assert.Single(page.Values);
+            matches.Add(page.Values[0]);
+            if (!string.IsNullOrEmpty(page.ContinuationToken))
+            {
+                Assert.StartsWith("mk8t1.", page.ContinuationToken, StringComparison.Ordinal);
+                Assert.True(markers.Add(page.ContinuationToken));
+            }
+        }
+        Assert.Equal(
+            [
+                $"{firstContainer.Name}/a",
+                $"{firstContainer.Name}/b",
+                $"{secondContainer.Name}/d"
+            ],
+            matches.Select(item => $"{item.BlobContainerName}/{item.BlobName}"), StringComparer.Ordinal);
+        Assert.Equal(2, markers.Count);
+        Assert.All(matches, item =>
+        {
+            Assert.Equal(2, item.Tags.Count);
+            Assert.Equal(token, item.Tags["project"]);
+            Assert.False(item.Tags.ContainsKey("unselected"));
+        });
+
+        var scoped = new List<string>();
+        await foreach (var item in firstContainer.FindBlobsByTagsAsync($"\"project\" = '{token}'")
+                           .ConfigureAwait(false))
+            scoped.Add(item.BlobName);
+        Assert.Equal(["a", "b", "c"], scoped);
+    }
+
+    private static async Task AssertTagUpdateAndValidationAsync(
+        BlobServiceClient service,
+        BlobContainerClient firstContainer,
+        BlobContainerClient secondContainer,
+        string token,
+        string expression)
+    {
+        await firstContainer.GetBlobClient("b").SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["project"] = "changed",
+            ["rank"] = "050"
+        }).ConfigureAwait(false);
+        var afterUpdate = new List<string>();
+        await foreach (var item in service.FindBlobsByTagsAsync(expression).ConfigureAwait(false))
+            afterUpdate.Add($"{item.BlobContainerName}/{item.BlobName}");
+        Assert.Equal([$"{firstContainer.Name}/a", $"{secondContainer.Name}/d"], afterUpdate);
+
+        var invalidExpression = await Assert.ThrowsAsync<RequestFailedException>(async () =>
+        {
+            await foreach (var _ in service.FindBlobsByTagsAsync(
+                               $"\"project\" > '{token}' AND \"project\" >= '{token}'").ConfigureAwait(false))
+            {
+            }
+        }).ConfigureAwait(false);
+        Assert.Equal(400, invalidExpression.Status);
+
+        var invalidTag = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            firstContainer.GetBlobClient("a").SetTagsAsync(
+                new Dictionary<string, string>(StringComparer.Ordinal) { ["bad?"] = "value" })).ConfigureAwait(false);
+        Assert.Equal(400, invalidTag.Status);
+        Assert.Equal("InvalidTag", invalidTag.ErrorCode);
     }
 
     [Fact]
