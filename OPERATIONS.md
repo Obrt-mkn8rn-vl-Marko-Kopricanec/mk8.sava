@@ -256,7 +256,8 @@ test checks the same lifecycle without Azurite. These responses follow the
 [Delete Blob lease rules](https://learn.microsoft.com/en-us/rest/api/storageservices/delete-blob#request-headers).
 A twenty-first scenario compares current and snapshot committed block lists
 after a later commit and staged upload. It also checks that omitting
-`blocklisttype` returns the committed list. Mk8.sava additionally checks
+`blocklisttype` returns the committed list while an explicitly empty value
+is rejected with 400. Mk8.sava additionally checks
 an older blob version through the official SDK. Pinned Azurite 3.35.0
 incorrectly exposes the current uncommitted block on a snapshot and ignores
 a stale `If-Match` on Get Block List. The differential records those two
@@ -353,7 +354,7 @@ when the delegation-key owner has the explicit
 it attributes new file ownership to the signed authorized object ID without
 an additional POSIX ACL check. A signed `suoid` can use the supported Blob ACL
 fallback paths described below. For Get Blob, Get Blob Properties, Get Blob
-Metadata, and Query Blob Contents, the impersonated object ID needs execute
+Metadata, Get Block List, and Query Blob Contents, the impersonated object ID needs execute
 permission on the container root and every parent directory, plus read
 permission on the file. Owner and stored named-user entries are evaluated,
 including the mask; `suoid` alone does not carry group membership evidence.
@@ -739,7 +740,7 @@ so it cannot run alongside a live service on that root. This is not an
 application-facing API or the separate `dfs` ACL mutation protocol. Blob-surface
 list/mutation authorization remains incomplete. Live Azure validation is
 optional, not a review prerequisite.
-For Get Blob, Get Blob Properties, Get Blob Metadata, and Query Blob Contents,
+For Get Blob, Get Blob Properties, Get Blob Metadata, Get Block List, and Query Blob Contents,
 a trusted bearer principal without a configured RBAC read grant can fall back
 to the same root/parent
 execute and file-read ACL check used for `suoid`, but only when its signed
@@ -826,6 +827,11 @@ For both bearer fallback and signed `suoid` reads, the ACL decision is bound to
 the blob generation served by the endpoint. A replacement or a blob created
 after authorization cannot turn an allowed read of an older or missing target
 into access to new content.
+Get Block List requires an existing ACL-readable blob for this fallback;
+staged-only blocks under a not-yet-committed name are not disclosed through
+an ACL grant on that missing file. Local bearer and signed-`suoid` SDK tests
+cover committed-list access; the bearer test also revokes file read and
+ancestor traverse permissions, while signed `suoid` denies a foreign ID.
 HNS identity projection follows the Blob REST request shape. List Blobs accepts
 `x-ms-upn` only when `include=permissions` is present. Get Blob and Get Blob
 Properties accept it only from service version 2023-11-03. The value must be a

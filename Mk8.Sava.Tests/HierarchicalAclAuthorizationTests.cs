@@ -107,7 +107,8 @@ public sealed class HierarchicalAclAuthorizationTests
     [InlineData("GET", "metadata", true)]
     [InlineData("POST", "query", true)]
     [InlineData("GET", "tags", false)]
-    [InlineData("GET", "blocklist", false)]
+    [InlineData("GET", "blocklist", true)]
+    [InlineData("HEAD", "blocklist", false)]
     [InlineData("PUT", "metadata", false)]
     [InlineData("POST", "queryOther", false)]
     public void AclFallbackOnlyTargetsBlobContentReadOperations(string method, string component, bool expected)

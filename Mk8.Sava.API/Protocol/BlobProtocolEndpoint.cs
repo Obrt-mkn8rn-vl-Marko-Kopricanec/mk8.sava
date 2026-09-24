@@ -2092,8 +2092,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                 request.Account, containerName, blobName, cancellationToken).ConfigureAwait(false);
         if (selected is null && staged.Count == 0)
             throw AzureStorageException.BlobNotFound();
-        var listType = http.Request.Query["blocklisttype"].ToString();
-        listType = listType.Length == 0 ? "committed" : listType.ToRequiredLowerInvariant();
+        var listType = http.Request.Query.ContainsKey("blocklisttype")
+            ? http.Request.Query["blocklisttype"].ToString().ToRequiredLowerInvariant()
+            : "committed";
         if (listType is not ("all" or "committed" or "uncommitted"))
             throw AzureStorageException.InvalidQuery("blocklisttype");
         if (selected is not null)
