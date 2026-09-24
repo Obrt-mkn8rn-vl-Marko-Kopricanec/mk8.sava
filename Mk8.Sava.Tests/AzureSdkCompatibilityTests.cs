@@ -7405,21 +7405,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var containerName = $"recompress-{Guid.NewGuid():N}";
             var container = service.GetBlobContainerClient(containerName);
             await container.CreateAsync();
-            var content = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(0, 5000).Select(index =>
-                $"{{\"tenant\":\"stable-tenant\",\"category\":\"storage-event\",\"sequence\":{index % 97},\"payload\":\"alpha-beta-gamma-delta\"}}\n")));
-            var blob = container.GetBlobClient("cold.jsonl");
-            await blob.UploadAsync(BinaryData.FromBytes(content));
-            var snapshotId = (await blob.CreateSnapshotAsync()).Value.Snapshot;
-            var propertiesBefore = await blob.GetPropertiesAsync();
-
-            var customerKey = RandomNumberGenerator.GetBytes(32);
-            var customerBlob = CreateEncryptedClient(
-                    application,
-                    new CustomerProvidedKey(customerKey),
-                    encryptionScope: null)
-                .GetBlobContainerClient(containerName)
-                .GetBlobClient("customer-key.jsonl");
-            await customerBlob.UploadAsync(BinaryData.FromBytes(content));
+            var (blob, customerBlob, content, snapshotId, etag, lastModified) =
+                await CreateRecompressionBlobsAsync(application, container);
 
             var blobService = application.Services.GetRequiredService<BlobService>();
             var chunkStore = application.Services.GetRequiredService<ChunkStore>();
@@ -7439,51 +7426,98 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 snapshot: null,
                 includeDeleted: false,
                 CancellationToken.None);
-            var paths = record.Content.Chunks
-                .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
-                .Select(chunk => ChunkPath(application.DataPath, chunk.Id))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-            var customerPaths = customerRecord.Content.Chunks
-                .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
-                .Select(chunk => ChunkPath(application.DataPath, chunk.Id))
-                .Distinct(StringComparer.Ordinal)
-                .ToArray();
-            var beforeBytes = paths.Sum(path => new FileInfo(path).Length);
-            var customerBytes = customerPaths.Sum(path => new FileInfo(path).Length);
-
-            using (chunkStore.Pin(record.Content))
-            {
-                var pinnedPass = await blobService.RunMaintenanceAsync(CancellationToken.None);
-                Assert.Equal(0, pinnedPass.RecompressedChunks);
-                Assert.Equal(beforeBytes, paths.Sum(path => new FileInfo(path).Length));
-            }
-
-            var optimized = await blobService.RunMaintenanceAsync(CancellationToken.None);
-            var afterBytes = paths.Sum(path => new FileInfo(path).Length);
-            Assert.True(optimized.RecompressedChunks > 0);
-            Assert.Equal(beforeBytes - afterBytes, optimized.RecompressionBytesSaved);
-            Assert.True(afterBytes < beforeBytes);
-            Assert.Equal(customerBytes, customerPaths.Sum(path => new FileInfo(path).Length));
-
-            var propertiesAfter = await blob.GetPropertiesAsync();
-            Assert.Equal(propertiesBefore.Value.ETag, propertiesAfter.Value.ETag);
-            Assert.Equal(propertiesBefore.Value.LastModified, propertiesAfter.Value.LastModified);
-            Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
-            Assert.Equal(
-                content,
-                (await blob.WithSnapshot(snapshotId).DownloadContentAsync()).Value.Content.ToArray());
-            Assert.Equal(content, (await customerBlob.DownloadContentAsync()).Value.Content.ToArray());
-
-            using var operatorClient = application.CreateClient();
-            var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute));
-            Assert.Contains("mk8_sava_maintenance_recompressed_chunks_total", metrics, StringComparison.Ordinal);
-            Assert.Contains("mk8_sava_maintenance_recompression_bytes_saved_total", metrics, StringComparison.Ordinal);
+            await AssertColdChunkMaintenanceAsync(application, blobService, chunkStore, record, customerRecord);
+            await AssertRecompressedStateAsync(
+                application, blob, customerBlob, snapshotId, content, etag, lastModified);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static async Task<(BlobClient Blob, BlobClient CustomerBlob, byte[] Content,
+        string SnapshotId, ETag Etag, DateTimeOffset LastModified)> CreateRecompressionBlobsAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container)
+    {
+        var content = Encoding.UTF8.GetBytes(string.Concat(Enumerable.Range(0, 5000).Select(index =>
+            $"{{\"tenant\":\"stable-tenant\",\"category\":\"storage-event\",\"sequence\":{index % 97},\"payload\":\"alpha-beta-gamma-delta\"}}\n")));
+        var blob = container.GetBlobClient("cold.jsonl");
+        await blob.UploadAsync(BinaryData.FromBytes(content)).ConfigureAwait(false);
+        var snapshotId = (await blob.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var propertiesBefore = await blob.GetPropertiesAsync().ConfigureAwait(false);
+
+        var customerKey = RandomNumberGenerator.GetBytes(32);
+        var customerBlob = CreateEncryptedClient(
+                application,
+                new CustomerProvidedKey(customerKey),
+                encryptionScope: null)
+            .GetBlobContainerClient(container.Name)
+            .GetBlobClient("customer-key.jsonl");
+        await customerBlob.UploadAsync(BinaryData.FromBytes(content)).ConfigureAwait(false);
+        return (blob, customerBlob, content, snapshotId,
+            propertiesBefore.Value.ETag, propertiesBefore.Value.LastModified);
+    }
+
+    private static async Task AssertColdChunkMaintenanceAsync(
+        SavaWebApplicationFactory application,
+        BlobService blobService,
+        ChunkStore chunkStore,
+        BlobRecord record,
+        BlobRecord customerRecord)
+    {
+        var paths = record.Content.Chunks
+            .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Select(chunk => ChunkPath(application.DataPath, chunk.Id))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var customerPaths = customerRecord.Content.Chunks
+            .Where(chunk => !chunk.Id.EndsWith("/$zero", StringComparison.Ordinal))
+            .Select(chunk => ChunkPath(application.DataPath, chunk.Id))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        var beforeBytes = paths.Sum(path => new FileInfo(path).Length);
+        var customerBytes = customerPaths.Sum(path => new FileInfo(path).Length);
+
+        using (chunkStore.Pin(record.Content))
+        {
+            var pinnedPass = await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.Equal(0, pinnedPass.RecompressedChunks);
+            Assert.Equal(beforeBytes, paths.Sum(path => new FileInfo(path).Length));
+        }
+
+        var optimized = await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        var afterBytes = paths.Sum(path => new FileInfo(path).Length);
+        Assert.True(optimized.RecompressedChunks > 0);
+        Assert.Equal(beforeBytes - afterBytes, optimized.RecompressionBytesSaved);
+        Assert.True(afterBytes < beforeBytes);
+        Assert.Equal(customerBytes, customerPaths.Sum(path => new FileInfo(path).Length));
+    }
+
+    private static async Task AssertRecompressedStateAsync(
+        SavaWebApplicationFactory application,
+        BlobClient blob,
+        BlobClient customerBlob,
+        string snapshotId,
+        byte[] content,
+        ETag etag,
+        DateTimeOffset lastModified)
+    {
+        var propertiesAfter = await blob.GetPropertiesAsync().ConfigureAwait(false);
+        Assert.Equal(etag, propertiesAfter.Value.ETag);
+        Assert.Equal(lastModified, propertiesAfter.Value.LastModified);
+        Assert.Equal(content, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Equal(content,
+            (await blob.WithSnapshot(snapshotId).DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Equal(content,
+            (await customerBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+
+        using var operatorClient = application.CreateClient();
+        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
+        Assert.Contains("mk8_sava_maintenance_recompressed_chunks_total", metrics, StringComparison.Ordinal);
+        Assert.Contains("mk8_sava_maintenance_recompression_bytes_saved_total", metrics, StringComparison.Ordinal);
     }
 
     [Fact]
