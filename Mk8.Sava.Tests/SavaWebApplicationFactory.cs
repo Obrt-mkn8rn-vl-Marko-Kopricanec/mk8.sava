@@ -1,6 +1,7 @@
 using Azure.Core;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -151,6 +152,39 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 
     public string DataPath { get; }
 
+    public new TestServer Server
+    {
+        get
+        {
+            var server = base.Server;
+            CaptureServices(base.Services);
+            return server;
+        }
+    }
+
+    public override IServiceProvider Services
+    {
+        get
+        {
+            var services = base.Services;
+            CaptureServices(services);
+            return services;
+        }
+    }
+
+    public new HttpClient CreateClient()
+    {
+        _ = Server;
+        return base.CreateClient();
+    }
+
+    private void CaptureServices(IServiceProvider services)
+    {
+        _storagePaths ??= services.GetRequiredService<StoragePaths>();
+        _metadataStore ??= services.GetRequiredService<MetadataStore>();
+        _chunkStore ??= services.GetRequiredService<ChunkStore>();
+    }
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -261,9 +295,6 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     public Task InitializeAsync()
     {
         _ = Server;
-        _storagePaths = Services.GetRequiredService<StoragePaths>();
-        _metadataStore = Services.GetRequiredService<MetadataStore>();
-        _chunkStore = Services.GetRequiredService<ChunkStore>();
         return Task.CompletedTask;
     }
 
@@ -277,7 +308,27 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         _chunkStore?.Dispose();
         _metadataStore?.Dispose();
         _storagePaths?.Dispose();
-        if (_deleteDataPath && Directory.Exists(DataPath))
-            Directory.Delete(DataPath, recursive: true);
+        if (_deleteDataPath)
+            await DeleteDataPathAsync().ConfigureAwait(false);
+    }
+
+    private async Task DeleteDataPathAsync()
+    {
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            if (!Directory.Exists(DataPath))
+                return;
+            try
+            {
+                Directory.Delete(DataPath, recursive: true);
+                return;
+            }
+            catch (IOException) when (OperatingSystem.IsWindows() && attempt < 7)
+            {
+                // Windows can release the last SQLite or test-server handle
+                // just after host shutdown. Persistent locks still fail.
+                await Task.Delay(100).ConfigureAwait(false);
+            }
+        }
     }
 }
