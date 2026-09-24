@@ -8588,6 +8588,18 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var credential = new StorageSharedKeyCredential(
             SavaWebApplicationFactory.AccountName,
             SavaWebApplicationFactory.AccountKey);
+        await AssertServiceDirectorySasAsync(application, container, startsOn, expiresOn, credential);
+        await AssertUserDelegationDirectorySasAsync(application, container, startsOn, expiresOn);
+        await AssertFlatDirectorySasRejectedAsync(factory, startsOn, expiresOn, credential);
+    }
+
+    private static async Task AssertServiceDirectorySasAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn,
+        StorageSharedKeyCredential credential)
+    {
         var serviceBuilder = new BlobSasBuilder
         {
             BlobContainerName = container.Name,
@@ -8604,36 +8616,41 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         BlobClient GetServiceSasBlob(string name) => CreateBlobClient(
             application,
-            new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}" +
-                $"?{serviceSas}"));
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}?{serviceSas}"));
 
-        var directoryProperties = await GetServiceSasBlob("signed/directory").GetPropertiesAsync();
-        Assert.Equal(
-            "directory",
+        var directoryProperties = await GetServiceSasBlob("signed/directory").GetPropertiesAsync()
+            .ConfigureAwait(false);
+        Assert.Equal("directory",
             directoryProperties.GetRawResponse().Headers.TryGetValue("x-ms-resource-type", out var resourceType)
                 ? resourceType
                 : null);
-        Assert.Equal(
-            "child",
-            (await GetServiceSasBlob("signed/directory/child.txt").DownloadContentAsync()).Value.Content.ToString());
-        Assert.Equal(
-            "leaf",
-            (await GetServiceSasBlob("signed/directory/nested/leaf.txt").DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("child",
+            (await GetServiceSasBlob("signed/directory/child.txt").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+        Assert.Equal("leaf",
+            (await GetServiceSasBlob("signed/directory/nested/leaf.txt").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
         var deniedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            GetServiceSasBlob("signed/sibling.txt").DownloadContentAsync());
+            GetServiceSasBlob("signed/sibling.txt").DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedSibling.Status);
         var deniedParent = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            GetServiceSasBlob("signed").GetPropertiesAsync());
+            GetServiceSasBlob("signed").GetPropertiesAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedParent.Status);
+    }
 
+    private static async Task AssertUserDelegationDirectorySasAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn)
+    {
         var token = CreateJwt(
             SavaWebApplicationFactory.AccountKey,
             SavaWebApplicationFactory.DelegatorObjectId,
             SavaWebApplicationFactory.TenantId);
         var delegator = CreateBearerClient(application, token);
         var key = await delegator.GetUserDelegationKeyAsync(
-            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn });
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn }).ConfigureAwait(false);
         var delegatedBuilder = new BlobSasBuilder
         {
             BlobContainerName = container.Name,
@@ -8652,16 +8669,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
 
         BlobClient GetDelegatedBlob(string name) => CreateBlobClient(
             application,
-            new Uri(
-                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}" +
-                $"?{delegatedSas}"));
+            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{name}?{delegatedSas}"));
 
-        Assert.Equal(
-            "child",
-            (await GetDelegatedBlob("signed/directory/child.txt").DownloadContentAsync()).Value.Content.ToString());
-        var deniedDelegatedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            GetDelegatedBlob("signed/sibling.txt").DownloadContentAsync());
-        Assert.Equal(StatusCodes.Status403Forbidden, deniedDelegatedSibling.Status);
+        Assert.Equal("child",
+            (await GetDelegatedBlob("signed/directory/child.txt").DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+        var deniedSibling = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            GetDelegatedBlob("signed/sibling.txt").DownloadContentAsync()).ConfigureAwait(false);
+        Assert.Equal(StatusCodes.Status403Forbidden, deniedSibling.Status);
 
         delegatedBuilder.PreauthorizedAgentObjectId = Guid.NewGuid().ToString();
         var impersonationSas = delegatedBuilder.ToSasQueryParameters(
@@ -8669,17 +8684,23 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             SavaWebApplicationFactory.AccountName);
         var impersonationBlob = CreateBlobClient(
             application,
-            new Uri(
-                $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/signed/directory/child.txt" +
-                $"?{impersonationSas}"));
+            new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/signed/directory/child.txt?{impersonationSas}"));
         var deniedImpersonation = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            impersonationBlob.DownloadContentAsync());
+            impersonationBlob.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal("AuthorizationFailure", deniedImpersonation.ErrorCode);
+    }
 
-        var flatOwner = CreateClient(factory);
+    private static async Task AssertFlatDirectorySasRejectedAsync(
+        SavaWebApplicationFactory flatApplication,
+        DateTimeOffset startsOn,
+        DateTimeOffset expiresOn,
+        StorageSharedKeyCredential credential)
+    {
+        var flatOwner = CreateClient(flatApplication);
         var flatContainer = flatOwner.GetBlobContainerClient($"flat-directory-sas-{Guid.NewGuid():N}");
-        await flatContainer.CreateAsync();
-        await flatContainer.GetBlobClient("signed/directory").UploadAsync(BinaryData.FromString("flat"));
+        await flatContainer.CreateAsync().ConfigureAwait(false);
+        await flatContainer.GetBlobClient("signed/directory").UploadAsync(BinaryData.FromString("flat"))
+            .ConfigureAwait(false);
         var flatBuilder = new BlobSasBuilder
         {
             BlobContainerName = flatContainer.Name,
@@ -8693,13 +8714,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         flatBuilder.SetPermissions(BlobContainerSasPermissions.Read);
         var flatSas = flatBuilder.ToSasQueryParameters(credential);
         var flatDirectory = CreateBlobClient(
-            factory,
-            new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{flatContainer.Name}/signed/directory" +
-                $"?{flatSas}"));
-        var deniedFlatDirectory = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            flatDirectory.DownloadContentAsync());
-        Assert.Equal(StatusCodes.Status403Forbidden, deniedFlatDirectory.Status);
+            flatApplication,
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost/{flatContainer.Name}/signed/directory?{flatSas}"));
+        var denied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            flatDirectory.DownloadContentAsync()).ConfigureAwait(false);
+        Assert.Equal(StatusCodes.Status403Forbidden, denied.Status);
     }
 
     [Fact]
@@ -8746,79 +8765,11 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var credential = new StorageSharedKeyCredential(
             SavaWebApplicationFactory.AccountName,
             SavaWebApplicationFactory.AccountKey);
-
-        const string signedBlobName = "signed-scope.txt";
-        const string signedScope = "signed-scope";
-        var builder = new BlobSasBuilder
-        {
-            BlobContainerName = container.Name,
-            BlobName = signedBlobName,
-            Resource = "b",
-            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
-            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
-            Protocol = SasProtocol.HttpsAndHttp,
-            EncryptionScope = signedScope
-        };
-        builder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
-        var sas = builder.ToSasQueryParameters(credential);
-        var signedBlobUri = new Uri(
-            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{signedBlobName}" +
-            $"?{sas}");
-        var signedBlob = CreateBlobClient(factory, signedBlobUri);
-        await signedBlob.UploadAsync(BinaryData.FromString("signed encryption scope"));
-        Assert.Equal(signedScope, (await container.GetBlobClient(signedBlobName).GetPropertiesAsync()).Value.EncryptionScope);
-
         using var transport = new HttpClient(factory.Server.CreateHandler());
-        using (var wrongScope = new HttpRequestMessage(HttpMethod.Put, signedBlobUri)
-        {
-            Content = new StringContent("wrong scope")
-        })
-        {
-            wrongScope.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-            wrongScope.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "wrong-scope");
-            using var response = await transport.SendAsync(wrongScope);
-            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-        }
+        await AssertCurrentEncryptionScopeSasAsync(factory, container, credential, transport);
 
-        const string legacyVersion = "2019-12-12";
         const string legacyBlobName = "legacy-scope.txt";
-        const string permissions = "cw";
-        const string protocol = "https";
-        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1)
-            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
-            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-        var canonicalResource =
-            $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{legacyBlobName}";
-        var stringToSign = string.Join(
-            '\n',
-            permissions,
-            startsOn,
-            expiresOn,
-            canonicalResource,
-            string.Empty,
-            string.Empty,
-            protocol,
-            legacyVersion,
-            "b",
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty,
-            string.Empty);
-        using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
-        var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
-        var legacyBlobUri = new Uri(
-            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{legacyBlobName}" +
-            $"?sp={permissions}" +
-            $"&st={Uri.EscapeDataString(startsOn)}" +
-            $"&se={Uri.EscapeDataString(expiresOn)}" +
-            $"&spr={protocol}" +
-            $"&sv={legacyVersion}" +
-            "&sr=b" +
-            $"&sig={Uri.EscapeDataString(signature)}");
+        var legacyBlobUri = CreateLegacyEncryptionScopeSasUri(container, legacyBlobName);
 
         using (var validLegacy = new HttpRequestMessage(HttpMethod.Put, legacyBlobUri)
         {
@@ -8849,6 +8800,86 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             (await container.GetBlobClient(legacyBlobName).DownloadContentAsync()).Value.Content.ToString());
     }
 
+    private static async Task AssertCurrentEncryptionScopeSasAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        StorageSharedKeyCredential credential,
+        HttpClient transport)
+    {
+        const string signedBlobName = "signed-scope.txt";
+        const string signedScope = "signed-scope";
+        var builder = new BlobSasBuilder
+        {
+            BlobContainerName = container.Name,
+            BlobName = signedBlobName,
+            Resource = "b",
+            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-1),
+            ExpiresOn = DateTimeOffset.UtcNow.AddMinutes(10),
+            Protocol = SasProtocol.HttpsAndHttp,
+            EncryptionScope = signedScope
+        };
+        builder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+        var sas = builder.ToSasQueryParameters(credential);
+        var signedBlobUri = new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{signedBlobName}?{sas}");
+        var signedBlob = CreateBlobClient(application, signedBlobUri);
+        await signedBlob.UploadAsync(BinaryData.FromString("signed encryption scope")).ConfigureAwait(false);
+        Assert.Equal(signedScope,
+            (await container.GetBlobClient(signedBlobName).GetPropertiesAsync().ConfigureAwait(false)).Value.EncryptionScope);
+
+        using (var wrongScope = new HttpRequestMessage(HttpMethod.Put, signedBlobUri)
+        {
+            Content = new StringContent("wrong scope")
+        })
+        {
+            wrongScope.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            wrongScope.Headers.TryAddWithoutValidation("x-ms-encryption-scope", "wrong-scope");
+            using var response = await transport.SendAsync(wrongScope).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+    }
+
+    private static Uri CreateLegacyEncryptionScopeSasUri(BlobContainerClient container, string blobName)
+    {
+        const string legacyVersion = "2019-12-12";
+        const string permissions = "cw";
+        const string protocol = "https";
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1)
+            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(10)
+            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var canonicalResource = $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blobName}";
+        var stringToSign = string.Join(
+            '\n',
+            permissions,
+            startsOn,
+            expiresOn,
+            canonicalResource,
+            string.Empty,
+            string.Empty,
+            protocol,
+            legacyVersion,
+            "b",
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty,
+            string.Empty);
+        using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
+        var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
+        return new Uri(
+            $"https://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blobName}" +
+            $"?sp={permissions}" +
+            $"&st={Uri.EscapeDataString(startsOn)}" +
+            $"&se={Uri.EscapeDataString(expiresOn)}" +
+            $"&spr={protocol}" +
+            $"&sv={legacyVersion}" +
+            "&sr=b" +
+            $"&sig={Uri.EscapeDataString(signature)}");
+    }
+
     [Fact]
     public async Task LegacyServiceSasUsesVersionedFieldsAndCanonicalResources()
     {
@@ -8862,63 +8893,8 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var expiresOn = DateTimeOffset.UtcNow.AddMinutes(29)
             .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
 
-        Uri CreateSasUri(string? version, string? contentType = null, DateTimeOffset? expiry = null)
-        {
-            var signedExpiry = (expiry ?? DateTimeOffset.Parse(expiresOn, CultureInfo.InvariantCulture))
-                .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
-            var parsedVersion = version is null
-                ? new DateOnly(2009, 9, 19)
-                : DateOnly.ParseExact(version, "yyyy-MM-dd", CultureInfo.InvariantCulture);
-            var canonicalResource = parsedVersion >= new DateOnly(2015, 2, 21)
-                ? $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}"
-                : $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
-            var fields = new List<string>
-            {
-                "r",
-                startsOn,
-                signedExpiry,
-                canonicalResource,
-                string.Empty
-            };
-            if (version is not null)
-            {
-                if (parsedVersion >= new DateOnly(2015, 4, 5))
-                {
-                    fields.Add(string.Empty);
-                    fields.Add("https,http");
-                }
-                fields.Add(version);
-                if (parsedVersion >= new DateOnly(2018, 11, 9))
-                {
-                    fields.Add("b");
-                    fields.Add(string.Empty);
-                }
-                if (parsedVersion >= new DateOnly(2020, 12, 6))
-                    fields.Add(string.Empty);
-                if (parsedVersion >= new DateOnly(2013, 8, 15))
-                {
-                    fields.Add(string.Empty);
-                    fields.Add(string.Empty);
-                    fields.Add(string.Empty);
-                    fields.Add(string.Empty);
-                    fields.Add(contentType ?? string.Empty);
-                }
-            }
-
-            using var hmac = new HMACSHA256(
-                Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
-            var signature = Convert.ToBase64String(
-                hmac.ComputeHash(Encoding.UTF8.GetBytes(string.Join('\n', fields))));
-            var query =
-                $"sp=r&st={Uri.EscapeDataString(startsOn)}&se={Uri.EscapeDataString(signedExpiry)}" +
-                (version is null ? string.Empty : $"&sv={version}") +
-                "&sr=b" +
-                (parsedVersion >= new DateOnly(2015, 4, 5) ? "&spr=https%2Chttp" : string.Empty) +
-                (contentType is null ? string.Empty : $"&rsct={Uri.EscapeDataString(contentType)}") +
-                $"&sig={Uri.EscapeDataString(signature)}";
-            return new Uri(
-                $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
-        }
+        Uri CreateSasUri(string? version, string? contentType = null, DateTimeOffset? expiry = null) =>
+            CreateLegacyServiceSasUri(container, blob, startsOn, expiresOn, version, contentType, expiry);
 
         using var transport = new HttpClient(factory.Server.CreateHandler());
         foreach (var uri in new[]
@@ -8961,6 +8937,70 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Assert.Equal(HttpStatusCode.Forbidden, excessiveLegacyLifetime.StatusCode);
             await AssertVersionedErrorAsync(excessiveLegacyLifetime, "AuthenticationFailed");
         }
+    }
+
+    private static Uri CreateLegacyServiceSasUri(
+        BlobContainerClient container,
+        BlobClient blob,
+        string startsOn,
+        string expiresOn,
+        string? version,
+        string? contentType,
+        DateTimeOffset? expiry)
+    {
+        var signedExpiry = (expiry ?? DateTimeOffset.Parse(expiresOn, CultureInfo.InvariantCulture))
+            .UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture);
+        var parsedVersion = version is null
+            ? new DateOnly(2009, 9, 19)
+            : DateOnly.ParseExact(version, "yyyy-MM-dd", CultureInfo.InvariantCulture);
+        var canonicalResource = parsedVersion >= new DateOnly(2015, 2, 21)
+            ? $"/blob/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}"
+            : $"/{SavaWebApplicationFactory.AccountName}/{container.Name}/{blob.Name}";
+        var fields = new List<string>
+        {
+            "r",
+            startsOn,
+            signedExpiry,
+            canonicalResource,
+            string.Empty
+        };
+        if (version is not null)
+        {
+            if (parsedVersion >= new DateOnly(2015, 4, 5))
+            {
+                fields.Add(string.Empty);
+                fields.Add("https,http");
+            }
+            fields.Add(version);
+            if (parsedVersion >= new DateOnly(2018, 11, 9))
+            {
+                fields.Add("b");
+                fields.Add(string.Empty);
+            }
+            if (parsedVersion >= new DateOnly(2020, 12, 6))
+                fields.Add(string.Empty);
+            if (parsedVersion >= new DateOnly(2013, 8, 15))
+            {
+                fields.Add(string.Empty);
+                fields.Add(string.Empty);
+                fields.Add(string.Empty);
+                fields.Add(string.Empty);
+                fields.Add(contentType ?? string.Empty);
+            }
+        }
+
+        using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
+        var signature = Convert.ToBase64String(
+            hmac.ComputeHash(Encoding.UTF8.GetBytes(string.Join('\n', fields))));
+        var query =
+            $"sp=r&st={Uri.EscapeDataString(startsOn)}&se={Uri.EscapeDataString(signedExpiry)}" +
+            (version is null ? string.Empty : $"&sv={version}") +
+            "&sr=b" +
+            (parsedVersion >= new DateOnly(2015, 4, 5) ? "&spr=https%2Chttp" : string.Empty) +
+            (contentType is null ? string.Empty : $"&rsct={Uri.EscapeDataString(contentType)}") +
+            $"&sig={Uri.EscapeDataString(signature)}";
+        return new Uri(
+            $"http://{SavaWebApplicationFactory.AccountName}.localhost/{container.Name}/{blob.Name}?{query}");
     }
 
     [Fact]
