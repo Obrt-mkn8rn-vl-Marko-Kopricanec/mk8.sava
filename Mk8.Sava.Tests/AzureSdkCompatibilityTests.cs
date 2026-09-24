@@ -10682,174 +10682,195 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var container = service.GetBlobContainerClient($"file-intent-{Guid.NewGuid():N}");
             await container.CreateAsync();
             using var transport = new HttpClient(application.Server.CreateHandler());
-            const string sourceUrl = "https://source.file.core.windows.net/share/source.bin";
-
-            HttpRequestMessage CreateRequest(
-                Uri destination,
-                string? intent = "backup",
-                string version = "2025-07-05",
-                string sourceValue = sourceUrl,
-                bool includeSourceAuthorization = true)
-            {
-                var request = new HttpRequestMessage(HttpMethod.Put, destination)
-                {
-                    Content = new ByteArrayContent([])
-                };
-                request.Headers.TryAddWithoutValidation("x-ms-version", version);
-                request.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceValue);
-                if (includeSourceAuthorization)
-                {
-                    request.Headers.TryAddWithoutValidation(
-                        "x-ms-copy-source-authorization",
-                        "Bearer azure-files-source-token");
-                }
-                if (intent is not null)
-                    request.Headers.TryAddWithoutValidation("x-ms-file-request-intent", intent);
-                return request;
-            }
-
-            var whole = container.GetBlockBlobClient("whole.bin");
-            using (var request = CreateRequest(whole.GenerateSasUri(
-                       BlobSasPermissions.Create | BlobSasPermissions.Write,
-                       DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-
-            var block = container.GetBlockBlobClient("block.bin");
-            var blockId = Convert.ToBase64String("file-intent-block"u8);
-            var blockUri = AppendQuery(
-                block.GenerateSasUri(
-                    BlobSasPermissions.Create | BlobSasPermissions.Write,
-                    DateTimeOffset.UtcNow.AddMinutes(5)),
-                $"comp=block&blockid={Uri.EscapeDataString(blockId)}");
-            using (var request = CreateRequest(blockUri))
-            {
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-            await block.CommitBlockListAsync([blockId]);
-
-            var append = container.GetAppendBlobClient("append.bin");
-            await append.CreateAsync();
-            var appendUri = AppendQuery(
-                append.GenerateSasUri(
-                    BlobSasPermissions.Add | BlobSasPermissions.Write,
-                    DateTimeOffset.UtcNow.AddMinutes(5)),
-                "comp=appendblock");
-            using (var request = CreateRequest(appendUri))
-            {
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-
-            var page = container.GetPageBlobClient("page.bin");
-            await page.CreateAsync(512);
-            var pageUri = AppendQuery(
-                page.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
-                "comp=page");
-            using (var request = CreateRequest(pageUri))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
-                request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
-                request.Headers.TryAddWithoutValidation("x-ms-source-range", "bytes=0-511");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-
-            var copied = container.GetBlockBlobClient("copied.bin");
-            using (var request = CreateRequest(copied.GenerateSasUri(
-                       BlobSasPermissions.Create | BlobSasPermissions.Write,
-                       DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-requires-sync", "true");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
-            }
+            var firstBlobs = await AssertFileIntentWholeAndBlockAsync(container, transport);
+            var remainingBlobs = await AssertFileIntentAppendPageAndCopyAsync(container, transport);
 
             Assert.Equal(5, source.RequestCount);
-            foreach (var blob in new BlobBaseClient[] { whole, block, append, page, copied })
+            foreach (var blob in firstBlobs.Concat(remainingBlobs))
                 Assert.Equal(sourceBytes, (await blob.DownloadContentAsync()).Value.Content.ToArray());
-
-            var rejected = container.GetBlockBlobClient("rejected.bin");
-            var rejectedUri = rejected.GenerateSasUri(
-                BlobSasPermissions.Create | BlobSasPermissions.Write,
-                DateTimeOffset.UtcNow.AddMinutes(5));
-            using (var request = CreateRequest(rejectedUri, intent: null))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
-                Assert.Contains(
-                    "<HeaderName>x-ms-file-request-intent</HeaderName>",
-                    await response.Content.ReadAsStringAsync(),
-                    StringComparison.Ordinal);
-            }
-            using (var request = CreateRequest(rejectedUri, intent: "restore"))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-            using (var request = CreateRequest(rejectedUri, version: "2025-01-05"))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
-                Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
-            }
+            await AssertFileIntentHeaderErrorsAsync(container, transport);
             Assert.Equal(5, source.RequestCount);
-            Assert.False((await rejected.ExistsAsync()).Value);
-
-            var asynchronous = container.GetBlockBlobClient("asynchronous.bin");
-            using (var request = CreateRequest(asynchronous.GenerateSasUri(
-                       BlobSasPermissions.Create | BlobSasPermissions.Write,
-                       DateTimeOffset.UtcNow.AddMinutes(5))))
-            {
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-                Assert.Equal("UnsupportedHeader", response.Headers.GetValues("x-ms-error-code").Single());
-            }
-
-            var anonymousFile = container.GetBlockBlobClient("anonymous-file.bin");
-            using (var request = CreateRequest(
-                       anonymousFile.GenerateSasUri(
-                           BlobSasPermissions.Create | BlobSasPermissions.Write,
-                           DateTimeOffset.UtcNow.AddMinutes(5)),
-                       intent: null,
-                       sourceValue: "https://source.file.core.windows.net/share/anonymous.bin",
-                       includeSourceAuthorization: false))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-
-            var bearerBlob = container.GetBlockBlobClient("bearer-blob.bin");
-            using (var request = CreateRequest(
-                       bearerBlob.GenerateSasUri(
-                           BlobSasPermissions.Create | BlobSasPermissions.Write,
-                           DateTimeOffset.UtcNow.AddMinutes(5)),
-                       intent: null,
-                       sourceValue: "https://source.blob.core.windows.net/container/source.bin"))
-            {
-                request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
-                using var response = await transport.SendAsync(request);
-                Assert.Equal(HttpStatusCode.Created, response.StatusCode);
-            }
-            Assert.Equal(7, source.RequestCount);
-            Assert.False((await asynchronous.ExistsAsync()).Value);
-            Assert.Equal(sourceBytes, (await anonymousFile.DownloadContentAsync()).Value.Content.ToArray());
-            Assert.Equal(sourceBytes, (await bearerBlob.DownloadContentAsync()).Value.Content.ToArray());
+            await AssertFileIntentAlternateSourcesAsync(container, transport, source, sourceBytes);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static HttpRequestMessage CreateFileIntentRequest(
+        Uri destination,
+        string? intent = "backup",
+        string version = "2025-07-05",
+        string sourceValue = "https://source.file.core.windows.net/share/source.bin",
+        bool includeSourceAuthorization = true)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Put, destination)
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", version);
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceValue);
+        if (includeSourceAuthorization)
+        {
+            request.Headers.TryAddWithoutValidation(
+                "x-ms-copy-source-authorization",
+                "Bearer azure-files-source-token");
+        }
+        if (intent is not null)
+            request.Headers.TryAddWithoutValidation("x-ms-file-request-intent", intent);
+        return request;
+    }
+
+    private static async Task<BlobBaseClient[]> AssertFileIntentWholeAndBlockAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        var whole = container.GetBlockBlobClient("whole.bin");
+        using (var request = CreateFileIntentRequest(whole.GenerateSasUri(
+                   BlobSasPermissions.Create | BlobSasPermissions.Write,
+                   DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        var block = container.GetBlockBlobClient("block.bin");
+        var blockId = Convert.ToBase64String("file-intent-block"u8);
+        var blockUri = AppendQuery(
+            block.GenerateSasUri(
+                BlobSasPermissions.Create | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            $"comp=block&blockid={Uri.EscapeDataString(blockId)}");
+        using (var request = CreateFileIntentRequest(blockUri))
+        {
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+        await block.CommitBlockListAsync([blockId]).ConfigureAwait(false);
+        return [whole, block];
+    }
+
+    private static async Task<BlobBaseClient[]> AssertFileIntentAppendPageAndCopyAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        var append = container.GetAppendBlobClient("append.bin");
+        await append.CreateAsync().ConfigureAwait(false);
+        var appendUri = AppendQuery(
+            append.GenerateSasUri(
+                BlobSasPermissions.Add | BlobSasPermissions.Write,
+                DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=appendblock");
+        using (var request = CreateFileIntentRequest(appendUri))
+        {
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        var page = container.GetPageBlobClient("page.bin");
+        await page.CreateAsync(512).ConfigureAwait(false);
+        var pageUri = AppendQuery(
+            page.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5)),
+            "comp=page");
+        using (var request = CreateFileIntentRequest(pageUri))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-page-write", "update");
+            request.Headers.TryAddWithoutValidation("x-ms-range", "bytes=0-511");
+            request.Headers.TryAddWithoutValidation("x-ms-source-range", "bytes=0-511");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        var copied = container.GetBlockBlobClient("copied.bin");
+        using (var request = CreateFileIntentRequest(copied.GenerateSasUri(
+                   BlobSasPermissions.Create | BlobSasPermissions.Write,
+                   DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-requires-sync", "true");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        }
+        return [append, page, copied];
+    }
+
+    private static async Task AssertFileIntentHeaderErrorsAsync(
+        BlobContainerClient container, HttpClient transport)
+    {
+        var rejected = container.GetBlockBlobClient("rejected.bin");
+        var rejectedUri = rejected.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        using (var request = CreateFileIntentRequest(rejectedUri, intent: null))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("MissingRequiredHeader", response.Headers.GetValues("x-ms-error-code").Single());
+            Assert.Contains("<HeaderName>x-ms-file-request-intent</HeaderName>",
+                await response.Content.ReadAsStringAsync().ConfigureAwait(false), StringComparison.Ordinal);
+        }
+        using (var request = CreateFileIntentRequest(rejectedUri, intent: "restore"))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        using (var request = CreateFileIntentRequest(rejectedUri, version: "2025-01-05"))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+            Assert.Equal("FeatureVersionMismatch", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+        Assert.False((await rejected.ExistsAsync().ConfigureAwait(false)).Value);
+    }
+
+    private static async Task AssertFileIntentAlternateSourcesAsync(
+        BlobContainerClient container, HttpClient transport, FileIntentSourceHandler source, byte[] sourceBytes)
+    {
+        var asynchronous = container.GetBlockBlobClient("asynchronous.bin");
+        using (var request = CreateFileIntentRequest(asynchronous.GenerateSasUri(
+                   BlobSasPermissions.Create | BlobSasPermissions.Write,
+                   DateTimeOffset.UtcNow.AddMinutes(5))))
+        {
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            Assert.Equal("UnsupportedHeader", response.Headers.GetValues("x-ms-error-code").Single());
+        }
+
+        var anonymousFile = container.GetBlockBlobClient("anonymous-file.bin");
+        using (var request = CreateFileIntentRequest(
+                   anonymousFile.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)),
+                   intent: null,
+                   sourceValue: "https://source.file.core.windows.net/share/anonymous.bin",
+                   includeSourceAuthorization: false))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+
+        var bearerBlob = container.GetBlockBlobClient("bearer-blob.bin");
+        using (var request = CreateFileIntentRequest(
+                   bearerBlob.GenerateSasUri(
+                       BlobSasPermissions.Create | BlobSasPermissions.Write,
+                       DateTimeOffset.UtcNow.AddMinutes(5)),
+                   intent: null,
+                   sourceValue: "https://source.blob.core.windows.net/container/source.bin"))
+        {
+            request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        }
+        Assert.Equal(7, source.RequestCount);
+        Assert.False((await asynchronous.ExistsAsync().ConfigureAwait(false)).Value);
+        Assert.Equal(sourceBytes,
+            (await anonymousFile.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Equal(sourceBytes,
+            (await bearerBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
     }
 
     [Fact]
