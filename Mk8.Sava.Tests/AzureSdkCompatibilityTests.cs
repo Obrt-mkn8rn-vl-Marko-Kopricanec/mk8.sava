@@ -12182,56 +12182,77 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["class"] = "tagged" }
         });
 
+        var sourceSas = await AssertCopySourceSasAsync(factory, container, source, content);
+
+        await AssertCopySourceTagConditionsAsync(factory, container, source, sourceSas, content);
+
+        await AssertCopyBearerSourceAsync(factory, container, source, content);
+
+        await AssertCopyUnsignedAndWrongResourceSourcesAsync(factory, container, source);
+        await AssertCopySourceLeaseHeaderRejectedAsync(factory, container, sourceSas);
+    }
+
+    private static async Task<Uri> AssertCopySourceSasAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, BlobClient source, byte[] content)
+    {
         var sourceSas = source.GenerateSasUri(
-            BlobSasPermissions.Read,
-            DateTimeOffset.UtcNow.AddMinutes(10));
+            BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(10));
         var destination = container.GetBlobClient("destination.bin");
         var destinationSas = destination.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(10));
-        var delegatedDestination = CreateBlobClient(factory, destinationSas);
-        var copy = await delegatedDestination.StartCopyFromUriAsync(sourceSas);
-        await copy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        var delegatedDestination = CreateBlobClient(application, destinationSas);
+        var copy = await delegatedDestination.StartCopyFromUriAsync(sourceSas).ConfigureAwait(false);
+        await copy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.Equal(content, (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        Assert.Equal("source-sas", (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value.Metadata["origin"]);
+        return sourceSas;
+    }
 
-        Assert.Equal(content, (await destination.DownloadContentAsync()).Value.Content.ToArray());
-        Assert.Equal("source-sas", (await destination.GetPropertiesAsync()).Value.Metadata["origin"]);
-
+    private static async Task AssertCopySourceTagConditionsAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container,
+        BlobClient source, Uri sourceSas, byte[] content)
+    {
         var taggedSourceSas = source.GenerateSasUri(
-            BlobSasPermissions.Read | BlobSasPermissions.Tag,
-            DateTimeOffset.UtcNow.AddMinutes(10));
+            BlobSasPermissions.Read | BlobSasPermissions.Tag, DateTimeOffset.UtcNow.AddMinutes(10));
         var taggedDestination = container.GetBlobClient("tag-conditioned.bin");
         var taggedDestinationSas = taggedDestination.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(10));
-        var taggedCopy = await CreateBlobClient(factory, taggedDestinationSas).StartCopyFromUriAsync(
+        var taggedCopy = await CreateBlobClient(application, taggedDestinationSas).StartCopyFromUriAsync(
             taggedSourceSas,
             new BlobCopyFromUriOptions
             {
                 SourceConditions = new BlobRequestConditions { TagConditions = "\"class\" = 'tagged'" }
-            });
-        await taggedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None);
-        Assert.Equal(content, (await taggedDestination.DownloadContentAsync()).Value.Content.ToArray());
+            }).ConfigureAwait(false);
+        await taggedCopy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None)
+            .ConfigureAwait(false);
+        Assert.Equal(content, (await taggedDestination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
 
         var untaggedSourceTarget = container.GetBlobClient("tag-condition-without-source-permission.bin");
         var untaggedSourceTargetSas = untaggedSourceTarget.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(10));
         var missingSourceTagPermission = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            CreateBlobClient(factory, untaggedSourceTargetSas).StartCopyFromUriAsync(
+            CreateBlobClient(application, untaggedSourceTargetSas).StartCopyFromUriAsync(
                 sourceSas,
                 new BlobCopyFromUriOptions
                 {
                     SourceConditions = new BlobRequestConditions { TagConditions = "\"class\" = 'tagged'" }
-                }));
+                })).ConfigureAwait(false);
         Assert.Equal(403, missingSourceTagPermission.Status);
-        Assert.False((await untaggedSourceTarget.ExistsAsync()).Value);
+        Assert.False((await untaggedSourceTarget.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertCopyBearerSourceAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, BlobClient source, byte[] content)
+    {
         var bearerTarget = container.GetBlobClient("bearer-source.bin");
         var bearerTargetSas = bearerTarget.GenerateSasUri(
-            BlobSasPermissions.Create | BlobSasPermissions.Write,
-            DateTimeOffset.UtcNow.AddMinutes(10));
+            BlobSasPermissions.Create | BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(10));
         var sourceToken = CreateJwt(SavaWebApplicationFactory.AccountKey, "reader-1");
-        using (var transport = new HttpClient(factory.Server.CreateHandler()))
+        using (var transport = new HttpClient(application.Server.CreateHandler()))
         using (var request = new HttpRequestMessage(HttpMethod.Put, bearerTargetSas)
         {
             Content = new ByteArrayContent([])
@@ -12240,51 +12261,54 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
             request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.Uri.AbsoluteUri);
             request.Headers.TryAddWithoutValidation("x-ms-copy-source-authorization", $"Bearer {sourceToken}");
-            using var response = await transport.SendAsync(request);
-            Assert.True(
-                response.StatusCode == HttpStatusCode.Accepted,
-                $"Expected 202 but received {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync()}");
+            using var response = await transport.SendAsync(request).ConfigureAwait(false);
+            Assert.True(response.StatusCode == HttpStatusCode.Accepted,
+                $"Expected 202 but received {(int)response.StatusCode}: " +
+                await response.Content.ReadAsStringAsync().ConfigureAwait(false));
         }
         for (var attempt = 0; attempt < 60; attempt++)
         {
-            if ((await bearerTarget.GetPropertiesAsync()).Value.CopyStatus == CopyStatus.Success)
+            if ((await bearerTarget.GetPropertiesAsync().ConfigureAwait(false)).Value.CopyStatus == CopyStatus.Success)
                 break;
-            await Task.Delay(50);
+            await Task.Delay(50).ConfigureAwait(false);
         }
-        Assert.Equal(content, (await bearerTarget.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Equal(content, (await bearerTarget.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
 
+    private static async Task AssertCopyUnsignedAndWrongResourceSourcesAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, BlobClient source)
+    {
         var unsignedTarget = container.GetBlobClient("unsigned-source.bin");
         var unsignedTargetSas = unsignedTarget.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(10));
         var unsignedSource = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            CreateBlobClient(factory, unsignedTargetSas).StartCopyFromUriAsync(source.Uri));
+            CreateBlobClient(application, unsignedTargetSas).StartCopyFromUriAsync(source.Uri)).ConfigureAwait(false);
         Assert.Equal(403, unsignedSource.Status);
-        Assert.False((await unsignedTarget.ExistsAsync()).Value);
+        Assert.False((await unsignedTarget.ExistsAsync().ConfigureAwait(false)).Value);
 
         var other = container.GetBlobClient("other.bin");
-        await other.UploadAsync(BinaryData.FromString("other"));
-        var otherSas = other.GenerateSasUri(
-            BlobSasPermissions.Read,
-            DateTimeOffset.UtcNow.AddMinutes(10));
-        var wrongResourceSource = new UriBuilder(source.Uri)
-        {
-            Query = otherSas.Query.TrimStart('?')
-        }.Uri;
+        await other.UploadAsync(BinaryData.FromString("other")).ConfigureAwait(false);
+        var otherSas = other.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(10));
+        var wrongResourceSource = new UriBuilder(source.Uri) { Query = otherSas.Query.TrimStart('?') }.Uri;
         var wrongResourceTarget = container.GetBlobClient("wrong-resource.bin");
         var wrongResourceTargetSas = wrongResourceTarget.GenerateSasUri(
             BlobSasPermissions.Read | BlobSasPermissions.Create | BlobSasPermissions.Write,
             DateTimeOffset.UtcNow.AddMinutes(10));
         var wrongResource = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            CreateBlobClient(factory, wrongResourceTargetSas).StartCopyFromUriAsync(wrongResourceSource));
+            CreateBlobClient(application, wrongResourceTargetSas).StartCopyFromUriAsync(wrongResourceSource))
+            .ConfigureAwait(false);
         Assert.Equal(403, wrongResource.Status);
-        Assert.False((await wrongResourceTarget.ExistsAsync()).Value);
+        Assert.False((await wrongResourceTarget.ExistsAsync().ConfigureAwait(false)).Value);
+    }
 
+    private static async Task AssertCopySourceLeaseHeaderRejectedAsync(
+        SavaWebApplicationFactory application, BlobContainerClient container, Uri sourceSas)
+    {
         var sourceLeaseTarget = container.GetBlobClient("source-lease-header.bin");
         var sourceLeaseTargetSas = sourceLeaseTarget.GenerateSasUri(
-            BlobSasPermissions.Create | BlobSasPermissions.Write,
-            DateTimeOffset.UtcNow.AddMinutes(10));
-        using var sourceLeaseTransport = new HttpClient(factory.Server.CreateHandler());
+            BlobSasPermissions.Create | BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(10));
+        using var sourceLeaseTransport = new HttpClient(application.Server.CreateHandler());
         using var sourceLeaseRequest = new HttpRequestMessage(HttpMethod.Put, sourceLeaseTargetSas)
         {
             Content = new ByteArrayContent([])
@@ -12292,10 +12316,10 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
         sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceSas.AbsoluteUri);
         sourceLeaseRequest.Headers.TryAddWithoutValidation("x-ms-source-lease-id", Guid.NewGuid().ToString());
-        using var sourceLeaseResponse = await sourceLeaseTransport.SendAsync(sourceLeaseRequest);
+        using var sourceLeaseResponse = await sourceLeaseTransport.SendAsync(sourceLeaseRequest).ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.BadRequest, sourceLeaseResponse.StatusCode);
         Assert.Equal("UnsupportedHeader", sourceLeaseResponse.Headers.GetValues("x-ms-error-code").Single());
-        Assert.False((await sourceLeaseTarget.ExistsAsync()).Value);
+        Assert.False((await sourceLeaseTarget.ExistsAsync().ConfigureAwait(false)).Value);
     }
 
     [Fact]
