@@ -7207,139 +7207,163 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var container = service.GetBlobContainerClient($"family-{Guid.NewGuid():N}");
             await container.CreateAsync();
             var metadata = application.Services.GetRequiredService<MetadataStore>();
+            await AssertIndexedFamilyDeletionIgnoresCorruptionAsync(application, container, metadata);
 
-            var deleted = container.GetBlobClient("delete-with-snapshots");
-            await deleted.UploadAsync(BinaryData.FromString("delete me"));
-            await deleted.CreateSnapshotAsync();
-            await deleted.CreateSnapshotAsync();
-            var unrelated = container.GetBlobClient("unrelated-corrupt-record");
-            await unrelated.UploadAsync(BinaryData.FromString("unrelated"));
+            await AssertAtomicFamilyMutationRollbackAsync(container, metadata);
 
-            var directConnectionString = new SqliteConnectionStringBuilder
-            {
-                DataSource = Path.Combine(application.DataPath, "metadata.db"),
-                ForeignKeys = true
-            }.ToString();
-            {
-                var connection = new SqliteConnection(directConnectionString);
-                await using (connection.ConfigureAwait(false))
-                {
-                    await connection.OpenAsync();
-                    await using var corrupt = connection.CreateCommand();
-                    corrupt.CommandText = """
-                        UPDATE blobs SET data = 'not-json'
-                        WHERE account = $account AND container = $container AND name = $name;
-                        """;
-                    corrupt.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
-                    corrupt.Parameters.AddWithValue("$container", container.Name);
-                    corrupt.Parameters.AddWithValue("$name", unrelated.Name);
-                    Assert.Equal(1, await corrupt.ExecuteNonQueryAsync());
-                }
-            }
-
-            await deleted.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
-            Assert.Empty(await metadata.ListBlobFamilyAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                deleted.Name,
-                includeDeleted: true,
-                CancellationToken.None));
-
-            {
-                var connection = new SqliteConnection(directConnectionString);
-                await using (connection.ConfigureAwait(false))
-                {
-                    await connection.OpenAsync();
-                    await using var removeCorruptRecord = connection.CreateCommand();
-                    removeCorruptRecord.CommandText = """
-                        DELETE FROM blobs
-                        WHERE account = $account AND container = $container AND name = $name;
-                        """;
-                    removeCorruptRecord.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
-                    removeCorruptRecord.Parameters.AddWithValue("$container", container.Name);
-                    removeCorruptRecord.Parameters.AddWithValue("$name", unrelated.Name);
-                    Assert.Equal(1, await removeCorruptRecord.ExecuteNonQueryAsync());
-                }
-            }
-
-            var atomic = container.GetBlobClient("atomic-family");
-            await atomic.UploadAsync(BinaryData.FromString("atomic"));
-            await atomic.CreateSnapshotAsync();
-            var before = await metadata.ListBlobFamilyAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                atomic.Name,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.Equal(2, before.Count);
-            var first = before[0];
-            var second = before[1];
-            var failedBatch = new[]
-            {
-                new BlobRecordMutation(
-                    first.GenerationId,
-                    first.Revision,
-                    first with
-                    {
-                        Revision = MetadataStore.NewRevision(),
-                        Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["mutated"] = "true" }
-                    }),
-                new BlobRecordMutation(
-                    second.GenerationId,
-                    "stale-revision",
-                    second with
-                    {
-                        Revision = MetadataStore.NewRevision(),
-                        Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["mutated"] = "true" }
-                    })
-            };
-            await Assert.ThrowsAsync<StorageConcurrencyException>(() =>
-                metadata.ApplyBlobRecordMutationsAsync(failedBatch, CancellationToken.None));
-            var afterFailedBatch = await metadata.ListBlobFamilyAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                atomic.Name,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.Equal(
-                before.Select(item => (item.GenerationId, item.Revision)),
-                afterFailedBatch.Select(item => (item.GenerationId, item.Revision)));
-            Assert.All(afterFailedBatch, item => Assert.False(item.Metadata.ContainsKey("mutated")));
-
-            var properties = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                properties with { BlobSoftDeleteEnabled = true, BlobSoftDeleteRetentionDays = 7 },
-                CancellationToken.None);
-            var restored = container.GetBlobClient("restore-family");
-            await restored.UploadAsync(BinaryData.FromString("restore"));
-            await restored.CreateSnapshotAsync();
-            await restored.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots);
-            var softDeleted = await metadata.ListBlobFamilyAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                restored.Name,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.Equal(2, softDeleted.Count);
-            Assert.All(softDeleted, item => Assert.True(item.IsDeleted));
-
-            await restored.UndeleteAsync();
-            var undeleted = await metadata.ListBlobFamilyAsync(
-                SavaWebApplicationFactory.AccountName,
-                container.Name,
-                restored.Name,
-                includeDeleted: true,
-                CancellationToken.None);
-            Assert.Equal(2, undeleted.Count);
-            Assert.All(undeleted, item => Assert.False(item.IsDeleted));
+            await AssertSoftDeletedFamilyRestoreAsync(container, metadata);
         }
         finally
         {
             await application.DisposeAsync();
         }
+    }
+
+    private static async Task ExecuteRawBlobRecordCommandAsync(
+        string directConnectionString,
+        BlobContainerClient container,
+        string blobName,
+        bool corrupt)
+    {
+        var connection = new SqliteConnection(directConnectionString);
+        await using (connection.ConfigureAwait(false))
+        {
+            await connection.OpenAsync().ConfigureAwait(false);
+            var command = connection.CreateCommand();
+            await using (command.ConfigureAwait(false))
+            {
+                if (corrupt)
+                    command.CommandText = """
+                        UPDATE blobs SET data = 'not-json'
+                        WHERE account = $account AND container = $container AND name = $name;
+                        """;
+                else
+                    command.CommandText = """
+                        DELETE FROM blobs
+                        WHERE account = $account AND container = $container AND name = $name;
+                        """;
+                command.Parameters.AddWithValue("$account", SavaWebApplicationFactory.AccountName);
+                command.Parameters.AddWithValue("$container", container.Name);
+                command.Parameters.AddWithValue("$name", blobName);
+                Assert.Equal(1, await command.ExecuteNonQueryAsync().ConfigureAwait(false));
+            }
+        }
+    }
+
+    private static async Task AssertIndexedFamilyDeletionIgnoresCorruptionAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        MetadataStore metadata)
+    {
+        var deleted = container.GetBlobClient("delete-with-snapshots");
+        await deleted.UploadAsync(BinaryData.FromString("delete me")).ConfigureAwait(false);
+        await deleted.CreateSnapshotAsync().ConfigureAwait(false);
+        await deleted.CreateSnapshotAsync().ConfigureAwait(false);
+        var unrelated = container.GetBlobClient("unrelated-corrupt-record");
+        await unrelated.UploadAsync(BinaryData.FromString("unrelated")).ConfigureAwait(false);
+
+        var directConnectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(application.DataPath, "metadata.db"),
+            ForeignKeys = true
+        }.ToString();
+        await ExecuteRawBlobRecordCommandAsync(
+            directConnectionString, container, unrelated.Name, corrupt: true).ConfigureAwait(false);
+
+        await deleted.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(false);
+        Assert.Empty(await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            deleted.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false));
+
+        await ExecuteRawBlobRecordCommandAsync(
+            directConnectionString, container, unrelated.Name, corrupt: false).ConfigureAwait(false);
+    }
+
+    private static async Task AssertAtomicFamilyMutationRollbackAsync(
+        BlobContainerClient container,
+        MetadataStore metadata)
+    {
+        var atomic = container.GetBlobClient("atomic-family");
+        await atomic.UploadAsync(BinaryData.FromString("atomic")).ConfigureAwait(false);
+        await atomic.CreateSnapshotAsync().ConfigureAwait(false);
+        var before = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            atomic.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(2, before.Count);
+        var first = before[0];
+        var second = before[1];
+        var failedBatch = new[]
+        {
+            new BlobRecordMutation(
+                first.GenerationId,
+                first.Revision,
+                first with
+                {
+                    Revision = MetadataStore.NewRevision(),
+                    Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["mutated"] = "true" }
+                }),
+            new BlobRecordMutation(
+                second.GenerationId,
+                "stale-revision",
+                second with
+                {
+                    Revision = MetadataStore.NewRevision(),
+                    Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["mutated"] = "true" }
+                })
+        };
+        await Assert.ThrowsAsync<StorageConcurrencyException>(() =>
+            metadata.ApplyBlobRecordMutationsAsync(failedBatch, CancellationToken.None)).ConfigureAwait(false);
+        var afterFailedBatch = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            atomic.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(
+            before.Select(item => (item.GenerationId, item.Revision)),
+            afterFailedBatch.Select(item => (item.GenerationId, item.Revision)));
+        Assert.All(afterFailedBatch, item => Assert.False(item.Metadata.ContainsKey("mutated")));
+    }
+
+    private static async Task AssertSoftDeletedFamilyRestoreAsync(
+        BlobContainerClient container,
+        MetadataStore metadata)
+    {
+        var properties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            properties with { BlobSoftDeleteEnabled = true, BlobSoftDeleteRetentionDays = 7 },
+            CancellationToken.None).ConfigureAwait(false);
+        var restored = container.GetBlobClient("restore-family");
+        await restored.UploadAsync(BinaryData.FromString("restore")).ConfigureAwait(false);
+        await restored.CreateSnapshotAsync().ConfigureAwait(false);
+        await restored.DeleteAsync(DeleteSnapshotsOption.IncludeSnapshots).ConfigureAwait(false);
+        var softDeleted = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            restored.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(2, softDeleted.Count);
+        Assert.All(softDeleted, item => Assert.True(item.IsDeleted));
+
+        await restored.UndeleteAsync().ConfigureAwait(false);
+        var undeleted = await metadata.ListBlobFamilyAsync(
+            SavaWebApplicationFactory.AccountName,
+            container.Name,
+            restored.Name,
+            includeDeleted: true,
+            CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(2, undeleted.Count);
+        Assert.All(undeleted, item => Assert.False(item.IsDeleted));
     }
 
     [Fact]
