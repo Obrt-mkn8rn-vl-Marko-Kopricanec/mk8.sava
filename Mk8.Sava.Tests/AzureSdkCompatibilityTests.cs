@@ -2628,12 +2628,35 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         var blob = container.GetBlobClient("parent/data.txt");
         await blob.UploadAsync(BinaryData.FromString("acl-content"));
 
+        var readAcl = await ApplyNamedAndGroupAclsAsync(application, container, blob, namedObjectId, groupId);
+
+        var namedToken = CreateJwt(SavaWebApplicationFactory.AccountKey, namedObjectId);
+        var named = CreateBearerClient(application, namedToken);
+        var groupMember = CreateBearerClient(
+            application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, groupMemberObjectId, groups: [groupId]));
+        var namedBlob = named.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
+        var groupBlob = groupMember.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
+        using var metadataTransport = new HttpClient(application.Server.CreateHandler());
+        await AssertNamedAndGroupAclReadsAsync(
+            metadataTransport, namedToken, named, namedBlob, groupBlob, blob.Name, container.Name);
+        await AssertNamedAndGroupAclRevocationAsync(
+            application, metadataTransport, namedToken, named, namedBlob, groupBlob, blob, container.Name, readAcl);
+    }
+
+    private static async Task<string> ApplyNamedAndGroupAclsAsync(
+        SavaWebApplicationFactory application,
+        BlobContainerClient container,
+        BlobClient blob,
+        string namedObjectId,
+        string groupId)
+    {
         var metadata = application.Services.GetRequiredService<MetadataStore>();
         var root = await metadata.GetContainerAsync(
             SavaWebApplicationFactory.AccountName,
             container.Name,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(root);
         var traverseAcl = $"user::rwx,user:{namedObjectId}:--x,group::r-x," +
                           $"group:{groupId}:--x,mask::r-x,other::---";
@@ -2660,64 +2683,90 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
                 Container = container.Name,
                 Path = blob.Name,
                 AccessAcl = readAcl
-            }));
+            }).ConfigureAwait(false));
         var updatedRoot = await metadata.GetContainerAsync(
             SavaWebApplicationFactory.AccountName,
             container.Name,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(false);
         Assert.NotNull(updatedRoot);
         Assert.NotEqual(root.ETag, updatedRoot.ETag, StringComparer.Ordinal);
+        return readAcl;
+    }
 
-        var namedToken = CreateJwt(SavaWebApplicationFactory.AccountKey, namedObjectId);
-        var named = CreateBearerClient(application, namedToken);
-        var groupMember = CreateBearerClient(
-            application,
-            CreateJwt(SavaWebApplicationFactory.AccountKey, groupMemberObjectId, groups: [groupId]));
-        var namedBlob = named.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
-        var groupBlob = groupMember.GetBlobContainerClient(container.Name).GetBlobClient(blob.Name);
-        Assert.Equal("acl-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
-        Assert.Equal("acl-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
-        using var metadataTransport = new HttpClient(application.Server.CreateHandler());
-        async Task<HttpStatusCode> MetadataStatusAsync()
-        {
-            using var metadataRequest = new HttpRequestMessage(
-                HttpMethod.Get, new Uri(namedBlob.Uri + "?comp=metadata", UriKind.Absolute));
-            metadataRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", namedToken);
-            metadataRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
-            using var metadataResponse = await metadataTransport.SendAsync(metadataRequest).ConfigureAwait(false);
-            return metadataResponse.StatusCode;
-        }
-        Assert.Equal(HttpStatusCode.OK, await MetadataStatusAsync());
-        var namedQuery = await named.GetBlobContainerClient(container.Name)
-            .GetBlockBlobClient(blob.Name).QueryAsync("SELECT _1 FROM BlobStorage;");
+    private static async Task<HttpStatusCode> GetNamedAclMetadataStatusAsync(
+        HttpClient metadataTransport,
+        string namedToken,
+        BlobClient namedBlob)
+    {
+        using var metadataRequest = new HttpRequestMessage(
+            HttpMethod.Get, new Uri(namedBlob.Uri + "?comp=metadata", UriKind.Absolute));
+        metadataRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", namedToken);
+        metadataRequest.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        using var metadataResponse = await metadataTransport.SendAsync(metadataRequest).ConfigureAwait(false);
+        return metadataResponse.StatusCode;
+    }
+
+    private static async Task AssertNamedAndGroupAclReadsAsync(
+        HttpClient metadataTransport,
+        string namedToken,
+        BlobServiceClient named,
+        BlobClient namedBlob,
+        BlobClient groupBlob,
+        string blobName,
+        string containerName)
+    {
+        Assert.Equal("acl-content", (await namedBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        Assert.Equal("acl-content", (await groupBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        Assert.Equal(HttpStatusCode.OK,
+            await GetNamedAclMetadataStatusAsync(metadataTransport, namedToken, namedBlob).ConfigureAwait(false));
+        var namedQuery = await named.GetBlobContainerClient(containerName)
+            .GetBlockBlobClient(blobName).QueryAsync("SELECT _1 FROM BlobStorage;").ConfigureAwait(false);
         using (var queryReader = new StreamReader(namedQuery.Value.Content))
-            Assert.Contains("acl-content", await queryReader.ReadToEndAsync(), StringComparison.Ordinal);
-        Assert.True((await namedBlob.GetPropertiesAsync()).GetRawResponse().Headers
+            Assert.Contains("acl-content", await queryReader.ReadToEndAsync().ConfigureAwait(false), StringComparison.Ordinal);
+        Assert.True((await namedBlob.GetPropertiesAsync().ConfigureAwait(false)).GetRawResponse().Headers
             .TryGetValue("x-ms-permissions", out var mode));
         Assert.Equal("rw-r-----", mode);
+    }
 
-        await blob.UploadAsync(BinaryData.FromString("replaced-content"), overwrite: true);
-        Assert.Equal("replaced-content", (await namedBlob.DownloadContentAsync()).Value.Content.ToString());
-        Assert.Equal("replaced-content", (await groupBlob.DownloadContentAsync()).Value.Content.ToString());
+    private static async Task AssertNamedAndGroupAclRevocationAsync(
+        SavaWebApplicationFactory application,
+        HttpClient metadataTransport,
+        string namedToken,
+        BlobServiceClient named,
+        BlobClient namedBlob,
+        BlobClient groupBlob,
+        BlobClient blob,
+        string containerName,
+        string readAcl)
+    {
+        await blob.UploadAsync(BinaryData.FromString("replaced-content"), overwrite: true).ConfigureAwait(false);
+        Assert.Equal("replaced-content", (await namedBlob.DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
+        Assert.Equal("replaced-content", (await groupBlob.DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
         Assert.Equal(1, await ApplyAclManifestAsync(application,
             new HierarchicalAclManifestEntry
             {
                 Account = SavaWebApplicationFactory.AccountName,
-                Container = container.Name,
+                Container = containerName,
                 Path = blob.Name,
                 AccessAcl = readAcl.Replace("mask::r--", "mask::---", StringComparison.Ordinal)
-            }));
-        var deniedNamed = await Assert.ThrowsAsync<RequestFailedException>(() => namedBlob.DownloadContentAsync());
-        var deniedGroup = await Assert.ThrowsAsync<RequestFailedException>(() => groupBlob.DownloadContentAsync());
+            }).ConfigureAwait(false));
+        var deniedNamed = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            namedBlob.DownloadContentAsync()).ConfigureAwait(false);
+        var deniedGroup = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            groupBlob.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedNamed.Status);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedGroup.Status);
-        Assert.Equal(HttpStatusCode.Forbidden, await MetadataStatusAsync());
+        Assert.Equal(HttpStatusCode.Forbidden,
+            await GetNamedAclMetadataStatusAsync(metadataTransport, namedToken, namedBlob).ConfigureAwait(false));
         var deniedQuery = await Assert.ThrowsAsync<RequestFailedException>(() => named
-            .GetBlobContainerClient(container.Name)
-            .GetBlockBlobClient(blob.Name).QueryAsync("SELECT _1 FROM BlobStorage;"));
+            .GetBlobContainerClient(containerName)
+            .GetBlockBlobClient(blob.Name).QueryAsync("SELECT _1 FROM BlobStorage;")).ConfigureAwait(false);
         Assert.Equal(StatusCodes.Status403Forbidden, deniedQuery.Status);
-        Assert.Equal("replaced-content", (await blob.DownloadContentAsync()).Value.Content.ToString());
+        Assert.Equal("replaced-content", (await blob.DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToString());
     }
 
     [Fact]
