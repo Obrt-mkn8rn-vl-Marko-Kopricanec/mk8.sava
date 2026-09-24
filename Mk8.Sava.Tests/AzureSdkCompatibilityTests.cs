@@ -13322,122 +13322,14 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
             var containerName = $"bounded-lifecycle-{Guid.NewGuid():N}";
             var container = service.GetBlobContainerClient(containerName);
             await container.CreateAsync();
-            for (var index = 0; index < 3; index++)
-            {
-                var blob = container.GetBlobClient($"expiring-{index}.bin");
-                await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(2048)));
-                var record = await blobService.GetBlobAsync(
-                    SavaWebApplicationFactory.AccountName,
-                    containerName,
-                    blob.Name,
-                    versionId: null,
-                    snapshot: null,
-                    includeDeleted: false,
-                    CancellationToken.None);
-                await blobService.SetExpiryAsync(
-                    record,
-                    DateTimeOffset.UtcNow.AddMilliseconds(100),
-                    CancellationToken.None);
-            }
+            var uncommitted = await CreateBoundedExpiryFixtureAsync(
+                blobService, metadata, container, containerName);
 
-            var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
-            for (var index = 0; index < 3; index++)
-            {
-                var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes($"bounded-block-{index:D2}"));
-                await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(2048)));
-            }
-            foreach (var block in await blobService.ListStagedBlocksAsync(
-                         SavaWebApplicationFactory.AccountName,
-                         containerName,
-                         uncommitted.Name,
-                         CancellationToken.None))
-            {
-                await metadata.PutStagedBlockAsync(
-                    block with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) },
-                    CancellationToken.None);
-            }
+            await AssertBoundedExpiryPassesAsync(blobService, metadata, containerName, uncommitted);
 
-            await Task.Delay(150);
-            for (var expectedRemaining = 2; expectedRemaining >= 0; expectedRemaining--)
-            {
-                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
-                Assert.Equal(1, result.ExpiredBlobs);
-                Assert.Equal(1, result.ExpiredUncommittedBlocks);
-                Assert.Equal(
-                    expectedRemaining,
-                    (await metadata.ListBlobsAsync(
-                        SavaWebApplicationFactory.AccountName,
-                        containerName,
-                        includeVersions: false,
-                        includeSnapshots: false,
-                        includeDeleted: false,
-                        CancellationToken.None)).Count);
-                Assert.Equal(
-                    expectedRemaining,
-                    (await blobService.ListStagedBlocksAsync(
-                        SavaWebApplicationFactory.AccountName,
-                        containerName,
-                        uncommitted.Name,
-                        CancellationToken.None)).Count);
-            }
+            var deletedContainerNames = await CreateExpiredDeletedContainersAsync(service, blobService, metadata);
 
-            var properties = await metadata.GetServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                CancellationToken.None);
-            await metadata.PutServicePropertiesAsync(
-                SavaWebApplicationFactory.AccountName,
-                properties with
-                {
-                    ContainerSoftDeleteEnabled = true,
-                    ContainerSoftDeleteRetentionDays = 1
-                },
-                CancellationToken.None);
-            var deletedContainerNames = Enumerable.Range(0, 3)
-                .Select(index => $"bounded-purge-{Guid.NewGuid():N}-{index}")
-                .ToArray();
-            foreach (var name in deletedContainerNames)
-            {
-                var client = service.GetBlobContainerClient(name);
-                await client.CreateAsync();
-                var record = await metadata.GetContainerAsync(
-                    SavaWebApplicationFactory.AccountName,
-                    name,
-                    includeDeleted: false,
-                    CancellationToken.None);
-                Assert.NotNull(record);
-                await blobService.DeleteContainerAsync(record!, CancellationToken.None);
-                var deleted = await metadata.GetContainerAsync(
-                    SavaWebApplicationFactory.AccountName,
-                    name,
-                    includeDeleted: true,
-                    CancellationToken.None);
-                Assert.NotNull(deleted);
-                await metadata.PutContainerAsync(
-                    deleted! with
-                    {
-                        Revision = MetadataStore.NewRevision(),
-                        DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
-                    },
-                    deleted.Revision,
-                    CancellationToken.None);
-            }
-
-            var purgedContainers = 0;
-            for (var pass = 0; pass < 8 && purgedContainers < deletedContainerNames.Length; pass++)
-            {
-                var result = await blobService.RunMaintenanceAsync(CancellationToken.None);
-                Assert.InRange(result.PurgedSoftDeletedContainers, 0, 1);
-                purgedContainers += result.PurgedSoftDeletedContainers;
-            }
-            Assert.Equal(deletedContainerNames.Length, purgedContainers);
-            foreach (var name in deletedContainerNames)
-            {
-                Assert.Null(await metadata.GetContainerAsync(
-                    SavaWebApplicationFactory.AccountName,
-                    name,
-                    includeDeleted: true,
-                    CancellationToken.None));
-            }
+            await AssertBoundedContainerPurgeAsync(blobService, metadata, deletedContainerNames);
         }
         finally
         {
@@ -13445,150 +13337,285 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         }
     }
 
+    private static async Task<BlockBlobClient> CreateBoundedExpiryFixtureAsync(
+        BlobService blobService, MetadataStore metadata,
+        BlobContainerClient container, string containerName)
+    {
+        for (var index = 0; index < 3; index++)
+        {
+            var blob = container.GetBlobClient($"expiring-{index}.bin");
+            await blob.UploadAsync(BinaryData.FromBytes(RandomNumberGenerator.GetBytes(2048)))
+                .ConfigureAwait(false);
+            var record = await blobService.GetBlobAsync(
+                SavaWebApplicationFactory.AccountName, containerName, blob.Name,
+                versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None)
+                .ConfigureAwait(false);
+            await blobService.SetExpiryAsync(record, DateTimeOffset.UtcNow.AddMilliseconds(100),
+                CancellationToken.None).ConfigureAwait(false);
+        }
+
+        var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
+        for (var index = 0; index < 3; index++)
+        {
+            var blockId = Convert.ToBase64String(Encoding.UTF8.GetBytes($"bounded-block-{index:D2}"));
+            await uncommitted.StageBlockAsync(blockId, new MemoryStream(RandomNumberGenerator.GetBytes(2048)))
+                .ConfigureAwait(false);
+        }
+        foreach (var block in await blobService.ListStagedBlocksAsync(
+                     SavaWebApplicationFactory.AccountName, containerName, uncommitted.Name,
+                     CancellationToken.None).ConfigureAwait(false))
+        {
+            await metadata.PutStagedBlockAsync(
+                block with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) }, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        return uncommitted;
+    }
+
+    private static async Task AssertBoundedExpiryPassesAsync(
+        BlobService blobService, MetadataStore metadata,
+        string containerName, BlockBlobClient uncommitted)
+    {
+        await Task.Delay(150).ConfigureAwait(false);
+        for (var expectedRemaining = 2; expectedRemaining >= 0; expectedRemaining--)
+        {
+            var result = await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.Equal(1, result.ExpiredBlobs);
+            Assert.Equal(1, result.ExpiredUncommittedBlocks);
+            Assert.Equal(expectedRemaining,
+                (await metadata.ListBlobsAsync(
+                    SavaWebApplicationFactory.AccountName, containerName,
+                    includeVersions: false, includeSnapshots: false, includeDeleted: false,
+                    CancellationToken.None).ConfigureAwait(false)).Count);
+            Assert.Equal(expectedRemaining,
+                (await blobService.ListStagedBlocksAsync(
+                    SavaWebApplicationFactory.AccountName, containerName, uncommitted.Name,
+                    CancellationToken.None).ConfigureAwait(false)).Count);
+        }
+    }
+
+    private static async Task<string[]> CreateExpiredDeletedContainersAsync(
+        BlobServiceClient service, BlobService blobService, MetadataStore metadata)
+    {
+        var properties = await metadata.GetServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName, CancellationToken.None).ConfigureAwait(false);
+        await metadata.PutServicePropertiesAsync(
+            SavaWebApplicationFactory.AccountName,
+            properties with { ContainerSoftDeleteEnabled = true, ContainerSoftDeleteRetentionDays = 1 },
+            CancellationToken.None).ConfigureAwait(false);
+        var deletedContainerNames = Enumerable.Range(0, 3)
+            .Select(index => $"bounded-purge-{Guid.NewGuid():N}-{index}").ToArray();
+        foreach (var name in deletedContainerNames)
+        {
+            var client = service.GetBlobContainerClient(name);
+            await client.CreateAsync().ConfigureAwait(false);
+            var record = await metadata.GetContainerAsync(
+                SavaWebApplicationFactory.AccountName, name, includeDeleted: false,
+                CancellationToken.None).ConfigureAwait(false);
+            Assert.NotNull(record);
+            await blobService.DeleteContainerAsync(record!, CancellationToken.None).ConfigureAwait(false);
+            var deleted = await metadata.GetContainerAsync(
+                SavaWebApplicationFactory.AccountName, name, includeDeleted: true,
+                CancellationToken.None).ConfigureAwait(false);
+            Assert.NotNull(deleted);
+            await metadata.PutContainerAsync(
+                deleted! with
+                {
+                    Revision = MetadataStore.NewRevision(),
+                    DeleteRetentionUntil = DateTimeOffset.UtcNow.AddMinutes(-1)
+                },
+                deleted.Revision, CancellationToken.None).ConfigureAwait(false);
+        }
+        return deletedContainerNames;
+    }
+
+    private static async Task AssertBoundedContainerPurgeAsync(
+        BlobService blobService, MetadataStore metadata, string[] deletedContainerNames)
+    {
+        var purgedContainers = 0;
+        for (var pass = 0; pass < 8 && purgedContainers < deletedContainerNames.Length; pass++)
+        {
+            var result = await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+            Assert.InRange(result.PurgedSoftDeletedContainers, 0, 1);
+            purgedContainers += result.PurgedSoftDeletedContainers;
+        }
+        Assert.Equal(deletedContainerNames.Length, purgedContainers);
+        foreach (var name in deletedContainerNames)
+        {
+            Assert.Null(await metadata.GetContainerAsync(
+                SavaWebApplicationFactory.AccountName, name, includeDeleted: true,
+                CancellationToken.None).ConfigureAwait(false));
+        }
+    }
+
     [Fact]
     public async Task ConsistentBackupRestoresExactSharedSnapshotAndUncommittedContent()
     {
         var source = new SavaWebApplicationFactory();
-        SavaWebApplicationFactory? restored = null;
         var backupPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-backup-{Guid.NewGuid():N}");
         var restoredPath = Path.Combine(Path.GetTempPath(), $"mk8-sava-restored-{Guid.NewGuid():N}");
         try
         {
             await source.InitializeAsync();
-            var service = CreateClient(source);
-            var containerName = $"backup-{Guid.NewGuid():N}";
-            var container = service.GetBlobContainerClient(containerName);
-            await container.CreateAsync();
-            var sharedBytes = Enumerable.Range(0, 96 * 1024).Select(index => (byte)(index % 251)).ToArray();
-            var first = container.GetBlobClient("first.bin");
-            var second = container.GetBlobClient("second.bin");
-            await first.UploadAsync(BinaryData.FromBytes(sharedBytes));
-            await second.UploadAsync(BinaryData.FromBytes(sharedBytes));
-            var snapshot = (await first.CreateSnapshotAsync()).Value.Snapshot;
-
-            var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
-            var blockId = Convert.ToBase64String("backup-block-0001"u8);
-            var uncommittedBytes = RandomNumberGenerator.GetBytes(24 * 1024);
-            await uncommitted.StageBlockAsync(blockId, new MemoryStream(uncommittedBytes));
-
-            var customerKey = RandomNumberGenerator.GetBytes(32);
-            var encrypted = CreateEncryptedClient(source, new CustomerProvidedKey(customerKey), encryptionScope: null)
-                .GetBlobContainerClient(containerName)
-                .GetBlobClient("customer-key.bin");
-            var encryptedBytes = RandomNumberGenerator.GetBytes(20 * 1024);
-            await encrypted.UploadAsync(BinaryData.FromBytes(encryptedBytes));
+            var scenario = await CreateBackupSourceScenarioAsync(source);
 
             var backup = source.Services.GetRequiredService<StorageBackupService>();
-            var created = await backup.CreateAsync(backupPath, CancellationToken.None);
-            Assert.True(created.BlobRecordCount >= 4);
-            Assert.True(created.ChunkCount > 0);
-            Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None));
+            var created = await AssertBackupManifestAsync(backup, backupPath);
 
-            var options = source.Services
-                .GetRequiredService<Microsoft.Extensions.Options.IOptions<Mk8.Sava.Configuration.SavaOptions>>()
-                .Value;
-            var wrongKeyOptions = new Mk8.Sava.Configuration.SavaOptions
-            {
-                DefaultAccount = SavaWebApplicationFactory.AccountName,
-                Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
-                {
-                    [SavaWebApplicationFactory.AccountName] = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64))
-                }
-            };
-            await Assert.ThrowsAsync<InvalidDataException>(() => StorageBackupService.ValidateBackupAsync(
-                backupPath,
-                wrongKeyOptions,
-                CancellationToken.None));
-            var existingTarget = Path.Combine(Path.GetTempPath(), $"mk8-sava-existing-{Guid.NewGuid():N}");
-            Directory.CreateDirectory(existingTarget);
-            try
-            {
-                await Assert.ThrowsAsync<IOException>(() => StorageBackupService.RestoreAsync(
-                    backupPath,
-                    existingTarget,
-                    options,
-                    CancellationToken.None));
-            }
-            finally
-            {
-                Directory.Delete(existingTarget);
-            }
-            var restoredBackup = await StorageBackupService.RestoreAsync(
-                backupPath,
-                restoredPath,
-                options,
-                CancellationToken.None);
-            Assert.Equal(created.ChunkCount, restoredBackup.ChunkCount);
-            Assert.Equal(created.ChunkCount, EnumerateChunkFiles(restoredPath).Count());
-            Assert.Empty(Directory.EnumerateFiles(Path.Combine(restoredPath, "staging")));
-            Assert.Equal(
-                ["metadata.db"],
-                Directory.EnumerateFiles(restoredPath).Select(Path.GetFileName).Order(StringComparer.Ordinal), StringComparer.Ordinal);
+            await AssertBackupRestoreGuardsAndLayoutAsync(source, backupPath, restoredPath, created);
 
-            restored = new SavaWebApplicationFactory(restoredPath);
+            var restored = new SavaWebApplicationFactory(restoredPath);
+            // xUnit1030 requires the Fact's continuation to retain its synchronization context.
+#pragma warning disable MA0004
+            await using var restoredDisposal = restored.ConfigureAwait(true);
+#pragma warning restore MA0004
             await restored.InitializeAsync();
-            var restoredContainer = CreateClient(restored).GetBlobContainerClient(containerName);
-            Assert.Equal(sharedBytes, (await restoredContainer.GetBlobClient(first.Name).DownloadContentAsync()).Value.Content.ToArray());
-            Assert.Equal(sharedBytes, (await restoredContainer.GetBlobClient(second.Name).DownloadContentAsync()).Value.Content.ToArray());
-            Assert.Equal(
-                sharedBytes,
-                (await restoredContainer.GetBlobClient(first.Name).WithSnapshot(snapshot).DownloadContentAsync()).Value.Content.ToArray());
+            await AssertRestoredBackupContentAsync(restored, scenario);
 
-            var restoredBlocks = await restoredContainer.GetBlockBlobClient(uncommitted.Name)
-                .GetBlockListAsync(BlockListTypes.Uncommitted);
-            var restoredBlock = Assert.Single(restoredBlocks.Value.UncommittedBlocks);
-            Assert.Equal(blockId, restoredBlock.Name);
-            Assert.Equal(uncommittedBytes.Length, restoredBlock.SizeLong);
-            await restoredContainer.GetBlockBlobClient(uncommitted.Name).CommitBlockListAsync([blockId]);
-            Assert.Equal(
-                uncommittedBytes,
-                (await restoredContainer.GetBlobClient(uncommitted.Name).DownloadContentAsync()).Value.Content.ToArray());
-            var restoredEncrypted = CreateEncryptedClient(
-                    restored,
-                    new CustomerProvidedKey(customerKey),
-                    encryptionScope: null)
-                .GetBlobContainerClient(containerName)
-                .GetBlobClient(encrypted.Name);
-            Assert.Equal(encryptedBytes, (await restoredEncrypted.DownloadContentAsync()).Value.Content.ToArray());
-
-            var backedUpChunk = Directory.EnumerateFiles(
-                Path.Combine(backupPath, "chunks"),
-                "*.chunk",
-                SearchOption.AllDirectories).First();
-            {
-                var corrupt = new FileStream(
-                             backedUpChunk,
-                             FileMode.Open,
-                             FileAccess.ReadWrite,
-                             FileShare.None,
-                             4096,
-                             FileOptions.Asynchronous);
-                await using (corrupt.ConfigureAwait(false))
-                {
-                    corrupt.Position = corrupt.Length - 1;
-                    var value = corrupt.ReadByte();
-                    Assert.NotEqual(-1, value);
-                    corrupt.Position--;
-                    corrupt.WriteByte((byte)(value ^ 0xff));
-                    // Durability tests require a media flush; FlushAsync cannot request one.
-#pragma warning disable CA1849
-                    corrupt.Flush(flushToDisk: true);
-#pragma warning restore CA1849
-                }
-            }
-            await Assert.ThrowsAsync<InvalidDataException>(() =>
-                backup.ValidateAsync(backupPath, CancellationToken.None));
+            await AssertCorruptedBackupRejectedAsync(backup, backupPath);
         }
         finally
         {
-            if (restored is not null)
-                await restored.DisposeAsync();
             await source.DisposeAsync();
             if (Directory.Exists(backupPath))
                 Directory.Delete(backupPath, recursive: true);
             if (Directory.Exists(restoredPath))
                 Directory.Delete(restoredPath, recursive: true);
         }
+    }
+
+    private sealed record BackupSourceScenario(
+        string ContainerName, string FirstName, string SecondName, byte[] SharedBytes, string Snapshot,
+        string UncommittedName, string BlockId, byte[] UncommittedBytes,
+        byte[] CustomerKey, string EncryptedName, byte[] EncryptedBytes);
+
+    private static async Task<BackupSourceScenario> CreateBackupSourceScenarioAsync(
+        SavaWebApplicationFactory source)
+    {
+        var service = CreateClient(source);
+        var containerName = $"backup-{Guid.NewGuid():N}";
+        var container = service.GetBlobContainerClient(containerName);
+        await container.CreateAsync().ConfigureAwait(false);
+        var sharedBytes = Enumerable.Range(0, 96 * 1024).Select(index => (byte)(index % 251)).ToArray();
+        var first = container.GetBlobClient("first.bin");
+        var second = container.GetBlobClient("second.bin");
+        await first.UploadAsync(BinaryData.FromBytes(sharedBytes)).ConfigureAwait(false);
+        await second.UploadAsync(BinaryData.FromBytes(sharedBytes)).ConfigureAwait(false);
+        var snapshot = (await first.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+
+        var uncommitted = container.GetBlockBlobClient("uncommitted.bin");
+        var blockId = Convert.ToBase64String("backup-block-0001"u8);
+        var uncommittedBytes = RandomNumberGenerator.GetBytes(24 * 1024);
+        await uncommitted.StageBlockAsync(blockId, new MemoryStream(uncommittedBytes)).ConfigureAwait(false);
+
+        var customerKey = RandomNumberGenerator.GetBytes(32);
+        var encrypted = CreateEncryptedClient(source, new CustomerProvidedKey(customerKey), encryptionScope: null)
+            .GetBlobContainerClient(containerName).GetBlobClient("customer-key.bin");
+        var encryptedBytes = RandomNumberGenerator.GetBytes(20 * 1024);
+        await encrypted.UploadAsync(BinaryData.FromBytes(encryptedBytes)).ConfigureAwait(false);
+        return new BackupSourceScenario(containerName, first.Name, second.Name, sharedBytes, snapshot,
+            uncommitted.Name, blockId, uncommittedBytes, customerKey, encrypted.Name, encryptedBytes);
+    }
+
+    private static async Task<StorageBackupValidation> AssertBackupManifestAsync(
+        StorageBackupService backup, string backupPath)
+    {
+        var created = await backup.CreateAsync(backupPath, CancellationToken.None).ConfigureAwait(false);
+        Assert.True(created.BlobRecordCount >= 4);
+        Assert.True(created.ChunkCount > 0);
+        Assert.Equal(created, await backup.ValidateAsync(backupPath, CancellationToken.None).ConfigureAwait(false));
+        return created;
+    }
+
+    private static async Task AssertBackupRestoreGuardsAndLayoutAsync(
+        SavaWebApplicationFactory source, string backupPath,
+        string restoredPath, StorageBackupValidation created)
+    {
+        var options = source.Services
+            .GetRequiredService<Microsoft.Extensions.Options.IOptions<Mk8.Sava.Configuration.SavaOptions>>()
+            .Value;
+        var wrongKeyOptions = new Mk8.Sava.Configuration.SavaOptions
+        {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = Convert.ToBase64String(RandomNumberGenerator.GetBytes(64))
+            }
+        };
+        await Assert.ThrowsAsync<InvalidDataException>(() => StorageBackupService.ValidateBackupAsync(
+            backupPath, wrongKeyOptions, CancellationToken.None)).ConfigureAwait(false);
+        var existingTarget = Path.Combine(Path.GetTempPath(), $"mk8-sava-existing-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(existingTarget);
+        try
+        {
+            await Assert.ThrowsAsync<IOException>(() => StorageBackupService.RestoreAsync(
+                backupPath, existingTarget, options, CancellationToken.None)).ConfigureAwait(false);
+        }
+        finally
+        {
+            Directory.Delete(existingTarget);
+        }
+        var restoredBackup = await StorageBackupService.RestoreAsync(
+            backupPath, restoredPath, options, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(created.ChunkCount, restoredBackup.ChunkCount);
+        Assert.Equal(created.ChunkCount, EnumerateChunkFiles(restoredPath).Count());
+        Assert.Empty(Directory.EnumerateFiles(Path.Combine(restoredPath, "staging")));
+        Assert.Equal(["metadata.db"],
+            Directory.EnumerateFiles(restoredPath).Select(Path.GetFileName).Order(StringComparer.Ordinal),
+            StringComparer.Ordinal);
+    }
+
+    private static async Task AssertRestoredBackupContentAsync(
+        SavaWebApplicationFactory restored, BackupSourceScenario scenario)
+    {
+        var restoredContainer = CreateClient(restored).GetBlobContainerClient(scenario.ContainerName);
+        Assert.Equal(scenario.SharedBytes,
+            (await restoredContainer.GetBlobClient(scenario.FirstName).DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToArray());
+        Assert.Equal(scenario.SharedBytes,
+            (await restoredContainer.GetBlobClient(scenario.SecondName).DownloadContentAsync().ConfigureAwait(false))
+            .Value.Content.ToArray());
+        Assert.Equal(scenario.SharedBytes,
+            (await restoredContainer.GetBlobClient(scenario.FirstName).WithSnapshot(scenario.Snapshot)
+                .DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+
+        var restoredBlocks = await restoredContainer.GetBlockBlobClient(scenario.UncommittedName)
+            .GetBlockListAsync(BlockListTypes.Uncommitted).ConfigureAwait(false);
+        var restoredBlock = Assert.Single(restoredBlocks.Value.UncommittedBlocks);
+        Assert.Equal(scenario.BlockId, restoredBlock.Name);
+        Assert.Equal(scenario.UncommittedBytes.Length, restoredBlock.SizeLong);
+        await restoredContainer.GetBlockBlobClient(scenario.UncommittedName)
+            .CommitBlockListAsync([scenario.BlockId]).ConfigureAwait(false);
+        Assert.Equal(scenario.UncommittedBytes,
+            (await restoredContainer.GetBlobClient(scenario.UncommittedName)
+                .DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+        var restoredEncrypted = CreateEncryptedClient(
+                restored, new CustomerProvidedKey(scenario.CustomerKey), encryptionScope: null)
+            .GetBlobContainerClient(scenario.ContainerName).GetBlobClient(scenario.EncryptedName);
+        Assert.Equal(scenario.EncryptedBytes,
+            (await restoredEncrypted.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
+    }
+
+    private static async Task AssertCorruptedBackupRejectedAsync(StorageBackupService backup, string backupPath)
+    {
+        var backedUpChunk = Directory.EnumerateFiles(
+            Path.Combine(backupPath, "chunks"), "*.chunk", SearchOption.AllDirectories).First();
+        var corrupt = new FileStream(backedUpChunk, FileMode.Open, FileAccess.ReadWrite,
+            FileShare.None, 4096, FileOptions.Asynchronous);
+        await using (corrupt.ConfigureAwait(false))
+        {
+            corrupt.Position = corrupt.Length - 1;
+            var value = corrupt.ReadByte();
+            Assert.NotEqual(-1, value);
+            corrupt.Position--;
+            corrupt.WriteByte((byte)(value ^ 0xff));
+            // Durability tests require a media flush; FlushAsync cannot request one.
+#pragma warning disable CA1849
+            corrupt.Flush(flushToDisk: true);
+#pragma warning restore CA1849
+        }
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            backup.ValidateAsync(backupPath, CancellationToken.None)).ConfigureAwait(false);
     }
 
     [Fact]
