@@ -6,7 +6,8 @@ namespace Mk8.Sava.Protocol;
 internal sealed class BlobSeekableReadStream(
     BlobService service,
     BlobRecord blob,
-    BlobEncryption encryption) : Stream
+    BlobEncryption encryption,
+    CancellationToken requestCancellationToken = default) : Stream
 {
     private long _position;
 
@@ -24,7 +25,7 @@ internal sealed class BlobSeekableReadStream(
     {
         // Parquet's Stream contract includes synchronous reads; the query path otherwise uses the async override.
 #pragma warning disable VSTHRD002
-        return ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        return ReadAsync(buffer.AsMemory(offset, count), requestCancellationToken).AsTask().GetAwaiter().GetResult();
 #pragma warning restore VSTHRD002
     }
 
@@ -37,7 +38,7 @@ internal sealed class BlobSeekableReadStream(
         {
             // Keep the synchronous Stream fallback available to Parquet; all I/O continuations avoid context capture.
 #pragma warning disable VSTHRD002
-            var read = ReadAsync(rented.AsMemory(0, buffer.Length)).AsTask().GetAwaiter().GetResult();
+            var read = ReadAsync(rented.AsMemory(0, buffer.Length), requestCancellationToken).AsTask().GetAwaiter().GetResult();
 #pragma warning restore VSTHRD002
             rented.AsSpan(0, read).CopyTo(buffer);
             return read;

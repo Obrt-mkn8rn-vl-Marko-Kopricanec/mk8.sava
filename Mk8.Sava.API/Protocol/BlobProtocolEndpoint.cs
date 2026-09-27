@@ -3565,7 +3565,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var encryption = new BlobEncryption(blob.EncryptionScope, null);
         if (query.Input.Kind == BlobQueryFormatKind.Parquet)
         {
-            var seekableContent = new BlobSeekableReadStream(service, blob, encryption);
+            var seekableContent = new BlobSeekableReadStream(service, blob, encryption, cancellationToken);
             await using (seekableContent.ConfigureAwait(false))
             {
                 await BlobQueryProtocol.ExecuteAsync(
