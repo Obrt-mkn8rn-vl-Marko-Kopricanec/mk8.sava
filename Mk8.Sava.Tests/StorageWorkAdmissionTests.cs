@@ -143,10 +143,19 @@ public sealed class StorageWorkAdmissionTests
         var encryption = new BlobEncryption(null, null);
         var bytes = RandomNumberGenerator.GetBytes(2 * 1024 * 1024);
         using var source = new MemoryStream(bytes, writable: false);
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        // This is a deadlock guard, not a disk-throughput assertion: Windows CI
+        // must durably flush the source and six copies while the full suite runs.
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
         using var stored = await chunks.StorePinnedAsync(SavaWebApplicationFactory.AccountName, encryption, source, cancellation.Token).ConfigureAwait(false);
-        await Task.WhenAll(Enumerable.Range(0, 6).Select(_ =>
-            CopyAndAssertAsync(chunks, stored.Manifest, encryption, bytes, cancellation.Token))).ConfigureAwait(false);
+        try
+        {
+            await Task.WhenAll(Enumerable.Range(0, 6).Select(_ =>
+                CopyAndAssertAsync(chunks, stored.Manifest, encryption, bytes, cancellation.Token))).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            Assert.Fail($"Cross-domain copies exceeded the deadlock guard. Admission state:\n{chunks.Admission.RenderPrometheus()}");
+        }
         Assert.Contains("mk8_sava_storage_work_active{lane=\"writes\"} 0\n", chunks.Admission.RenderPrometheus(), StringComparison.Ordinal);
     }
 
