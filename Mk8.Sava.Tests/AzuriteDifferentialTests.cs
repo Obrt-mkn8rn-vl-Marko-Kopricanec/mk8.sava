@@ -524,6 +524,48 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task CompletedCopyPropertiesSurviveMetadataAndTagUpdatesMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-copy-properties-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseCopyPropertyMutationsAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseCopyPropertyMutationsAsync(localContainer).ConfigureAwait(false);
+            Assert.False(expected.PropertiesClearedCopy);
+            Assert.True(expected.PropertiesCopyPreserved);
+            Assert.Equal(expected with
+            {
+                PropertiesClearedCopy = actual.PropertiesClearedCopy,
+                PropertiesCopyPreserved = actual.PropertiesCopyPreserved
+            }, actual);
+            Assert.True(actual.TagCopyPreserved);
+            Assert.True(actual.MetadataCopyPreserved);
+            Assert.True(actual.TagEntityUnchanged);
+            Assert.True(actual.MetadataETagChanged);
+            Assert.True(actual.PropertiesClearedCopy);
+            Assert.False(actual.PropertiesCopyPreserved);
+            Assert.Equal("changed", actual.Metadata);
+            Assert.Equal("changed", actual.Tag);
+            Assert.Equal("copied payload", actual.Content);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task BlobPrefixMetadataAndHierarchyPagingMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1475,6 +1517,58 @@ public sealed class AzuriteDifferentialTests
             properties.ContentLength, Convert.ToHexString(SHA256.HashData(actual)));
     }
 
+    private static async Task<CopyPropertyMutationObservation> ExerciseCopyPropertyMutationsAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var source = container.GetBlobClient("source.bin");
+        await source.UploadAsync(BinaryData.FromString("copied payload"), new BlobUploadOptions
+        {
+            Metadata = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "original" }
+        }).ConfigureAwait(false);
+        var destination = container.GetBlobClient("destination.bin");
+        var copy = await destination.StartCopyFromUriAsync(source.Uri, new BlobCopyFromUriOptions
+        {
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "original" }
+        }).ConfigureAwait(false);
+        await copy.WaitForCompletionAsync().ConfigureAwait(false);
+        var before = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(CopyStatus.Success, before.CopyStatus);
+        Assert.Equal(copy.Id, before.CopyId);
+        Assert.False(string.IsNullOrEmpty(before.CopyId));
+        Assert.Equal(204, (await destination.SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "changed"
+        }).ConfigureAwait(false)).Status);
+        var afterTags = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal("original", afterTags.Metadata["phase"]);
+        await destination.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "changed"
+        }).ConfigureAwait(false);
+        var afterMetadata = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        await destination.SetHttpHeadersAsync(new BlobHttpHeaders { ContentType = "application/x-copy-properties" })
+            .ConfigureAwait(false);
+        var afterProperties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        return new CopyPropertyMutationObservation(
+            CopyPropertiesMatch(before, afterTags), CopyPropertiesMatch(before, afterMetadata),
+            before.ETag == afterTags.ETag && before.LastModified == afterTags.LastModified,
+            before.ETag != afterMetadata.ETag,
+            afterProperties.CopyId is null && afterProperties.CopySource is null &&
+            afterProperties.CopyStatus == default && afterProperties.CopyProgress is null &&
+            afterProperties.CopyCompletedOn == default,
+            CopyPropertiesMatch(before, afterProperties),
+            afterProperties.Metadata["phase"],
+            (await destination.GetTagsAsync().ConfigureAwait(false)).Value.Tags["phase"],
+            (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+    }
+
+    private static bool CopyPropertiesMatch(BlobProperties expected, BlobProperties actual) =>
+        string.Equals(expected.CopyId, actual.CopyId, StringComparison.Ordinal) && expected.CopyStatus == actual.CopyStatus &&
+        expected.CopySource == actual.CopySource && string.Equals(expected.CopyProgress, actual.CopyProgress, StringComparison.Ordinal) &&
+        expected.CopyCompletedOn == actual.CopyCompletedOn &&
+        string.Equals(expected.CopyStatusDescription, actual.CopyStatusDescription, StringComparison.Ordinal);
+
     private static async Task<BlobListingObservation> ExerciseBlobListingAsync(BlobContainerClient container)
     {
         await container.CreateAsync().ConfigureAwait(false);
@@ -1976,6 +2070,11 @@ public sealed class AzuriteDifferentialTests
     private sealed record CopyObservation(
         int StaleSourceStatus, string? StaleSourceCode, int StartStatus,
         string CopyStatus, long Length, string ContentSha256);
+
+    private sealed record CopyPropertyMutationObservation(
+        bool TagCopyPreserved, bool MetadataCopyPreserved, bool TagEntityUnchanged,
+        bool MetadataETagChanged, bool PropertiesClearedCopy, bool PropertiesCopyPreserved,
+        string Metadata, string Tag, string Content);
 
     private sealed record BlobListingObservation(
         string FlatPages, int FlatContinuations,
