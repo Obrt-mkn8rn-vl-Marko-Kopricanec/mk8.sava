@@ -313,6 +313,16 @@ Azurite 3.35.0 incorrectly retains all copy properties after that HTTP-property
 write; the differential records this exception, and mk8.sava clears them.
 Local cases also cover versioned accounts: metadata creates a new version,
 tag writes do not, and the previous version retains its copy properties.
+Completed append copies likewise retain all copy properties after Append
+Block and Seal Append Blob. A twenty-sixth differential compares those
+mutations, changed ETags, committed-block-count deltas, exact destination
+and source bytes, and rejection of an append after sealing. Local REST/SDK
+cases also retain copy properties through HNS expiry setting/clearing,
+unlocked immutability-policy setting/deletion, and legal-hold setting/removal.
+Retention changes leave the ETag, last-modified time and version ID unchanged;
+these HNS/retention cases are official-contract local evidence, not emulator
+differentials. Only the documented Set Blob Properties, Put Blob and Put
+Block List writes clear completed-copy properties.
 Container-scoped tag searches enforce the documented `2021-04-10` service
 version boundary. Local SDK cases reject `2019-12-12` and `2020-12-06`
 container requests with `FeatureVersionMismatch`, accept `2021-04-10`, and
