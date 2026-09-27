@@ -108,7 +108,8 @@ internal sealed class UrlTransferClient(
         var length = await ValidateReadSourceResponseAsync(
             destinationRequest, response, rangeText, long.MaxValue, sourceLengthConflict: false, cancellationToken).ConfigureAwait(false);
         var returned = response.Content.Headers.ContentRange;
-        if (length != expected || returned is null || returned.From != range.Start || returned.To != range.End ||
+        if (length != expected || returned is null || !string.Equals(returned.Unit, "bytes", StringComparison.OrdinalIgnoreCase) ||
+            returned.From != range.Start || returned.To != range.End ||
             returned.Length != sourceLength || !string.Equals(response.Headers.ETag?.ToString(), etag, StringComparison.Ordinal))
             throw CannotVerifyCopySource("The source returned an inconsistent page range or snapshot ETag.");
         var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
@@ -119,9 +120,9 @@ internal sealed class UrlTransferClient(
             {
                 await consume(limited, cancellationToken).ConfigureAwait(false);
             }
-            catch (EndOfStreamException)
+            catch (Exception exception) when (exception is EndOfStreamException or RequestBodyTooLargeException)
             {
-                throw CannotVerifyCopySource("The source page range ended before the requested length.");
+                throw CannotVerifyCopySource("The source page range body did not match the requested length.");
             }
         }
     }
@@ -145,8 +146,7 @@ internal sealed class UrlTransferClient(
             var document = await ReadSourceXmlAsync(destinationRequest,
                 BuildComponentUri(sourceUri, parameters.ToArray()), etag, cancellationToken,
                 incrementalCopyContinuity: true).ConfigureAwait(false);
-            if (!string.Equals(document.Root?.Name.LocalName, "PageList", StringComparison.Ordinal))
-                throw CannotVerifyCopySource("The source returned an invalid page-diff document.");
+            ValidatePageListDocument(document);
             pages.AddRange(ParsePageRangeEntries(document, "PageRange", sourceLength));
             clears.AddRange(ParsePageRangeEntries(document, "ClearRange", Math.Max(sourceLength, previousLength)));
             marker = document.Descendants().FirstOrDefault(element => string.Equals(element.Name.LocalName, "NextMarker", StringComparison.Ordinal))?.Value;
@@ -167,7 +167,7 @@ internal sealed class UrlTransferClient(
                 !long.TryParse(endText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
                 start < 0 || end < start || end == long.MaxValue || start % 512 != 0 ||
                 (end + 1) % 512 != 0 || end >= maximumLength)
-                throw CannotVerifyCopySource("The source returned an invalid page-diff range.");
+                throw CannotVerifyCopySource("The source returned an invalid page range.");
             yield return new PageRange(start, end);
         }
     }
@@ -880,19 +880,8 @@ internal sealed class UrlTransferClient(
                 BuildComponentUri(sourceUri, parameters.ToArray()),
                 etag,
                 cancellationToken).ConfigureAwait(false);
-            foreach (var range in document.Descendants().Where(element => string.Equals(element.Name.LocalName, "PageRange", StringComparison.Ordinal)))
-            {
-                var startText = range.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "Start", StringComparison.Ordinal))?.Value;
-                var endText = range.Elements().FirstOrDefault(element => string.Equals(element.Name.LocalName, "End", StringComparison.Ordinal))?.Value;
-                if (!long.TryParse(startText, NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
-                    !long.TryParse(endText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
-                    start < 0 || end < start || end == long.MaxValue ||
-                    start % 512 != 0 || (end + 1) % 512 != 0 || end >= contentLength)
-                {
-                    throw CannotVerifyCopySource("The source returned an invalid page range list.");
-                }
-                ranges.Add(new PageRange(start, end));
-            }
+            ValidatePageListDocument(document);
+            ranges.AddRange(ParsePageRangeEntries(document, "PageRange", contentLength));
             marker = document.Descendants()
                 .FirstOrDefault(element => string.Equals(element.Name.LocalName, "NextMarker", StringComparison.Ordinal))
                 ?.Value;
@@ -900,6 +889,12 @@ internal sealed class UrlTransferClient(
                 throw CannotVerifyCopySource("The source page range continuation marker repeated.");
         } while (!string.IsNullOrEmpty(marker));
         return ranges;
+    }
+
+    private static void ValidatePageListDocument(XDocument document)
+    {
+        if (!string.Equals(document.Root?.Name.LocalName, "PageList", StringComparison.Ordinal))
+            throw CannotVerifyCopySource("The source returned an invalid page-list document.");
     }
 
     private async Task<XDocument> ReadSourceXmlAsync(
@@ -961,7 +956,11 @@ internal sealed class UrlTransferClient(
         Uri sourceUri,
         params KeyValuePair<string, string?>[] componentParameters)
     {
-        var replaced = componentParameters.Select(parameter => parameter.Key).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // Source shape requests own their component and pagination state, rather
+        // than inheriting a caller's marker or turning a full list into a diff.
+        var replaced = componentParameters.Select(parameter => parameter.Key)
+            .Concat(["prevsnapshot", "marker", "maxresults", "blocklisttype"])
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(sourceUri.Query);
         var values = query
             .Where(pair => !replaced.Contains(pair.Key))

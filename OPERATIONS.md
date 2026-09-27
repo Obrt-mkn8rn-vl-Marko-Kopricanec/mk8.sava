@@ -469,6 +469,12 @@ at most 4 MiB. Cleared pages and length changes are applied to a sparse
 destination manifest; unchanged snapshots require no data GET. Prior
 destination snapshots remain independently readable. Inconsistent range,
 length, or ETag responses fail before publishing a replacement copy.
+Page-list responses require the expected XML root; internal shape requests
+own their pagination/diff parameters instead of inheriting a marker from the
+source blob URL. Range responses must use byte units, and both short and
+overlong bodies fail as `CannotVerifyCopySource`, not a client upload-size
+error. Tests exercise failure on the second changed range, reclaim the
+unpublished staged content, then retry while checking exact old/new snapshots.
 Local SDK/HTTP tests cover sparse growth, clear, shrink, empty deltas and
 multi-range transfers. These are not a whole-operation emulator differential:
 Azurite does not implement incremental copy or page diff.

@@ -125,7 +125,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     internal SavaWebApplicationFactory(
         TimeProvider timeProvider,
         IReadOnlyDictionary<string, string?> configurationOverrides,
-        Func<HttpMessageHandler> urlTransferHandlerFactory)
+        Func<HttpMessageHandler> urlTransferHandlerFactory,
+        bool disableMaintenance = false)
         : this(
             Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
             urlTransferHandlerFactory,
@@ -133,6 +134,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
             timeProvider,
             deleteDataPath: true)
     {
+        _disableMaintenance = disableMaintenance;
     }
 
     internal SavaWebApplicationFactory(

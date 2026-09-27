@@ -2051,59 +2051,9 @@ public sealed class BlobService(
             cancellationToken).ConfigureAwait(false);
     }
 
-    // Preserve the exact x-ms-copy-source text in the stored copy state.
-#pragma warning disable CA1054
-    public Task<BlobRecord> BeginIncrementalCopyFromStreamAsync(
-        string account,
-        string container,
-        string name,
-        Stream sourceContent,
-        long sourceLength,
-        string sourceSnapshot,
-        string sourceIdentity,
-        DateTimeOffset sourceCreatedAt,
-        long sourceSequenceNumber,
-        IReadOnlyList<PageRange> sourcePageRanges,
-        BlobWriteOptions options,
-        string sourceUri,
-        BlobRecord? current,
-        CancellationToken cancellationToken)
-    {
-#pragma warning restore CA1054
-        ArgumentNullException.ThrowIfNull(sourceContent);
-        ArgumentNullException.ThrowIfNull(sourcePageRanges);
-        ArgumentNullException.ThrowIfNull(options);
-        var sourceDescriptor = new IncrementalCopySourceDescriptor(
-            BlobKind.PageBlob,
-            sourceSnapshot,
-            sourceIdentity,
-            sourceCreatedAt,
-            sourceSequenceNumber,
-            sourcePageRanges,
-            null);
-        return BeginIncrementalCopyCoreAsync(
-            account,
-            container,
-            name,
-            sourceDescriptor,
-            options,
-            sourceUri,
-            current,
-            async (encryption, token) =>
-            {
-                var stored = await chunks.StorePinnedAsync(account, encryption, sourceContent, token).ConfigureAwait(false);
-                if (stored.Manifest.Length != sourceLength)
-                {
-                    stored.Dispose();
-                    throw CannotVerifyCopySource("The incremental copy source length did not match its Content-Length value.");
-                }
-                return new PreparedCopyContent(stored.Manifest, [], [stored]);
-            },
-            cancellationToken);
-    }
-
     // The HTTP layer supplies bounded source ranges; the BLL owns staging,
     // sparse reconstruction, conditions, publication and reference lifetimes.
+    // Preserve the exact x-ms-copy-source text in the stored copy state.
 #pragma warning disable CA1054
     public Task<BlobRecord> BeginIncrementalCopyFromPageRangesAsync(
         string account, string container, string name, long sourceLength,
