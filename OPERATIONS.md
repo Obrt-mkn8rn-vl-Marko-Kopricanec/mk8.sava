@@ -518,7 +518,12 @@ column arrays or result rows are produced; malformed counts return a fatal
 `InvalidParquetFile` query error rather than inventing zero/null rows. The
 current decoder still materializes a valid row group's columns, so this is not
 a per-query memory ceiling. Arrow results use the caller's declared schema and are emitted
-as bounded record batches inside Azure's Avro query envelope; the service does
+as record batches inside Azure's Avro query envelope. Each batch targets at most
+4 MiB of estimated retained cells plus UTF-16/UTF-8 text and at most 1,024 rows,
+flushing before another row would exceed the byte target. A single wider row is
+still valid and is emitted alone, so the target is not a per-row size limit or
+an absolute process-memory ceiling. Partially constructed Arrow column arrays
+are disposed if a later column fails. The service does
 not retain or buffer the complete result set. The normal .NET compatibility
 suite exercises multiple Parquet row groups and all six Azure Arrow field types,
 including null and empty-result stream shapes, through the official SDK.
