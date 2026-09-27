@@ -18,7 +18,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class MicrosoftGraphGroupMembershipResolverTests
+public sealed partial class MicrosoftGraphGroupMembershipResolverTests
 {
     private const string ReaderObjectId = "dd2af586-602b-4b90-9e7d-f32ffac9c88e";
     private const string ReaderGroupId = "69c6e8bb-a8f4-4fc9-a022-8149b983621a";
