@@ -176,6 +176,9 @@ through ASP.NET's in-memory test server.
 
 The Azurite differential lane is run with
 `DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/azurite/run.sh`.
+Set `MK8_SAVA_AZURITE_SKIP_BUILD=1` only after building matching Release
+artifacts yourself; this preserves a strict-analyzer build for the differential
+run instead of replacing it with the runner's default build.
 It starts a disposable, strict-mode Azurite Blob server on loopback, pins
 Azurite `3.35.0` and its dependency graph, and uses the same official .NET
 Blob SDK against Azurite and mk8.sava. It compares container creation,
@@ -1002,6 +1005,48 @@ tier changes.
   lifecycle maintenance. These operator endpoints contain no credentials or
   blob names, but deployments should still restrict them to the monitoring
   network.
+
+### Storage work admission
+
+The process shares four independently bounded FIFO work lanes. Configure them
+under `Sava`:
+
+| Setting | Default | Accepted range |
+| --- | ---: | ---: |
+| `MaximumConcurrentStorageReads` | 16 | 1–256 |
+| `MaximumConcurrentStorageWrites` | 8 | 1–256 |
+| `MaximumConcurrentChunkCodecs` | 4 | 1–256 |
+| `MaximumConcurrentBlobQueries` | 2 | 1–32 |
+| `MaximumQueuedStorageOperations` | 128 per lane | 0–4096 |
+
+Uploads wait before consuming their content or creating chunk staging files.
+Range reads and compositions wait before reconstructing content. A read keeps
+its permit until its output completes; HTTP downloads retain it across checksum
+buffering and structured-response framing as well. Queries have an additional
+permit spanning request parsing, execution, and response output. Compression,
+authenticated chunk reads, and decompression share the codec lane, including
+maintenance. Queued readers and cross-domain copies pin their source extents so
+garbage collection cannot remove content while they wait. Cross-domain copies
+acquire a writer permit before starting their reader/pipe producer, avoiding
+an admission-order cycle when there is only one reader and writer.
+
+Cancellation removes queued work. A full queue rejects work with HTTP 503,
+Azure error `ServerBusy`, and `Retry-After: 1`; callers should use their ordinary
+SDK retry policy. This is the documented
+[Azure transient overload error](https://learn.microsoft.com/en-us/rest/api/storageservices/common-rest-api-error-codes).
+Rejected writes do not publish replacement content or metadata. If a failure
+occurs after response output has started, the connection is aborted rather
+than appending an error to blob bytes. A saturated maintenance codec queue
+defers the pass for retry rather than labeling content corrupt.
+
+`/metrics` exports `mk8_sava_storage_work_active`,
+`mk8_sava_storage_work_queued`, and
+`mk8_sava_storage_work_rejected_total`, with only the fixed `reads`, `writes`,
+`codecs`, and `queries` lane labels. Canceled waits are not queue rejections.
+These limits bound concurrent work and queue length, not total process RSS,
+network connections, logical storage capacity, or filesystem free space.
+Memory still scales with configured chunk size, manifests, and query input;
+deployment sizing and a free-space reserve remain necessary.
 
 The existing chunk, staging, and metadata byte gauges measure serialized file
 lengths. On Linux, `mk8_sava_storage_allocated_root_bytes` additionally measures

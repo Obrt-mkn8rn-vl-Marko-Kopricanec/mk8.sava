@@ -1149,6 +1149,26 @@ public sealed class BlobService(
         Stream destination,
         CancellationToken cancellationToken)
     {
+        EnsureReadableContent(blob);
+        await chunks.WriteRangeAsync(blob.Content, encryption, offset, length, destination, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal async Task WriteContentUnderReadLeaseAsync(
+        System.Threading.RateLimiting.RateLimitLease readLease,
+        BlobRecord blob,
+        BlobEncryption encryption,
+        long offset,
+        long length,
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        EnsureReadableContent(blob);
+        await chunks.WriteRangeUnderReadLeaseAsync(
+            readLease, blob.Content, encryption, offset, length, destination, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void EnsureReadableContent(BlobRecord blob)
+    {
         ArgumentNullException.ThrowIfNull(blob);
         EnsureNoPendingCopy(blob);
         if (string.Equals(blob.AccessTier, "Archive", StringComparison.Ordinal))
@@ -1158,7 +1178,6 @@ public sealed class BlobService(
                 "BlobArchived",
                 "This operation is not permitted on an archived blob.");
         }
-        await chunks.WriteRangeAsync(blob.Content, encryption, offset, length, destination, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<BlobRecord> SetBlobMetadataAsync(

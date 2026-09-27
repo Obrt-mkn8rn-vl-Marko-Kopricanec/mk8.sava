@@ -30,7 +30,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 corepack yarn --cwd "$script_directory" install --frozen-lockfile --non-interactive --ignore-engines
-"$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore -c Release
+if [[ "${MK8_SAVA_AZURITE_SKIP_BUILD:-0}" != "1" ]]; then
+    "$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore -c Release
+fi
 
 port=$(python3 - <<'PY'
 import socket

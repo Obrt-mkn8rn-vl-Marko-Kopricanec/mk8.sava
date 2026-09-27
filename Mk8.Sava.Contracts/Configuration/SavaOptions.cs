@@ -44,6 +44,11 @@ public sealed class SavaOptions : IValidatableObject
     public bool EnableCrossAccountDeduplication { get; init; }
     public string? CrossAccountEncryptionKey { get; init; }
     public long MaximumRequestBodyBytes { get; init; } = 5_000L * 1024 * 1024;
+    public int MaximumConcurrentStorageReads { get; init; } = 16;
+    public int MaximumConcurrentStorageWrites { get; init; } = 8;
+    public int MaximumConcurrentChunkCodecs { get; init; } = 4;
+    public int MaximumConcurrentBlobQueries { get; init; } = 2;
+    public int MaximumQueuedStorageOperations { get; init; } = 128;
     public IList<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
@@ -76,10 +81,26 @@ public sealed class SavaOptions : IValidatableObject
             yield return result;
         foreach (var result in ValidateTransfer())
             yield return result;
+        foreach (var result in ValidateAdmission())
+            yield return result;
         foreach (var result in ValidateMaintenance())
             yield return result;
         foreach (var result in ValidateBearer())
             yield return result;
+    }
+
+    private IEnumerable<ValidationResult> ValidateAdmission()
+    {
+        if (MaximumConcurrentStorageReads is < 1 or > 256)
+            yield return new ValidationResult("MaximumConcurrentStorageReads must be between 1 and 256.", [nameof(MaximumConcurrentStorageReads)]);
+        if (MaximumConcurrentStorageWrites is < 1 or > 256)
+            yield return new ValidationResult("MaximumConcurrentStorageWrites must be between 1 and 256.", [nameof(MaximumConcurrentStorageWrites)]);
+        if (MaximumConcurrentChunkCodecs is < 1 or > 256)
+            yield return new ValidationResult("MaximumConcurrentChunkCodecs must be between 1 and 256.", [nameof(MaximumConcurrentChunkCodecs)]);
+        if (MaximumConcurrentBlobQueries is < 1 or > 32)
+            yield return new ValidationResult("MaximumConcurrentBlobQueries must be between 1 and 32.", [nameof(MaximumConcurrentBlobQueries)]);
+        if (MaximumQueuedStorageOperations is < 0 or > 4096)
+            yield return new ValidationResult("MaximumQueuedStorageOperations must be between 0 and 4096.", [nameof(MaximumQueuedStorageOperations)]);
     }
 
     private IEnumerable<ValidationResult> ValidateAccounts()
