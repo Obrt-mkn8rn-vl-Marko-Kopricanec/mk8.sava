@@ -61,6 +61,8 @@ builder.Services.AddSingleton<IStorageAnalyticsSink>(services =>
 builder.Services.AddSingleton<BlobService>();
 builder.Services.AddSingleton<StorageBackupService>();
 builder.Services.AddSingleton<StorageDataKeyContinuity>();
+builder.Services.AddSingleton<StorageInitializationService>();
+builder.Services.AddHostedService(services => services.GetRequiredService<StorageInitializationService>());
 builder.Services.AddHostedService<StorageMaintenanceService>();
 builder.Services.AddSingleton<StorageAuthenticator>();
 builder.Services.AddSingleton<TokenCredential>(services =>
@@ -103,6 +105,7 @@ builder.Services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Tim
     });
 
 var app = builder.Build();
+await using var appDisposal = app.ConfigureAwait(false);
 
 if (operatorCommand is { Name: "restore" })
 {
@@ -131,21 +134,9 @@ if (operatorCommand is { Name: "validate" })
     return;
 }
 
-try
-{
-    await app.Services.GetRequiredService<MetadataStore>().InitializeAsync().ConfigureAwait(false);
-    await app.Services.GetRequiredService<StorageDataKeyContinuity>().EnsureAsync(CancellationToken.None).ConfigureAwait(false);
-    await app.Services.GetRequiredService<BlobService>().ApplyConfiguredAccountCapabilitiesAsync().ConfigureAwait(false);
-    var prunedChunkDirectories = app.Services.GetRequiredService<StoragePaths>()
-        .PruneLegacyEmptyChunkDirectories();
-    if (prunedChunkDirectories > 0)
-        StorageLogMessages.LegacyChunkDirectoriesPruned(app.Logger, prunedChunkDirectories);
-}
-catch
-{
-    await app.DisposeAsync().ConfigureAwait(false);
-    throw;
-}
+if (operatorCommand is not null)
+    await app.Services.GetRequiredService<StorageInitializationService>()
+        .InitializeAsync(CancellationToken.None).ConfigureAwait(false);
 
 if (operatorCommand is { Name: "create" })
 {
