@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Xml.Linq;
 using Azure;
 using Azure.Core.Pipeline;
@@ -9,11 +10,125 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
+using Microsoft.Extensions.DependencyInjection;
+using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
 public sealed class ExternalIncrementalCopyTransferTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UnavailablePreviousSnapshotOrMalformedDiffKeepsTheCompletedDestination(bool deletePreviousSnapshot)
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl();
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        var first = await CopyInitialSparseSnapshotAsync(fixture).ConfigureAwait(true);
+        var previousSourceSnapshot = control.LastSourceSnapshot!;
+        var before = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        using var payload = new MemoryStream(Enumerable.Repeat((byte)0xD8, 512).ToArray(), writable: false);
+        await fixture.Source.UploadPagesAsync(payload, 0).ConfigureAwait(true);
+        if (deletePreviousSnapshot)
+            await fixture.Source.WithSnapshot(previousSourceSnapshot).DeleteAsync().ConfigureAwait(true);
+        else
+            control.MalformedPageDiff = true;
+        reads.Clear();
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => CopyLatestSnapshotAsync(fixture))
+            .ConfigureAwait(true);
+        Assert.Equal("CannotVerifyCopySource", rejected.ErrorCode);
+        Assert.Equal(500, rejected.Status);
+        Assert.Empty(reads);
+        var after = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(before.CopyId, after.CopyId);
+        Assert.Equal(before.ETag, after.ETag);
+        Assert.Equal(first, after.DestinationSnapshot);
+        await AssertInitialSnapshotAsync(fixture, first).ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task MalformedOccupiedPageListCannotPublishAZeroFilledCopy()
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl { MalformedPageList = true };
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        await CreateInitialSparseSourceAsync(fixture.Source).ConfigureAwait(true);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => CopyLatestSnapshotAsync(fixture))
+            .ConfigureAwait(true);
+        Assert.Equal("CannotVerifyCopySource", rejected.ErrorCode);
+        Assert.False((await fixture.Target.ExistsAsync().ConfigureAwait(true)).Value);
+        Assert.Empty(reads);
+        control.MalformedPageList = false;
+        var snapshot = await CopyLatestSnapshotAsync(fixture).ConfigureAwait(true);
+        await AssertInitialSnapshotAsync(fixture, snapshot).ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task SourceBlobQueryParametersCannotSkipOccupiedPages()
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl();
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        await CreateInitialSparseSourceAsync(fixture.Source).ConfigureAwait(true);
+        await fixture.Source.ResizeAsync(8192).ConfigureAwait(true);
+        using var payload = new MemoryStream(Enumerable.Repeat((byte)0xB6, 512).ToArray(), writable: false);
+        await fixture.Source.UploadPagesAsync(payload, 4096).ConfigureAwait(true);
+        var snapshot = await CopyLatestSnapshotAsync(fixture, "marker=1&maxresults=1").ConfigureAwait(true);
+        var expected = new byte[8192];
+        Array.Fill(expected, (byte)0xA5, 0, 512);
+        Array.Fill(expected, (byte)0xB6, 4096, 512);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(snapshot).DownloadContentAsync()
+            .ConfigureAwait(true)).Value.Content.ToArray());
+        AssertTransferredBytes(fixture, 1024);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(1)]
+    public async Task InvalidSecondRangeBodyKeepsPriorCopyAndPermitsReclamationAndRetry(int bodyLengthDelta)
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl();
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        var first = await CopyInitialSparseSnapshotAsync(fixture).ConfigureAwait(true);
+        var before = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        var payload = Enumerable.Repeat((byte)0xC7, 10 * 1024 * 1024).ToArray();
+        await fixture.Source.ResizeAsync(12 * 1024 * 1024).ConfigureAwait(true);
+        await UploadLargePagesAsync(fixture.Source, payload).ConfigureAwait(true);
+        reads.Clear();
+        control.RangeBodyLengthDelta = bodyLengthDelta;
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => CopyLatestSnapshotAsync(fixture))
+            .ConfigureAwait(true);
+        Assert.Equal("CannotVerifyCopySource", rejected.ErrorCode);
+        Assert.Equal(500, rejected.Status);
+        Assert.Equal(2, reads.Count);
+        var after = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(before.CopyId, after.CopyId);
+        Assert.Equal(before.ETag, after.ETag);
+        Assert.Equal(first, after.DestinationSnapshot);
+        Assert.True(await application.Services.GetRequiredService<BlobService>()
+            .CollectGarbageAsync(CancellationToken.None).ConfigureAwait(true) > 0);
+        await AssertInitialSnapshotAsync(fixture, first).ConfigureAwait(true);
+        control.RangeBodyLengthDelta = 0;
+        reads.Clear();
+        var retry = await CopyLatestSnapshotAsync(fixture).ConfigureAwait(true);
+        var expected = new byte[12 * 1024 * 1024];
+        payload.CopyTo(expected, 0);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(retry).DownloadContentAsync()
+            .ConfigureAwait(true)).Value.Content.ToArray());
+        AssertTransferredBytes(fixture, payload.Length);
+        await AssertInitialSnapshotAsync(fixture, first).ConfigureAwait(true);
+    }
+
     [Theory]
     [InlineData("2016-05-31", "2016-05-31")]
     [InlineData("2016-05-31", "2017-11-09")]
@@ -106,11 +221,13 @@ public sealed class ExternalIncrementalCopyTransferTests
             .ConfigureAwait(true)).Value.Content.ToArray());
     }
 
-    [Fact]
-    public async Task InconsistentSourceRangeDoesNotPublishAnIncrementalCopy()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InconsistentSourceRangeDoesNotPublishAnIncrementalCopy(bool wrongUnit)
     {
         var reads = new ConcurrentQueue<SourceRead>();
-        var control = new SourceReadControl();
+        var control = new SourceReadControl { CorruptRangeUnits = wrongUnit };
         var application = CreateApplication(reads, control);
         await using var disposal = application.ConfigureAwait(true);
         var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
@@ -138,7 +255,8 @@ public sealed class ExternalIncrementalCopyTransferTests
         application = new SavaWebApplicationFactory(TimeProvider.System,
             new Dictionary<string, string?>(StringComparer.Ordinal) { ["Sava:AsyncCopyCompletionDelay"] = "00:00:00" },
             () => new RecordingHandler(application?.Server.CreateHandler() ??
-                throw new InvalidOperationException("Source is not initialized."), reads, control));
+                throw new InvalidOperationException("Source is not initialized."), reads, control),
+            disableMaintenance: true);
         return application;
     }
 
@@ -185,6 +303,14 @@ public sealed class ExternalIncrementalCopyTransferTests
         await source.UploadPagesAsync(payload, 0).ConfigureAwait(false);
     }
 
+    private static async Task AssertInitialSnapshotAsync(CopyFixture fixture, string snapshot)
+    {
+        var expected = new byte[4096];
+        Array.Fill(expected, (byte)0xA5, 0, 512);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(snapshot).DownloadContentAsync()
+            .ConfigureAwait(false)).Value.Content.ToArray());
+    }
+
     private static async Task<string> CopyGrowthAndClearAsync(CopyFixture fixture, string firstSnapshot)
     {
         fixture.Reads.Clear();
@@ -225,10 +351,13 @@ public sealed class ExternalIncrementalCopyTransferTests
         Assert.Equal(Enumerable.Repeat((byte)0xB6, 512), previous.Skip(4096).Take(512));
     }
 
-    private static async Task<string> CopyLatestSnapshotAsync(CopyFixture fixture)
+    private static async Task<string> CopyLatestSnapshotAsync(CopyFixture fixture, string? additionalSourceQuery = null)
     {
         var sourceSnapshot = (await fixture.Source.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        fixture.Control.LastSourceSnapshot = sourceSnapshot;
         var sas = fixture.Source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        if (!string.IsNullOrEmpty(additionalSourceQuery))
+            sas = new Uri(sas.AbsoluteUri + '&' + additionalSourceQuery);
         var copy = await fixture.Target.StartCopyIncrementalAsync(sas, sourceSnapshot).ConfigureAwait(false);
         await copy.WaitForCompletionAsync(TimeSpan.FromMilliseconds(50), CancellationToken.None).ConfigureAwait(false);
         return (await fixture.Target.GetPropertiesAsync().ConfigureAwait(false)).Value.DestinationSnapshot!;
@@ -283,7 +412,17 @@ public sealed class ExternalIncrementalCopyTransferTests
     {
         public bool CorruptRanges { get; set; }
 
+        public bool CorruptRangeUnits { get; init; }
+
         public bool HideCreationTime { get; init; }
+
+        public bool MalformedPageList { get; set; }
+
+        public bool MalformedPageDiff { get; set; }
+
+        public string? LastSourceSnapshot { get; set; }
+
+        public int RangeBodyLengthDelta { get; set; }
 
         public ConcurrentQueue<SourceHead> Heads { get; } = new();
     }
@@ -310,10 +449,36 @@ public sealed class ExternalIncrementalCopyTransferTests
                 if (control.CorruptRanges && response.Content.Headers.ContentRange is { Length: { } total })
                 {
                     var length = response.Content.Headers.ContentLength!.Value;
-                    response.Content.Headers.ContentRange = new ContentRangeHeaderValue(512, 512 + length - 1, total);
+                    response.Content.Headers.ContentRange = control.CorruptRangeUnits
+                        ? new ContentRangeHeaderValue(0, length - 1, total) { Unit = "items" }
+                        : new ContentRangeHeaderValue(512, 512 + length - 1, total);
                 }
+                if (control.RangeBodyLengthDelta != 0 && request.Headers.Range?.Ranges.FirstOrDefault()?.From >= 4 * 1024 * 1024)
+                    await ChangeBodyLengthAsync(response, control.RangeBodyLengthDelta, cancellationToken).ConfigureAwait(false);
+            }
+            else if (request.Method == HttpMethod.Get && response.IsSuccessStatusCode &&
+                     (control.MalformedPageList ||
+                      control.MalformedPageDiff && request.RequestUri!.Query.Contains("prevsnapshot=", StringComparison.OrdinalIgnoreCase)))
+            {
+                response.Content.Dispose();
+                response.Content = new StringContent("<NotPageList />", Encoding.UTF8, "application/xml");
             }
             return response;
+        }
+
+        private static async Task ChangeBodyLengthAsync(
+            HttpResponseMessage response, int difference, CancellationToken cancellationToken)
+        {
+            var previous = response.Content;
+            var body = await previous.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+            var changed = new byte[body.Length + difference];
+            body.AsSpan(0, Math.Min(body.Length, changed.Length)).CopyTo(changed);
+            var replacement = new ByteArrayContent(changed);
+            foreach (var header in previous.Headers)
+                replacement.Headers.TryAddWithoutValidation(header.Key, header.Value);
+            replacement.Headers.ContentLength = previous.Headers.ContentLength;
+            response.Content = replacement;
+            previous.Dispose();
         }
     }
 }
