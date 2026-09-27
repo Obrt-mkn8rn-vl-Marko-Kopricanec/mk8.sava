@@ -277,6 +277,15 @@ name page boundary. The test records these emulator limitations explicitly.
 The [List Blobs contract](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs)
 includes snapshots when requested and specifies oldest-to-newest snapshot
 order and opaque continuation markers.
+A twenty-third SDK scenario changes a snapshot's tags independently of the
+current blob and checks 204, exact snapshot bytes, and unchanged ETag and
+last-modified values on both objects. Mk8.sava and Azurite agree. Ordinary
+local SDK tests also retag and clear an older blob version, preserve the
+snapshot/version identities, enforce dedicated tag-SAS permissions and tag
+conditions, and check the `2020-08-04` snapshot tag-write boundary in the
+[Set Blob Tags contract](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tags).
+Content and metadata on historical targets remain immutable; tags are a
+separately mutable dataset under their own authorization.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

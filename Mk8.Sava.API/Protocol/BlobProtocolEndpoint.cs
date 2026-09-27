@@ -2349,7 +2349,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     {
         Require(request, 't');
         RequireBlobIndexTags(request, service, "Set Blob Tags");
-        EnsureMutableVersion(blob);
+        if (blob.Snapshot is not null)
+            RequireFeatureVersion(request, new DateOnly(2020, 8, 4), "Set Blob Tags on a snapshot");
         EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
         EvaluateBlobTagConditions(http.Request, request, blob, write: true);
         EnsureLease(http.Request, blob.Lease, "blob");
