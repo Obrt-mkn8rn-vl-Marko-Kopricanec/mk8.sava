@@ -200,9 +200,40 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         _chunkStore ??= services.GetRequiredService<ChunkStore>();
     }
 
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var host = builder.Build();
+        try
+        {
+            // DeferredHost.StartAsync registers ApplicationStarted before its
+            // first await. Only then let the entry point initialize storage.
+            // Otherwise a fast startup failure can dispose the provider before
+            // DeferredHost acquires it, obscuring the actual validation error.
+            var starting = host.StartAsync();
+            host.Services.GetRequiredService<SavaTestHostLifetime>().Release();
+#pragma warning disable VSTHRD002 // WebApplicationFactory.CreateHost is a synchronous framework override; unwrap the registered startup task's original failure.
+            starting.GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
+            CaptureServices(host.Services);
+            return host;
+        }
+        catch
+        {
+            host.Dispose();
+            throw;
+        }
+    }
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
+        builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<IHostLifetime>();
+            services.AddSingleton(new SavaTestHostLifetime());
+            services.AddSingleton<IHostLifetime>(provider => provider.GetRequiredService<SavaTestHostLifetime>());
+        });
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
             configuration.AddInMemoryCollection(CreateBaseConfiguration());
