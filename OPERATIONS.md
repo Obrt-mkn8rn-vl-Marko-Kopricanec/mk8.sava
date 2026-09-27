@@ -543,6 +543,16 @@ are disposed if a later column fails. The service does
 not retain or buffer the complete result set. The normal .NET compatibility
 suite exercises multiple Parquet row groups and all six Azure Arrow field types,
 including null and empty-result stream shapes, through the official SDK.
+`Sava:MaximumBlobQueryResultMemoryBytes` defaults to 256 MiB (8 MiB–2 GiB).
+Before encoding each selected row, a conservative estimate includes retained
+cells, names, text, escaping and concurrent encoding copies. Repeated references
+in a projection count repeatedly because each produces encoded bytes. A first
+row exceeding capacity returns HTTP 503 `ServerBusy` with `Retry-After: 1`
+before response streaming. A later capacity failure terminates the response;
+it never emits a successful completion for truncated results. This admission
+estimate is not an absolute RSS ceiling. Avro result data uses at most 64 KiB
+per data record, including when one selected row is much wider; Azure SDKs
+reconstruct the same complete result stream across those records.
 The SQL evaluator supports Azure's row-wise arithmetic and comparison
 precedence, typed `CAST`, `BETWEEN`, `IN`, `NULLIF`, `COALESCE`,
 `CHAR_LENGTH`/`CHARACTER_LENGTH`, `LOWER`, `UPPER`, `SUBSTRING`, and `LIMIT`.
@@ -1043,6 +1053,7 @@ under `Sava`:
 | `MaximumConcurrentChunkCodecs` | 4 | 1–256 |
 | `MaximumConcurrentBlobQueries` | 2 | 1–32 |
 | `MaximumParquetQueryMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
+| `MaximumBlobQueryResultMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
 | `MaximumQueuedStorageOperations` | 128 per lane | 0–4096 |
 
 Uploads wait before consuming their content or creating chunk staging files.
