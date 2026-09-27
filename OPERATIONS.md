@@ -982,7 +982,11 @@ values, not authoritative quota or content-integrity data. Linux link-churn
 cases exercise replacement on either phase of one-step inventory passes.
 The controlled scale test
 uses 50,000 chunk files across 50 shards while 512 staging files are created,
-flushed, and deleted concurrently. The scale-test collection runs without
+flushed, and deleted concurrently. Dedicated workers rendezvous before and
+after each inventory pass and eight-mutation batch; timestamp intervals
+must show actual overlap, and all 512 mutations must finish during the scan.
+Synchronization waits are excluded from pass and mutation latency measurements.
+The scale-test collection runs without
 other xUnit tests in parallel so unrelated test activity does not enter its
 wall-clock budget. It requires at most 110 inventory passes,
 at most 500 ms per 1024-step pass, and a staging-mutation p99 below 250 ms.
