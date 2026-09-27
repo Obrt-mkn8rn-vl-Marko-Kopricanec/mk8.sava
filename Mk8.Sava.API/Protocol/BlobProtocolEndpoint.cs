@@ -3583,7 +3583,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             await BlobQueryProtocol.PrepareParquetInputAsync(
                 content, options.MaximumParquetQueryMemoryBytes, cancellationToken).ConfigureAwait(false);
         await BlobQueryProtocol.ExecuteAsync(query, content, http.Response.Body,
-            blob.Content.Length, cancellationToken, prepared, options.MaximumBlobQueryResultMemoryBytes).ConfigureAwait(false);
+            blob.Content.Length, cancellationToken, prepared, options.MaximumBlobQueryResultMemoryBytes,
+            options.MaximumBlobQueryInputMemoryBytes).ConfigureAwait(false);
     }
 
     private static async Task ExecuteTextQueryAsync(
@@ -3594,6 +3595,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         BlobEncryption encryption,
         CancellationToken cancellationToken)
     {
+        var options = http.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
         var pipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: 1024 * 1024,
             resumeWriterThreshold: 512 * 1024,
@@ -3617,8 +3619,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                     http.Response.Body,
                     blob.Content.Length,
                     cancellationToken,
-                    maximumResultMemoryBytes: http.RequestServices.GetRequiredService<IOptions<SavaOptions>>()
-                        .Value.MaximumBlobQueryResultMemoryBytes).ConfigureAwait(false);
+                    maximumResultMemoryBytes: options.MaximumBlobQueryResultMemoryBytes,
+                    maximumInputMemoryBytes: options.MaximumBlobQueryInputMemoryBytes).ConfigureAwait(false);
             }
             finally
             {

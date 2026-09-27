@@ -553,6 +553,19 @@ it never emits a successful completion for truncated results. This admission
 estimate is not an absolute RSS ceiling. Avro result data uses at most 64 KiB
 per data record, including when one selected row is much wider; Azure SDKs
 reconstruct the same complete result stream across those records.
+`Sava:MaximumBlobQueryInputMemoryBytes` independently defaults to 256 MiB
+(8 MiB–2 GiB). Delimited input accounts for characters, fields, generated names,
+cells and retained headers before growing the record. JSON input accounts for
+record/parser/DOM expansion before parsing and preflights the row's field count
+before allocating names or cells. These are conservative admission estimates,
+not fixed Azure input-column limits or total process-memory guarantees. They
+also apply when a narrow projection or aggregate would hide a very wide input.
+The existing 16 MiB input-record character limit is separate. SQL parsing and
+evaluation are bounded to 128 nested levels; nested table-path expansion has
+the same depth bound. Long operator chains count toward evaluation depth even
+when the parser constructs them iteratively. Exceeding these deployment
+capacities returns the same retryable 503 before output, rather than risking
+process stack exhaustion.
 The SQL evaluator supports Azure's row-wise arithmetic and comparison
 precedence, typed `CAST`, `BETWEEN`, `IN`, `NULLIF`, `COALESCE`,
 `CHAR_LENGTH`/`CHARACTER_LENGTH`, `LOWER`, `UPPER`, `SUBSTRING`, and `LIMIT`.
@@ -1054,6 +1067,7 @@ under `Sava`:
 | `MaximumConcurrentBlobQueries` | 2 | 1–32 |
 | `MaximumParquetQueryMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
 | `MaximumBlobQueryResultMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
+| `MaximumBlobQueryInputMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
 | `MaximumQueuedStorageOperations` | 128 per lane | 0–4096 |
 
 Uploads wait before consuming their content or creating chunk staging files.
