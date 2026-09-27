@@ -75,7 +75,8 @@ internal static class BlobQueryProtocol
         Stream input,
         Stream response,
         long totalBytes,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ParquetQueryInput? parquetInput = null)
     {
         var plan = BlobQueryPlan.Parse(request.Expression);
         using var avro = new BlobQueryAvroWriter(response);
@@ -83,7 +84,7 @@ internal static class BlobQueryProtocol
 
         try
         {
-            var selections = ExecutePlanAsync(input, request.Input, plan, cancellationToken)
+            var selections = ExecutePlanAsync(input, request.Input, plan, parquetInput, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
             await using (selections.ConfigureAwait(false))
             {
@@ -137,6 +138,7 @@ internal static class BlobQueryProtocol
         Stream input,
         BlobQueryTextFormat format,
         BlobQueryPlan plan,
+        ParquetQueryInput? parquetInput,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (plan.IsSplit)
@@ -153,7 +155,7 @@ internal static class BlobQueryProtocol
             yield break;
         }
 
-        var rows = ReadRowsAsync(input, format, plan, cancellationToken)
+        var rows = ReadRowsAsync(input, format, plan, parquetInput, cancellationToken)
             .GetAsyncEnumerator(cancellationToken);
         await using (rows.ConfigureAwait(false))
         {
@@ -557,55 +559,67 @@ internal static class BlobQueryProtocol
         _ => throw new InvalidOperationException("Unknown Arrow field type.")
     };
 
-    private static async IAsyncEnumerable<QueryRow> ReadParquetRowsAsync(
+    public static async Task<ParquetQueryInput> PrepareParquetInputAsync(
         Stream input,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        long memoryBytes,
+        CancellationToken cancellationToken)
     {
-        if (!input.CanSeek)
-        {
-            throw new BlobQueryDataException(
-                "InvalidParquetFile",
-                "The Parquet query input is not seekable.",
-                0);
-        }
-
-        ParquetReader reader;
+        var guard = new ParquetQueryResourceGuard(memoryBytes);
         try
         {
-            reader = await ParquetReader.CreateAsync(
+            await guard.ValidateFooterAsync(input, cancellationToken).ConfigureAwait(false);
+            var reader = await ParquetReader.CreateAsync(
                 input,
                 leaveStreamOpen: true,
                 cancellationToken: cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
+            {
+                var fields = reader.Schema.GetDataFields();
+                if (fields.Length == 0)
+                    throw InvalidParquetFile("The Parquet schema does not contain any data fields.");
+                if (fields.Any(field => field.Path.Length != 1 || field.MaxRepetitionLevel != 0 || field.IsArray))
+                {
+                    throw new BlobQueryDataException(
+                        "UnsupportedParquetType",
+                        "Nested and repeated Parquet fields are not supported by Query Blob Contents.",
+                        0);
+                }
+                ValidateParquetDimensions(reader, fields);
+                await guard.ValidatePagesAsync(reader, input, cancellationToken).ConfigureAwait(false);
+                return new ParquetQueryInput(fields, fields.Select(field => field.Name).ToArray(), guard.MaximumMetadataBytes, null);
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
-        catch (Exception)
+        catch (AzureStorageException)
         {
-            throw InvalidParquetFile();
+            throw;
         }
-
-        await using (reader.ConfigureAwait(false))
+        catch (BlobQueryDataException exception)
         {
-            var fields = reader.Schema.GetDataFields();
-            if (fields.Length == 0)
-                throw InvalidParquetFile("The Parquet schema does not contain any data fields.");
-            if (fields.Any(field => field.Path.Length != 1 || field.MaxRepetitionLevel != 0 || field.IsArray))
-            {
-                throw new BlobQueryDataException(
-                    "UnsupportedParquetType",
-                    "Nested and repeated Parquet fields are not supported by Query Blob Contents.",
-                    0);
-            }
+            return new ParquetQueryInput([], [], guard.MaximumMetadataBytes, exception);
+        }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return new ParquetQueryInput([], [], guard.MaximumMetadataBytes, InvalidParquetFile());
+        }
+    }
 
-            ValidateParquetDimensions(reader, fields);
-            var names = fields.Select(field => field.Name).ToArray();
-            await foreach (var row in ParquetQueryBatchReader.ReadRowsAsync(input, fields, names, cancellationToken)
-                               .ConfigureAwait(false))
-            {
-                yield return row;
-            }
+    private static async IAsyncEnumerable<QueryRow> ReadParquetRowsAsync(
+        Stream input,
+        ParquetQueryInput? prepared,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        prepared ??= await PrepareParquetInputAsync(input, 256L * 1024 * 1024, cancellationToken).ConfigureAwait(false);
+        if (prepared.Error is { } error)
+            throw error;
+        await foreach (var row in ParquetQueryBatchReader.ReadRowsAsync(
+                           input, prepared.Fields, prepared.Names, cancellationToken, prepared.MetadataBytes).ConfigureAwait(false))
+        {
+            yield return row;
         }
     }
 
@@ -621,7 +635,7 @@ internal static class BlobQueryProtocol
         long totalRows = 0;
         foreach (ref readonly var group in CollectionsMarshal.AsSpan(metadata.RowGroups))
         {
-            if (group.NumRows < 0 || group.NumRows > int.MaxValue || group.NumRows > metadata.NumRows - totalRows)
+            if (group.NumRows < 0 || group.NumRows > metadata.NumRows - totalRows)
                 throw InvalidParquetFile("The Parquet row-group counts do not match the file row count.");
             if (group.Columns.Count != fields.Length)
                 throw InvalidParquetFile("The Parquet row group does not contain every schema column exactly once.");
@@ -765,11 +779,12 @@ internal static class BlobQueryProtocol
         Stream input,
         BlobQueryTextFormat format,
         BlobQueryPlan plan,
+        ParquetQueryInput? parquetInput,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (format.Kind == BlobQueryFormatKind.Parquet)
         {
-            await foreach (var row in ReadParquetRowsAsync(input, cancellationToken).ConfigureAwait(false))
+            await foreach (var row in ReadParquetRowsAsync(input, parquetInput, cancellationToken).ConfigureAwait(false))
                 yield return row;
             yield break;
         }

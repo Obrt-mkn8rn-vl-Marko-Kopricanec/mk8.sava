@@ -16,12 +16,15 @@ internal static class ParquetQueryBatchReader
         Stream input,
         DataField[] fields,
         string[] names,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken,
+        int maximumMetadataBytes = 1024 * 1024)
     {
         using var properties = ParquetSharp.ReaderProperties.GetDefaultReaderProperties();
         properties.EnableBufferedStream();
         properties.BufferSize = 1024 * 1024;
         properties.EnablePageChecksumVerification();
+        properties.SetThriftStringSizeLimit(maximumMetadataBytes);
+        properties.SetThriftContainerSizeLimit(maximumMetadataBytes);
         using var arrowProperties = ParquetSharp.Arrow.ArrowReaderProperties.GetDefault();
         arrowProperties.PreBuffer = false;
         arrowProperties.UseThreads = false;

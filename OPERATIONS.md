@@ -520,7 +520,18 @@ result rows are produced; malformed counts return a fatal
 `InvalidParquetFile` query error rather than inventing zero/null rows. The
 decoder no longer creates whole-row-group managed cell arrays. Encoded pages,
 dictionaries, and footer metadata still require memory; batching alone is not
-a hard per-query memory ceiling. Native assets must be included for the target
+a hard per-query memory ceiling. Before decoding, preflight bounds compact-
+Thrift containers and strings by their actual encoded bytes, checks flat schema
+geometry before recursive reconstruction, and validates column/page ranges,
+value counts, dictionary dimensions and compressed/uncompressed totals. Page
+ranges cannot consume the footer. `Sava:MaximumParquetQueryMemoryBytes` defaults
+to 256 MiB (accepted range 8 MiB–2 GiB). It admits a conservative estimate of
+footer expansion, buffered input, encoded/decoded pages, page-sized indexes,
+dictionaries and a numeric batch; it is not a measured process-RSS ceiling.
+Exceeding configured capacity returns HTTP 503 `ServerBusy` with `Retry-After: 1`
+before Avro output starts, rather than calling a valid large file corrupt.
+Increase capacity with deployment sizing when necessary. `LIMIT 0` does not
+decode input or require those decoding resources. Native assets must be included for the target
 RID when publishing. Synchronous native input reads honor request cancellation,
 and page checksums are verified when present. Arrow results use the caller's declared schema and are emitted
 as record batches inside Azure's Avro query envelope. Each batch targets at most
@@ -1031,6 +1042,7 @@ under `Sava`:
 | `MaximumConcurrentStorageWrites` | 8 | 1–256 |
 | `MaximumConcurrentChunkCodecs` | 4 | 1–256 |
 | `MaximumConcurrentBlobQueries` | 2 | 1–32 |
+| `MaximumParquetQueryMemoryBytes` | 256 MiB | 8 MiB–2 GiB |
 | `MaximumQueuedStorageOperations` | 128 per lane | 0–4096 |
 
 Uploads wait before consuming their content or creating chunk staging files.
