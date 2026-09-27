@@ -302,6 +302,17 @@ An ID supplied without an active lease still returns 412
 and [Set Tags recording](https://github.com/Azure/azure-sdk-assets/blob/net/storage/Azure.Storage.Blobs_d375d3a88b/net/sdk/storage/Azure.Storage.Blobs/tests/SessionRecords/BlobBaseClientTests/SetTagsAsync_LeaseFailed.json).
 Local SDK tests additionally cover malformed IDs, breaking/expired/broken
 leases, lease-free snapshot tags, and ordinary lease-free content reads.
+A twenty-fifth SDK scenario changes tags and metadata on a completed copy,
+then changes HTTP properties. Mk8.sava and Azurite retain the original copy
+ID, status, source, progress, and completion time across tag/metadata writes.
+Tag writes keep ETag and last-modified unchanged; metadata writes change
+ETag. Set Blob Properties clears the copy headers without changing bytes.
+This follows the copy-header lifetime in
+[Get Blob Properties](https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-properties#response-headers).
+Azurite 3.35.0 incorrectly retains all copy properties after that HTTP-property
+write; the differential records this exception, and mk8.sava clears them.
+Local cases also cover versioned accounts: metadata creates a new version,
+tag writes do not, and the previous version retains its copy properties.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

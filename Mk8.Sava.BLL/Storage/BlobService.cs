@@ -1176,8 +1176,7 @@ public sealed class BlobService(
             Metadata = userMetadata,
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow(),
-            Copy = null
+            LastModified = metadata.GetUtcNow()
         };
         var properties = await metadata.GetServicePropertiesAsync(current.Account, cancellationToken).ConfigureAwait(false);
         if (properties.VersioningEnabled && !IsHierarchicalNamespaceEnabled(current.Account))
@@ -1210,7 +1209,7 @@ public sealed class BlobService(
         current = PrepareBlobWrite(current);
         if (tags.Count > 10)
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
-        var updated = current with { Tags = tags, Copy = null, Revision = MetadataStore.NewRevision() };
+        var updated = current with { Tags = tags, Revision = MetadataStore.NewRevision() };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
     }

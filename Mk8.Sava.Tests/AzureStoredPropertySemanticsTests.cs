@@ -750,7 +750,7 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
     }
 
     [Fact]
-    public async Task CopyPropertiesSurviveLeasePageAndBlockStagingButClearOnOtherWrites()
+    public async Task CopyPropertiesSurviveLeasePageMetadataAndStagingButClearOnPropertyAndCommitWrites()
     {
         var service = CreateClient();
         var container = service.GetBlobContainerClient($"copy-properties-{Guid.NewGuid():N}");
@@ -777,6 +777,8 @@ public sealed class AzureStoredPropertySemanticsTests(SavaWebApplicationFactory 
             offset: 0);
         Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
         await pageDestination.SetMetadataAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["mutation"] = "metadata" });
+        Assert.Equal(CopyStatus.Success, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
+        await pageDestination.SetHttpHeadersAsync(new BlobHttpHeaders { ContentType = "application/octet-stream" });
         Assert.Equal(default, (await pageDestination.GetPropertiesAsync()).Value.CopyStatus);
 
         var blockSource = container.GetBlockBlobClient("block-source.bin");
