@@ -62,12 +62,16 @@ internal sealed class BlobQueryPlan
             return null;
         if (_predicate is not null && !_predicate.Evaluate(row))
             return null;
-        _selectedRows++;
         if (_projections is [{ Star: true }])
+        {
+            _selectedRows++;
             return new QuerySelection(row.Names, row.Values);
-        return new QuerySelection(
+        }
+        var selected = new QuerySelection(
             _projections.Select(projection => projection.Name).ToArray(),
             _projections.Select(projection => projection.Expression!.Evaluate(row)).ToArray());
+        _selectedRows++;
+        return selected;
     }
 
     public void Accumulate(QueryRow row)
@@ -805,6 +809,8 @@ internal sealed class BlobQueryPlan
     {
         if (TryDecimal(left, out var leftDecimal) && TryDecimal(right, out var rightDecimal))
             return leftDecimal.CompareTo(rightDecimal);
+        if (left.Value is long or decimal or double || right.Value is long or decimal or double)
+            throw new BlobQueryDataException("InvalidTypeConversion", "Invalid type conversion.", 0);
         if (TryTimestamp(left, out var leftTimestamp) && TryTimestamp(right, out var rightTimestamp))
             return leftTimestamp.CompareTo(rightTimestamp);
         if (left.Value is bool leftBoolean && right.Value is bool rightBoolean)

@@ -157,6 +157,12 @@ DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/java/run.sh
 DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/cpp/run.sh
 ```
 
+The SDK and fault harnesses reuse matching application binaries when
+`MK8_SAVA_TEST_CONFIGURATION=Release`
+and `MK8_SAVA_TEST_SKIP_BUILD=1` are set after a matching strict Release build.
+These options also apply to the crash and ENOSPC harnesses; their default remains
+a fresh Debug build. Never skip a build after changing application/test source.
+The offline CI lanes reuse the strict Release artifacts they have just built.
 The JavaScript harness requires Node.js 20 or later and Corepack. It pins the
 newest Azure client line supporting Node.js 20 and locks its transitive Azure
 packages to Node.js 20-compatible releases. The Python harness requires Python
@@ -173,6 +179,18 @@ Azure client version, and builds every native dependency in disposable download,
 binary-cache, install, and build roots. Each harness starts a real loopback
 mk8.sava process with a disposable storage root rather than routing the client
 through ASP.NET's in-memory test server.
+
+For target-RID publish qualification, the JavaScript
+`SdkCompatibility/javascript/published-smoke.mjs` helper runs against a
+disposable HTTP loopback endpoint using `MK8_SAVA_BLOB_ENDPOINT`,
+`MK8_SAVA_ACCOUNT_NAME`, and `MK8_SAVA_ACCOUNT_KEY`. Invoke it with `seed` to
+create a three-row Parquet blob and query it through the native decoder;
+invoke it with `verify` after operator backup/restore to check the same exact
+bytes, metadata and independent SDK-decoded query output. The helper also
+replays Microsoft's recorded CSV/JSON query defaults, nonfatal numeric-row
+conversion error and fatal JSON parse error. It intentionally
+retains its fixed test container for restore verification and rejects
+non-loopback endpoints. Use only a dedicated disposable storage root.
 
 The Azurite differential lane is run with
 `DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/SdkCompatibility/azurite/run.sh`.
@@ -571,6 +589,20 @@ precedence, typed `CAST`, `BETWEEN`, `IN`, `NULLIF`, `COALESCE`,
 `CHAR_LENGTH`/`CHARACTER_LENGTH`, `LOWER`, `UPPER`, `SUBSTRING`, and `LIMIT`.
 Once a `LIMIT` is satisfied, input enumeration and its underlying blob read are
 cancelled instead of scanning the remainder of the object.
+Query timestamp conversion uses invariant ISO date/time shapes, including
+Microsoft's documented partial forms `2007T` and `2010-01-01T`. Reduced precision
+uses January, day one and midnight for omitted components, and UTC for an
+omitted offset; an explicit offset is preserved. SQL and Arrow text conversion
+share this parser. Locale-specific dates, time-only strings that would invent
+today's date, and empty fractional seconds produce a fatal query error instead
+of silently acquiring a different meaning.
+Absent or empty optional text separators use the Azure query defaults; actual
+whitespace separators remain data, including an entity-escaped CRLF. Numeric
+comparison conversion failures emit nonfatal `InvalidTypeConversion` events
+with the input record's UTF-8 byte offset and skip only that row. Later valid
+rows are still returned. JSON parse errors emit fatal `ParseError` events and
+terminate input processing. These behaviors have offline regressions based on
+Microsoft's saved SDK recordings; they do not require live Azure accounts.
 Date expressions include `DATE_ADD`, `DATE_DIFF`, `EXTRACT`, `TO_STRING`,
 `TO_TIMESTAMP`, and `UTCNOW`; `TRIM` accepts Azure's `BOTH`, `LEADING`, and
 `TRAILING` forms with caller-selected characters.

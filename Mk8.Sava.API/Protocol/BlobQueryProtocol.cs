@@ -28,7 +28,7 @@ internal static class BlobQueryProtocol
         try
         {
             using var reader = ProtocolParsing.CreateXmlReader(body);
-            var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
+            var document = await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, cancellationToken).ConfigureAwait(false);
             var root = document.Root;
             if (!string.Equals(root?.Name.LocalName, "QueryRequest", StringComparison.Ordinal))
                 throw InvalidXml("The QueryRequest root element is required.");
@@ -85,7 +85,7 @@ internal static class BlobQueryProtocol
 
         try
         {
-            var selections = ExecutePlanAsync(input, request.Input, plan, parquetInput, maximumInputMemoryBytes, cancellationToken)
+            var selections = ExecutePlanAsync(input, request.Input, plan, parquetInput, maximumInputMemoryBytes, avro, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
             await using (selections.ConfigureAwait(false))
             {
@@ -131,6 +131,8 @@ internal static class BlobQueryProtocol
         }
         catch (BlobQueryDataException exception)
         {
+            if (request.Output.Kind != BlobQueryFormatKind.Arrow && string.Equals(exception.Name, "ParseError", StringComparison.Ordinal))
+                await avro.AppendDataAsync(Encoding.UTF8.GetBytes(request.Output.RecordSeparator), cancellationToken).ConfigureAwait(false);
             await avro.WriteErrorAsync(true, exception.Name, exception.Message, exception.Position, cancellationToken).ConfigureAwait(false);
         }
 
@@ -143,6 +145,7 @@ internal static class BlobQueryProtocol
         BlobQueryPlan plan,
         ParquetQueryInput? parquetInput,
         long maximumInputMemoryBytes,
+        BlobQueryAvroWriter avro,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (plan.IsSplit)
@@ -163,7 +166,7 @@ internal static class BlobQueryProtocol
             .GetAsyncEnumerator(cancellationToken);
         await using (rows.ConfigureAwait(false))
         {
-            await foreach (var selection in SelectRowsAsync(rows, plan, cancellationToken).ConfigureAwait(false))
+            await foreach (var selection in SelectRowsAsync(rows, plan, avro, cancellationToken).ConfigureAwait(false))
                 yield return selection;
         }
     }
@@ -171,6 +174,7 @@ internal static class BlobQueryProtocol
     private static async IAsyncEnumerable<QuerySelection> SelectRowsAsync(
         IAsyncEnumerator<QueryRow> rows,
         BlobQueryPlan plan,
+        BlobQueryAvroWriter avro,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (plan.IsAggregate)
@@ -180,7 +184,14 @@ internal static class BlobQueryProtocol
             while (await rows.MoveNextAsync().ConfigureAwait(false))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                plan.Accumulate(rows.Current);
+                try
+                {
+                    plan.Accumulate(rows.Current);
+                }
+                catch (BlobQueryDataException exception) when (string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal))
+                {
+                    await avro.WriteErrorAsync(false, exception.Name, exception.Message, rows.Current.Position, cancellationToken).ConfigureAwait(false);
+                }
             }
             if (plan.CompleteAggregate() is { } aggregate)
                 yield return aggregate;
@@ -190,7 +201,17 @@ internal static class BlobQueryProtocol
         while (!plan.LimitReached && await rows.MoveNextAsync().ConfigureAwait(false))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (plan.Select(rows.Current) is { } selected)
+            QuerySelection? selected;
+            try
+            {
+                selected = plan.Select(rows.Current);
+            }
+            catch (BlobQueryDataException exception) when (string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal))
+            {
+                await avro.WriteErrorAsync(false, exception.Name, exception.Message, rows.Current.Position, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+            if (selected is not null)
                 yield return selected;
         }
     }
@@ -205,8 +226,8 @@ internal static class BlobQueryProtocol
         if (type is "delimited" or "csv")
         {
             var configuration = format is null ? null : Child(format, "DelimitedTextConfiguration");
-            var column = ChildValue(configuration, "ColumnSeparator") ?? ",";
-            var record = ChildValue(configuration, "RecordSeparator") ?? "\n";
+            var column = DefaultEmpty(ChildValue(configuration, "ColumnSeparator"), ",");
+            var record = DefaultEmpty(ChildValue(configuration, "RecordSeparator"), "\n");
             var quote = ParseCharacter(ChildValue(configuration, "FieldQuote"), '"', "FieldQuote");
             var escape = ParseCharacter(ChildValue(configuration, "EscapeChar"), '\\', "EscapeChar");
             var headers = ParseBoolean(ChildValue(configuration, "HasHeaders"), false, "HasHeaders");
@@ -227,7 +248,7 @@ internal static class BlobQueryProtocol
         if (string.Equals(type, "json", StringComparison.Ordinal))
         {
             var configuration = format is null ? null : Child(format, "JsonTextConfiguration");
-            var record = ChildValue(configuration, "RecordSeparator") ?? "\n";
+            var record = DefaultEmpty(ChildValue(configuration, "RecordSeparator"), "\n");
             ValidateSeparator(record, "RecordSeparator");
             return new BlobQueryTextFormat(BlobQueryFormatKind.Json, ",", '"', record, '\\', false, []);
         }
@@ -856,8 +877,9 @@ internal static class BlobQueryProtocol
     {
         string[]? headers = null;
         var rowNumber = 0L;
-        await foreach (var fields in ReadDelimitedRowsAsync(reader, format, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
+        await foreach (var record in ReadDelimitedRowsAsync(reader, format, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
         {
+            var fields = record.Fields;
             rowNumber++;
             if (headers is null && format.HasHeaders)
             {
@@ -870,7 +892,7 @@ internal static class BlobQueryProtocol
                 ? Enumerable.Range(1, fields.Count).Select(index => $"_{index}").ToArray()
                 : headers;
             var cells = fields.Select(value => new QueryCell(value)).ToArray();
-            yield return new QueryRow(names, cells);
+            yield return new QueryRow(names, cells, Position: record.Position);
         }
     }
 
@@ -886,7 +908,7 @@ internal static class BlobQueryProtocol
         {
             if (string.IsNullOrWhiteSpace(record))
             {
-                position += record.Length + format.RecordSeparator.Length;
+                position += Encoding.UTF8.GetByteCount(record) + Encoding.UTF8.GetByteCount(format.RecordSeparator);
                 continue;
             }
 
@@ -898,9 +920,9 @@ internal static class BlobQueryProtocol
             catch (JsonException exception)
             {
                 throw new BlobQueryDataException(
-                    "InvalidJson",
-                    exception.Message,
-                    position + (exception.BytePositionInLine ?? 0));
+                    "ParseError",
+                    DescribeJsonParseError(record, exception),
+                    position);
             }
 
             using (document)
@@ -910,21 +932,35 @@ internal static class BlobQueryProtocol
                     root.ValueKind is not (JsonValueKind.Object or JsonValueKind.Array))
                 {
                     throw new BlobQueryDataException(
-                        "InvalidJsonType",
+                        "ParseError",
                         "Each JSON query input record must be an object or array.",
                         position);
                 }
                 foreach (var row in plan.ExpandJsonRows(root,
                              BlobQueryResources.BufferedInputBytes + 48L * record.Length,
                              maximumInputMemoryBytes, cancellationToken))
-                    yield return row;
+                    yield return row with { Position = position };
             }
 
-            position += record.Length + format.RecordSeparator.Length;
+            position += Encoding.UTF8.GetByteCount(record) + Encoding.UTF8.GetByteCount(format.RecordSeparator);
         }
     }
 
-    private static async IAsyncEnumerable<IReadOnlyList<string>> ReadDelimitedRowsAsync(
+    private static string DescribeJsonParseError(string record, JsonException exception)
+    {
+        var trimmed = record.AsSpan().TrimStart();
+        if (!trimmed.IsEmpty && trimmed[0] is not ('{' or '[') && exception.LineNumber == 0 &&
+            exception.BytePositionInLine is { } offset && offset < Encoding.UTF8.GetByteCount(record))
+        {
+            var bytes = Encoding.UTF8.GetBytes(record);
+            return $"Unexpected token '{(char)bytes[checked((int)offset)]}' at [byte: {offset}]. Expecting tokens '{{', or '['. ";
+        }
+        return exception.Message;
+    }
+
+    private readonly record struct DelimitedRecord(IReadOnlyList<string> Fields, long Position);
+
+    private static async IAsyncEnumerable<DelimitedRecord> ReadDelimitedRowsAsync(
         TextReader reader,
         BlobQueryTextFormat format,
         long maximumInputMemoryBytes,
@@ -947,14 +983,14 @@ internal static class BlobQueryProtocol
                 {
                     var completed = state.Consume(buffer[index]);
                     if (completed is not null)
-                        yield return completed;
+                        yield return completed.Value;
                 }
 #pragma warning restore HLQ013
             }
 
             var final = state.Complete();
             if (final is not null)
-                yield return final;
+                yield return final.Value;
         }
         finally
         {
@@ -972,9 +1008,15 @@ internal static class BlobQueryProtocol
         private int _recordCharacters;
         private long _retainedHeaderBytes;
         private bool _headerRetained;
+        private long _position;
+        private long _recordPosition;
+        private bool _previousHighSurrogate;
 
-        public string[]? Consume(char character)
+        public DelimitedRecord? Consume(char character)
         {
+            _position += character < 0x80 ? 1 : character < 0x800 ? 2 :
+                char.IsLowSurrogate(character) && _previousHighSurrogate ? 1 : 3;
+            _previousHighSurrogate = char.IsHighSurrogate(character);
             _recordCharacters++;
             if (_recordCharacters > MaximumRecordCharacters)
                 throw new BlobQueryDataException("RecordTooLarge", "A query input record exceeds 16 MiB.", 0);
@@ -1002,7 +1044,7 @@ internal static class BlobQueryProtocol
             return _inQuotes ? ConsumeQuoted(character) : ConsumeUnquoted(character);
         }
 
-        private string[]? ConsumeQuoted(char character)
+        private DelimitedRecord? ConsumeQuoted(char character)
         {
             if (character == format.Quote)
                 _quotePending = true;
@@ -1013,7 +1055,7 @@ internal static class BlobQueryProtocol
             return null;
         }
 
-        private string[]? ConsumeUnquoted(char character)
+        private DelimitedRecord? ConsumeUnquoted(char character)
         {
             if (character == format.Quote && _field.Length == 0)
             {
@@ -1029,7 +1071,8 @@ internal static class BlobQueryProtocol
                     _field.Length--;
                 _fields.Add(_field.ToString());
                 _field.Clear();
-                var completed = _fields.ToArray();
+                var completed = new DelimitedRecord(_fields.ToArray(), _recordPosition);
+                _recordPosition = _position;
                 if (format.HasHeaders && !_headerRetained)
                 {
                     _retainedHeaderBytes = 8L * _recordCharacters + 256L * _fields.Count;
@@ -1048,7 +1091,7 @@ internal static class BlobQueryProtocol
             return null;
         }
 
-        public string[]? Complete()
+        public DelimitedRecord? Complete()
         {
             ValidateCapacity();
             if (_inQuotes && !_quotePending)
@@ -1058,7 +1101,7 @@ internal static class BlobQueryProtocol
             if (_field.Length == 0 && _fields.Count == 0)
                 return null;
             _fields.Add(_field.ToString());
-            return _fields.ToArray();
+            return new DelimitedRecord(_fields.ToArray(), _recordPosition);
         }
 
         private void ValidateCapacity() => BlobQueryResources.ValidateInput(
@@ -1181,12 +1224,15 @@ internal static class BlobQueryProtocol
 
     private static char ParseCharacter(string? value, char fallback, string name)
     {
-        if (value is null)
+        if (string.IsNullOrEmpty(value))
             return fallback;
         if (value.Length != 1)
             throw InvalidXml($"{name} must contain exactly one character.");
         return value[0];
     }
+
+    private static string DefaultEmpty(string? value, string fallback) =>
+        string.IsNullOrEmpty(value) ? fallback : value;
 
     private static bool ParseBoolean(string? value, bool fallback, string name) => value?.ToRequiredLowerInvariant() switch
     {

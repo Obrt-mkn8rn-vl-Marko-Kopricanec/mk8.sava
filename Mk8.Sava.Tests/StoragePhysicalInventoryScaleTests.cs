@@ -91,7 +91,11 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             CreateShardedChunks(paths.Chunks, shardCount: 50, filesPerShard: 1000);
 
             using var scanner = new StoragePhysicalInventoryScanner(paths);
+            var before = await ScanWithConcurrentStagingWritesAsync(scanner: null, paths.Staging);
+            ReportControl("before", before);
             var measured = await ScanWithConcurrentStagingWritesAsync(scanner, paths.Staging);
+            var after = await ScanWithConcurrentStagingWritesAsync(scanner: null, paths.Staging);
+            ReportControl("after", after);
             output.WriteLine(FormattableString.Invariant(
                 $"inventory_concurrent_writes,passes={measured.Passes},overlapping_passes={measured.OverlappingPasses},mutations={measured.WriteCount},max_pass_ms={measured.MaxPass.TotalMilliseconds:F3},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
             Assert.InRange(measured.Passes, 1, 110);
@@ -105,6 +109,13 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         {
             await application.DisposeAsync();
         }
+    }
+
+    private void ReportControl(string phase, ConcurrentScanMeasurements measured)
+    {
+        output.WriteLine(FormattableString.Invariant(
+            $"inventory_control_writes,phase={phase},passes={measured.Passes},mutations={measured.WriteCount},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
+        Assert.Equal(ConcurrentWriteCount, measured.WriteCount);
     }
 
     [Theory]
@@ -189,7 +200,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     }
 
     private static async Task<ConcurrentScanMeasurements> ScanWithConcurrentStagingWritesAsync(
-        StoragePhysicalInventoryScanner scanner, string stagingDirectory)
+        StoragePhysicalInventoryScanner? scanner, string stagingDirectory)
     {
         using var rendezvous = new Barrier(2);
         using var abort = new CancellationTokenSource();
@@ -217,7 +228,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     }
 
     private static (int Passes, int OverlappingPasses, TimeSpan MaxPass) ScanWhileWriting(
-        StoragePhysicalInventoryScanner scanner, Barrier rendezvous, long[] batchTimes,
+        StoragePhysicalInventoryScanner? scanner, Barrier rendezvous, long[] batchTimes,
         int[] scanFinished, CancellationTokenSource abort)
     {
         var passes = 0;
@@ -230,7 +241,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             {
                 WaitForPhase(rendezvous, abort.Token);
                 var started = Stopwatch.GetTimestamp();
-                complete = scanner.Advance(EntriesPerPass);
+                complete = scanner?.Advance(EntriesPerPass) ?? passes + 1 >= ConcurrentWriteCount / WritesPerPass;
                 var finished = Stopwatch.GetTimestamp();
                 var elapsed = Stopwatch.GetElapsedTime(started, finished);
                 if (elapsed > maximum)
@@ -239,7 +250,8 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
                 WaitForPhase(rendezvous, abort.Token);
                 if (batchTimes[0] < finished && batchTimes[1] > started)
                     overlappingPasses++;
-                Assert.InRange(scanner.LastPassSteps, 1, EntriesPerPass);
+                if (scanner is not null)
+                    Assert.InRange(scanner.LastPassSteps, 1, EntriesPerPass);
                 Assert.True(++passes <= 110, "The concurrent scan did not finish within the pass budget.");
             }
             while (!complete);
