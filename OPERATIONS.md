@@ -884,15 +884,22 @@ Local signed-token, fake-Graph, and SDK-over-HTTP tests cover this path without
 live Azure accounts. Bearer ACL fallback for other operations remains incomplete.
 For HNS List Blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback support `delimiter=/` directory listing and no-delimiter recursive
-listing with either no prefix or a complete directory prefix. The requested
-directory requires read and execute, with execute on its ancestors. Before a
-recursive page is returned, every directory traversed by its entries must
-also grant read and execute; an inaccessible descendant fails that page with
+listing with no prefix, a complete directory prefix, or a filename prefix.
+The containing directory selected by the last `/` in a name prefix requires
+read and execute; a root-level filename filter selects the container root.
+Ancestors require execute, not read. Before a recursive page is returned,
+directories below the listed scope that its entries traverse must also grant
+read and execute; an inaccessible descendant fails that page with
 403 rather than exposing its contents. Mixed-access recursive response and
 continuation behavior is not established as Azure-identical; other ACL-only
 listing shapes remain fail-closed. This local rule follows the documented
 [HNS directory listing permissions](https://learn.microsoft.com/en-us/azure/storage/blobs/data-lake-storage-access-control#common-scenarios-for-acl-permissions)
-and is covered for bearer and signed `suoid` requests without a live account.
+and [Blob name-prefix contract](https://learn.microsoft.com/en-us/rest/api/storageservices/list-blobs#uri-parameters).
+Bearer and signed `suoid` SDK cases page root and nested filename filters
+one result at a time in both flat and hierarchical listings, preserve empty
+results, and deny missing directory read/execute or traversal grants. Nested
+listing also succeeds when an ancestor grants execute without read. These
+checks require no live account; Azurite does not implement HNS.
 For current HNS blobs, bearer `oid` and signed user-delegation `suoid` ACL
 fallback can authorize Put Blob, Put Block, Put Block List, Set Blob Metadata,
 Set Blob Properties, Set Blob Tier, Set Blob Expiry, and Delete Blob through

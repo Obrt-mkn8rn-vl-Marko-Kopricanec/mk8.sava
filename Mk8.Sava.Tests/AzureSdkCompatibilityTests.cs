@@ -3216,6 +3216,116 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
         Assert.DoesNotContain("default:", file.Acl, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HierarchicalAclFilenamePrefixesUseTheContainingDirectoryWithSdkPaging(bool useDelegationSas)
+    {
+        const string readerObjectId = "5c3f2b09-05b9-4f34-a694-a25dc7c2b743";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:Permissions"] = "rl",
+            [$"Sava:BearerAuthentication:Principals:{SavaWebApplicationFactory.DelegatorObjectId}:CanManageOwnership"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync();
+        var container = CreateClient(application).GetBlobContainerClient($"hns-filename-prefix-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        foreach (var name in new[] { "root-one.txt", "root-two.txt", "visible/one-a.txt", "visible/one-b.txt",
+                     "visible/two.txt", "hidden/secret.txt", "ancestor/visible/one-a.txt", "ancestor/visible/one-b.txt" })
+            await container.GetBlobClient(name).UploadAsync(BinaryData.FromString(name));
+
+        var entry = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = string.Empty,
+            AccessAcl = $"user::rwx,user:{readerObjectId}:r-x,group::r-x,mask::r-x,other::---"
+        };
+        await ApplyAclManifestAsync(application, entry, entry with { Path = "visible" },
+            entry with { Path = "ancestor", AccessAcl = $"user::rwx,user:{readerObjectId}:--x,group::r-x,mask::r-x,other::---" },
+            entry with { Path = "ancestor/visible" });
+        var reader = await CreateFilenamePrefixReaderAsync(application, container.Name, readerObjectId, useDelegationSas);
+
+        await AssertFilenamePrefixPagesAsync(reader, "root-", ["root-one.txt", "root-two.txt"]);
+        await AssertFilenamePrefixPagesAsync(reader, "visible/one-", ["visible/one-a.txt", "visible/one-b.txt"]);
+        await AssertFilenamePrefixPagesAsync(reader, "ancestor/visible/", ["ancestor/visible/one-a.txt", "ancestor/visible/one-b.txt"]);
+        await AssertFilenamePrefixPagesAsync(reader, "ancestor/visible/one-", ["ancestor/visible/one-a.txt", "ancestor/visible/one-b.txt"]);
+        await AssertFilenamePrefixPagesAsync(reader, "visible/missing", []);
+        var hidden = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            AssertFilenamePrefixPagesAsync(reader, "hidden/sec", ["hidden/secret.txt"]));
+        Assert.Equal(StatusCodes.Status403Forbidden, hidden.Status);
+
+        await ApplyAclManifestAsync(application, entry with
+        {
+            AccessAcl = $"user::rwx,user:{readerObjectId}:--x,group::r-x,mask::r-x,other::---"
+        });
+        await AssertFilenamePrefixPagesAsync(reader, "visible/one-", ["visible/one-a.txt", "visible/one-b.txt"]);
+        var rootDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            AssertFilenamePrefixPagesAsync(reader, "root-", ["root-one.txt", "root-two.txt"]));
+        Assert.Equal(StatusCodes.Status403Forbidden, rootDenied.Status);
+        await ApplyAclManifestAsync(application, entry with
+        {
+            Path = "visible",
+            AccessAcl = $"user::rwx,user:{readerObjectId}:r--,group::r-x,mask::r-x,other::---"
+        });
+        var traversalDenied = await Assert.ThrowsAsync<RequestFailedException>(() =>
+            AssertFilenamePrefixPagesAsync(reader, "visible/one-", ["visible/one-a.txt", "visible/one-b.txt"]));
+        Assert.Equal(StatusCodes.Status403Forbidden, traversalDenied.Status);
+        Assert.Equal("visible/one-a.txt", (await container.GetBlobClient("visible/one-a.txt").DownloadContentAsync())
+            .Value.Content.ToString());
+    }
+
+    private static async Task<BlobContainerClient> CreateFilenamePrefixReaderAsync(
+        SavaWebApplicationFactory application, string containerName, string readerObjectId, bool useDelegationSas)
+    {
+        if (!useDelegationSas)
+            return CreateBearerClient(application, CreateJwt(SavaWebApplicationFactory.AccountKey, readerObjectId))
+                .GetBlobContainerClient(containerName);
+        var delegator = CreateBearerClient(application, CreateJwt(SavaWebApplicationFactory.AccountKey,
+            SavaWebApplicationFactory.DelegatorObjectId, SavaWebApplicationFactory.TenantId));
+        var startsOn = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expiresOn = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await delegator.GetUserDelegationKeyAsync(
+            new BlobGetUserDelegationKeyOptions(expiresOn) { StartsOn = startsOn }).ConfigureAwait(false)).Value;
+        var sas = BuildSignedDirectoryListSas(key, startsOn, expiresOn, containerName, readerObjectId);
+        return new BlobContainerClient(new Uri($"https://{SavaWebApplicationFactory.AccountName}.localhost/{containerName}?{sas}"),
+            new BlobClientOptions { Transport = new HttpClientTransport(application.Server.CreateHandler()), Retry = { MaxRetries = 0 } });
+    }
+
+    private static async Task AssertFilenamePrefixPagesAsync(
+        BlobContainerClient reader, string prefix, string[] expected)
+    {
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var names = new List<string>();
+        await foreach (var page in reader.GetBlobsAsync(new GetBlobsOptions { Prefix = prefix })
+                           .AsPages(pageSizeHint: 1).WithCancellation(deadline.Token).ConfigureAwait(false))
+        {
+            Assert.True(page.Values.Count <= 1);
+            names.AddRange(page.Values.Select(item => item.Name));
+            Assert.True(names.Count <= expected.Length, "A filename-prefix continuation repeated or exposed unrelated names.");
+        }
+        Assert.Equal(expected, names, StringComparer.Ordinal);
+
+        names.Clear();
+        await foreach (var page in reader.GetBlobsByHierarchyAsync(new GetBlobsByHierarchyOptions
+        {
+            Prefix = prefix,
+            Delimiter = "/"
+        }).AsPages(pageSizeHint: 1).WithCancellation(deadline.Token).ConfigureAwait(false))
+        {
+            Assert.True(page.Values.Count <= 1);
+            foreach (var item in page.Values)
+            {
+                Assert.True(item.IsBlob);
+                names.Add(item.Blob.Name);
+            }
+            Assert.True(names.Count <= expected.Length, "A filename-prefix hierarchy continuation repeated or exposed unrelated names.");
+        }
+        Assert.Equal(expected, names, StringComparer.Ordinal);
+    }
+
     [Fact]
     public async Task HierarchicalAclListsOnlyAnAuthorizedDirectoryWithSdkPaging()
     {

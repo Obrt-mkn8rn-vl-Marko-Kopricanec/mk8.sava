@@ -187,8 +187,7 @@ internal static class HierarchicalAclAuthorization
 
         var prefix = http.Query["prefix"].ToString();
         if (prefix.Length > 0 &&
-            (!prefix.EndsWith('/') ||
-             prefix.StartsWith('/') ||
+            (prefix.StartsWith('/') ||
              prefix.Contains("//", StringComparison.Ordinal)))
             return false;
 
@@ -220,8 +219,8 @@ internal static class HierarchicalAclAuthorization
             !PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'x'))
             throw AzureStorageException.AuthorizationFailure();
 
-        var prefix = http.Query["prefix"].ToString();
-        if (prefix.Length == 0)
+        var target = GetListingDirectory(http);
+        if (target.Length == 0)
         {
             if (!PosixAccessControl.Allows(root.Acl, root.Owner, root.Group, objectId, groups, 'r'))
                 throw AzureStorageException.AuthorizationFailure();
@@ -230,7 +229,6 @@ internal static class HierarchicalAclAuthorization
 
         await metadata.EnsureHierarchicalDirectoriesAsync(
             request.Account, request.Container, cancellationToken).ConfigureAwait(false);
-        var target = prefix[..^1];
         var separator = target.IndexOf('/', StringComparison.Ordinal);
         while (separator > 0)
         {
@@ -264,6 +262,7 @@ internal static class HierarchicalAclAuthorization
         if (http.Query["delimiter"].ToString().Length > 0)
             return;
 
+        var listingDirectory = GetListingDirectory(http);
         var checkedDirectories = new HashSet<string>(StringComparer.Ordinal);
         foreach (var item in page.Items)
         {
@@ -272,7 +271,9 @@ internal static class HierarchicalAclAuthorization
             while (separator > 0)
             {
                 var path = name[..separator];
-                if (checkedDirectories.Add(path))
+                // The scope check already requires execute on ancestors and read/execute
+                // on the listed directory. Only descendants are recursively enumerated.
+                if (path.Length > listingDirectory.Length && checkedDirectories.Add(path))
                 {
                     var directory = await metadata.GetBlobAsync(
                         request.Account, request.Container!, path,
@@ -285,6 +286,13 @@ internal static class HierarchicalAclAuthorization
                 separator = name.IndexOf('/', separator + 1);
             }
         }
+    }
+
+    private static string GetListingDirectory(HttpRequest http)
+    {
+        var prefix = http.Query["prefix"].ToString();
+        var separator = prefix.LastIndexOf('/');
+        return separator < 0 ? string.Empty : prefix[..separator];
     }
 
     internal static bool IsBlobReadOperation(HttpRequest http)
