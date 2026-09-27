@@ -2102,6 +2102,98 @@ public sealed class BlobService(
             cancellationToken);
     }
 
+    // The HTTP layer supplies bounded source ranges; the BLL owns staging,
+    // sparse reconstruction, conditions, publication and reference lifetimes.
+#pragma warning disable CA1054
+    public Task<BlobRecord> BeginIncrementalCopyFromPageRangesAsync(
+        string account, string container, string name, long sourceLength,
+        string sourceSnapshot, string sourceIdentity, DateTimeOffset sourceCreatedAt,
+        long sourceSequenceNumber, IReadOnlyList<PageRange> sourcePageRanges,
+        BlobWriteOptions options, string sourceUri, BlobRecord? current,
+        IPageCopySource pageSource, CancellationToken cancellationToken)
+    {
+#pragma warning restore CA1054
+        ArgumentNullException.ThrowIfNull(sourcePageRanges);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(pageSource);
+        var descriptor = new IncrementalCopySourceDescriptor(
+            BlobKind.PageBlob, sourceSnapshot, sourceIdentity, sourceCreatedAt,
+            sourceSequenceNumber, sourcePageRanges, null);
+        return BeginIncrementalCopyCoreAsync(
+            account, container, name, descriptor, options, sourceUri, current,
+            (encryption, token) => PrepareIncrementalPageCopyContentAsync(
+                account, encryption, current, sourceLength, pageSource, token),
+            cancellationToken);
+    }
+
+    private async Task<PreparedCopyContent> PrepareIncrementalPageCopyContentAsync(
+        string account, BlobEncryption encryption, BlobRecord? current, long sourceLength,
+        IPageCopySource pageSource, CancellationToken cancellationToken)
+    {
+        var changes = await pageSource.ReadChangesAsync(
+            current?.IncrementalCopySourceSnapshot, current?.Content.Length ?? 0, cancellationToken).ConfigureAwait(false);
+        var prepared = await chunks.ResizeSparsePinnedAsync(
+            account, encryption, current?.Content ?? chunks.Empty(account, encryption),
+            sourceLength, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            foreach (var range in changes.ClearRanges)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (range.Start >= sourceLength)
+                    continue;
+                var length = Math.Min(range.End, sourceLength - 1) - range.Start + 1;
+                var next = await chunks.ReplaceRangePinnedAsync(
+                    account, encryption, prepared.Manifest, range.Start, length,
+                    replacement: null, clear: true, cancellationToken).ConfigureAwait(false);
+                prepared.Dispose();
+                prepared = next;
+            }
+            foreach (var range in changes.PageRanges)
+            {
+                for (var start = range.Start; start <= range.End;)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var end = Math.Min(range.End, start + (4 * 1024 * 1024) - 1);
+                    var next = await ReadIncrementalPageRangeAsync(
+                        account, encryption, prepared.Manifest, pageSource, new PageRange(start, end),
+                        cancellationToken).ConfigureAwait(false);
+                    prepared.Dispose();
+                    prepared = next;
+                    start = end + 1;
+                }
+            }
+            return new PreparedCopyContent(prepared.Manifest, [], [prepared]);
+        }
+        catch
+        {
+            prepared.Dispose();
+            throw;
+        }
+    }
+
+    private async Task<StoredContent> ReadIncrementalPageRangeAsync(
+        string account, BlobEncryption encryption, ContentManifest current,
+        IPageCopySource pageSource, PageRange range, CancellationToken cancellationToken)
+    {
+        StoredContent? prepared = null;
+        try
+        {
+            await pageSource.ReadRangeAsync(range, async (stream, token) =>
+            {
+                prepared = await chunks.ReplaceRangePinnedAsync(
+                    account, encryption, current, range.Start, range.End - range.Start + 1,
+                    stream, clear: false, token).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
+            return prepared ?? throw new InvalidOperationException("The page source did not provide the requested range.");
+        }
+        catch
+        {
+            prepared?.Dispose();
+            throw;
+        }
+    }
+
     private async Task<BlobRecord> BeginIncrementalCopyCoreAsync(
         string account,
         string container,
