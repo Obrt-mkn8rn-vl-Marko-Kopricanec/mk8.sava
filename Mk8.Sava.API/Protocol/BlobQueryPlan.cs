@@ -947,11 +947,7 @@ internal sealed class BlobQueryPlan
                     : new DateTimeOffset(dateTime);
                 return true;
             default:
-                return DateTimeOffset.TryParse(
-                    value.ToText(),
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal,
-                    out timestamp);
+                return BlobQueryTimestamp.TryParse(value.ToText(), out timestamp);
         }
     }
 

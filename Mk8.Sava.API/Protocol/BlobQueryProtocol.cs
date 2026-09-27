@@ -526,11 +526,7 @@ internal static class BlobQueryProtocol
                 builder.AppendNull();
             else if (cell.Value is DateTimeOffset timestamp)
                 builder.Append(timestamp);
-            else if (DateTimeOffset.TryParse(
-                         cell.ToText(),
-                         CultureInfo.InvariantCulture,
-                         DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                         out timestamp))
+            else if (BlobQueryTimestamp.TryParse(cell.ToText(), out timestamp))
             {
                 builder.Append(timestamp);
             }
