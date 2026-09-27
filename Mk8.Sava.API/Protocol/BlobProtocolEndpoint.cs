@@ -2014,6 +2014,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                         "CannotVerifyCopySource",
                         "The source did not return a valid creation time for incremental copy.");
                 }
+                await VerifyExternalIncrementalCopyContinuityAsync(
+                    http.Request, transfers, current, sourceUri, snapshots[0]!, createdAt,
+                    source.ETag, cancellationToken).ConfigureAwait(false);
                 return await service.BeginIncrementalCopyFromStreamAsync(
                     request.Account,
                     containerName,
@@ -2033,6 +2036,22 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             cancellationToken,
             preserveSourceShape: true).ConfigureAwait(false);
         return transfer.Value;
+    }
+
+    private static Task VerifyExternalIncrementalCopyContinuityAsync(
+        HttpRequest request, UrlTransferClient transfers, BlobRecord? current, Uri sourceUri,
+        string sourceSnapshot, DateTimeOffset createdAt, string? sourceETag, CancellationToken cancellationToken)
+    {
+        if (current is { IsIncrementalCopy: true, IncrementalCopySourceSnapshot: { } previousSnapshot } &&
+            string.Equals(current.IncrementalCopySource, sourceUri.GetLeftPart(UriPartial.Path), StringComparison.Ordinal) &&
+            current.IncrementalCopySourceCreatedAt == createdAt &&
+            !string.Equals(current.Copy?.Status, "pending", StringComparison.Ordinal) &&
+            string.CompareOrdinal(previousSnapshot, sourceSnapshot) < 0)
+        {
+            return transfers.VerifyIncrementalCopyContinuityAsync(
+                request, sourceUri, previousSnapshot, sourceETag, cancellationToken);
+        }
+        return Task.CompletedTask;
     }
 
     private static void RequireIncrementalCopyVersion(StorageRequestContext request)

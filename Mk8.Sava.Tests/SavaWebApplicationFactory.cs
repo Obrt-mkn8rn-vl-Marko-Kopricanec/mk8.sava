@@ -123,6 +123,19 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     }
 
     internal SavaWebApplicationFactory(
+        TimeProvider timeProvider,
+        IReadOnlyDictionary<string, string?> configurationOverrides,
+        Func<HttpMessageHandler> urlTransferHandlerFactory)
+        : this(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"),
+            urlTransferHandlerFactory,
+            configurationOverrides,
+            timeProvider,
+            deleteDataPath: true)
+    {
+    }
+
+    internal SavaWebApplicationFactory(
         string dataPath,
         IStorageFaultInjector faultInjector,
         IStorageAnalyticsSink? analyticsSink,

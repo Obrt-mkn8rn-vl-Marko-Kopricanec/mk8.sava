@@ -449,6 +449,17 @@ token on every source request. It remains optional for public/SAS Azure Files
 sources and for bearer-authenticated non-File URLs; asynchronous and incremental
 Copy Blob reject it because Azure exposes the header only on Put Blob, synchronous
 Copy Blob, Put Block, Put Page, and Append Block from URL.
+For a subsequent external incremental page copy, the source's page-diff
+operation is checked against the last successfully copied snapshot, with
+the source snapshot ETag. A source `BlobOverwritten` response maps to
+409 `IncrementalCopyBlobMismatch` before destination publication, even
+when replacement has the same RFC1123 creation timestamp. A fixed-clock,
+two-account SDK/HTTP regression verifies rejection and byte-exact source
+and destination snapshots. Other source failures retain the existing
+versioned error mapping. See the
+[Incremental Copy Blob restrictions](https://learn.microsoft.com/en-us/rest/api/storageservices/incremental-copy-blob#remarks).
+The transfer still reads the full source snapshot; differential-only
+network transfer is not yet implemented or claimed.
 Outbound URL-source requests do not follow HTTP redirects. A redirected source
 fails with `CannotVerifyCopySource` without contacting the redirect target, so
 source bearer tokens and customer-provided encryption-key headers cannot be
