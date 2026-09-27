@@ -4,9 +4,9 @@ namespace Mk8.Sava.Storage;
 // advances at most the configured number of directory or entry operations.
 internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDisposable
 {
-    private readonly Stack<IEnumerator<string>> _directories = new();
+    private readonly Stack<IEnumerator<FileSystemInfo>> _directories = new();
     private readonly HashSet<(uint Major, uint Minor, ulong Inode)> _hardLinks = [];
-    private string? _nextPath = paths.Root;
+    private FileSystemInfo? _nextEntry = new DirectoryInfo(paths.Root);
     private bool _measureAllocation = OperatingSystem.IsLinux();
     private long? _allocatedBytes = OperatingSystem.IsLinux() ? 0 : null;
     private long _chunkBytes;
@@ -25,12 +25,12 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumSteps);
 
         LastPassSteps = 0;
-        while (LastPassSteps < maximumSteps && (_nextPath is not null || _directories.Count > 0))
+        while (LastPassSteps < maximumSteps && (_nextEntry is not null || _directories.Count > 0))
         {
-            if (_nextPath is { } path)
+            if (_nextEntry is { } entry)
             {
-                _nextPath = null;
-                MeasureEntry(path);
+                _nextEntry = null;
+                MeasureEntry(entry);
             }
             else
             {
@@ -39,12 +39,12 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
             LastPassSteps++;
         }
 
-        return _nextPath is null && _directories.Count == 0;
+        return _nextEntry is null && _directories.Count == 0;
     }
 
     public StoragePhysicalUsage ToPhysicalUsage(int packedChunkCount)
     {
-        if (_nextPath is not null || _directories.Count > 0)
+        if (_nextEntry is not null || _directories.Count > 0)
             throw new InvalidOperationException("The physical inventory is incomplete.");
 
         return new StoragePhysicalUsage(
@@ -62,7 +62,7 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
         {
             if (entries.MoveNext())
             {
-                _nextPath = entries.Current;
+                _nextEntry = entries.Current;
                 return;
             }
         }
@@ -78,11 +78,12 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
         _directories.Pop().Dispose();
     }
 
-    private void MeasureEntry(string path)
+    private void MeasureEntry(FileSystemInfo entry)
     {
-        if (!TryGetAttributes(path, out var attributes))
+        if (!TryGetAttributes(entry, out var attributes))
             return;
 
+        var path = entry.FullName;
         MeasureAllocation(path);
         if ((attributes & FileAttributes.ReparsePoint) != FileAttributes.None)
             return;
@@ -92,15 +93,15 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
             return;
         }
 
-        if (TryGetLength(path, out var length))
+        if (entry is FileInfo file && TryGetLength(file, out var length))
             ClassifyFile(path, length);
     }
 
-    private static bool TryGetAttributes(string path, out FileAttributes attributes)
+    private static bool TryGetAttributes(FileSystemInfo entry, out FileAttributes attributes)
     {
         try
         {
-            attributes = File.GetAttributes(path);
+            attributes = entry.Attributes;
             return true;
         }
         catch (FileNotFoundException)
@@ -143,19 +144,28 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
     {
         try
         {
-            _directories.Push(Directory.EnumerateFileSystemEntries(path).GetEnumerator());
+            // Enumeration caches metadata. Reject directory-link replacements
+            // observed between maintenance passes before descending into them.
+            var attributes = File.GetAttributes(path);
+            if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != FileAttributes.Directory)
+                return;
+            _directories.Push(new DirectoryInfo(path).EnumerateFileSystemInfos().GetEnumerator());
         }
         catch (DirectoryNotFoundException)
         {
             // The directory disappeared between stat and enumeration.
         }
+        catch (FileNotFoundException)
+        {
+            // The queued directory disappeared between maintenance passes.
+        }
     }
 
-    private static bool TryGetLength(string path, out long length)
+    private static bool TryGetLength(FileInfo file, out long length)
     {
         try
         {
-            length = new FileInfo(path).Length;
+            length = file.Length;
             return true;
         }
         catch (FileNotFoundException)

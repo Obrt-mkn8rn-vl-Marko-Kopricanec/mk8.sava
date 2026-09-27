@@ -105,6 +105,87 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DirectoryLinksChangedBetweenPassesAreNotFollowedOnLinux(bool linkOnEvenStep)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+        var application = CreateApplication();
+        var externalRoot = Path.Combine(Path.GetTempPath(), $"mk8-sava-inventory-links-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(externalRoot);
+        try
+        {
+            await application.InitializeAsync();
+            var paths = application.Services.GetRequiredService<StoragePaths>();
+            var target = Path.Combine(paths.Chunks, "replacement");
+            var held = Path.Combine(externalRoot, "held");
+            var outside = Path.Combine(externalRoot, "outside");
+            Directory.CreateDirectory(target);
+            Directory.CreateDirectory(outside);
+            await File.WriteAllBytesAsync(Path.Combine(target, "original.chunk"), [0x5a]);
+            await File.WriteAllBytesAsync(Path.Combine(outside, "foreign.chunk"), new byte[8192]);
+            using (var scanner = new StoragePhysicalInventoryScanner(paths))
+            {
+                ScanWhileAlternatingDirectoryLink(scanner, target, held, outside, linkOnEvenStep);
+                var usage = scanner.ToPhysicalUsage(packedChunkCount: 0);
+                Assert.InRange(usage.ChunkBytes, 0, 1);
+                Assert.InRange(usage.ChunkCount, 0, 1);
+            }
+            using var settled = new StoragePhysicalInventoryScanner(paths);
+            var passes = 0;
+            while (!settled.Advance(maximumSteps: 1))
+                Assert.True(++passes < 100);
+            var stable = settled.ToPhysicalUsage(packedChunkCount: 0);
+            Assert.Equal(1, stable.ChunkBytes);
+            Assert.Equal(1, stable.ChunkCount);
+        }
+        finally
+        {
+            await application.DisposeAsync();
+            Directory.Delete(externalRoot, recursive: true);
+        }
+    }
+
+    private static void ScanWhileAlternatingDirectoryLink(
+        StoragePhysicalInventoryScanner scanner, string target, string held, string outside, bool linkOnEvenStep)
+    {
+        var linked = false;
+        try
+        {
+            for (var step = 0; step < 100; step++)
+            {
+                var shouldLink = (step % 2 == 0) == linkOnEvenStep;
+                if (shouldLink != linked)
+                {
+                    if (shouldLink)
+                    {
+                        Directory.Move(target, held);
+                        Directory.CreateSymbolicLink(target, outside);
+                    }
+                    else
+                    {
+                        Directory.Delete(target);
+                        Directory.Move(held, target);
+                    }
+                    linked = shouldLink;
+                }
+                if (scanner.Advance(maximumSteps: 1))
+                    return;
+            }
+            Assert.Fail("Directory-link churn prevented the bounded inventory from completing.");
+        }
+        finally
+        {
+            if (linked)
+            {
+                Directory.Delete(target);
+                Directory.Move(held, target);
+            }
+        }
+    }
+
     private static async Task<ConcurrentScanMeasurements> ScanWithConcurrentStagingWritesAsync(
         StoragePhysicalInventoryScanner scanner, string stagingDirectory)
     {

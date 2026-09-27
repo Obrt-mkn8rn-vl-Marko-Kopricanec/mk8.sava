@@ -966,7 +966,15 @@ accounting API; `mk8_sava_storage_allocation_available` is 1 only after a
 valid measurement and distinguishes an unmeasured or unsupported host from
 an empty root. A full inventory still adds I/O on large roots, but it no longer
 monopolizes one maintenance pass. Like any live filesystem walk, it is a sampled
-inventory, not an atomic filesystem snapshot. A controlled local scale test
+inventory, not an atomic filesystem snapshot. The scanner uses
+enumeration-provided file metadata instead of querying each file's
+attributes and length again. This is especially relevant to Windows, where
+the runtime populates these fields from native directory results. Directory
+attributes are still checked immediately before descent to reject replacement
+links observed between maintenance passes; cached file lengths remain sampled
+values, not authoritative quota or content-integrity data. Linux link-churn
+cases exercise replacement on either phase of one-step inventory passes.
+The controlled scale test
 uses 50,000 chunk files across 50 shards while 512 staging files are created,
 flushed, and deleted concurrently. The scale-test collection runs without
 other xUnit tests in parallel so unrelated test activity does not enter its
