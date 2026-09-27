@@ -10,6 +10,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
 {
     private const int EntriesPerPass = 1024;
     private const int ConcurrentWriteCount = 512;
+    private const int WritesPerPass = 8;
 
     [Fact]
     public async Task FiftyThousandChunksScanWithinBoundedPassesAndAllocation()
@@ -92,9 +93,10 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             using var scanner = new StoragePhysicalInventoryScanner(paths);
             var measured = await ScanWithConcurrentStagingWritesAsync(scanner, paths.Staging);
             output.WriteLine(FormattableString.Invariant(
-                $"inventory_concurrent_writes,passes={measured.Passes},overlapping_passes={measured.OverlappingPasses},max_pass_ms={measured.MaxPass.TotalMilliseconds:F3},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
+                $"inventory_concurrent_writes,passes={measured.Passes},overlapping_passes={measured.OverlappingPasses},mutations={measured.WriteCount},max_pass_ms={measured.MaxPass.TotalMilliseconds:F3},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
             Assert.InRange(measured.Passes, 1, 110);
             Assert.True(measured.OverlappingPasses > 0, "The scan did not overlap any completed staging mutations.");
+            Assert.Equal(ConcurrentWriteCount, measured.WriteCount);
             Assert.True(measured.MaxPass <= TimeSpan.FromMilliseconds(500), "A bounded inventory pass exceeded 500 ms.");
             Assert.True(measured.P99Write <= TimeSpan.FromMilliseconds(250), "Staging mutation p99 exceeded 250 ms.");
             Assert.Equal(50_000, scanner.ToPhysicalUsage(packedChunkCount: 0).ChunkCount);
@@ -189,23 +191,34 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     private static async Task<ConcurrentScanMeasurements> ScanWithConcurrentStagingWritesAsync(
         StoragePhysicalInventoryScanner scanner, string stagingDirectory)
     {
-        using var firstPass = new ManualResetEventSlim(false);
-        var writesCompleted = new int[1];
-        var writer = Task.Run(() => WriteStagingFiles(firstPass, stagingDirectory, writesCompleted));
-        var scan = Task.Run(() => ScanWhileWriting(scanner, firstPass, writesCompleted));
+        using var rendezvous = new Barrier(2);
+        using var abort = new CancellationTokenSource();
+        var batchTimes = new long[2];
+        var scanFinished = new int[1];
+        // Dedicated workers avoid thread-pool starvation. Rendezvous waits are not timed;
+        // each batch and inventory pass start in the same phase and must both finish.
+        var writer = Task.Factory.StartNew(
+            () => WriteStagingFiles(rendezvous, stagingDirectory, batchTimes, scanFinished, abort),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        var scan = Task.Factory.StartNew(
+            () => ScanWhileWriting(scanner, rendezvous, batchTimes, scanFinished, abort),
+            CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         await Task.WhenAll(writer, scan).ConfigureAwait(false);
         var latencies = await writer.ConfigureAwait(false);
         var scanResult = await scan.ConfigureAwait(false);
+        Assert.NotEmpty(latencies);
         Array.Sort(latencies);
         return new ConcurrentScanMeasurements(
             scanResult.Passes,
             scanResult.OverlappingPasses,
+            latencies.Length,
             scanResult.MaxPass,
             latencies[(int)Math.Ceiling(latencies.Length * 0.99) - 1]);
     }
 
     private static (int Passes, int OverlappingPasses, TimeSpan MaxPass) ScanWhileWriting(
-        StoragePhysicalInventoryScanner scanner, ManualResetEventSlim firstPass, int[] writesCompleted)
+        StoragePhysicalInventoryScanner scanner, Barrier rendezvous, long[] batchTimes,
+        int[] scanFinished, CancellationTokenSource abort)
     {
         var passes = 0;
         var overlappingPasses = 0;
@@ -215,54 +228,82 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             bool complete;
             do
             {
+                WaitForPhase(rendezvous, abort.Token);
                 var started = Stopwatch.GetTimestamp();
                 complete = scanner.Advance(EntriesPerPass);
-                var elapsed = Stopwatch.GetElapsedTime(started);
+                var finished = Stopwatch.GetTimestamp();
+                var elapsed = Stopwatch.GetElapsedTime(started, finished);
                 if (elapsed > maximum)
                     maximum = elapsed;
-                if (++passes == 1)
-                    firstPass.Set();
-                var completed = Volatile.Read(ref writesCompleted[0]);
-                if (completed is > 0 and < ConcurrentWriteCount)
+                Volatile.Write(ref scanFinished[0], complete ? 1 : 0);
+                WaitForPhase(rendezvous, abort.Token);
+                if (batchTimes[0] < finished && batchTimes[1] > started)
                     overlappingPasses++;
                 Assert.InRange(scanner.LastPassSteps, 1, EntriesPerPass);
-                Assert.True(passes <= 110, "The concurrent scan did not finish within the pass budget.");
+                Assert.True(++passes <= 110, "The concurrent scan did not finish within the pass budget.");
             }
             while (!complete);
             return (passes, overlappingPasses, maximum);
         }
-        finally
+        catch
         {
-            firstPass.Set();
+            abort.Cancel();
+            throw;
         }
     }
 
     private static TimeSpan[] WriteStagingFiles(
-        ManualResetEventSlim firstPass, string stagingDirectory, int[] writesCompleted)
+        Barrier rendezvous, string stagingDirectory, long[] batchTimes,
+        int[] scanFinished, CancellationTokenSource abort)
     {
-        firstPass.Wait();
         var latencies = new TimeSpan[ConcurrentWriteCount];
-        ReadOnlySpan<byte> content = [0x5a];
-        for (var index = 0; index < ConcurrentWriteCount; index++)
+        var index = 0;
+        try
         {
-            var path = Path.Combine(stagingDirectory,
-                $"inventory-writer-{index.ToString("D4", System.Globalization.CultureInfo.InvariantCulture)}.tmp");
-            var started = Stopwatch.GetTimestamp();
-            using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
-                       FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, FileOptions.WriteThrough))
+            do
             {
-                file.Write(content);
-                file.Flush(flushToDisk: true);
+                WaitForPhase(rendezvous, abort.Token);
+                batchTimes[0] = Stopwatch.GetTimestamp();
+                var batchStart = index;
+                var end = Math.Min(index + WritesPerPass, ConcurrentWriteCount);
+                for (; index < end; index++)
+                    latencies[index] = WriteStagingFile(stagingDirectory, index);
+                batchTimes[1] = index > batchStart ? Stopwatch.GetTimestamp() : 0;
+                WaitForPhase(rendezvous, abort.Token);
             }
-            File.Delete(path);
-            latencies[index] = Stopwatch.GetElapsedTime(started);
-            Volatile.Write(ref writesCompleted[0], index + 1);
+            while (Volatile.Read(ref scanFinished[0]) == 0);
+            return latencies[..index];
         }
-        return latencies;
+        catch
+        {
+            abort.Cancel();
+            throw;
+        }
+    }
+
+    private static TimeSpan WriteStagingFile(string stagingDirectory, int index)
+    {
+        var path = Path.Combine(stagingDirectory,
+            $"inventory-writer-{index.ToString("D4", System.Globalization.CultureInfo.InvariantCulture)}.tmp");
+        var started = Stopwatch.GetTimestamp();
+        using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
+                   FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, FileOptions.WriteThrough))
+        {
+            file.Write([0x5a]);
+            file.Flush(flushToDisk: true);
+        }
+        File.Delete(path);
+        return Stopwatch.GetElapsedTime(started);
+    }
+
+    private static void WaitForPhase(Barrier rendezvous, CancellationToken cancellationToken)
+    {
+        if (!rendezvous.SignalAndWait(TimeSpan.FromSeconds(30), cancellationToken))
+            throw new TimeoutException("The inventory scan and staging writer did not rendezvous.");
     }
 
     private sealed record ConcurrentScanMeasurements(
-        int Passes, int OverlappingPasses, TimeSpan MaxPass, TimeSpan P99Write);
+        int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write);
 
     private static SavaWebApplicationFactory CreateApplication() => new(
         Path.Combine(Path.GetTempPath(), $"mk8-sava-inventory-scale-{Guid.NewGuid():N}"),
