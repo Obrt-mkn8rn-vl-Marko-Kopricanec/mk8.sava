@@ -88,7 +88,7 @@ DOTNET_HOST_PATH=/path/to/dotnet Mk8.Sava.Tests/CrashHarness/run-enospc.sh
 ```
 
 It mounts a private 32 MiB tmpfs beneath a freshly created temporary directory,
-fills it until the kernel returns `ENOSPC`, and runs eight independent boundaries:
+fills it until the kernel returns `ENOSPC`, and runs nine independent boundaries:
 a 512 KiB standalone upload with only 256 KiB free, metadata-only container
 creation with 128 KiB free, blob metadata and HTTP-property updates with 256 KiB
 free each, a packed
@@ -96,7 +96,8 @@ upload with 8 KiB free, pack compaction with 4 KiB free, and a blob-publication
 transaction where a fault hook fills the tmpfs after staging but immediately
 before the SQLite commit, and a pack-compaction transaction where the same
 technique fills it after the replacement pack is published but before SQLite
-switches the index. The tests confirm an earlier acknowledged object remains
+switches the index, plus a blob deletion transaction under a completely full
+filesystem. The tests confirm an earlier acknowledged object remains
 exact, failed metadata/property updates retain the last acknowledged value
 and ETag, failed logical publication is
 absent after restart, partial/unreachable extents can be reclaimed or discarded,
@@ -109,6 +110,9 @@ collection reclaims the orphan after restart, and retry publishes exact bytes.
 The compaction-commit case checks that the old pack remains authoritative,
 the unindexed replacement can be reclaimed after restart, and compaction can
 then succeed without changing live bytes.
+The deletion case confirms both acknowledged objects remain byte-exact before
+and after restart when deletion cannot commit, then permits retry after space
+is restored.
 The mount is private to the harness process and is unmounted on exit. This
 does not cover every SQLite commit, filesystem, Windows, or power-loss boundary.
 
@@ -458,8 +462,16 @@ two-account SDK/HTTP regression verifies rejection and byte-exact source
 and destination snapshots. Other source failures retain the existing
 versioned error mapping. See the
 [Incremental Copy Blob restrictions](https://learn.microsoft.com/en-us/rest/api/storageservices/incremental-copy-blob#remarks).
-The transfer still reads the full source snapshot; differential-only
-network transfer is not yet implemented or claimed.
+External incremental copies use HEAD plus the occupied-page list for the
+first snapshot and Get Page Ranges with `prevsnapshot` for later snapshots.
+Only occupied or changed page bytes are fetched, in ETag-pinned ranges of
+at most 4 MiB. Cleared pages and length changes are applied to a sparse
+destination manifest; unchanged snapshots require no data GET. Prior
+destination snapshots remain independently readable. Inconsistent range,
+length, or ETag responses fail before publishing a replacement copy.
+Local SDK/HTTP tests cover sparse growth, clear, shrink, empty deltas and
+multi-range transfers. These are not a whole-operation emulator differential:
+Azurite does not implement incremental copy or page diff.
 Outbound URL-source requests do not follow HTTP redirects. A redirected source
 fails with `CannotVerifyCopySource` without contacting the redirect target, so
 source bearer tokens and customer-provided encryption-key headers cannot be

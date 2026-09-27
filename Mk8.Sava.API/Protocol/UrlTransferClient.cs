@@ -68,6 +68,108 @@ internal sealed class UrlTransferClient(
         }
     }
 
+    public async Task<UrlPageCopySource> ReadPageCopySourceAsync(
+        HttpRequest destinationRequest, string sourceValue, CancellationToken cancellationToken)
+    {
+        var (sourceUri, _) = ValidateReadSourceRequest(destinationRequest, sourceValue, long.MaxValue, allowFileRequestIntent: false);
+        using var request = CreateReadSourceRequest(destinationRequest, sourceUri, sourceRange: null, allowSourceCustomerProvidedKey: false);
+        request.Method = HttpMethod.Head;
+        using var response = await SendReadSourceRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        var length = await ValidateReadSourceResponseAsync(
+            destinationRequest, response, sourceRange: null, long.MaxValue,
+            sourceLengthConflict: false, cancellationToken).ConfigureAwait(false);
+        if (ReadBlobKind(response) != BlobKind.PageBlob)
+            throw new AzureStorageException(StatusCodes.Status409Conflict, "InvalidSourceBlobType", "The source blob type is invalid for incremental copy.");
+        var etag = response.Headers.ETag?.ToString();
+        var createdAt = ReadCreationTime(response);
+        if (length < 0 || length > 8L * 1024 * 1024 * 1024 * 1024 || length % 512 != 0 ||
+            string.IsNullOrEmpty(etag) || !createdAt.HasValue)
+            throw CannotVerifyCopySource("The source page snapshot properties are invalid or incomplete.");
+        var ranges = await ReadPageRangesAsync(destinationRequest, sourceUri, etag, length, cancellationToken).ConfigureAwait(false);
+        var properties = new UrlSource(Stream.Null, length, ReadHttpProperties(response), ReadMetadata(response),
+            new Dictionary<string, string>(StringComparer.Ordinal), BlobKind.PageBlob,
+            ReadSingleHeader(response, "x-ms-access-tier"), etag,
+            ReadLongHeader(response, "x-ms-blob-sequence-number"), false, 0, [], ranges, createdAt);
+        return new UrlPageCopySource(this, destinationRequest, sourceUri, properties);
+    }
+
+    public async Task ReadPinnedPageRangeAsync(
+        HttpRequest destinationRequest, Uri sourceUri, string etag, long sourceLength,
+        PageRange range, Func<Stream, CancellationToken, Task> consume, CancellationToken cancellationToken)
+    {
+        var rangeText = string.Create(CultureInfo.InvariantCulture, $"bytes={range.Start}-{range.End}");
+        using var request = CreateReadSourceRequest(destinationRequest, sourceUri, rangeText, allowSourceCustomerProvidedKey: false);
+        request.Headers.Remove("If-Match");
+        request.Headers.TryAddWithoutValidation("If-Match", etag);
+        using var response = await SendReadSourceRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        var expected = range.End - range.Start + 1;
+        var length = await ValidateReadSourceResponseAsync(
+            destinationRequest, response, rangeText, long.MaxValue, sourceLengthConflict: false, cancellationToken).ConfigureAwait(false);
+        var returned = response.Content.Headers.ContentRange;
+        if (length != expected || returned is null || returned.From != range.Start || returned.To != range.End ||
+            returned.Length != sourceLength || !string.Equals(response.Headers.ETag?.ToString(), etag, StringComparison.Ordinal))
+            throw CannotVerifyCopySource("The source returned an inconsistent page range or snapshot ETag.");
+        var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            using var limited = new LengthLimitedReadStream(stream, expected);
+            try
+            {
+                await consume(limited, cancellationToken).ConfigureAwait(false);
+            }
+            catch (EndOfStreamException)
+            {
+                throw CannotVerifyCopySource("The source page range ended before the requested length.");
+            }
+        }
+    }
+
+    public async Task<PageRangeDiff> ReadPageDiffAsync(
+        HttpRequest destinationRequest, Uri sourceUri, string etag, long sourceLength,
+        long previousLength, string previousSnapshot, CancellationToken cancellationToken)
+    {
+        var pages = new List<PageRange>();
+        var clears = new List<PageRange>();
+        var markers = new HashSet<string>(StringComparer.Ordinal);
+        string? marker = null;
+        do
+        {
+            var parameters = new List<KeyValuePair<string, string?>>
+            {
+                new("comp", "pagelist"), new("prevsnapshot", previousSnapshot)
+            };
+            if (!string.IsNullOrEmpty(marker))
+                parameters.Add(new KeyValuePair<string, string?>("marker", marker));
+            var document = await ReadSourceXmlAsync(destinationRequest,
+                BuildComponentUri(sourceUri, parameters.ToArray()), etag, cancellationToken,
+                incrementalCopyContinuity: true).ConfigureAwait(false);
+            if (!string.Equals(document.Root?.Name.LocalName, "PageList", StringComparison.Ordinal))
+                throw CannotVerifyCopySource("The source returned an invalid page-diff document.");
+            pages.AddRange(ParsePageRangeEntries(document, "PageRange", sourceLength));
+            clears.AddRange(ParsePageRangeEntries(document, "ClearRange", Math.Max(sourceLength, previousLength)));
+            marker = document.Descendants().FirstOrDefault(element => string.Equals(element.Name.LocalName, "NextMarker", StringComparison.Ordinal))?.Value;
+            if (!string.IsNullOrEmpty(marker) && !markers.Add(marker))
+                throw CannotVerifyCopySource("The source page-diff continuation marker repeated.");
+        }
+        while (!string.IsNullOrEmpty(marker));
+        return new PageRangeDiff(pages, clears);
+    }
+
+    private static IEnumerable<PageRange> ParsePageRangeEntries(XDocument document, string elementName, long maximumLength)
+    {
+        foreach (var element in document.Descendants().Where(element => string.Equals(element.Name.LocalName, elementName, StringComparison.Ordinal)))
+        {
+            var startText = element.Elements().FirstOrDefault(child => string.Equals(child.Name.LocalName, "Start", StringComparison.Ordinal))?.Value;
+            var endText = element.Elements().FirstOrDefault(child => string.Equals(child.Name.LocalName, "End", StringComparison.Ordinal))?.Value;
+            if (!long.TryParse(startText, NumberStyles.None, CultureInfo.InvariantCulture, out var start) ||
+                !long.TryParse(endText, NumberStyles.None, CultureInfo.InvariantCulture, out var end) ||
+                start < 0 || end < start || end == long.MaxValue || start % 512 != 0 ||
+                (end + 1) % 512 != 0 || end >= maximumLength)
+                throw CannotVerifyCopySource("The source returned an invalid page-diff range.");
+            yield return new PageRange(start, end);
+        }
+    }
+
     private async Task<UrlTransferResult<TResult>> ConsumeValidatedSourceAsync<TResult>(
         HttpRequest destinationRequest,
         Uri sourceUri,
@@ -796,22 +898,6 @@ internal sealed class UrlTransferClient(
                 throw CannotVerifyCopySource("The source page range continuation marker repeated.");
         } while (!string.IsNullOrEmpty(marker));
         return ranges;
-    }
-
-    public async Task VerifyIncrementalCopyContinuityAsync(
-        HttpRequest destinationRequest, Uri sourceUri, string previousSnapshot, string? etag,
-        CancellationToken cancellationToken)
-    {
-        var document = await ReadSourceXmlAsync(
-            destinationRequest,
-            BuildComponentUri(sourceUri,
-                new KeyValuePair<string, string?>("comp", "pagelist"),
-                new KeyValuePair<string, string?>("prevsnapshot", previousSnapshot)),
-            etag,
-            cancellationToken,
-            incrementalCopyContinuity: true).ConfigureAwait(false);
-        if (!string.Equals(document.Root?.Name.LocalName, "PageList", StringComparison.Ordinal))
-            throw CannotVerifyCopySource("The source returned an invalid page-diff document.");
     }
 
     private async Task<XDocument> ReadSourceXmlAsync(

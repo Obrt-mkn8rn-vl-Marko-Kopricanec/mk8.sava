@@ -1990,68 +1990,14 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         }
 
         var transfers = http.RequestServices.GetRequiredService<UrlTransferClient>();
-        var transfer = await transfers.ReadAsync(
-            http.Request,
-            copySource,
-            sourceRange: null,
-            allowSourceCustomerProvidedKey: false,
-            allowFileRequestIntent: false,
-            long.MaxValue,
-            sourceLengthConflict: false,
-            async source =>
-            {
-                if (source.Kind != BlobKind.PageBlob)
-                {
-                    throw new AzureStorageException(
-                        StatusCodes.Status409Conflict,
-                        "InvalidSourceBlobType",
-                        "The source blob type is invalid for incremental copy.");
-                }
-                if (source.CreatedAt is not { } createdAt)
-                {
-                    throw new AzureStorageException(
-                        StatusCodes.Status409Conflict,
-                        "CannotVerifyCopySource",
-                        "The source did not return a valid creation time for incremental copy.");
-                }
-                await VerifyExternalIncrementalCopyContinuityAsync(
-                    http.Request, transfers, current, sourceUri, snapshots[0]!, createdAt,
-                    source.ETag, cancellationToken).ConfigureAwait(false);
-                return await service.BeginIncrementalCopyFromStreamAsync(
-                    request.Account,
-                    containerName,
-                    blobName,
-                    source.Content,
-                    source.ContentLength!.Value,
-                    snapshots[0]!,
-                    sourceUri.GetLeftPart(UriPartial.Path),
-                    createdAt,
-                    source.SequenceNumber,
-                    source.PageRanges,
-                    ReadUrlCopyWriteOptions(http.Request, source, copySourceTags: false, current, synchronous: false),
-                    publicSource,
-                    current,
-                    cancellationToken).ConfigureAwait(false);
-            },
-            cancellationToken,
-            preserveSourceShape: true).ConfigureAwait(false);
-        return transfer.Value;
-    }
-
-    private static Task VerifyExternalIncrementalCopyContinuityAsync(
-        HttpRequest request, UrlTransferClient transfers, BlobRecord? current, Uri sourceUri,
-        string sourceSnapshot, DateTimeOffset createdAt, string? sourceETag, CancellationToken cancellationToken)
-    {
-        if (current is { IsIncrementalCopy: true, IncrementalCopySourceSnapshot: { } previousSnapshot } &&
-            string.Equals(current.IncrementalCopySource, sourceUri.GetLeftPart(UriPartial.Path), StringComparison.Ordinal) &&
-            current.IncrementalCopySourceCreatedAt == createdAt &&
-            !string.Equals(current.Copy?.Status, "pending", StringComparison.Ordinal) &&
-            string.CompareOrdinal(previousSnapshot, sourceSnapshot) < 0)
-        {
-            return transfers.VerifyIncrementalCopyContinuityAsync(
-                request, sourceUri, previousSnapshot, sourceETag, cancellationToken);
-        }
-        return Task.CompletedTask;
+        var pageSource = await transfers.ReadPageCopySourceAsync(http.Request, copySource, cancellationToken).ConfigureAwait(false);
+        var source = pageSource.Properties;
+        return await service.BeginIncrementalCopyFromPageRangesAsync(
+            request.Account, containerName, blobName, source.ContentLength!.Value,
+            snapshots[0]!, sourceUri.GetLeftPart(UriPartial.Path), source.CreatedAt!.Value,
+            source.SequenceNumber, source.PageRanges,
+            ReadUrlCopyWriteOptions(http.Request, source, copySourceTags: false, current, synchronous: false),
+            publicSource, current, pageSource, cancellationToken).ConfigureAwait(false);
     }
 
     private static void RequireIncrementalCopyVersion(StorageRequestContext request)
