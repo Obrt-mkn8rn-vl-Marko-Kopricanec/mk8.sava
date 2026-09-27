@@ -513,7 +513,11 @@ Query Blob Contents accepts Azure's `delimited`/`csv`, JSON, and Parquet input
 forms and its delimited/CSV, JSON, and Arrow result forms. Parquet input is read
 through authenticated seeks over the deduplicated chunk store and retains at
 most one row group, rather than copying the complete blob to memory or a
-temporary file. Arrow results use the caller's declared schema and are emitted
+temporary file. File, row-group, and flat-column counts must agree before any
+column arrays or result rows are produced; malformed counts return a fatal
+`InvalidParquetFile` query error rather than inventing zero/null rows. The
+current decoder still materializes a valid row group's columns, so this is not
+a per-query memory ceiling. Arrow results use the caller's declared schema and are emitted
 as bounded record batches inside Azure's Avro query envelope; the service does
 not retain or buffer the complete result set. The normal .NET compatibility
 suite exercises multiple Parquet row groups and all six Azure Arrow field types,

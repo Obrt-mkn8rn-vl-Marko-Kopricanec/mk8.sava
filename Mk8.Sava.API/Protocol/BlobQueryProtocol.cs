@@ -558,6 +558,7 @@ internal static class BlobQueryProtocol
                     0);
             }
 
+            ValidateParquetDimensions(reader, fields);
             var names = fields.Select(field => field.Name).ToArray();
             for (var groupIndex = 0; groupIndex < reader.RowGroupCount; groupIndex++)
             {
@@ -568,6 +569,39 @@ internal static class BlobQueryProtocol
                 }
             }
         }
+    }
+
+    private static void ValidateParquetDimensions(ParquetReader reader, Parquet.Schema.DataField[] fields)
+    {
+        var metadata = reader.Metadata;
+        if (metadata is null || metadata.NumRows < 0)
+            throw InvalidParquetFile("The Parquet file declares an invalid row count.");
+        var fieldNames = fields.Select(field => field.Name).ToHashSet(StringComparer.Ordinal);
+        if (fieldNames.Count != fields.Length)
+            throw InvalidParquetFile("The Parquet schema contains duplicate column names.");
+
+        long totalRows = 0;
+        foreach (ref readonly var group in CollectionsMarshal.AsSpan(metadata.RowGroups))
+        {
+            if (group.NumRows < 0 || group.NumRows > int.MaxValue || group.NumRows > metadata.NumRows - totalRows)
+                throw InvalidParquetFile("The Parquet row-group counts do not match the file row count.");
+            if (group.Columns.Count != fields.Length)
+                throw InvalidParquetFile("The Parquet row group does not contain every schema column exactly once.");
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (ref readonly var column in CollectionsMarshal.AsSpan(group.Columns))
+            {
+                var definition = column.MetaData;
+                if (definition is null || definition.NumValues != group.NumRows ||
+                    definition.PathInSchema.Count != 1 || !fieldNames.Contains(definition.PathInSchema[0]) ||
+                    !seen.Add(definition.PathInSchema[0]))
+                {
+                    throw InvalidParquetFile("The Parquet column dimensions do not match the row-group schema and row count.");
+                }
+            }
+            totalRows += group.NumRows;
+        }
+        if (totalRows != metadata.NumRows)
+            throw InvalidParquetFile("The Parquet row-group counts do not match the file row count.");
     }
 
     private static async IAsyncEnumerable<QueryRow> ReadParquetGroupAsync(
