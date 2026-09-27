@@ -77,14 +77,15 @@ internal static class BlobQueryProtocol
         long totalBytes,
         CancellationToken cancellationToken,
         ParquetQueryInput? parquetInput = null,
-        long maximumResultMemoryBytes = 256L * 1024 * 1024)
+        long maximumResultMemoryBytes = 256L * 1024 * 1024,
+        long maximumInputMemoryBytes = 256L * 1024 * 1024)
     {
         var plan = BlobQueryPlan.Parse(request.Expression);
         using var avro = new BlobQueryAvroWriter(response);
 
         try
         {
-            var selections = ExecutePlanAsync(input, request.Input, plan, parquetInput, cancellationToken)
+            var selections = ExecutePlanAsync(input, request.Input, plan, parquetInput, maximumInputMemoryBytes, cancellationToken)
                 .GetAsyncEnumerator(cancellationToken);
             await using (selections.ConfigureAwait(false))
             {
@@ -141,6 +142,7 @@ internal static class BlobQueryProtocol
         BlobQueryTextFormat format,
         BlobQueryPlan plan,
         ParquetQueryInput? parquetInput,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (plan.IsSplit)
@@ -157,7 +159,7 @@ internal static class BlobQueryProtocol
             yield break;
         }
 
-        var rows = ReadRowsAsync(input, format, plan, parquetInput, cancellationToken)
+        var rows = ReadRowsAsync(input, format, plan, parquetInput, maximumInputMemoryBytes, cancellationToken)
             .GetAsyncEnumerator(cancellationToken);
         await using (rows.ConfigureAwait(false))
         {
@@ -822,6 +824,7 @@ internal static class BlobQueryProtocol
         BlobQueryTextFormat format,
         BlobQueryPlan plan,
         ParquetQueryInput? parquetInput,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         if (format.Kind == BlobQueryFormatKind.Parquet)
@@ -840,23 +843,24 @@ internal static class BlobQueryProtocol
 
         if (format.Kind == BlobQueryFormatKind.Delimited)
         {
-            await foreach (var row in ReadDelimitedQueryRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
+            await foreach (var row in ReadDelimitedQueryRowsAsync(reader, format, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
                 yield return row;
             yield break;
         }
 
-        await foreach (var row in ReadJsonQueryRowsAsync(reader, format, plan, cancellationToken).ConfigureAwait(false))
+        await foreach (var row in ReadJsonQueryRowsAsync(reader, format, plan, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
             yield return row;
     }
 
     private static async IAsyncEnumerable<QueryRow> ReadDelimitedQueryRowsAsync(
         TextReader reader,
         BlobQueryTextFormat format,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         string[]? headers = null;
         var rowNumber = 0L;
-        await foreach (var fields in ReadDelimitedRowsAsync(reader, format, cancellationToken).ConfigureAwait(false))
+        await foreach (var fields in ReadDelimitedRowsAsync(reader, format, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
         {
             rowNumber++;
             if (headers is null && format.HasHeaders)
@@ -878,10 +882,11 @@ internal static class BlobQueryProtocol
         TextReader reader,
         BlobQueryTextFormat format,
         BlobQueryPlan plan,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var position = 0L;
-        await foreach (var record in ReadRawRecordsAsync(reader, format.RecordSeparator, cancellationToken).ConfigureAwait(false))
+        await foreach (var record in ReadRawRecordsAsync(reader, format.RecordSeparator, maximumInputMemoryBytes, cancellationToken).ConfigureAwait(false))
         {
             if (string.IsNullOrWhiteSpace(record))
             {
@@ -913,7 +918,9 @@ internal static class BlobQueryProtocol
                         "Each JSON query input record must be an object or array.",
                         position);
                 }
-                foreach (var row in plan.ExpandJsonRows(root))
+                foreach (var row in plan.ExpandJsonRows(root,
+                             BlobQueryResources.BufferedInputBytes + 48L * record.Length,
+                             maximumInputMemoryBytes, cancellationToken))
                     yield return row;
             }
 
@@ -924,10 +931,11 @@ internal static class BlobQueryProtocol
     private static async IAsyncEnumerable<IReadOnlyList<string>> ReadDelimitedRowsAsync(
         TextReader reader,
         BlobQueryTextFormat format,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<char>.Shared.Rent(64 * 1024);
-        var state = new DelimitedReaderState(format);
+        var state = new DelimitedReaderState(format, maximumInputMemoryBytes);
 
         try
         {
@@ -958,7 +966,7 @@ internal static class BlobQueryProtocol
         }
     }
 
-    private sealed class DelimitedReaderState(BlobQueryTextFormat format)
+    private sealed class DelimitedReaderState(BlobQueryTextFormat format, long maximumInputMemoryBytes)
     {
         private readonly StringBuilder _field = new();
         private readonly List<string> _fields = [];
@@ -966,12 +974,15 @@ internal static class BlobQueryProtocol
         private bool _quotePending;
         private bool _escapePending;
         private int _recordCharacters;
+        private long _retainedHeaderBytes;
+        private bool _headerRetained;
 
         public string[]? Consume(char character)
         {
             _recordCharacters++;
             if (_recordCharacters > MaximumRecordCharacters)
                 throw new BlobQueryDataException("RecordTooLarge", "A query input record exceeds 16 MiB.", 0);
+            ValidateCapacity();
 
             if (_escapePending)
             {
@@ -1023,6 +1034,11 @@ internal static class BlobQueryProtocol
                 _fields.Add(_field.ToString());
                 _field.Clear();
                 var completed = _fields.ToArray();
+                if (format.HasHeaders && !_headerRetained)
+                {
+                    _retainedHeaderBytes = 8L * _recordCharacters + 256L * _fields.Count;
+                    _headerRetained = true;
+                }
                 _fields.Clear();
                 _recordCharacters = 0;
                 return completed;
@@ -1038,6 +1054,7 @@ internal static class BlobQueryProtocol
 
         public string[]? Complete()
         {
+            ValidateCapacity();
             if (_inQuotes && !_quotePending)
                 throw new BlobQueryDataException("UnclosedQuote", "A delimited query input field contains an unclosed quote.", 0);
             if (_escapePending)
@@ -1047,11 +1064,16 @@ internal static class BlobQueryProtocol
             _fields.Add(_field.ToString());
             return _fields.ToArray();
         }
+
+        private void ValidateCapacity() => BlobQueryResources.ValidateInput(
+            BlobQueryResources.BufferedInputBytes + _retainedHeaderBytes +
+            8L * _recordCharacters + 256L * (_fields.Count + 1), maximumInputMemoryBytes);
     }
 
     private static async IAsyncEnumerable<string> ReadRawRecordsAsync(
         TextReader reader,
         string separator,
+        long maximumInputMemoryBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<char>.Shared.Rent(64 * 1024);
@@ -1070,6 +1092,8 @@ internal static class BlobQueryProtocol
                     record.Append(buffer[index]);
                     if (record.Length > MaximumRecordCharacters)
                         throw new BlobQueryDataException("RecordTooLarge", "A query input record exceeds 16 MiB.", 0);
+                    BlobQueryResources.ValidateInput(
+                        BlobQueryResources.BufferedInputBytes + 48L * record.Length, maximumInputMemoryBytes);
                     if (!EndsWith(record, separator))
                         continue;
                     record.Length -= separator.Length;

@@ -6,6 +6,7 @@ namespace Mk8.Sava.Protocol;
 
 internal sealed class BlobQueryPlan
 {
+    private const int MaximumQueryDepth = 128;
     private readonly IReadOnlyList<QueryProjection> _projections;
     private readonly QueryPredicate? _predicate;
     private readonly long? _limit;
@@ -42,13 +43,17 @@ internal sealed class BlobQueryPlan
     public long SplitSize => _splitSize ?? throw new InvalidOperationException("The query is not a split query.");
     public string SplitName => _splitName ?? throw new InvalidOperationException("The query is not a split query.");
 
-    public IEnumerable<QueryRow> ExpandJsonRows(JsonElement root)
+    public IEnumerable<QueryRow> ExpandJsonRows(JsonElement root, long retainedBytes, long maximumInputMemoryBytes,
+        CancellationToken cancellationToken)
     {
         IEnumerable<JsonElement> nodes = [root];
         foreach (var segment in _tablePath)
             nodes = ExpandJsonSegment(nodes, segment);
         foreach (var node in nodes)
+        {
+            BlobQueryResources.ValidateJsonRow(node, retainedBytes, maximumInputMemoryBytes, cancellationToken);
             yield return CreateJsonRow(node);
+        }
     }
 
     public QuerySelection? Select(QueryRow row)
@@ -93,6 +98,7 @@ internal sealed class BlobQueryPlan
 
     private abstract record QueryExpression
     {
+        public virtual int Depth => 1;
         public abstract QueryCell Evaluate(QueryRow row);
     }
 
@@ -142,6 +148,7 @@ internal sealed class BlobQueryPlan
         QueryExpression Right,
         string Operator) : QueryExpression
     {
+        public override int Depth { get; } = 1 + Math.Max(Left.Depth, Right.Depth);
         public override QueryCell Evaluate(QueryRow row) =>
             EvaluateBinary(Left.Evaluate(row), Right.Evaluate(row), Operator);
     }
@@ -150,6 +157,7 @@ internal sealed class BlobQueryPlan
         QueryExpression Operand,
         bool Negate) : QueryExpression
     {
+        public override int Depth { get; } = 1 + Operand.Depth;
         public override QueryCell Evaluate(QueryRow row)
         {
             var value = Operand.Evaluate(row);
@@ -174,6 +182,7 @@ internal sealed class BlobQueryPlan
         QueryExpression Operand,
         QueryValueType Type) : QueryExpression
     {
+        public override int Depth { get; } = 1 + Operand.Depth;
         public override QueryCell Evaluate(QueryRow row) => Cast(Operand.Evaluate(row), Type);
     }
 
@@ -181,6 +190,7 @@ internal sealed class BlobQueryPlan
         string Name,
         IReadOnlyList<QueryExpression> Arguments) : QueryExpression
     {
+        public override int Depth { get; } = 1 + (Arguments.Count == 0 ? 0 : Arguments.Max(argument => argument.Depth));
         public override QueryCell Evaluate(QueryRow row) => EvaluateFunction(Name, Arguments, row);
     }
 
@@ -189,6 +199,7 @@ internal sealed class BlobQueryPlan
         QueryExpression? Operand,
         bool CountStar) : QueryExpression
     {
+        public override int Depth { get; } = 1 + (Operand?.Depth ?? 0);
         public override QueryCell Evaluate(QueryRow row) =>
             throw new InvalidOperationException("Aggregate expressions are evaluated across rows.");
     }
@@ -201,11 +212,13 @@ internal sealed class BlobQueryPlan
 
     private abstract record QueryPredicate
     {
+        public abstract int Depth { get; }
         public abstract bool Evaluate(QueryRow row);
     }
 
     private sealed record LogicalPredicate(QueryPredicate Left, QueryPredicate Right, bool And) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Math.Max(Left.Depth, Right.Depth);
         public override bool Evaluate(QueryRow row) => And
             ? Left.Evaluate(row) && Right.Evaluate(row)
             : Left.Evaluate(row) || Right.Evaluate(row);
@@ -213,21 +226,25 @@ internal sealed class BlobQueryPlan
 
     private sealed record NotPredicate(QueryPredicate Inner) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Inner.Depth;
         public override bool Evaluate(QueryRow row) => !Inner.Evaluate(row);
     }
 
     private sealed record NullPredicate(QueryExpression Operand, bool Negated) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Operand.Depth;
         public override bool Evaluate(QueryRow row) => (Operand.Evaluate(row).Value is null) != Negated;
     }
 
     private sealed record MissingPredicate(QueryExpression Operand, bool Negated) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Operand.Depth;
         public override bool Evaluate(QueryRow row) => Operand.Evaluate(row).IsMissing != Negated;
     }
 
     private sealed record TruthPredicate(QueryExpression Operand) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Operand.Depth;
         public override bool Evaluate(QueryRow row) => Operand.Evaluate(row).Value switch
         {
             null => false,
@@ -246,6 +263,7 @@ internal sealed class BlobQueryPlan
         QueryExpression Right,
         string Operator) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Math.Max(Left.Depth, Right.Depth);
         public override bool Evaluate(QueryRow row)
         {
             var left = Left.Evaluate(row);
@@ -273,6 +291,7 @@ internal sealed class BlobQueryPlan
         QueryExpression Upper,
         bool Negated) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Math.Max(Value.Depth, Math.Max(Lower.Depth, Upper.Depth));
         public override bool Evaluate(QueryRow row)
         {
             var value = Value.Evaluate(row);
@@ -290,6 +309,7 @@ internal sealed class BlobQueryPlan
         IReadOnlyList<QueryExpression> Candidates,
         bool Negated) : QueryPredicate
     {
+        public override int Depth { get; } = 1 + Math.Max(Value.Depth, Candidates.Max(candidate => candidate.Depth));
         public override bool Evaluate(QueryRow row)
         {
             var value = Value.Evaluate(row);
@@ -962,6 +982,7 @@ internal sealed class BlobQueryPlan
         private readonly List<QueryToken> _tokens;
         private readonly string? _sourceAlias;
         private int _position;
+        private int _parseDepth;
 
         public QueryParser(string expression)
         {
@@ -998,6 +1019,12 @@ internal sealed class BlobQueryPlan
             _ = MatchSymbol(";");
             if (Current.Kind != QueryTokenKind.End)
                 throw InvalidQuery(Current.Position, $"Unexpected token '{Current.Text}'.");
+
+            if (tablePath.Count > MaximumQueryDepth || predicate?.Depth > MaximumQueryDepth ||
+                projections.Any(projection => projection.Expression?.Depth > MaximumQueryDepth))
+            {
+                throw DepthCapacityExceeded();
+            }
 
             var aggregate = ParseAggregate(ref projections);
             var (splitSize, splitName) = ParseSplit(ref projections, predicate, limit, tablePath);
@@ -1144,6 +1171,19 @@ internal sealed class BlobQueryPlan
 
         private QueryPredicate ParseNot()
         {
+            EnterParseScope();
+            try
+            {
+                return ParseNotCore();
+            }
+            finally
+            {
+                _parseDepth--;
+            }
+        }
+
+        private QueryPredicate ParseNotCore()
+        {
             if (MatchKeyword("NOT"))
                 return new NotPredicate(ParseNot());
             if (MatchSymbol("("))
@@ -1221,12 +1261,35 @@ internal sealed class BlobQueryPlan
 
         private QueryExpression ParseUnary()
         {
+            EnterParseScope();
+            try
+            {
+                return ParseUnaryCore();
+            }
+            finally
+            {
+                _parseDepth--;
+            }
+        }
+
+        private QueryExpression ParseUnaryCore()
+        {
             if (MatchSymbol("+"))
                 return new QueryUnaryExpression(ParseUnary(), Negate: false);
             if (MatchSymbol("-"))
                 return new QueryUnaryExpression(ParseUnary(), Negate: true);
             return ParsePrimary();
         }
+
+        private void EnterParseScope()
+        {
+            if (++_parseDepth > MaximumQueryDepth)
+                throw DepthCapacityExceeded();
+        }
+
+        private static AzureStorageException DepthCapacityExceeded() => new(
+            503, "ServerBusy", "The query exceeds this deployment's parser or evaluation depth capacity.",
+            responseHeaders: new Dictionary<string, string>(StringComparer.Ordinal) { ["Retry-After"] = "1" });
 
         private QueryExpression ParsePrimary()
         {
