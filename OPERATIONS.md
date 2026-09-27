@@ -511,13 +511,18 @@ report `false`, and snapshots and non-versioned blobs omit both headers.
 
 Query Blob Contents accepts Azure's `delimited`/`csv`, JSON, and Parquet input
 forms and its delimited/CSV, JSON, and Arrow result forms. Parquet input is read
-through authenticated seeks over the deduplicated chunk store and retains at
-most one row group, rather than copying the complete blob to memory or a
-temporary file. File, row-group, and flat-column counts must agree before any
-column arrays or result rows are produced; malformed counts return a fatal
+through authenticated seeks over the deduplicated chunk store, without copying
+the complete blob to memory or a temporary file. The pinned ParquetSharp native
+decoder disables whole-column prefetch and parallel decoding and reconstructs
+at most 1,024 numeric rows per Arrow input batch, or one row when variable-width
+fields are present. File, row-group, and flat-column counts must agree before
+result rows are produced; malformed counts return a fatal
 `InvalidParquetFile` query error rather than inventing zero/null rows. The
-current decoder still materializes a valid row group's columns, so this is not
-a per-query memory ceiling. Arrow results use the caller's declared schema and are emitted
+decoder no longer creates whole-row-group managed cell arrays. Encoded pages,
+dictionaries, and footer metadata still require memory; batching alone is not
+a hard per-query memory ceiling. Native assets must be included for the target
+RID when publishing. Synchronous native input reads honor request cancellation,
+and page checksums are verified when present. Arrow results use the caller's declared schema and are emitted
 as record batches inside Azure's Avro query envelope. Each batch targets at most
 4 MiB of estimated retained cells plus UTF-16/UTF-8 text and at most 1,024 rows,
 flushing before another row would exceed the byte target. A single wider row is

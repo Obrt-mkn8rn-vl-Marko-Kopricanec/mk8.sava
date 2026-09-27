@@ -7,6 +7,7 @@
     <PackageReference Include="Apache.Arrow" Version="22.1.0" />
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.12" />
     <PackageReference Include="Parquet.Net" Version="6.1.0" />
+    <PackageReference Include="ParquetSharp" Version="24.0.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Mk8.Sava.BLL/Mk8.Sava.BLL.csproj" />
