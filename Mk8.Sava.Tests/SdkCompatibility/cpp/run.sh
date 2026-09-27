@@ -5,6 +5,7 @@ ulimit -c 0
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "$script_directory/../../.." && pwd)
 dotnet_host=${DOTNET_HOST_PATH:-dotnet}
+configuration=${MK8_SAVA_TEST_CONFIGURATION:-Debug}
 temporary_root=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
 data_path=$(mktemp -d "$temporary_root/mk8-sava-cpp-XXXXXX")
 runtime_path=$(mktemp -d "$temporary_root/mk8-sava-cpp-runtime-XXXXXX")
@@ -124,7 +125,9 @@ ninja_host=$(env VCPKG_DISABLE_METRICS=1 \
     -DVCPKG_TARGET_TRIPLET=x64-linux
 "$cmake_host" --build "$runtime_path/build" --parallel
 
-"$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore
+if [[ "${MK8_SAVA_TEST_SKIP_BUILD:-0}" != "1" ]]; then
+    "$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore -c "$configuration"
+fi
 
 port=$(python3 - <<'PY'
 import socket
@@ -142,7 +145,7 @@ env \
     Sava__DataPath="$data_path" \
     Sava__DefaultAccount="$account_name" \
     Sava__Accounts__devstoreaccount1="$account_key" \
-    "$dotnet_host" "$repository_root/Mk8.Sava.API/bin/Debug/net10.0/Mk8.Sava.API.dll" \
+    "$dotnet_host" "$repository_root/Mk8.Sava.API/bin/$configuration/net10.0/Mk8.Sava.API.dll" \
     >"$server_log" 2>&1 &
 server_pid=$!
 

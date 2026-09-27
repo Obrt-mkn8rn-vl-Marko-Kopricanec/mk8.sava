@@ -181,7 +181,7 @@ internal static class ProtocolParsing
     public static async Task<Dictionary<string, string>> ReadTagsBodyAsync(Stream body, CancellationToken cancellationToken)
     {
         using var reader = CreateXmlReader(body);
-        var document = await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
+        var document = await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, cancellationToken).ConfigureAwait(false);
         var tags = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var tag in document.Descendants().Where(element => string.Equals(element.Name.LocalName, "Tag", StringComparison.Ordinal)))
         {

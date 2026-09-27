@@ -5,7 +5,8 @@ namespace Mk8.Sava.Protocol;
 internal sealed record QueryRow(
     IReadOnlyList<string> Names,
     IReadOnlyList<QueryCell> Values,
-    bool PreserveMissing = false)
+    bool PreserveMissing = false,
+    long Position = 0)
 {
     public QueryCell Resolve(string name, bool caseSensitive = false)
     {

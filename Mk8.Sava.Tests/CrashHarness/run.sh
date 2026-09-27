@@ -5,11 +5,14 @@ ulimit -c 0 || true
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "$script_directory/../.." && pwd)
 dotnet_host=${DOTNET_HOST_PATH:-dotnet}
+configuration=${MK8_SAVA_TEST_CONFIGURATION:-Debug}
 test_project="$repository_root/Mk8.Sava.Tests/Mk8.Sava.Tests.csproj"
 worker_filter='FullyQualifiedName=Mk8.Sava.Tests.StorageCrashHarnessTests.CrashWorker'
 validation_filter='FullyQualifiedName=Mk8.Sava.Tests.StorageCrashHarnessTests.ValidateCrashRecovery'
 
-"$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore
+if [[ "${MK8_SAVA_TEST_SKIP_BUILD:-0}" != "1" ]]; then
+    "$dotnet_host" build "$repository_root/Mk8.Sava.slnx" --no-restore -c "$configuration"
+fi
 
 for scenario in chunk-staging-write chunk-publication metadata-precommit metadata-postcommit reclamation-delete pack-record-append pack-metadata-precommit pack-metadata-postcommit; do
     data_path=$(mktemp -d "${TMPDIR:-/tmp}/mk8-sava-${scenario}-XXXXXX")
@@ -20,6 +23,7 @@ for scenario in chunk-staging-write chunk-publication metadata-precommit metadat
         "$dotnet_host" test "$test_project" \
             --no-build \
             --no-restore \
+            -c "$configuration" \
             --filter "$worker_filter" \
             --logger 'console;verbosity=minimal'; then
         echo "The ${scenario} worker unexpectedly exited successfully; retained ${data_path} for inspection." >&2
@@ -32,6 +36,7 @@ for scenario in chunk-staging-write chunk-publication metadata-precommit metadat
         "$dotnet_host" test "$test_project" \
             --no-build \
             --no-restore \
+            -c "$configuration" \
             --filter "$validation_filter" \
             --logger 'console;verbosity=minimal'
 done
@@ -45,6 +50,7 @@ env \
     "$dotnet_host" test "$test_project" \
         --no-build \
         --no-restore \
+        -c "$configuration" \
         --filter "$lease_filter" \
         --logger 'console;verbosity=minimal' &
 holder_pid=$!
@@ -72,6 +78,7 @@ if ! env \
     "$dotnet_host" test "$test_project" \
         --no-build \
         --no-restore \
+        -c "$configuration" \
         --filter "$lease_filter" \
         --logger 'console;verbosity=minimal'; then
     touch "$lease_path/release-holder"
