@@ -196,8 +196,8 @@ app.MapGet("/health/ready", async (
         },
         statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
 });
-app.MapGet("/metrics", (IStorageTelemetry telemetry) =>
-    Results.Text(telemetry.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
+app.MapGet("/metrics", (IStorageTelemetry telemetry, ChunkStore chunks) =>
+    Results.Text(telemetry.RenderPrometheus() + chunks.Admission.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
 await app.RunAsync().ConfigureAwait(false);

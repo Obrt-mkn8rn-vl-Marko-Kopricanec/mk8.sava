@@ -3439,6 +3439,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                 "Structured response bodies require service version 2025-01-05 or later.");
         }
 
+        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
+        using var pin = chunks.Pin(blob.Content);
+        using var readLease = await chunks.Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
@@ -3452,7 +3455,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         await StructuredBodyEncoder.WriteAsync(
             length,
             async (rangeStart, rangeLength, destination, token) =>
-                await service.WriteContentAsync(
+                await service.WriteContentUnderReadLeaseAsync(
+                    readLease,
                     blob,
                     encryption,
                     start + rangeStart,
@@ -3474,6 +3478,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         bool wantCrc64,
         CancellationToken cancellationToken)
     {
+        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
+        using var pin = chunks.Pin(blob.Content);
+        using var readLease = await chunks.Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
@@ -3487,7 +3494,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         if (wantMd5 || wantCrc64)
         {
             using var buffer = new MemoryStream((int)length);
-            await service.WriteContentAsync(blob, encryption, start, length, buffer, cancellationToken).ConfigureAwait(false);
+            await service.WriteContentUnderReadLeaseAsync(readLease, blob, encryption, start, length, buffer, cancellationToken).ConfigureAwait(false);
             var bytes = buffer.ToArray();
             if (wantMd5)
             {
@@ -3505,7 +3512,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             return;
         }
 
-        await service.WriteContentAsync(blob, encryption, start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
+        await service.WriteContentUnderReadLeaseAsync(readLease, blob, encryption, start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task HandleQueryAsync(
@@ -3546,6 +3553,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         EvaluateReadConditions(http.Request, blob);
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
+        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
+        using var pin = chunks.Pin(blob.Content);
+        using var admission = await chunks.Admission.AcquireQueryAsync(cancellationToken).ConfigureAwait(false);
         var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
         blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
         AzureResponseWriter.AddBlobQueryHeaders(http.Response, blob);

@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.IO.Pipelines;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.RateLimiting;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 
@@ -46,6 +47,7 @@ public sealed class ChunkStore : IDisposable
         }
     }
     internal int PhysicalUsageScanStepsLastPass { get; private set; }
+    internal StorageWorkAdmission Admission { get; }
 
     public void Dispose()
     {
@@ -54,6 +56,7 @@ public sealed class ChunkStore : IDisposable
             _physicalInventoryScanner?.Dispose();
             _physicalInventoryScanner = null;
         }
+        Admission.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -68,6 +71,7 @@ public sealed class ChunkStore : IDisposable
         _metadata = metadata;
         _faultInjector = faultInjector;
         _options = options.Value;
+        Admission = new StorageWorkAdmission(_options);
         _chunkDigest = SHA256.HashData;
         _chunker = new ContentDefinedChunker(
             _options.MinimumChunkBytes,
@@ -110,6 +114,8 @@ public sealed class ChunkStore : IDisposable
         if (IsInDomain(destinationAccount, destinationEncryption, source))
             return new StoredContent(source, Pin(source));
 
+        using var sourcePin = Pin(source);
+        using var admission = await Admission.AcquireWriteAsync(cancellationToken).ConfigureAwait(false);
         using var transferCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var pipe = new Pipe(new PipeOptions(
             pauseWriterThreshold: checked(_options.MaximumChunkBytes * 2L),
@@ -121,7 +127,7 @@ public sealed class ChunkStore : IDisposable
         {
             var input = pipe.Reader.AsStream(leaveOpen: true);
             await using var inputDisposal = input.ConfigureAwait(false);
-            copied = await StorePinnedCoreAsync(
+            copied = await StorePinnedWithinLeaseAsync(
                 destinationAccount,
                 destinationEncryption,
                 input,
@@ -183,6 +189,17 @@ public sealed class ChunkStore : IDisposable
     }
 
     private async Task<StoredContent> StorePinnedCoreAsync(
+        string account,
+        BlobEncryption encryption,
+        Stream source,
+        long maximumBytes,
+        CancellationToken cancellationToken)
+    {
+        using var admission = await Admission.AcquireWriteAsync(cancellationToken).ConfigureAwait(false);
+        return await StorePinnedWithinLeaseAsync(account, encryption, source, maximumBytes, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<StoredContent> StorePinnedWithinLeaseAsync(
         string account,
         BlobEncryption encryption,
         Stream source,
@@ -314,6 +331,11 @@ public sealed class ChunkStore : IDisposable
         if (manifests.Any(manifest => !string.Equals(manifest.Domain, domain, StringComparison.Ordinal)))
             throw new InvalidOperationException("Content from different encryption domains must be copied through verified plaintext.");
 
+        foreach (var manifest in manifests)
+            ValidateManifest(manifest);
+        using var pin = PinChunkIds(manifests.SelectMany(manifest => manifest.Chunks)
+            .Select(chunk => chunk.Id).ToHashSet(StringComparer.Ordinal));
+        using var admission = await Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
         if (manifests.Any(manifest => string.Equals(manifest.Sha256, ContentManifest.SparseHash, StringComparison.Ordinal)))
         {
             var sparseReferences = new List<ChunkReference>();
@@ -443,12 +465,37 @@ public sealed class ChunkStore : IDisposable
         }
     }
 
-    public async Task WriteRangeAsync(
+    public Task WriteRangeAsync(
         ContentManifest manifest,
         BlobEncryption encryption,
         long offset,
         long length,
         Stream destination,
+        CancellationToken cancellationToken) =>
+        WriteRangeCoreAsync(manifest, encryption, offset, length, destination, acquireReadPermit: true, cancellationToken);
+
+    internal Task WriteRangeUnderReadLeaseAsync(
+        RateLimitLease readLease,
+        ContentManifest manifest,
+        BlobEncryption encryption,
+        long offset,
+        long length,
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(readLease);
+        if (!readLease.IsAcquired)
+            throw new InvalidOperationException("A read permit must be acquired before reading content.");
+        return WriteRangeCoreAsync(manifest, encryption, offset, length, destination, acquireReadPermit: false, cancellationToken);
+    }
+
+    private async Task WriteRangeCoreAsync(
+        ContentManifest manifest,
+        BlobEncryption encryption,
+        long offset,
+        long length,
+        Stream destination,
+        bool acquireReadPermit,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(manifest);
@@ -465,6 +512,7 @@ public sealed class ChunkStore : IDisposable
             return;
 
         using var pin = Pin(manifest);
+        using var admission = acquireReadPermit ? await Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false) : null;
         IncrementalHash? completeHash = offset == 0 &&
                                         length == manifest.Length &&
                                         !string.Equals(manifest.Sha256, ContentManifest.SparseHash, StringComparison.Ordinal)
@@ -1623,6 +1671,7 @@ public sealed class ChunkStore : IDisposable
         int compressionMinimumSavingsBytes,
         CancellationToken cancellationToken)
     {
+        using var admission = await Admission.AcquireCodecAsync(cancellationToken).ConfigureAwait(false);
         byte codec = 0;
         byte[] encoded = bytes;
         using (var compressed = new MemoryStream())
@@ -1682,6 +1731,7 @@ public sealed class ChunkStore : IDisposable
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
+        using var admission = await Admission.AcquireCodecAsync(cancellationToken).ConfigureAwait(false);
         var stored = await ReadStoredChunkFileBytesAsync(id, cancellationToken).ConfigureAwait(false);
         using var input = new MemoryStream(stored, writable: false);
         return await ReadVerifiedChunkStreamAsync(input, id, domain, customerProvidedKey, cancellationToken).ConfigureAwait(false);
@@ -1694,6 +1744,7 @@ public sealed class ChunkStore : IDisposable
         byte[]? customerProvidedKey,
         CancellationToken cancellationToken)
     {
+        using var admission = await Admission.AcquireCodecAsync(cancellationToken).ConfigureAwait(false);
         var input = new FileStream(
             path,
             FileMode.Open,

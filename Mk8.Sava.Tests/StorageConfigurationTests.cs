@@ -6,6 +6,52 @@ namespace Mk8.Sava.Tests;
 public sealed class StorageConfigurationTests
 {
     [Fact]
+    public void AdmissionUpperBoundsAndZeroQueueAreAccepted()
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
+            },
+            MaximumConcurrentStorageReads = 256,
+            MaximumConcurrentStorageWrites = 256,
+            MaximumConcurrentChunkCodecs = 256,
+            MaximumConcurrentBlobQueries = 32,
+            MaximumQueuedStorageOperations = 0
+        };
+        Assert.Empty(options.Validate(new ValidationContext(options)));
+    }
+
+    [Theory]
+    [InlineData(0, 0)]
+    [InlineData(-1, -1)]
+    [InlineData(257, 4097)]
+    public void InvalidAdmissionBudgetsAreRejected(int concurrent, int queued)
+    {
+        var options = new SavaOptions
+        {
+            Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
+            },
+            MaximumConcurrentStorageReads = concurrent,
+            MaximumConcurrentStorageWrites = concurrent,
+            MaximumConcurrentChunkCodecs = concurrent,
+            MaximumConcurrentBlobQueries = concurrent,
+            MaximumQueuedStorageOperations = queued
+        };
+        var errors = options.Validate(new ValidationContext(options)).ToArray();
+        foreach (var property in new[]
+        {
+            nameof(SavaOptions.MaximumConcurrentStorageReads), nameof(SavaOptions.MaximumConcurrentStorageWrites),
+            nameof(SavaOptions.MaximumConcurrentChunkCodecs), nameof(SavaOptions.MaximumConcurrentBlobQueries)
+        })
+            Assert.Contains(errors, error => error.MemberNames.Contains(property, StringComparer.Ordinal));
+        Assert.Equal(queued != 0, errors.Any(error => error.MemberNames.Contains(nameof(SavaOptions.MaximumQueuedStorageOperations), StringComparer.Ordinal)));
+    }
+
+    [Fact]
     public void UnsupportedGraphCloudIsRejectedBeforeServingRequests()
     {
         var options = new SavaOptions
