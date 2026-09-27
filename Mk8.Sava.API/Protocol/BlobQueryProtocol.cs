@@ -19,6 +19,7 @@ internal static class BlobQueryProtocol
     private const int MaximumExpressionBytes = 256 * 1024;
     private const int MaximumRecordCharacters = 16 * 1024 * 1024;
     private const int ArrowRecordBatchSize = 1024;
+    private const long ArrowRecordBatchTargetBytes = 4 * 1024 * 1024;
     private static readonly byte[] Utf8Preamble = [0xEF, 0xBB, 0xBF];
 
     public static async Task<BlobQueryRequest> ReadRequestAsync(
@@ -309,6 +310,7 @@ internal static class BlobQueryProtocol
         await writer.WriteStartAsync(cancellationToken).ConfigureAwait(false);
 
         var batch = new List<QuerySelection>(ArrowRecordBatchSize);
+        long batchBytes = 0;
         while (await rows.MoveNextAsync().ConfigureAwait(false))
         {
             var selected = rows.Current;
@@ -320,16 +322,46 @@ internal static class BlobQueryProtocol
                     0);
             }
 
+            var rowBytes = EstimateArrowRowBytes(selected);
+            if (batch.Count > 0 && rowBytes > ArrowRecordBatchTargetBytes - batchBytes)
+            {
+                await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
+                batch.Clear();
+                batchBytes = 0;
+            }
             batch.Add(selected);
-            if (batch.Count < ArrowRecordBatchSize)
+            batchBytes += rowBytes;
+            if (batch.Count < ArrowRecordBatchSize && batchBytes < ArrowRecordBatchTargetBytes)
                 continue;
             await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
             batch.Clear();
+            batchBytes = 0;
         }
 
         if (batch.Count > 0)
             await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
         await writer.WriteEndAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static long EstimateArrowRowBytes(QuerySelection row)
+    {
+        // Account for retained cells/references and both UTF-16 source strings
+        // and their UTF-8 Arrow representation. This is a batching target, not
+        // a rejection limit: one irreducible wide row is emitted on its own.
+        long bytes = 64 + 16L * row.Values.Count + 8L * row.Names.Count;
+        foreach (var cell in row.Values)
+        {
+            bytes += 64;
+            var text = cell.Value switch
+            {
+                string value => value,
+                JsonElement value => value.GetRawText(),
+                _ => null
+            };
+            if (text is not null)
+                bytes += 24 + 2L * text.Length + Encoding.UTF8.GetByteCount(text);
+        }
+        return bytes;
     }
 
     private static Field CreateArrowField(QueryArrowColumn field)
@@ -354,11 +386,21 @@ internal static class BlobQueryProtocol
         List<QuerySelection> rows,
         CancellationToken cancellationToken)
     {
-        var arrays = fields
-            .Select((field, index) => BuildArrowArray(field, rows, index))
-            .ToArray();
-        using var batch = new RecordBatch(schema, arrays, rows.Count);
-        await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        var arrays = new IArrowArray[fields.Count];
+        var constructed = 0;
+        try
+        {
+            for (; constructed < arrays.Length; constructed++)
+                arrays[constructed] = BuildArrowArray(fields[constructed], rows, constructed);
+            using var batch = new RecordBatch(schema, arrays, rows.Count);
+            constructed = 0; // Ownership transfers to the record batch only after its constructor succeeds.
+            await writer.WriteRecordBatchAsync(batch, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (ref readonly var array in arrays.AsSpan(0, constructed))
+                array.Dispose();
+        }
     }
 
     private static IArrowArray BuildArrowArray(
