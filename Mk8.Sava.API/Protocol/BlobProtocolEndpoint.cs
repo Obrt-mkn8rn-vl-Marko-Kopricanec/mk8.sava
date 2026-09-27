@@ -617,6 +617,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     {
         Require(request, 'f');
         RequireBlobIndexTags(request, service, "Find Blobs by Tags");
+        RequireFeatureVersion(request, new DateOnly(2021, 4, 10), "Find Blobs by Tags in Container");
         _ = await service.GetContainerAsync(
             request.Account,
             containerName,

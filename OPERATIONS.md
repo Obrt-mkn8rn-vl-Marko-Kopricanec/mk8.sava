@@ -313,6 +313,12 @@ Azurite 3.35.0 incorrectly retains all copy properties after that HTTP-property
 write; the differential records this exception, and mk8.sava clears them.
 Local cases also cover versioned accounts: metadata creates a new version,
 tag writes do not, and the previous version retains its copy properties.
+Container-scoped tag searches enforce the documented `2021-04-10` service
+version boundary. Local SDK cases reject `2019-12-12` and `2020-12-06`
+container requests with `FeatureVersionMismatch`, accept `2021-04-10`, and
+keep account-wide queries (including an `@container` predicate) working on
+all three versions. See
+[Find Blobs by Tags in Container](https://learn.microsoft.com/en-us/rest/api/storageservices/find-blobs-by-tags-container#remarks).
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile
