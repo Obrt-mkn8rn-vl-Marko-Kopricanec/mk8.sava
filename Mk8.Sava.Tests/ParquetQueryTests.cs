@@ -49,12 +49,16 @@ public sealed class ParquetQueryTests(SavaWebApplicationFactory application) : I
         Assert.Equal([1, 2, 3], values);
     }
 
-    private static async Task AssertQueryAsync(SavaWebApplicationFactory application, long fileRows, long groupRows, bool corrupt)
+    internal static Task AssertCorruptQueryAsync(SavaWebApplicationFactory application, byte[] bytes) =>
+        AssertQueryAsync(application, 3, 3, corrupt: true, bytes);
+
+    private static async Task AssertQueryAsync(SavaWebApplicationFactory application, long fileRows, long groupRows, bool corrupt,
+        byte[]? fixture = null)
     {
         var container = CreateClient(application).GetBlobContainerClient($"parquet-{Guid.NewGuid():N}");
         await container.CreateAsync().ConfigureAwait(false);
         var blob = container.GetBlockBlobClient("rows.parquet");
-        var bytes = CreatePlainFixture(fileRows, groupRows);
+        var bytes = fixture ?? CreatePlainFixture(fileRows, groupRows);
         using var input = new MemoryStream(bytes, writable: false);
         await blob.UploadAsync(input).ConfigureAwait(false);
         var before = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
@@ -86,14 +90,22 @@ public sealed class ParquetQueryTests(SavaWebApplicationFactory application) : I
         Assert.Equal(bytes, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
     }
 
-    private static byte[] CreatePlainFixture(long fileRows, long groupRows)
+    internal static byte[] CreatePlainFixture(long fileRows, long groupRows,
+        int pageValues = 3, int pageCompressedBytes = 12, int pageUncompressedBytes = 12,
+        long columnCompressedBytes = 29, long columnUncompressedBytes = 29, long dataPageOffset = 4)
     {
         // Apache Parquet's compact-Thrift schema: one required INT32 column,
         // one uncompressed PLAIN data page containing 1, 2, 3. Only the file
         // and row-group row counts vary; the column and page always declare 3.
         using var input = new MemoryStream();
         input.Write("PAR1"u8);
-        input.Write([0x15, 0, 0x15, 24, 0x15, 24, 0x2C, 0x15, 6, 0x15, 0, 0x15, 6, 0x15, 6, 0, 0]);
+        input.Write([0x15, 0, 0x15]);
+        WriteCompactInteger(input, pageUncompressedBytes);
+        input.WriteByte(0x15);
+        WriteCompactInteger(input, pageCompressedBytes);
+        input.Write([0x2C, 0x15]);
+        WriteCompactInteger(input, pageValues);
+        input.Write([0x15, 0, 0x15, 6, 0x15, 6, 0, 0]);
         Span<byte> integer = stackalloc byte[sizeof(int)];
         for (var value = 1; value <= 3; value++)
         {
@@ -109,7 +121,15 @@ public sealed class ParquetQueryTests(SavaWebApplicationFactory application) : I
         WriteCompactInteger(footer, fileRows);
         footer.Write([0x19, 0x1C, 0x19, 0x1C, 0x26, 8, 0x1C, 0x15, 2, 0x19, 0x25, 0, 6, 0x19, 0x18, 2]);
         footer.Write("id"u8);
-        footer.Write([0x15, 0, 0x16, 6, 0x16, 58, 0x16, 58, 0x26, 8, 0, 0, 0x16, 58, 0x16]);
+        footer.Write([0x15, 0, 0x16, 6, 0x16]);
+        WriteCompactInteger(footer, columnUncompressedBytes);
+        footer.WriteByte(0x16);
+        WriteCompactInteger(footer, columnCompressedBytes);
+        footer.WriteByte(0x26);
+        WriteCompactInteger(footer, dataPageOffset);
+        footer.Write([0, 0, 0x16]);
+        WriteCompactInteger(footer, columnUncompressedBytes);
+        footer.WriteByte(0x16);
         WriteCompactInteger(footer, groupRows);
         footer.Write([0, 0]);
         input.Write(footer.GetBuffer().AsSpan(0, checked((int)footer.Length)));

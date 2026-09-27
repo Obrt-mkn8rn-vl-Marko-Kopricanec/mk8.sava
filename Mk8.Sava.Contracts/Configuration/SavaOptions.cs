@@ -48,6 +48,7 @@ public sealed class SavaOptions : IValidatableObject
     public int MaximumConcurrentStorageWrites { get; init; } = 8;
     public int MaximumConcurrentChunkCodecs { get; init; } = 4;
     public int MaximumConcurrentBlobQueries { get; init; } = 2;
+    public long MaximumParquetQueryMemoryBytes { get; init; } = 256L * 1024 * 1024;
     public int MaximumQueuedStorageOperations { get; init; } = 128;
     public IList<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
     public int SoftDeleteRetentionDays { get; init; } = 7;
@@ -101,6 +102,8 @@ public sealed class SavaOptions : IValidatableObject
             yield return new ValidationResult("MaximumConcurrentBlobQueries must be between 1 and 32.", [nameof(MaximumConcurrentBlobQueries)]);
         if (MaximumQueuedStorageOperations is < 0 or > 4096)
             yield return new ValidationResult("MaximumQueuedStorageOperations must be between 0 and 4096.", [nameof(MaximumQueuedStorageOperations)]);
+        if (MaximumParquetQueryMemoryBytes is < 8L * 1024 * 1024 or > 2L * 1024 * 1024 * 1024)
+            yield return new ValidationResult("MaximumParquetQueryMemoryBytes must be between 8 MiB and 2 GiB.", [nameof(MaximumParquetQueryMemoryBytes)]);
     }
 
     private IEnumerable<ValidationResult> ValidateAccounts()

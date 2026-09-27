@@ -3565,20 +3565,25 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var encryption = new BlobEncryption(blob.EncryptionScope, null);
         if (query.Input.Kind == BlobQueryFormatKind.Parquet)
         {
-            var seekableContent = new BlobSeekableReadStream(service, blob, encryption, cancellationToken);
-            await using (seekableContent.ConfigureAwait(false))
-            {
-                await BlobQueryProtocol.ExecuteAsync(
-                    query,
-                    seekableContent,
-                    http.Response.Body,
-                    blob.Content.Length,
-                    cancellationToken).ConfigureAwait(false);
-                return;
-            }
+            await ExecuteParquetQueryAsync(http, service, blob, query, encryption, cancellationToken).ConfigureAwait(false);
+            return;
         }
 
         await ExecuteTextQueryAsync(http, service, blob, query, encryption, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task ExecuteParquetQueryAsync(
+        HttpContext http, BlobService service, BlobRecord blob, BlobQueryRequest query,
+        BlobEncryption encryption, CancellationToken cancellationToken)
+    {
+        var content = new BlobSeekableReadStream(service, blob, encryption, cancellationToken);
+        await using var disposal = content.ConfigureAwait(false);
+        var options = http.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+        var prepared = BlobQueryPlan.Parse(query.Expression).LimitReached ? null :
+            await BlobQueryProtocol.PrepareParquetInputAsync(
+                content, options.MaximumParquetQueryMemoryBytes, cancellationToken).ConfigureAwait(false);
+        await BlobQueryProtocol.ExecuteAsync(query, content, http.Response.Body,
+            blob.Content.Length, cancellationToken, prepared).ConfigureAwait(false);
     }
 
     private static async Task ExecuteTextQueryAsync(
