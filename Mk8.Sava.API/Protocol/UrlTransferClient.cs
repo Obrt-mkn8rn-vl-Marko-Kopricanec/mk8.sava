@@ -798,11 +798,28 @@ internal sealed class UrlTransferClient(
         return ranges;
     }
 
+    public async Task VerifyIncrementalCopyContinuityAsync(
+        HttpRequest destinationRequest, Uri sourceUri, string previousSnapshot, string? etag,
+        CancellationToken cancellationToken)
+    {
+        var document = await ReadSourceXmlAsync(
+            destinationRequest,
+            BuildComponentUri(sourceUri,
+                new KeyValuePair<string, string?>("comp", "pagelist"),
+                new KeyValuePair<string, string?>("prevsnapshot", previousSnapshot)),
+            etag,
+            cancellationToken,
+            incrementalCopyContinuity: true).ConfigureAwait(false);
+        if (!string.Equals(document.Root?.Name.LocalName, "PageList", StringComparison.Ordinal))
+            throw CannotVerifyCopySource("The source returned an invalid page-diff document.");
+    }
+
     private async Task<XDocument> ReadSourceXmlAsync(
         HttpRequest destinationRequest,
         Uri uri,
         string? etag,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool incrementalCopyContinuity = false)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, uri);
         AddSourceAuthenticationHeaders(destinationRequest, request);
@@ -829,7 +846,8 @@ internal sealed class UrlTransferClient(
         using (response)
         {
             if (!response.IsSuccessStatusCode)
-                throw await CreateSourceFailureAsync(destinationRequest, response, cancellationToken).ConfigureAwait(false);
+                throw await CreateSourceFailureAsync(
+                    destinationRequest, response, cancellationToken, incrementalCopyContinuity).ConfigureAwait(false);
             try
             {
                 var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
@@ -929,7 +947,8 @@ internal sealed class UrlTransferClient(
     private static async Task<AzureStorageException> CreateSourceFailureAsync(
         HttpRequest destinationRequest,
         HttpResponseMessage response,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool incrementalCopyContinuity = false)
     {
         var sourceStatus = ((int)response.StatusCode).ToString(CultureInfo.InvariantCulture);
         var sourceErrorCode = response.Headers.TryGetValues("x-ms-error-code", out var errorCodes)
@@ -937,6 +956,14 @@ internal sealed class UrlTransferClient(
             : null;
         var sourceError = await ReadSourceErrorAsync(response.Content, cancellationToken).ConfigureAwait(false);
         sourceErrorCode ??= sourceError.Code;
+        if (incrementalCopyContinuity && response.StatusCode == HttpStatusCode.Conflict &&
+            string.Equals(sourceErrorCode, "BlobOverwritten", StringComparison.Ordinal))
+        {
+            return new AzureStorageException(
+                StatusCodes.Status409Conflict,
+                "IncrementalCopyBlobMismatch",
+                "The source blob was re-created after the previously copied snapshot.");
+        }
         var sourceErrorMessage = sourceError.Message;
         var message = sourceErrorMessage ??
                       $"Could not verify the copy source because it returned HTTP status {sourceStatus} ({response.ReasonPhrase}).";
