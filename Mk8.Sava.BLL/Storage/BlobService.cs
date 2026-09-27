@@ -981,8 +981,7 @@ public sealed class BlobService(
                 ? now
                 : current.LastAccessedAt,
             Lease = current.Lease,
-            AppendBlockCount = checked(current.AppendBlockCount + 1),
-            Copy = null
+            AppendBlockCount = checked(current.AppendBlockCount + 1)
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
@@ -1310,8 +1309,7 @@ public sealed class BlobService(
             IsSealed = true,
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
-            LastModified = metadata.GetUtcNow(),
-            Copy = null
+            LastModified = metadata.GetUtcNow()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
         return updated;
@@ -1433,7 +1431,6 @@ public sealed class BlobService(
         var updated = current with
         {
             ExpiresAt = expiresAt,
-            Copy = null,
             Revision = MetadataStore.NewRevision(),
             ETag = MetadataStore.NewETag(),
             LastModified = metadata.GetUtcNow()
@@ -1464,7 +1461,6 @@ public sealed class BlobService(
         {
             ImmutabilityUntil = expiresOn,
             ImmutabilityLocked = locked,
-            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
@@ -1485,7 +1481,6 @@ public sealed class BlobService(
         {
             ImmutabilityUntil = null,
             ImmutabilityLocked = false,
-            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
@@ -1504,7 +1499,6 @@ public sealed class BlobService(
         var updated = current with
         {
             HasLegalHold = hasLegalHold,
-            Copy = null,
             Revision = MetadataStore.NewRevision()
         };
         await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);

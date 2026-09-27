@@ -566,6 +566,44 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task CompletedAppendCopyPropertiesSurviveAppendAndSealMatchAzurite()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-copy-append-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseCopiedAppendMutationsAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseCopiedAppendMutationsAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.True(actual.AppendCopyPreserved);
+            Assert.True(actual.SealCopyPreserved);
+            Assert.True(actual.AppendETagChanged);
+            Assert.True(actual.SealETagChanged);
+            Assert.True(actual.Sealed);
+            Assert.Equal(1, actual.AppendedBlockCount);
+            Assert.Equal(0, actual.SealedBlockCountChange);
+            Assert.Equal("copied payload suffix", actual.Content);
+            Assert.Equal("copied payload", actual.SourceContent);
+            Assert.Equal(409, actual.SealedAppendStatus);
+            Assert.Equal("BlobIsSealed", actual.SealedAppendError);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task BlobPrefixMetadataAndHierarchyPagingMatchAzurite()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1563,6 +1601,42 @@ public sealed class AzuriteDifferentialTests
             (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
     }
 
+    private static async Task<AppendCopyMutationObservation> ExerciseCopiedAppendMutationsAsync(
+        BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var source = container.GetAppendBlobClient("source.bin");
+        await source.CreateAsync().ConfigureAwait(false);
+        using (var payload = BinaryData.FromString("copied payload").ToStream())
+            await source.AppendBlockAsync(payload).ConfigureAwait(false);
+        var destination = container.GetAppendBlobClient("destination.bin");
+        var copy = await destination.StartCopyFromUriAsync(source.Uri).ConfigureAwait(false);
+        await copy.WaitForCompletionAsync().ConfigureAwait(false);
+        var before = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(CopyStatus.Success, before.CopyStatus);
+        Assert.Equal(copy.Id, before.CopyId);
+        using (var suffix = BinaryData.FromString(" suffix").ToStream())
+            Assert.Equal(201, (await destination.AppendBlockAsync(suffix).ConfigureAwait(false)).GetRawResponse().Status);
+        var appended = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(200, (await destination.SealAsync().ConfigureAwait(false)).GetRawResponse().Status);
+        var sealedProperties = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        using var rejected = BinaryData.FromString("rejected").ToStream();
+        var failure = await Assert.ThrowsAsync<RequestFailedException>(() => destination.AppendBlockAsync(rejected))
+            .ConfigureAwait(false);
+        var afterFailure = (await destination.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(sealedProperties.ETag, afterFailure.ETag);
+        Assert.True(CopyPropertiesMatch(sealedProperties, afterFailure));
+        return new AppendCopyMutationObservation(
+            CopyPropertiesMatch(before, appended), CopyPropertiesMatch(before, sealedProperties),
+            before.ETag != appended.ETag, appended.ETag != sealedProperties.ETag,
+            sealedProperties.IsSealed,
+            appended.BlobCommittedBlockCount - before.BlobCommittedBlockCount,
+            sealedProperties.BlobCommittedBlockCount - appended.BlobCommittedBlockCount,
+            (await destination.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString(),
+            (await source.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString(),
+            failure.Status, failure.ErrorCode);
+    }
+
     private static bool CopyPropertiesMatch(BlobProperties expected, BlobProperties actual) =>
         string.Equals(expected.CopyId, actual.CopyId, StringComparison.Ordinal) && expected.CopyStatus == actual.CopyStatus &&
         expected.CopySource == actual.CopySource && string.Equals(expected.CopyProgress, actual.CopyProgress, StringComparison.Ordinal) &&
@@ -2070,6 +2144,11 @@ public sealed class AzuriteDifferentialTests
     private sealed record CopyObservation(
         int StaleSourceStatus, string? StaleSourceCode, int StartStatus,
         string CopyStatus, long Length, string ContentSha256);
+
+    private sealed record AppendCopyMutationObservation(
+        bool AppendCopyPreserved, bool SealCopyPreserved, bool AppendETagChanged, bool SealETagChanged,
+        bool? Sealed, int? AppendedBlockCount, int? SealedBlockCountChange,
+        string Content, string SourceContent, int SealedAppendStatus, string? SealedAppendError);
 
     private sealed record CopyPropertyMutationObservation(
         bool TagCopyPreserved, bool MetadataCopyPreserved, bool TagEntityUnchanged,
