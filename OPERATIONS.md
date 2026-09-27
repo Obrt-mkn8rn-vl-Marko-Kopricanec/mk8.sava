@@ -286,6 +286,22 @@ conditions, and check the `2020-08-04` snapshot tag-write boundary in the
 [Set Blob Tags contract](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tags).
 Content and metadata on historical targets remain immutable; tags are a
 separately mutable dataset under their own authorization.
+A twenty-fourth SDK scenario exercises tag reads and writes on an actively
+leased blob. Matching-ID access succeeds without changing bytes or entity
+headers, and a released ID is rejected with 412. Pinned Azurite permits tag
+reads without an active lease ID and returns 412 for mismatched IDs and tag
+writes without the ID. Mk8.sava follows the operation-specific
+[Get Blob Tags](https://learn.microsoft.com/en-us/rest/api/storageservices/get-blob-tags#request-headers)
+and [Set Blob Tags](https://learn.microsoft.com/en-us/rest/api/storageservices/set-blob-tags#request-headers)
+contract instead: the matching ID is required for both operations, with 403
+for a missing or mismatched active ID. It retains the standard lease error
+labels; the operation pages specify the status but not those labels.
+An ID supplied without an active lease still returns 412
+`LeaseNotPresentWithBlobOperation`, consistent with the official SDK's saved
+[Get Tags recording](https://github.com/Azure/azure-sdk-assets/blob/net/storage/Azure.Storage.Blobs_d375d3a88b/net/sdk/storage/Azure.Storage.Blobs/tests/SessionRecords/BlobBaseClientTests/GetTagsAsync_LeaseFailed.json)
+and [Set Tags recording](https://github.com/Azure/azure-sdk-assets/blob/net/storage/Azure.Storage.Blobs_d375d3a88b/net/sdk/storage/Azure.Storage.Blobs/tests/SessionRecords/BlobBaseClientTests/SetTagsAsync_LeaseFailed.json).
+Local SDK tests additionally cover malformed IDs, breaking/expired/broken
+leases, lease-free snapshot tags, and ordinary lease-free content reads.
 The script configures Azurite with the test account key used by mk8.sava and
 removes its disposable storage root after success. It requires Node.js 20,
 Corepack/Yarn, `curl`, and Python 3 for a free loopback port. The lockfile

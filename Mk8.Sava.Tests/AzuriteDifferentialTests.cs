@@ -584,6 +584,52 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task TagLeaseRequirementsFollowPublishedContractDespiteAzuriteReadAndStatusDifferences()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-tag-lease-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseTagLeaseAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseTagLeaseAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal((200, (string?)null), expected.MissingRead);
+            Assert.Equal((412, "LeaseIdMismatchWithBlobOperation"), expected.WrongRead);
+            Assert.Equal((412, "LeaseIdMissing"), expected.MissingWrite);
+            Assert.Equal((412, "LeaseIdMismatchWithBlobOperation"), expected.WrongWrite);
+            Assert.Equal((403, "LeaseIdMissing"), actual.MissingRead);
+            Assert.Equal((403, "LeaseIdMismatchWithBlobOperation"), actual.WrongRead);
+            Assert.Equal((403, "LeaseIdMissing"), actual.MissingWrite);
+            Assert.Equal((403, "LeaseIdMismatchWithBlobOperation"), actual.WrongWrite);
+            Assert.Equal(expected with
+            {
+                MissingRead = actual.MissingRead,
+                WrongRead = actual.WrongRead,
+                MissingWrite = actual.MissingWrite,
+                WrongWrite = actual.WrongWrite
+            }, actual);
+            Assert.Equal((412, "LeaseNotPresentWithBlobOperation"), actual.ReleasedRead);
+            Assert.Equal((412, "LeaseNotPresentWithBlobOperation"), actual.ReleasedWrite);
+            Assert.Equal("updated", actual.Phase);
+            Assert.Equal("payload", actual.Content);
+            Assert.True(actual.EntityUnchanged);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SnapshotListingFollowsPublishedOrderDespiteAzuritePagingBug()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1545,6 +1591,55 @@ public sealed class AzuriteDifferentialTests
             beforeCurrent.ETag == afterCurrent.ETag && beforeCurrent.LastModified == afterCurrent.LastModified);
     }
 
+    private static async Task<TagLeaseObservation> ExerciseTagLeaseAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var blob = container.GetBlobClient("payload.bin");
+        var tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "original" };
+        await blob.UploadAsync(BinaryData.FromString("payload"), new BlobUploadOptions { Tags = tags })
+            .ConfigureAwait(false);
+        var before = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var lease = blob.GetBlobLeaseClient();
+        var id = (await lease.AcquireAsync(BlobLeaseClient.InfiniteLeaseDuration).ConfigureAwait(false)).Value.LeaseId;
+        var wrong = new BlobRequestConditions { LeaseId = Guid.NewGuid().ToString() };
+        var matching = new BlobRequestConditions { LeaseId = id };
+        var missingRead = await ObserveTagOperationAsync(async () =>
+            (await blob.GetTagsAsync().ConfigureAwait(false)).GetRawResponse()).ConfigureAwait(false);
+        var wrongRead = await ObserveTagOperationAsync(async () =>
+            (await blob.GetTagsAsync(wrong).ConfigureAwait(false)).GetRawResponse()).ConfigureAwait(false);
+        tags["phase"] = "rejected";
+        var missingWrite = await ObserveTagOperationAsync(() => blob.SetTagsAsync(tags)).ConfigureAwait(false);
+        var wrongWrite = await ObserveTagOperationAsync(() => blob.SetTagsAsync(tags, wrong)).ConfigureAwait(false);
+        Assert.Equal("original", (await blob.GetTagsAsync(matching).ConfigureAwait(false)).Value.Tags["phase"]);
+        Assert.Equal("payload", (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
+        tags["phase"] = "updated";
+        Assert.Equal(204, (await blob.SetTagsAsync(tags, matching).ConfigureAwait(false)).Status);
+        Assert.Equal("updated", (await blob.GetTagsAsync(matching).ConfigureAwait(false)).Value.Tags["phase"]);
+        await blob.GetBlobLeaseClient(id).ReleaseAsync().ConfigureAwait(false);
+        var releasedRead = await ObserveTagOperationAsync(async () =>
+            (await blob.GetTagsAsync(matching).ConfigureAwait(false)).GetRawResponse()).ConfigureAwait(false);
+        var releasedWrite = await ObserveTagOperationAsync(() => blob.SetTagsAsync(tags, matching)).ConfigureAwait(false);
+        var after = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        return new TagLeaseObservation(
+            missingRead, wrongRead, missingWrite, wrongWrite, releasedRead, releasedWrite,
+            (await blob.GetTagsAsync().ConfigureAwait(false)).Value.Tags["phase"],
+            (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString(),
+            before.ETag == after.ETag && before.LastModified == after.LastModified);
+    }
+
+    private static async Task<(int Status, string? ErrorCode)> ObserveTagOperationAsync(Func<Task<Response>> operation)
+    {
+        try
+        {
+            var response = await operation().ConfigureAwait(false);
+            return (response.Status, null);
+        }
+        catch (RequestFailedException exception)
+        {
+            return (exception.Status, exception.ErrorCode);
+        }
+    }
+
     private static string DescribeSnapshotListItem(BlobItem item)
     {
         var phase = item.Metadata is not null && item.Metadata.TryGetValue("phase", out var value)
@@ -1891,6 +1986,15 @@ public sealed class AzuriteDifferentialTests
     private sealed record SnapshotTagsObservation(
         int SetStatus, string SnapshotTag, string CurrentTag, string Content,
         bool SnapshotEntityUnchanged, bool CurrentEntityUnchanged);
+
+    private sealed record TagLeaseObservation(
+        (int Status, string? ErrorCode) MissingRead,
+        (int Status, string? ErrorCode) WrongRead,
+        (int Status, string? ErrorCode) MissingWrite,
+        (int Status, string? ErrorCode) WrongWrite,
+        (int Status, string? ErrorCode) ReleasedRead,
+        (int Status, string? ErrorCode) ReleasedWrite,
+        string Phase, string Content, bool EntityUnchanged);
 
     private sealed record StoredPolicySasObservation(
         string Identifier, string Permissions, string ReadBytes,
