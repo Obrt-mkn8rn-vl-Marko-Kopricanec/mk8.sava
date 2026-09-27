@@ -2309,7 +2309,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         RequireBlobIndexTags(request, service, "Get Blob Tags");
         EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
         EvaluateBlobTagConditions(http.Request, request, blob, write: false);
-        ValidateOptionalLease(http.Request, blob.Lease, "blob");
+        EnsureTagLease(http.Request, blob.Lease);
         await AzureResponseWriter.WriteTagsAsync(http, blob.Tags, cancellationToken).ConfigureAwait(false);
         return;
     }
@@ -2353,7 +2353,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             RequireFeatureVersion(request, new DateOnly(2020, 8, 4), "Set Blob Tags on a snapshot");
         EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
         EvaluateBlobTagConditions(http.Request, request, blob, write: true);
-        EnsureLease(http.Request, blob.Lease, "blob");
+        EnsureTagLease(http.Request, blob.Lease);
         Dictionary<string, string> tags = null!;
         _ = await WithIntegrityValidationAsync(
             http.Request,
@@ -4541,6 +4541,24 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             lease,
             ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
             resource);
+    }
+
+    private static void EnsureTagLease(HttpRequest request, LeaseRecord lease)
+    {
+        try
+        {
+            EnsureLease(request, lease, "blob");
+        }
+        catch (AzureStorageException exception) when (
+            exception.ErrorCode is "LeaseIdMissing" or "LeaseIdMismatchWithBlobOperation")
+        {
+            // Get/Set Blob Tags specify 403 for a missing or mismatched active lease,
+            // unlike ordinary blob operations. An ID without an active lease remains 412.
+            throw new AzureStorageException(
+                StatusCodes.Status403Forbidden,
+                exception.ErrorCode,
+                exception.Message);
+        }
     }
 
     private static void EnsureAsynchronousCopyDestinationLease(
