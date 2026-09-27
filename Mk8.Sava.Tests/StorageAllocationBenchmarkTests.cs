@@ -11,6 +11,8 @@ namespace Mk8.Sava.Tests;
 [Collection("Storage allocation benchmark")]
 public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
 {
+    private const string WorkerVariable = "MK8_SAVA_ALLOCATION_BENCHMARK_WORKER";
+
     [Fact]
     public async Task OrdinarySdkWorkloadsReportFilesystemAllocationAgainstRawFiles()
     {
@@ -20,6 +22,61 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
             return;
         }
 
+        if (string.Equals(Environment.GetEnvironmentVariable(WorkerVariable), "1", StringComparison.Ordinal))
+            await RunBenchmarkAsync().ConfigureAwait(true);
+        else
+            await RunIsolatedBenchmarkAsync().ConfigureAwait(true);
+    }
+
+    private async Task RunIsolatedBenchmarkAsync()
+    {
+        using var worker = new Process { StartInfo = CreateWorkerStartInfo() };
+        Assert.True(worker.Start());
+        var standardOutput = worker.StandardOutput.ReadToEndAsync();
+        var standardError = worker.StandardError.ReadToEndAsync();
+        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        try
+        {
+            await worker.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!worker.HasExited)
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+            }
+            await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
+        }
+        var measuredOutput = await standardOutput.ConfigureAwait(false);
+        output.WriteLine(measuredOutput);
+        output.WriteLine(await standardError.ConfigureAwait(false));
+        Assert.Equal(0, worker.ExitCode);
+        foreach (var workload in new[] { "eight_exact_duplicates", "five_shifted_partials", "eight_versions",
+                     "one_hundred_twenty_eight_small", "four_incompressible" })
+            Assert.Contains(workload + ',', measuredOutput, StringComparison.Ordinal);
+    }
+
+    private static ProcessStartInfo CreateWorkerStartInfo()
+    {
+        var startInfo = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        startInfo.ArgumentList.Add("vstest");
+        startInfo.ArgumentList.Add(typeof(StorageAllocationBenchmarkTests).Assembly.Location);
+        startInfo.ArgumentList.Add("--TestCaseFilter:FullyQualifiedName=Mk8.Sava.Tests.StorageAllocationBenchmarkTests." +
+                                   nameof(OrdinarySdkWorkloadsReportFilesystemAllocationAgainstRawFiles));
+        startInfo.ArgumentList.Add("--logger:console;verbosity=detailed");
+        startInfo.Environment[WorkerVariable] = "1";
+        return startInfo;
+    }
+
+    private async Task RunBenchmarkAsync()
+    {
         var rawRoot = Path.Combine(Path.GetTempPath(), $"mk8-sava-raw-baseline-{Guid.NewGuid():N}");
         Directory.CreateDirectory(rawRoot);
         try
@@ -35,7 +92,7 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                 ["Logging:LogLevel:Default"] = "Warning"
             });
             await using var applicationDisposal1 = application.ConfigureAwait(false);
-            await application.InitializeAsync();
+            await application.InitializeAsync().ConfigureAwait(false);
             var account = SavaWebApplicationFactory.AccountName;
             var endpoint = new Uri($"http://{account}.localhost");
             var client = new BlobServiceClient(
@@ -47,9 +104,9 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
                     Retry = { MaxRetries = 0 }
                 });
             var container = client.GetBlobContainerClient($"allocation-{Guid.NewGuid():N}");
-            await container.CreateAsync();
+            await container.CreateAsync().ConfigureAwait(false);
             var benchmark = new AllocationBenchmarkScenario(application, container, rawRoot, output);
-            await benchmark.RunAsync().ConfigureAwait(true);
+            await benchmark.RunAsync().ConfigureAwait(false);
         }
         finally
         {

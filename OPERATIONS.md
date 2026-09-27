@@ -472,6 +472,12 @@ length, or ETag responses fail before publishing a replacement copy.
 Local SDK/HTTP tests cover sparse growth, clear, shrink, empty deltas and
 multi-range transfers. These are not a whole-operation emulator differential:
 Azurite does not implement incremental copy or page diff.
+The copy route is available from REST version `2016-05-31`, including versions
+before source HEAD responses contain `x-ms-creation-time` (`2017-11-09`).
+Available creation times are retained and compared without inventing a timestamp
+when the header is absent. The ETag-pinned source page diff remains the
+authoritative continuity check for subsequent external copies. Requests at or
+above `2017-11-09` still require a valid creation-time header.
 Outbound URL-source requests do not follow HTTP redirects. A redirected source
 fails with `CannotVerifyCopySource` without contacting the redirect target, so
 source bearer tokens and customer-provided encryption-key headers cannot be
@@ -1098,7 +1104,14 @@ SQLite, chunk, pack, and staging allocation. It also samples allocated staging
 space and process working set every 10 ms during each workload. Those sampled
 peaks are lower bounds, not exact maxima; the in-process test host's working
 set is not a separate production-server measurement. Do not use this benchmark
-alone for production performance claims:
+alone for production performance claims.
+
+The test launches its five workloads in a fresh child VSTest process, so
+unrelated fixtures and heap state retained by a full-suite test host do not
+enter its working-set measurement. The parent requires successful completion
+and all five result rows; it enforces a five-minute worker deadline and stops
+the worker tree on timeout. Neither the allocation nor memory budgets are
+relaxed by this isolation. Run it with:
 
 ```bash
 dotnet test Mk8.Sava.Tests/Mk8.Sava.Tests.csproj \
