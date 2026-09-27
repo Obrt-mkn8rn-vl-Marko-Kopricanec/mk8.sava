@@ -83,7 +83,9 @@ internal sealed class UrlTransferClient(
         var etag = response.Headers.ETag?.ToString();
         var createdAt = ReadCreationTime(response);
         if (length < 0 || length > 8L * 1024 * 1024 * 1024 * 1024 || length % 512 != 0 ||
-            string.IsNullOrEmpty(etag) || !createdAt.HasValue)
+            string.IsNullOrEmpty(etag) ||
+            ((IsServiceVersionAtLeast(destinationRequest, new DateOnly(2017, 11, 9)) ||
+              ReadSingleHeader(response, "x-ms-creation-time") is not null) && !createdAt.HasValue))
             throw CannotVerifyCopySource("The source page snapshot properties are invalid or incomplete.");
         var ranges = await ReadPageRangesAsync(destinationRequest, sourceUri, etag, length, cancellationToken).ConfigureAwait(false);
         var properties = new UrlSource(Stream.Null, length, ReadHttpProperties(response), ReadMetadata(response),

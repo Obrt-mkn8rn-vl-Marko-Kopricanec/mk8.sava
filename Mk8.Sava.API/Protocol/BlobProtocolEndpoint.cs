@@ -1994,7 +1994,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var source = pageSource.Properties;
         return await service.BeginIncrementalCopyFromPageRangesAsync(
             request.Account, containerName, blobName, source.ContentLength!.Value,
-            snapshots[0]!, sourceUri.GetLeftPart(UriPartial.Path), source.CreatedAt!.Value,
+            snapshots[0]!, sourceUri.GetLeftPart(UriPartial.Path), source.CreatedAt,
             source.SequenceNumber, source.PageRanges,
             ReadUrlCopyWriteOptions(http.Request, source, copySourceTags: false, current, synchronous: false),
             publicSource, current, pageSource, cancellationToken).ConfigureAwait(false);

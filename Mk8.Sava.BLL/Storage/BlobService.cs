@@ -2107,7 +2107,7 @@ public sealed class BlobService(
 #pragma warning disable CA1054
     public Task<BlobRecord> BeginIncrementalCopyFromPageRangesAsync(
         string account, string container, string name, long sourceLength,
-        string sourceSnapshot, string sourceIdentity, DateTimeOffset sourceCreatedAt,
+        string sourceSnapshot, string sourceIdentity, DateTimeOffset? sourceCreatedAt,
         long sourceSequenceNumber, IReadOnlyList<PageRange> sourcePageRanges,
         BlobWriteOptions options, string sourceUri, BlobRecord? current,
         IPageCopySource pageSource, CancellationToken cancellationToken)
@@ -2264,7 +2264,7 @@ public sealed class BlobService(
             SequenceNumber = source.SequenceNumber,
             IsIncrementalCopy = true,
             IncrementalCopySource = source.Identity,
-            IncrementalCopySourceCreatedAt = source.CreatedAt,
+            IncrementalCopySourceCreatedAt = source.CreatedAt ?? current?.IncrementalCopySourceCreatedAt,
             IncrementalCopySourceIncarnationId = source.PageBlobIncarnationId,
             PendingCopyContent = preparedContent,
             PendingCopyPageRanges = [.. source.PageRanges],
@@ -2305,7 +2305,8 @@ public sealed class BlobService(
             current = PrepareBlobWrite(current);
             if (!current.IsIncrementalCopy || current.Kind != BlobKind.PageBlob ||
                 !string.Equals(current.IncrementalCopySource, source.Identity, StringComparison.Ordinal) ||
-                current.IncrementalCopySourceCreatedAt != source.CreatedAt ||
+                (current.IncrementalCopySourceCreatedAt is { } previousCreatedAt &&
+                 source.CreatedAt is { } createdAt && previousCreatedAt != createdAt) ||
                 !SamePageBlobIncarnation(
                     current.IncrementalCopySourceIncarnationId, source.PageBlobIncarnationId))
             {
@@ -2338,7 +2339,7 @@ public sealed class BlobService(
         BlobKind Kind,
         string? Snapshot,
         string Identity,
-        DateTimeOffset CreatedAt,
+        DateTimeOffset? CreatedAt,
         long SequenceNumber,
         IReadOnlyList<PageRange> PageRanges,
         string? PageBlobIncarnationId);

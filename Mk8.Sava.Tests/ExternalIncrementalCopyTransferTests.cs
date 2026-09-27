@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Http.Headers;
+using System.Xml.Linq;
 using Azure;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 
@@ -11,6 +14,64 @@ namespace Mk8.Sava.Tests;
 
 public sealed class ExternalIncrementalCopyTransferTests
 {
+    [Theory]
+    [InlineData("2016-05-31", "2016-05-31")]
+    [InlineData("2016-05-31", "2017-11-09")]
+    [InlineData("2017-11-09", "2016-05-31")]
+    public async Task CreationTimeHeaderAvailabilityDoesNotRestrictIncrementalCopyVersions(
+        string firstVersion, string laterVersion)
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl();
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        await CreateInitialSparseSourceAsync(fixture.Source).ConfigureAwait(true);
+        var first = await CopyLatestSnapshotWithVersionAsync(transport, fixture, firstVersion).ConfigureAwait(true);
+        using var payload = new MemoryStream(Enumerable.Repeat((byte)0xB6, 512).ToArray(), writable: false);
+        await fixture.Source.UploadPagesAsync(payload, 512).ConfigureAwait(true);
+        var second = await CopyLatestSnapshotWithVersionAsync(transport, fixture, laterVersion).ConfigureAwait(true);
+        Assert.Equal([new SourceHead(firstVersion, string.CompareOrdinal(firstVersion, "2017-11-09") >= 0),
+            new SourceHead(laterVersion, string.CompareOrdinal(laterVersion, "2017-11-09") >= 0)], control.Heads.ToArray());
+        var expected = new byte[4096];
+        Array.Fill(expected, (byte)0xA5, 0, 512);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(first).DownloadContentAsync()
+            .ConfigureAwait(true)).Value.Content.ToArray());
+        Array.Fill(expected, (byte)0xB6, 512, 512);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(second).DownloadContentAsync()
+            .ConfigureAwait(true)).Value.Content.ToArray());
+        var before = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        await fixture.Source.CreateAsync(4096).ConfigureAwait(true);
+        using var rejected = await StartSnapshotCopyWithVersionAsync(transport, fixture, laterVersion).ConfigureAwait(true);
+        Assert.Equal(HttpStatusCode.Conflict, rejected.StatusCode);
+        var error = XDocument.Parse(await rejected.Content.ReadAsStringAsync().ConfigureAwait(true));
+        Assert.Equal("IncrementalCopyBlobMismatch", error.Root!.Element("Code")!.Value);
+        var after = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(true)).Value;
+        Assert.Equal(before.CopyId, after.CopyId);
+        Assert.Equal(before.ETag, after.ETag);
+        Assert.Equal(second, after.DestinationSnapshot);
+        Assert.Equal(expected, (await fixture.Target.WithSnapshot(second).DownloadContentAsync()
+            .ConfigureAwait(true)).Value.Content.ToArray());
+    }
+
+    [Fact]
+    public async Task MissingCreationTimeIsStillRejectedForModernSourceRequests()
+    {
+        var reads = new ConcurrentQueue<SourceRead>();
+        var control = new SourceReadControl { HideCreationTime = true };
+        var application = CreateApplication(reads, control);
+        await using var disposal = application.ConfigureAwait(true);
+        var fixture = await CreateFixtureAsync(application, reads, control).ConfigureAwait(true);
+        await CreateInitialSparseSourceAsync(fixture.Source).ConfigureAwait(true);
+        var rejected = await Assert.ThrowsAsync<RequestFailedException>(() => CopyLatestSnapshotAsync(fixture))
+            .ConfigureAwait(true);
+        Assert.Equal("CannotVerifyCopySource", rejected.ErrorCode);
+        Assert.Equal(500, rejected.Status);
+        Assert.False((await fixture.Target.ExistsAsync().ConfigureAwait(true)).Value);
+        Assert.Empty(reads);
+    }
+
     [Fact]
     public async Task SparseCopiesReadOnlyOccupiedAndChangedPagesAcrossResizeAndEmptyDelta()
     {
@@ -107,9 +168,7 @@ public sealed class ExternalIncrementalCopyTransferTests
 
     private static async Task<string> CopyInitialSparseSnapshotAsync(CopyFixture fixture)
     {
-        await fixture.Source.CreateAsync(4096).ConfigureAwait(false);
-        using var payload = new MemoryStream(Enumerable.Repeat((byte)0xA5, 512).ToArray(), writable: false);
-        await fixture.Source.UploadPagesAsync(payload, 0).ConfigureAwait(false);
+        await CreateInitialSparseSourceAsync(fixture.Source).ConfigureAwait(false);
         var destinationSnapshot = await CopyLatestSnapshotAsync(fixture).ConfigureAwait(false);
         var expected = new byte[4096];
         Array.Fill(expected, (byte)0xA5, 0, 512);
@@ -117,6 +176,13 @@ public sealed class ExternalIncrementalCopyTransferTests
             .ConfigureAwait(false)).Value.Content.ToArray());
         AssertTransferredBytes(fixture, 512);
         return destinationSnapshot;
+    }
+
+    private static async Task CreateInitialSparseSourceAsync(PageBlobClient source)
+    {
+        await source.CreateAsync(4096).ConfigureAwait(false);
+        using var payload = new MemoryStream(Enumerable.Repeat((byte)0xA5, 512).ToArray(), writable: false);
+        await source.UploadPagesAsync(payload, 0).ConfigureAwait(false);
     }
 
     private static async Task<string> CopyGrowthAndClearAsync(CopyFixture fixture, string firstSnapshot)
@@ -168,6 +234,29 @@ public sealed class ExternalIncrementalCopyTransferTests
         return (await fixture.Target.GetPropertiesAsync().ConfigureAwait(false)).Value.DestinationSnapshot!;
     }
 
+    private static async Task<string> CopyLatestSnapshotWithVersionAsync(
+        HttpClient transport, CopyFixture fixture, string serviceVersion)
+    {
+        using var response = await StartSnapshotCopyWithVersionAsync(transport, fixture, serviceVersion).ConfigureAwait(false);
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var properties = (await fixture.Target.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(CopyStatus.Success, properties.CopyStatus);
+        return properties.DestinationSnapshot!;
+    }
+
+    private static async Task<HttpResponseMessage> StartSnapshotCopyWithVersionAsync(
+        HttpClient transport, CopyFixture fixture, string serviceVersion)
+    {
+        var snapshot = (await fixture.Source.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot;
+        var source = fixture.Source.GenerateSasUri(BlobSasPermissions.Read, DateTimeOffset.UtcNow.AddMinutes(5));
+        var target = fixture.Target.GenerateSasUri(BlobSasPermissions.Write, DateTimeOffset.UtcNow.AddMinutes(5));
+        var uri = new UriBuilder(target) { Query = target.Query.TrimStart('?') + "&comp=incrementalcopy" }.Uri;
+        using var request = new HttpRequestMessage(HttpMethod.Put, uri) { Content = new ByteArrayContent([]) };
+        request.Headers.TryAddWithoutValidation("x-ms-version", serviceVersion);
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", source.AbsoluteUri + "&snapshot=" + Uri.EscapeDataString(snapshot));
+        return await transport.SendAsync(request).ConfigureAwait(false);
+    }
+
     private static void AssertTransferredBytes(CopyFixture fixture, long expected)
     {
         var dataReads = fixture.Reads.ToArray();
@@ -185,12 +274,18 @@ public sealed class ExternalIncrementalCopyTransferTests
 
     private sealed record SourceRead(string? Range, long ContentLength);
 
+    private sealed record SourceHead(string ServiceVersion, bool HasCreationTime);
+
     private sealed record CopyFixture(PageBlobClient Source, PageBlobClient Target,
         ConcurrentQueue<SourceRead> Reads, SourceReadControl Control);
 
     private sealed class SourceReadControl
     {
         public bool CorruptRanges { get; set; }
+
+        public bool HideCreationTime { get; init; }
+
+        public ConcurrentQueue<SourceHead> Heads { get; } = new();
     }
 
     private sealed class RecordingHandler(
@@ -200,6 +295,13 @@ public sealed class ExternalIncrementalCopyTransferTests
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            if (request.Method == HttpMethod.Head && response.IsSuccessStatusCode)
+            {
+                if (control.HideCreationTime)
+                    response.Headers.Remove("x-ms-creation-time");
+                control.Heads.Enqueue(new SourceHead(request.Headers.GetValues("x-ms-version").Single(),
+                    response.Headers.Contains("x-ms-creation-time")));
+            }
             if (request.Method == HttpMethod.Get &&
                 !request.RequestUri!.Query.Contains("comp=pagelist", StringComparison.OrdinalIgnoreCase) &&
                 response.IsSuccessStatusCode)
