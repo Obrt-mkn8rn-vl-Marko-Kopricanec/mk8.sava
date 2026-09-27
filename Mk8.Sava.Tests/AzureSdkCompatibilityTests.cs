@@ -13496,21 +13496,33 @@ public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory
     }
 
     [Fact]
-    public async Task MaintenanceReclaimsAbandonedStagingAndSurfacesChunkCorruption()
-    {
-        var blobService = factory.Services.GetRequiredService<BlobService>();
-        var freshPath = await AssertAbandonedStagingCleanupAsync(factory, blobService);
+    public async Task MaintenanceReclaimsAbandonedStagingAndSurfacesChunkCorruption() =>
+        await AssertMaintenanceCorruptionRecoveryAsync().ConfigureAwait(true);
 
-        var service = CreateClient(factory);
+    private static async Task AssertMaintenanceCorruptionRecoveryAsync()
+    {
+        var application = new SavaWebApplicationFactory(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-integrity-faults-{Guid.NewGuid():N}"),
+            new NullStorageFaultInjector(),
+            analyticsSink: null,
+            configurationOverrides: null,
+            deleteDataPath: true,
+            disableMaintenance: true);
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var blobService = application.Services.GetRequiredService<BlobService>();
+        var freshPath = await AssertAbandonedStagingCleanupAsync(application, blobService).ConfigureAwait(false);
+
+        var service = CreateClient(application);
         var containerName = $"integrity-{Guid.NewGuid():N}";
         var container = service.GetBlobContainerClient(containerName);
-        await container.CreateAsync();
-        var (blob, chunkPath) = await CorruptBlobChunkAsync(factory, blobService, container, containerName);
+        await container.CreateAsync().ConfigureAwait(false);
+        var (blob, chunkPath) = await CorruptBlobChunkAsync(application, blobService, container, containerName).ConfigureAwait(false);
 
-        await blobService.RunMaintenanceAsync(CancellationToken.None);
-        using var operatorClient = factory.CreateClient();
-        await AssertCorruptChunkStatusAndRecoveryAsync(blobService, blob, chunkPath, operatorClient);
-        await AssertMissingChunkStatusAndRecoveryAsync(factory, blobService, container, containerName, operatorClient);
+        await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
+        using var operatorClient = application.CreateClient();
+        await AssertCorruptChunkStatusAndRecoveryAsync(blobService, blob, chunkPath, operatorClient).ConfigureAwait(false);
+        await AssertMissingChunkStatusAndRecoveryAsync(application, blobService, container, containerName, operatorClient).ConfigureAwait(false);
 
         File.Delete(freshPath);
     }
