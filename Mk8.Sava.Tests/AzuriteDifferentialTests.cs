@@ -551,6 +551,39 @@ public sealed class AzuriteDifferentialTests
 
     [AzuriteFact]
     [Trait("Category", "Azurite")]
+    public async Task SnapshotTagReplacementPreservesCurrentTagsAndBlobIdentity()
+    {
+        var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
+            ?? throw new InvalidOperationException("The Azurite connection string was removed after discovery.");
+        var azurite = new BlobServiceClient(connectionString, CreateOptions());
+        var application = new SavaWebApplicationFactory();
+        await using var disposal = application.ConfigureAwait(false);
+        await application.InitializeAsync().ConfigureAwait(false);
+        var local = CreateLocalClient(application);
+        var name = $"mk8-azurite-snapshot-tags-{Guid.NewGuid():N}";
+        var azuriteContainer = azurite.GetBlobContainerClient(name);
+        var localContainer = local.GetBlobContainerClient(name);
+        try
+        {
+            var expected = await ExerciseSnapshotTagsAsync(azuriteContainer).ConfigureAwait(false);
+            var actual = await ExerciseSnapshotTagsAsync(localContainer).ConfigureAwait(false);
+            Assert.Equal(expected, actual);
+            Assert.Equal(204, expected.SetStatus);
+            Assert.Equal("snapshot", expected.SnapshotTag);
+            Assert.Equal("current", expected.CurrentTag);
+            Assert.Equal("payload", expected.Content);
+            Assert.True(expected.SnapshotEntityUnchanged);
+            Assert.True(expected.CurrentEntityUnchanged);
+        }
+        finally
+        {
+            await DeleteIfExistsAsync(localContainer).ConfigureAwait(false);
+            await DeleteIfExistsAsync(azuriteContainer).ConfigureAwait(false);
+        }
+    }
+
+    [AzuriteFact]
+    [Trait("Category", "Azurite")]
     public async Task SnapshotListingFollowsPublishedOrderDespiteAzuritePagingBug()
     {
         var connectionString = Environment.GetEnvironmentVariable(AzuriteFactAttribute.ConnectionStringVariable)
@@ -1484,6 +1517,34 @@ public sealed class AzuriteDifferentialTests
         return new SnapshotListingObservation(string.Join('|', unpaged), string.Join('|', pages), continuationCount);
     }
 
+    private static async Task<SnapshotTagsObservation> ExerciseSnapshotTagsAsync(BlobContainerClient container)
+    {
+        await container.CreateAsync().ConfigureAwait(false);
+        var current = container.GetBlobClient("payload.bin");
+        await current.UploadAsync(BinaryData.FromString("payload"), new BlobUploadOptions
+        {
+            Tags = new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "original" }
+        }).ConfigureAwait(false);
+        var snapshot = current.WithSnapshot((await current.CreateSnapshotAsync().ConfigureAwait(false)).Value.Snapshot);
+        await current.SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal) { ["phase"] = "current" })
+            .ConfigureAwait(false);
+        var beforeSnapshot = (await snapshot.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var beforeCurrent = (await current.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var set = await snapshot.SetTagsAsync(new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["phase"] = "snapshot"
+        }).ConfigureAwait(false);
+        var afterSnapshot = (await snapshot.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        var afterCurrent = (await current.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        return new SnapshotTagsObservation(
+            set.Status,
+            (await snapshot.GetTagsAsync().ConfigureAwait(false)).Value.Tags["phase"],
+            (await current.GetTagsAsync().ConfigureAwait(false)).Value.Tags["phase"],
+            (await snapshot.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString(),
+            beforeSnapshot.ETag == afterSnapshot.ETag && beforeSnapshot.LastModified == afterSnapshot.LastModified,
+            beforeCurrent.ETag == afterCurrent.ETag && beforeCurrent.LastModified == afterCurrent.LastModified);
+    }
+
     private static string DescribeSnapshotListItem(BlobItem item)
     {
         var phase = item.Metadata is not null && item.Metadata.TryGetValue("phase", out var value)
@@ -1826,6 +1887,10 @@ public sealed class AzuriteDifferentialTests
         string HierarchyPages, int HierarchyContinuations);
 
     private sealed record SnapshotListingObservation(string Unpaged, string Pages, int ContinuationCount);
+
+    private sealed record SnapshotTagsObservation(
+        int SetStatus, string SnapshotTag, string CurrentTag, string Content,
+        bool SnapshotEntityUnchanged, bool CurrentEntityUnchanged);
 
     private sealed record StoredPolicySasObservation(
         string Identifier, string Permissions, string ReadBytes,
