@@ -3583,7 +3583,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             await BlobQueryProtocol.PrepareParquetInputAsync(
                 content, options.MaximumParquetQueryMemoryBytes, cancellationToken).ConfigureAwait(false);
         await BlobQueryProtocol.ExecuteAsync(query, content, http.Response.Body,
-            blob.Content.Length, cancellationToken, prepared).ConfigureAwait(false);
+            blob.Content.Length, cancellationToken, prepared, options.MaximumBlobQueryResultMemoryBytes).ConfigureAwait(false);
     }
 
     private static async Task ExecuteTextQueryAsync(
@@ -3616,7 +3616,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                     content,
                     http.Response.Body,
                     blob.Content.Length,
-                    cancellationToken).ConfigureAwait(false);
+                    cancellationToken,
+                    maximumResultMemoryBytes: http.RequestServices.GetRequiredService<IOptions<SavaOptions>>()
+                        .Value.MaximumBlobQueryResultMemoryBytes).ConfigureAwait(false);
             }
             finally
             {

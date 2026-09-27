@@ -76,11 +76,11 @@ internal static class BlobQueryProtocol
         Stream response,
         long totalBytes,
         CancellationToken cancellationToken,
-        ParquetQueryInput? parquetInput = null)
+        ParquetQueryInput? parquetInput = null,
+        long maximumResultMemoryBytes = 256L * 1024 * 1024)
     {
         var plan = BlobQueryPlan.Parse(request.Expression);
         using var avro = new BlobQueryAvroWriter(response);
-        await avro.InitializeAsync(cancellationToken).ConfigureAwait(false);
 
         try
         {
@@ -94,6 +94,7 @@ internal static class BlobQueryProtocol
                         selections,
                         request.Output.ArrowSchema,
                         avro,
+                        maximumResultMemoryBytes,
                         cancellationToken).ConfigureAwait(false);
                     await avro.CompleteAsync(totalBytes, cancellationToken).ConfigureAwait(false);
                     return;
@@ -103,6 +104,7 @@ internal static class BlobQueryProtocol
                 while (await selections.MoveNextAsync().ConfigureAwait(false))
                 {
                     var selected = selections.Current;
+                    ValidateResultMemory(selected, maximumResultMemoryBytes, cancellationToken);
 
                     if (!wroteHeader && request.Output.Kind == BlobQueryFormatKind.Delimited && request.Output.HasHeaders)
                     {
@@ -301,8 +303,12 @@ internal static class BlobQueryProtocol
         IAsyncEnumerator<QuerySelection> rows,
         IReadOnlyList<QueryArrowColumn> fields,
         BlobQueryAvroWriter avro,
+        long maximumResultMemoryBytes,
         CancellationToken cancellationToken)
     {
+        var hasRow = await rows.MoveNextAsync().ConfigureAwait(false);
+        if (hasRow)
+            ValidateResultMemory(rows.Current, maximumResultMemoryBytes, cancellationToken);
         var schema = new Schema(
             fields.Select(CreateArrowField),
             new Dictionary<string, string>(StringComparer.Ordinal));
@@ -312,9 +318,10 @@ internal static class BlobQueryProtocol
 
         var batch = new List<QuerySelection>(ArrowRecordBatchSize);
         long batchBytes = 0;
-        while (await rows.MoveNextAsync().ConfigureAwait(false))
+        while (hasRow)
         {
             var selected = rows.Current;
+            ValidateResultMemory(selected, maximumResultMemoryBytes, cancellationToken);
             if (selected.Values.Count != fields.Count)
             {
                 throw new BlobQueryDataException(
@@ -332,11 +339,13 @@ internal static class BlobQueryProtocol
             }
             batch.Add(selected);
             batchBytes += rowBytes;
-            if (batch.Count < ArrowRecordBatchSize && batchBytes < ArrowRecordBatchTargetBytes)
-                continue;
-            await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
-            batch.Clear();
-            batchBytes = 0;
+            if (batch.Count >= ArrowRecordBatchSize || batchBytes >= ArrowRecordBatchTargetBytes)
+            {
+                await WriteArrowBatchAsync(writer, schema, fields, batch, cancellationToken).ConfigureAwait(false);
+                batch.Clear();
+                batchBytes = 0;
+            }
+            hasRow = await rows.MoveNextAsync().ConfigureAwait(false);
         }
 
         if (batch.Count > 0)
@@ -364,6 +373,39 @@ internal static class BlobQueryProtocol
         }
         return bytes;
     }
+
+    private static void ValidateResultMemory(QuerySelection row, long maximumBytes, CancellationToken cancellationToken)
+    {
+        long bytes = 64 + 96L * row.Values.Count + 8L * row.Names.Count;
+        foreach (var cell in row.Values)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var text = cell.Value switch
+            {
+                string value => value,
+                JsonElement value => value.GetRawText(),
+                _ => null
+            };
+            // Escaped JSON/CSV, encoder growth/copies and Arrow construction
+            // coexist with retained UTF-16 input. Shared references still
+            // produce repeated encoded bytes in a projection.
+            if (text is not null)
+                bytes += 24 + 2L * text.Length + 24L * Encoding.UTF8.GetByteCount(text);
+            if (bytes > maximumBytes)
+                throw ResultCapacityExceeded();
+        }
+        foreach (var name in row.Names)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            bytes += 24 + 2L * name.Length + 24L * Encoding.UTF8.GetByteCount(name);
+            if (bytes > maximumBytes)
+                throw ResultCapacityExceeded();
+        }
+    }
+
+    private static AzureStorageException ResultCapacityExceeded() => new(
+        503, "ServerBusy", "The query result exceeds this deployment's configured encoding capacity.",
+        responseHeaders: new Dictionary<string, string>(StringComparer.Ordinal) { ["Retry-After"] = "1" });
 
     private static Field CreateArrowField(QueryArrowColumn field)
     {

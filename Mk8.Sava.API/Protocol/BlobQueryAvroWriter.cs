@@ -38,15 +38,15 @@ internal sealed class BlobQueryAvroWriter(Stream destination) : IDisposable
 
     public async Task AppendDataAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
     {
-        EnsureWritable();
-        if (_data.Length > 0 && _data.Length + data.Length > DataBlockSize)
-            await FlushDataAsync(cancellationToken).ConfigureAwait(false);
-        if (data.Length >= DataBlockSize)
+        await EnsureWritableAsync(cancellationToken).ConfigureAwait(false);
+        while (!data.IsEmpty)
         {
-            await WriteRecordAsync(0, payload => WriteBytes(payload, data.Span), cancellationToken).ConfigureAwait(false);
-            return;
+            var count = Math.Min(DataBlockSize - checked((int)_data.Length), data.Length);
+            await _data.WriteAsync(data[..count], cancellationToken).ConfigureAwait(false);
+            data = data[count..];
+            if (_data.Length == DataBlockSize)
+                await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         }
-        await _data.WriteAsync(data, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task WriteErrorAsync(
@@ -56,7 +56,7 @@ internal sealed class BlobQueryAvroWriter(Stream destination) : IDisposable
         long position,
         CancellationToken cancellationToken)
     {
-        EnsureWritable();
+        await EnsureWritableAsync(cancellationToken).ConfigureAwait(false);
         await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         await WriteRecordAsync(1, payload =>
         {
@@ -69,7 +69,7 @@ internal sealed class BlobQueryAvroWriter(Stream destination) : IDisposable
 
     public async Task CompleteAsync(long totalBytes, CancellationToken cancellationToken)
     {
-        EnsureWritable();
+        await EnsureWritableAsync(cancellationToken).ConfigureAwait(false);
         await FlushDataAsync(cancellationToken).ConfigureAwait(false);
         await WriteRecordAsync(2, payload =>
         {
@@ -108,10 +108,12 @@ internal sealed class BlobQueryAvroWriter(Stream destination) : IDisposable
         await destination.WriteAsync(block.GetBuffer().AsMemory(0, checked((int)block.Length)), cancellationToken).ConfigureAwait(false);
     }
 
-    private void EnsureWritable()
+    private async Task EnsureWritableAsync(CancellationToken cancellationToken)
     {
-        if (!_initialized || _completed)
+        if (_completed)
             throw new InvalidOperationException("The Avro writer is not writable.");
+        if (!_initialized)
+            await InitializeAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static void WriteBytes(Stream stream, ReadOnlySpan<byte> value)
