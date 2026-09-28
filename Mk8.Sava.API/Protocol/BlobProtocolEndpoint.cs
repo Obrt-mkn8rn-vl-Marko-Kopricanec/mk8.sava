@@ -3642,7 +3642,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                 {
                     await producer.ConfigureAwait(false);
                 }
-                catch (OperationCanceledException) when (producerCancellation.IsCancellationRequested)
+                catch (OperationCanceledException exception) when (
+                    producerCancellation.IsCancellationRequested &&
+                    !CatastrophicExceptionPolicy.Contains(exception))
                 {
                 }
             }
