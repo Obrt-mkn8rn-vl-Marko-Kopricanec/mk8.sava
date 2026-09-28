@@ -531,6 +531,10 @@ proxy support with an equivalent enforced destination policy remains open.
 Source URLs containing embedded userinfo are rejected before an outbound
 request. Public and private DNS answers are evaluated at socket connection;
 the exact-host private-source exception does not extend to lookalike suffixes.
+Internal Copy Blob and incremental-copy shortcuts require the source URL's
+HTTP(S) scheme, host, and effective port to match the destination authority.
+Other authorities use the outbound-source policy. Copy-source metadata strips
+SAS signatures, userinfo, and fragments before it can appear in responses.
 
 Version-aware Get Blob and Get Blob Properties responses expose both
 `x-ms-version-id` and `x-ms-is-current-version` from service version

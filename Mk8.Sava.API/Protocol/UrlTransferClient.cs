@@ -238,14 +238,20 @@ internal sealed class UrlTransferClient(
             throw AzureStorageException.FeatureVersionMismatch(
                 "Source transactional CRC64 checksums require service version 2019-02-02 or later.");
         }
+        var sourceUri = ValidateSourceUri(sourceValue);
+        ValidateFileRequestIntent(destinationRequest, sourceUri, allowFileRequestIntent);
+        return (sourceUri, effectiveMaximumBytes);
+    }
+
+    internal static Uri ValidateSourceUri(string sourceValue)
+    {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
             sourceUri.Scheme is not ("http" or "https") ||
             sourceUri.UserInfo.Length != 0)
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
-        ValidateFileRequestIntent(destinationRequest, sourceUri, allowFileRequestIntent);
-        return (sourceUri, effectiveMaximumBytes);
+        return sourceUri;
     }
 
     private static HttpRequestMessage CreateReadSourceRequest(
@@ -438,12 +444,7 @@ internal sealed class UrlTransferClient(
         string sourceValue,
         bool allowed)
     {
-        if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
-            sourceUri.Scheme is not ("http" or "https") ||
-            sourceUri.UserInfo.Length != 0)
-        {
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
-        }
+        var sourceUri = ValidateSourceUri(sourceValue);
         ValidateFileRequestIntent(destination, sourceUri, allowed);
     }
 
