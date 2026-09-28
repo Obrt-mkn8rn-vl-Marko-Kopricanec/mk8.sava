@@ -857,6 +857,16 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                 request.Authorization.AclListObjectId!,
                 request.Authorization.AclListGroups!,
                 cancellationToken).ConfigureAwait(false);
+            if (request.Authorization.SasIssuerAclObjectId is { } issuerId)
+            {
+                await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
+                    metadata, http.Request, request, issuerId,
+                    request.Authorization.SasIssuerAclGroups!, request.Authorization.Permissions,
+                    cancellationToken).ConfigureAwait(false);
+                await HierarchicalAclAuthorization.EnsureRecursiveListPageAsync(
+                    metadata, http.Request, request, blobs, issuerId,
+                    request.Authorization.SasIssuerAclGroups!, cancellationToken).ConfigureAwait(false);
+            }
         }
         ValidateListedBlobTypes(request, blobs);
     }
@@ -4315,24 +4325,35 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             request.Authorization.Permissions,
             cancellationToken).ConfigureAwait(false);
         HierarchicalAclAuthorization.EnsureAuthorizedGeneration(request.Authorization, generation);
+        if (request.Authorization.SasIssuerAclObjectId is { } issuerId)
+        {
+            var issuerGeneration = await HierarchicalAclAuthorization.EnsureAppendAsync(
+                http.RequestServices.GetRequiredService<MetadataStore>(), http.Request, request,
+                issuerId, request.Authorization.SasIssuerAclGroups!, request.Authorization.Permissions,
+                cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(issuerGeneration, generation, StringComparison.Ordinal))
+                throw AzureStorageException.AuthorizationFailure();
+        }
     }
 
-    private static Task RecheckParentMutationAclAsync(
+    private static async Task RecheckParentMutationAclAsync(
         HttpContext http,
         StorageRequestContext request,
         CancellationToken cancellationToken)
     {
         if (!request.Authorization.AclMutationChecked)
-            return Task.CompletedTask;
-
-        return HierarchicalAclAuthorization.EnsureParentMutationAsync(
-            http.RequestServices.GetRequiredService<MetadataStore>(),
-            http.Request,
-            request,
-            request.Authorization.AclMutationObjectId!,
-            request.Authorization.AclMutationGroups!,
-            request.Authorization.Permissions,
-            cancellationToken);
+            return;
+        var metadata = http.RequestServices.GetRequiredService<MetadataStore>();
+        await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+            metadata, http.Request, request, request.Authorization.AclMutationObjectId!,
+            request.Authorization.AclMutationGroups!, request.Authorization.Permissions,
+            cancellationToken).ConfigureAwait(false);
+        if (request.Authorization.SasIssuerAclObjectId is { } issuerId)
+        {
+            await HierarchicalAclAuthorization.EnsureParentMutationAsync(
+                metadata, http.Request, request, issuerId, request.Authorization.SasIssuerAclGroups!,
+                request.Authorization.Permissions, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static async Task AuthorizeBlobReadAsync(

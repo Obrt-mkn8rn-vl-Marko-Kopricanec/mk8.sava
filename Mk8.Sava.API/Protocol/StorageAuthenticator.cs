@@ -42,10 +42,13 @@ internal sealed class StorageAuthenticator(
         if (authorization.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
         {
             var hasSas = context.Request.Query.ContainsKey("sig");
+            var isDelegationKeyRequest = request.ResourceKind == StorageResourceKind.Service &&
+                HttpMethods.IsPost(context.Request.Method) &&
+                context.Request.Query["comp"].ToString().Equals("userdelegationkey", StringComparison.OrdinalIgnoreCase);
             var bearer = await AuthenticateBearerAsync(
                 context,
                 request,
-                requireDataAuthorization: !hasSas).ConfigureAwait(false);
+                requireDataAuthorization: !hasSas && !isDelegationKeyRequest).ConfigureAwait(false);
             return hasSas
                 ? await AuthenticateSasAsync(context, request, bearer, cancellationToken)
 .ConfigureAwait(false) : bearer;
@@ -482,6 +485,8 @@ internal sealed class StorageAuthenticator(
         var isCrossTenantUserBoundSas = false;
         string? delegatedCreatorObjectId = null;
         string? aclObjectId = null;
+        string? issuerObjectId = null;
+        string? issuerTenantId = null;
         if (isAccountSas)
         {
             stringToSign = BuildAccountSasStringToSign(
@@ -489,18 +494,11 @@ internal sealed class StorageAuthenticator(
         }
         else if (isUserDelegationSas)
         {
-            var plan = BuildUserDelegationSasPlan(
+            (stringToSign, signingKey, permissions, startsAt, expiresAt, signedResource,
+                delegatedCreatorObjectId, aclObjectId, isCrossTenantUserBoundSas,
+                issuerObjectId, issuerTenantId) = BuildUserDelegationSasPlan(
                 context, request, query, signedVersion, version, permissions,
                 startsAt, expiresAt, signedIp, protocol, bearer);
-            stringToSign = plan.StringToSign;
-            signingKey = plan.SigningKey;
-            permissions = plan.Permissions;
-            startsAt = plan.StartsAt;
-            expiresAt = plan.ExpiresAt;
-            signedResource = plan.SignedResource;
-            delegatedCreatorObjectId = plan.CreatorObjectId;
-            aclObjectId = plan.AclObjectId;
-            isCrossTenantUserBoundSas = plan.IsCrossTenantUserBoundSas;
         }
         else
         {
@@ -514,14 +512,39 @@ internal sealed class StorageAuthenticator(
 
         VerifySasSignature(signingKey, stringToSign, suppliedSignature);
         ValidateSasTimeAndPolicies(
-            request, query, permissions, startsAt, expiresAt,
+            request, query, isUserDelegationSas ? query["sp"].ToString() : permissions, startsAt, expiresAt,
             signedStartsAt, signedExpiresAt, hasSignedVersion,
             isAccountSas, isUserDelegationSas, isCrossTenantUserBoundSas);
-        var acl = await EvaluateSasAclAsync(
-            context, request, aclObjectId, permissions, cancellationToken).ConfigureAwait(false);
+        (permissions, aclObjectId, var acl, var issuerAcl) = await EvaluateSasGrantsAsync(
+            context, request, permissions, issuerObjectId, issuerTenantId, aclObjectId,
+            cancellationToken).ConfigureAwait(false);
         return CreateSasAuthorization(
             query, permissions, startsAt, expiresAt, isAccountSas, isUserDelegationSas,
-            signedResource, delegatedCreatorObjectId, aclObjectId, acl);
+            signedResource, delegatedCreatorObjectId, aclObjectId, acl, issuerObjectId, issuerAcl);
+    }
+
+    private async Task<(string Permissions, string? AclObjectId, SasAclGrant Acl, SasAclGrant? IssuerAcl)> EvaluateSasGrantsAsync(
+        HttpContext context, StorageRequestContext request, string permissions,
+        string? issuerObjectId, string? issuerTenantId, string? aclObjectId,
+        CancellationToken cancellationToken)
+    {
+        SasAclGrant? issuerAcl = null;
+        if (issuerObjectId is not null &&
+            GetIssuerAclPermission(context.Request, request, context.Request.Query["sp"].ToString()) is { } issuerPermission &&
+            !permissions.Contains(issuerPermission, StringComparison.Ordinal))
+        {
+            issuerAcl = await EvaluateIssuerAclAsync(
+                context, request, issuerObjectId, issuerTenantId!,
+                issuerPermission, cancellationToken).ConfigureAwait(false);
+            permissions += issuerPermission;
+        }
+        if (permissions.Length == 0)
+            throw AzureStorageException.AuthorizationFailure();
+        var acl = await EvaluateSasAclAsync(
+            context, request, aclObjectId, permissions, NoGroups, cancellationToken).ConfigureAwait(false);
+        if (aclObjectId is null && issuerAcl is not null)
+            return (permissions, issuerObjectId, issuerAcl.Value, null);
+        return (permissions, aclObjectId, acl, issuerAcl);
     }
 
     private (string Version, string SuppliedSignature, bool HasSignedVersion, DateOnly SignedVersion,
@@ -623,7 +646,9 @@ internal sealed class StorageAuthenticator(
         string signedResource,
         string? delegatedCreatorObjectId,
         string? aclObjectId,
-        SasAclGrant acl)
+        SasAclGrant acl,
+        string? issuerObjectId,
+        SasAclGrant? issuerAcl)
     {
         return new StorageAuthorization(
             StorageAuthorizationKind.Sas,
@@ -639,13 +664,58 @@ internal sealed class StorageAuthenticator(
             AclAuthorizedGenerationId: acl.AuthorizedGenerationId,
             AclListChecked: acl.ListChecked,
             AclListObjectId: acl.ListChecked ? aclObjectId : null,
-            AclListGroups: acl.ListChecked ? NoGroups : null,
+            AclListGroups: acl.ListChecked ? acl.Groups : null,
             AclMutationChecked: acl.MutationChecked,
             AclMutationObjectId: acl.MutationChecked ? aclObjectId : null,
-            AclMutationGroups: acl.MutationChecked ? NoGroups : null,
+            AclMutationGroups: acl.MutationChecked ? acl.Groups : null,
             AclAppendChecked: acl.AppendChecked,
             AclAppendObjectId: acl.AppendChecked ? aclObjectId : null,
-            AclAppendGroups: acl.AppendChecked ? NoGroups : null);
+            AclAppendGroups: acl.AppendChecked ? acl.Groups : null,
+            SasIssuerAclObjectId: issuerAcl is not null &&
+                !string.Equals(aclObjectId, issuerObjectId, StringComparison.Ordinal) ? issuerObjectId : null,
+            SasIssuerAclGroups: issuerAcl?.Groups,
+            SasIssuerAclGenerationId: issuerAcl?.AuthorizedGenerationId);
+    }
+
+    private static char? GetIssuerAclPermission(HttpRequest http, StorageRequestContext request, string signedPermissions)
+    {
+        char? permission;
+        if (HierarchicalAclAuthorization.IsAppendOperation(http, request))
+            permission = signedPermissions.Contains('w', StringComparison.Ordinal) ? 'w' : 'a';
+        else
+            permission = HierarchicalAclAuthorization.GetParentMutationPermission(http, request) ??
+                         (HierarchicalAclAuthorization.IsDirectoryListOperation(http, request) ? 'l' :
+                             request.ResourceKind == StorageResourceKind.Blob &&
+                             HierarchicalAclAuthorization.IsBlobReadOperation(http) ? 'r' : null);
+        return permission is { } value && signedPermissions.Contains(value, StringComparison.Ordinal)
+            ? value
+            : null;
+    }
+
+    private async Task<SasAclGrant> EvaluateIssuerAclAsync(
+        HttpContext context, StorageRequestContext request, string objectId, string tenantId,
+        char permission, CancellationToken cancellationToken)
+    {
+        if (!IsHierarchicalNamespaceEnabled(request.Account))
+            throw AzureStorageException.AuthorizationFailure();
+        try
+        {
+            return await EvaluateSasAclAsync(
+                context, request, objectId, permission.ToString(), NoGroups, cancellationToken).ConfigureAwait(false);
+        }
+        catch (AzureStorageException error) when (
+            string.Equals(error.ErrorCode, "AuthorizationFailure", StringComparison.Ordinal) &&
+            _options.BearerAuthentication.GraphGroupResolution.Enabled)
+        {
+            var principal = new ClaimsPrincipal(new ClaimsIdentity(
+            [
+                new Claim("tid", tenantId),
+                new Claim("hasgroups", "true")
+            ], "VerifiedUserDelegationSas"));
+            var groups = await groupMembershipResolver.ResolveAsync(principal, objectId, cancellationToken).ConfigureAwait(false);
+            return await EvaluateSasAclAsync(
+                context, request, objectId, permission.ToString(), groups, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private async Task<SasAclGrant> EvaluateSasAclAsync(
@@ -653,6 +723,7 @@ internal sealed class StorageAuthenticator(
         StorageRequestContext request,
         string? aclObjectId,
         string permissions,
+        IReadOnlySet<string> groups,
         CancellationToken cancellationToken)
     {
         if (aclObjectId is null)
@@ -660,40 +731,41 @@ internal sealed class StorageAuthenticator(
         if (HierarchicalAclAuthorization.IsAppendOperation(context.Request, request))
         {
             var generationId = await HierarchicalAclAuthorization.EnsureAppendAsync(
-                metadata, context.Request, request, aclObjectId, NoGroups,
+                metadata, context.Request, request, aclObjectId, groups,
                 permissions, cancellationToken).ConfigureAwait(false);
-            return new SasAclGrant(generationId, false, false, true);
+            return new SasAclGrant(generationId, false, false, true, groups);
         }
         if (HierarchicalAclAuthorization.GetParentMutationPermission(context.Request, request) is not null)
         {
             await HierarchicalAclAuthorization.EnsureParentMutationAsync(
-                metadata, context.Request, request, aclObjectId, NoGroups,
+                metadata, context.Request, request, aclObjectId, groups,
                 permissions, cancellationToken).ConfigureAwait(false);
-            return new SasAclGrant(null, false, true, false);
+            return new SasAclGrant(null, false, true, false, groups);
         }
         if (HierarchicalAclAuthorization.IsDirectoryListOperation(context.Request, request))
         {
             await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
-                metadata, context.Request, request, aclObjectId, NoGroups,
+                metadata, context.Request, request, aclObjectId, groups,
                 permissions, cancellationToken).ConfigureAwait(false);
-            return new SasAclGrant(null, true, false, false);
+            return new SasAclGrant(null, true, false, false, groups);
         }
         var readGenerationId = await HierarchicalAclAuthorization.EnsureReadAsync(
             metadata,
             context.Request,
             request,
             aclObjectId,
-            NoGroups,
+            groups,
             permissions,
             cancellationToken).ConfigureAwait(false);
-        return new SasAclGrant(readGenerationId, false, false, false);
+        return new SasAclGrant(readGenerationId, false, false, false, groups);
     }
 
     private readonly record struct SasAclGrant(
         string? AuthorizedGenerationId,
         bool ListChecked,
         bool MutationChecked,
-        bool AppendChecked);
+        bool AppendChecked,
+        IReadOnlySet<string>? Groups = null);
 
     private static string BuildAccountSasStringToSign(
         HttpContext context,
@@ -1083,7 +1155,10 @@ internal sealed class StorageAuthenticator(
         var canonicalizedResource = BuildSasCanonicalResource(request, resourceType, query, signedVersion);
 
         var key = ReadUserDelegationKeyValues(request, query);
-        permissions = IntersectPermissions(permissions, key.GrantedPermissions);
+        // A delegation SAS must not inherit its requested bits when the issuer
+        // has no RBAC data grant. Unlike a stored policy, an empty grant is not
+        // an omitted-policy fallback; the HNS ACL path is checked separately.
+        permissions = new string(permissions.Where(key.GrantedPermissions.Contains).ToArray());
         startsAt = Latest(startsAt, key.StartsAt);
         expiresAt = Earliest(expiresAt, key.ExpiresAt);
         var identity = ValidateUserDelegationIdentity(request, query, signedVersion, key, bearer);
@@ -1108,7 +1183,9 @@ internal sealed class StorageAuthenticator(
             resourceType,
             identity.CreatorObjectId,
             identity.AclObjectId,
-            identity.IsCrossTenantUserBoundSas);
+            identity.IsCrossTenantUserBoundSas,
+            key.ObjectId,
+            key.TenantId);
     }
 
     private sealed record UserDelegationSasPlan(
@@ -1120,7 +1197,9 @@ internal sealed class StorageAuthenticator(
         string SignedResource,
         string CreatorObjectId,
         string? AclObjectId,
-        bool IsCrossTenantUserBoundSas);
+        bool IsCrossTenantUserBoundSas,
+        string IssuerObjectId,
+        string IssuerTenantId);
 
     private static string BuildSharedKeyString(
         HttpRequest request,

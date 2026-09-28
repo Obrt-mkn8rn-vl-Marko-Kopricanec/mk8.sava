@@ -30,7 +30,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory)
+public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory factory)
     : IClassFixture<SavaWebApplicationFactory>
 {
     private static readonly JsonSerializerOptions IndentedWebJsonOptions = new(JsonSerializerDefaults.Web)
