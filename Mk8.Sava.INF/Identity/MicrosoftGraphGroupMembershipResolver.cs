@@ -53,9 +53,11 @@ internal sealed partial class MicrosoftGraphGroupMembershipResolver(
             return await FetchGroupsAsync(objectGuid, configuration.GraphEndpoint, cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (Exception error) when (error is AuthenticationFailedException or CredentialUnavailableException or
-                                      HttpRequestException or JsonException or InvalidOperationException or TaskCanceledException &&
-                                      !cancellationToken.IsCancellationRequested)
+        catch (Exception error) when (
+            (error is AuthenticationFailedException or CredentialUnavailableException or
+                HttpRequestException or JsonException or InvalidOperationException or TaskCanceledException) &&
+            !cancellationToken.IsCancellationRequested &&
+            !CatastrophicExceptionPolicy.Contains(error))
         {
             GraphLookupFailed(logger, error);
             throw AzureStorageException.AuthorizationFailure();

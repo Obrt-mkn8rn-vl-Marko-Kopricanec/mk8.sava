@@ -64,7 +64,7 @@ internal static class BlobQueryProtocol
         {
             throw;
         }
-        catch (XmlException exception)
+        catch (XmlException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             throw InvalidXml(exception.Message);
         }
@@ -131,6 +131,8 @@ internal static class BlobQueryProtocol
         }
         catch (BlobQueryDataException exception)
         {
+            if (CatastrophicExceptionPolicy.Contains(exception))
+                throw;
             if (request.Output.Kind != BlobQueryFormatKind.Arrow && string.Equals(exception.Name, "ParseError", StringComparison.Ordinal))
                 await avro.AppendDataAsync(Encoding.UTF8.GetBytes(request.Output.RecordSeparator), cancellationToken).ConfigureAwait(false);
             await avro.WriteErrorAsync(true, exception.Name, exception.Message, exception.Position, cancellationToken).ConfigureAwait(false);
@@ -188,7 +190,9 @@ internal static class BlobQueryProtocol
                 {
                     plan.Accumulate(rows.Current);
                 }
-                catch (BlobQueryDataException exception) when (string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal))
+                catch (BlobQueryDataException exception) when (
+                    string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal) &&
+                    !CatastrophicExceptionPolicy.Contains(exception))
                 {
                     await avro.WriteErrorAsync(false, exception.Name, exception.Message, rows.Current.Position, cancellationToken).ConfigureAwait(false);
                 }
@@ -206,7 +210,9 @@ internal static class BlobQueryProtocol
             {
                 selected = plan.Select(rows.Current);
             }
-            catch (BlobQueryDataException exception) when (string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal))
+            catch (BlobQueryDataException exception) when (
+                string.Equals(exception.Name, "InvalidTypeConversion", StringComparison.Ordinal) &&
+                !CatastrophicExceptionPolicy.Contains(exception))
             {
                 await avro.WriteErrorAsync(false, exception.Name, exception.Message, rows.Current.Position, cancellationToken).ConfigureAwait(false);
                 continue;
@@ -491,7 +497,9 @@ internal static class BlobQueryProtocol
         {
             throw;
         }
-        catch (Exception exception) when (exception is ArgumentException or FormatException or OverflowException)
+        catch (Exception exception) when (
+            (exception is ArgumentException or FormatException or OverflowException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw new BlobQueryDataException(
                 "InvalidArrowType",
@@ -658,11 +666,11 @@ internal static class BlobQueryProtocol
         {
             throw;
         }
-        catch (BlobQueryDataException exception)
+        catch (BlobQueryDataException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             return new ParquetQueryInput([], [], guard.MaximumMetadataBytes, exception);
         }
-        catch (Exception exception) when (exception is not OutOfMemoryException)
+        catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             cancellationToken.ThrowIfCancellationRequested();
             return new ParquetQueryInput([], [], guard.MaximumMetadataBytes, InvalidParquetFile());
@@ -917,7 +925,7 @@ internal static class BlobQueryProtocol
             {
                 document = JsonDocument.Parse(record);
             }
-            catch (JsonException exception)
+            catch (JsonException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
             {
                 throw new BlobQueryDataException(
                     "ParseError",

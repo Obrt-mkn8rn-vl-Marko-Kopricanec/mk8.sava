@@ -15,12 +15,12 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
             await next(context).ConfigureAwait(false);
         }
         catch (OperationCanceledException exception) when (
-            context.RequestAborted.IsCancellationRequested && !ContainsCatastrophicException(exception))
+            context.RequestAborted.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
             context.Abort();
         }
 #pragma warning disable CA1031 // The outer HTTP boundary must translate unexpected failures to Azure's InternalError response.
-        catch (Exception exception) when (!ContainsCatastrophicException(exception))
+        catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             if (!IsKnownStorageException(exception) && logger.IsEnabled(LogLevel.Error))
                 StorageLogMessages.StorageOperationFailed(logger, exception, GetRequestId(context));
@@ -33,34 +33,6 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         exception is AzureStorageException or RequestBodyTooLargeException or StorageConcurrencyException or
             StorageImmutabilityException or StoragePendingCopyException or StorageBlobTypeMismatchException or
             StoragePathConflictException or XmlException;
-
-    internal static bool ContainsCatastrophicException(Exception exception)
-    {
-        if (exception is OutOfMemoryException or AccessViolationException)
-            return true;
-
-        var remaining = new Stack<Exception>();
-        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
-        remaining.Push(exception);
-        while (remaining.TryPop(out var current))
-        {
-            if (!visited.Add(current))
-                continue;
-            if (current is OutOfMemoryException or AccessViolationException)
-                return true;
-            if (current is AggregateException aggregate)
-            {
-                foreach (var inner in aggregate.InnerExceptions)
-                    remaining.Push(inner);
-            }
-            else if (current.InnerException is { } inner)
-            {
-                remaining.Push(inner);
-            }
-        }
-
-        return false;
-    }
 
     private static AzureStorageException MapException(Exception exception) => exception switch
     {

@@ -82,7 +82,8 @@ internal sealed class UrlSourceEgressPolicy
             {
                 return await _connectSocket(address, endpoint.Port, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception exception) when (exception is SocketException or IOException)
+            catch (Exception exception) when (
+                (exception is SocketException or IOException) && !CatastrophicExceptionPolicy.Contains(exception))
             {
                 lastFailure = exception;
             }

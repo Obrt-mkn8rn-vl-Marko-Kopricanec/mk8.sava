@@ -3237,7 +3237,9 @@ public sealed class BlobService(
         {
             return (false, false, false);
         }
-        catch (Exception exception) when (exception is AzureStorageException or StorageImmutabilityException)
+        catch (Exception exception) when (
+            (exception is AzureStorageException or StorageImmutabilityException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             var recordedFailure = await metadata.MarkObjectReplicationFailureAsync(
                 source, proposedState, statusKey, cancellationToken).ConfigureAwait(false);
