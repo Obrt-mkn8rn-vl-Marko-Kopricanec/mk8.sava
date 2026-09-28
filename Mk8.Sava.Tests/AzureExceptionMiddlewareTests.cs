@@ -1,0 +1,94 @@
+using System.Text;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging.Abstractions;
+using Mk8.Sava.Protocol;
+
+namespace Mk8.Sava.Tests;
+
+public sealed class AzureExceptionMiddlewareTests
+{
+    [Fact]
+    public async Task UnexpectedFailureIsAzureShapedWithoutExposingDetails()
+    {
+        var context = CreateContext();
+        var middleware = CreateMiddleware(_ => throw new InvalidOperationException("secret failure detail"));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+        Assert.Equal("InternalError", context.Response.Headers["x-ms-error-code"]);
+        Assert.False(string.IsNullOrEmpty(context.Response.Headers["x-ms-request-id"]));
+        var body = ReadBody(context);
+        Assert.Contains("<Code>InternalError</Code>", body, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret failure detail", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RequestAbortedCancellationDoesNotWriteAnErrorResponse()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+        var context = CreateContext();
+        context.RequestAborted = cancellation.Token;
+        var middleware = CreateMiddleware(_ => throw new OperationCanceledException(cancellation.Token));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(0, context.Response.Body.Length);
+        Assert.False(context.Response.Headers.ContainsKey("x-ms-error-code"));
+    }
+
+    [Fact]
+    public async Task NonAbortedCancellationIsAnAzureInternalError()
+    {
+        var context = CreateContext();
+        var middleware = CreateMiddleware(_ => throw new OperationCanceledException("timed out"));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+        Assert.Equal("InternalError", context.Response.Headers["x-ms-error-code"]);
+    }
+
+    [Theory]
+    [MemberData(nameof(CatastrophicFailures))]
+    public async Task CatastrophicFailureEscapesWithoutFormatting(Exception failure)
+    {
+        var context = CreateContext();
+        var middleware = CreateMiddleware(_ => throw failure);
+
+        var escaped = await Assert.ThrowsAnyAsync<Exception>(() => middleware.InvokeAsync(context));
+
+        Assert.Same(failure, escaped);
+        Assert.Equal(0, context.Response.Body.Length);
+        Assert.False(context.Response.Headers.ContainsKey("x-ms-error-code"));
+    }
+
+    public static TheoryData<Exception> CatastrophicFailures => new()
+    {
+#pragma warning disable CA2201 // Deliberately construct runtime-reserved exceptions to verify the outer HTTP boundary does not swallow them.
+        new OutOfMemoryException(),
+        new AccessViolationException(),
+        new InvalidOperationException("wrapped", new OutOfMemoryException()),
+        new AggregateException(new InvalidOperationException("ordinary"),
+            new InvalidOperationException("wrapped", new AccessViolationException()))
+#pragma warning restore CA2201
+    };
+
+    private static AzureExceptionMiddleware CreateMiddleware(RequestDelegate next) =>
+        new(next, NullLogger<AzureExceptionMiddleware>.Instance);
+
+    private static DefaultHttpContext CreateContext()
+    {
+        var context = new DefaultHttpContext();
+        context.Response.Body = new MemoryStream();
+        return context;
+    }
+
+    private static string ReadBody(HttpContext context)
+    {
+        context.Response.Body.Position = 0;
+        using var reader = new StreamReader(context.Response.Body, Encoding.UTF8, leaveOpen: true);
+        return reader.ReadToEnd();
+    }
+}
