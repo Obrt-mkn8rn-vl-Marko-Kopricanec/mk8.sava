@@ -69,7 +69,8 @@ public sealed partial class AzureSdkCompatibilityTests
 
     private static BlobClient CreateOrdinaryDelegationClient(
         SavaWebApplicationFactory application, BlobContainerClient container, BlobClient blob,
-        UserDelegationKey key, DateTimeOffset starts, DateTimeOffset expires)
+        UserDelegationKey key, DateTimeOffset starts, DateTimeOffset expires,
+        BlobSasPermissions permissions = BlobSasPermissions.Read)
     {
         var builder = new BlobSasBuilder
         {
@@ -79,7 +80,7 @@ public sealed partial class AzureSdkCompatibilityTests
             StartsOn = starts,
             ExpiresOn = expires
         };
-        builder.SetPermissions(BlobSasPermissions.Read);
+        builder.SetPermissions(permissions);
         var sas = builder.ToSasQueryParameters(key, SavaWebApplicationFactory.AccountName).ToString();
         Assert.DoesNotContain("suoid=", sas, StringComparison.Ordinal);
         return new BlobClient(new Uri(blob.Uri + "?" + sas), new BlobClientOptions

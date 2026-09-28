@@ -176,7 +176,7 @@ internal static class BlobProtocolEndpoint
             request.ServiceVersion,
             cancellationToken).ConfigureAwait(false);
         var authenticator = http.RequestServices.GetRequiredService<StorageAuthenticator>();
-        var key = authenticator.IssueUserDelegationKey(request, keyRequest);
+        var key = await authenticator.IssueUserDelegationKeyAsync(request, keyRequest, cancellationToken).ConfigureAwait(false);
         await AzureResponseWriter.WriteUserDelegationKeyAsync(http, key, cancellationToken).ConfigureAwait(false);
     }
 

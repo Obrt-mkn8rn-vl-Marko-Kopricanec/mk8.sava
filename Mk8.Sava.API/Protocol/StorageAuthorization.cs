@@ -29,7 +29,8 @@ internal sealed record StorageAuthorization(
     IReadOnlySet<string>? AclAppendGroups = null,
     string? SasIssuerAclObjectId = null,
     IReadOnlySet<string>? SasIssuerAclGroups = null,
-    string? SasIssuerAclGenerationId = null)
+    string? SasIssuerAclGenerationId = null,
+    IReadOnlyDictionary<string, string>? TrustedRoleGrants = null)
 {
     public static StorageAuthorization Anonymous { get; } = new(StorageAuthorizationKind.Anonymous, string.Empty);
     public static StorageAuthorization Owner { get; } = new(StorageAuthorizationKind.SharedKey, "racwdxltmeop");

@@ -17294,7 +17294,8 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         string base64Key,
         string objectId,
         string? tenantId = null,
-        IEnumerable<string>? groups = null)
+        IEnumerable<string>? groups = null,
+        IEnumerable<string>? roles = null)
     {
         var key = new SymmetricSecurityKey(Convert.FromBase64String(base64Key)) { KeyId = "test-key" };
         var claims = new List<Claim> { new("oid", objectId) };
@@ -17302,6 +17303,8 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             claims.Add(new Claim("tid", tenantId));
         if (groups is not null)
             claims.AddRange(groups.Select(group => new Claim("groups", group)));
+        if (roles is not null)
+            claims.AddRange(roles.Select(role => new Claim("roles", role)));
         var token = new JwtSecurityToken(
             issuer: "https://issuer.mk8.test",
             audience: "https://storage.azure.com/",
