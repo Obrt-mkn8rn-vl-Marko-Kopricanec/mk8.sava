@@ -1922,6 +1922,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         EnsureNoPendingCopyDestination(current);
         var copySource = ProtocolParsing.First(http.Request.Headers, "x-ms-copy-source")
                          ?? throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+        _ = UrlTransferClient.ValidateSourceUri(copySource);
         var publicSource = SanitizeCopySource(copySource);
         var resolvedSource = ResolveInternalCopySource(
             http.Request, request, copySource, allowSasCrossAccount: true);
@@ -2704,6 +2705,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                     http, request, service, containerName, blobName, current, copySource, cancellationToken).ConfigureAwait(false);
                 return;
             }
+            _ = UrlTransferClient.ValidateSourceUri(copySource);
             var requestedType = ProtocolParsing.First(http.Request.Headers, "x-ms-blob-type");
             var requiresSyncValue = ProtocolParsing.First(http.Request.Headers, "x-ms-requires-sync");
             var requiresSync = false;
@@ -3686,13 +3688,16 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         string sourceValue,
         bool allowSasCrossAccount = false)
     {
-        if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri))
-            throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+        var sourceUri = UrlTransferClient.ValidateSourceUri(sourceValue);
 
         var options = destination.HttpContext.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
         var destinationHost = destination.Host.Host;
         string? hostAccount = null;
-        if (!string.Equals(sourceUri.Host, destinationHost, StringComparison.OrdinalIgnoreCase))
+        var destinationPort = destination.Host.Port ??
+            (string.Equals(destination.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ? 443 : 80);
+        if (!string.Equals(sourceUri.Scheme, destination.Scheme, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(sourceUri.Host, destinationHost, StringComparison.OrdinalIgnoreCase) ||
+            sourceUri.Port != destinationPort)
             return null;
         if (StorageResourcePath.HostIdentifiesAccount(destinationHost, destinationRequest.Account))
             hostAccount = destinationRequest.Account;
@@ -3713,9 +3718,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         var query = QueryHelpers.ParseQuery(sourceUri.Query);
         if (!string.Equals(account, destinationRequest.Account, StringComparison.Ordinal) &&
-            (!allowSasCrossAccount || !query.ContainsKey("sig") ||
-             !string.Equals(sourceUri.Scheme, destination.Scheme, StringComparison.OrdinalIgnoreCase) ||
-             !string.Equals(sourceUri.Authority, destination.Host.Value, StringComparison.OrdinalIgnoreCase)))
+            (!allowSasCrossAccount || !query.ContainsKey("sig")))
             return null;
         return new ResolvedInternalCopySource(
             sourceUri,
@@ -5850,14 +5853,18 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static string SanitizeCopySource(string sourceValue)
     {
-        if (sourceValue.Length > 2048 || !Uri.TryCreate(sourceValue, UriKind.Absolute, out var source))
+        if (sourceValue.Length > 2048)
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
+        var source = UrlTransferClient.ValidateSourceUri(sourceValue);
         var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(source.Query);
         var values = query
             .Where(pair => !string.Equals(pair.Key, "sig", StringComparison.OrdinalIgnoreCase))
             .SelectMany(pair => pair.Value.Select(value => new KeyValuePair<string, string?>(pair.Key, value)));
         var builder = new UriBuilder(source)
         {
+            UserName = string.Empty,
+            Password = string.Empty,
+            Fragment = string.Empty,
             Query = QueryString.Create(values).Value?.TrimStart('?') ?? string.Empty
         };
         return builder.Uri.AbsoluteUri;
