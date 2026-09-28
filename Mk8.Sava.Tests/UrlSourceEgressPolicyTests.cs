@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Protocol;
 
@@ -46,5 +47,96 @@ public sealed class UrlSourceEgressPolicyTests
         Assert.False(policy.Allows("eviltrusted.internal", privateAddress));
         Assert.False(policy.Allows("trusted.internal.evil.example", privateAddress));
         Assert.True(policy.Allows("public.example", IPAddress.Parse("1.1.1.1")));
+    }
+
+    [Fact]
+    public async Task MixedDnsAnswerConnectsOnlyToAllowedAddresses()
+    {
+        var loopback = IPAddress.Loopback;
+        var publicAddress = IPAddress.Parse("1.1.1.1");
+        var attempted = new List<IPAddress>();
+        var policy = new UrlSourceEgressPolicy(
+            new SavaOptions(),
+            (host, _) =>
+            {
+                Assert.Equal("mixed.example", host);
+                return Task.FromResult(new[] { loopback, publicAddress });
+            },
+            (address, port, _) =>
+            {
+                Assert.Equal(443, port);
+                attempted.Add(address);
+                return ValueTask.FromResult<Stream>(new MemoryStream());
+            });
+
+        using var stream = await policy.ConnectEndpointAsync(new DnsEndPoint("mixed.example", 443), CancellationToken.None);
+
+        Assert.Equal([publicAddress], attempted);
+    }
+
+    [Fact]
+    public async Task PrivateOnlyDnsAnswerFailsBeforeAnyConnection()
+    {
+        var attempted = new List<IPAddress>();
+        var policy = new UrlSourceEgressPolicy(
+            new SavaOptions(),
+            (_, _) => Task.FromResult(new[] { IPAddress.Loopback, IPAddress.Parse("169.254.169.254") }),
+            (address, _, _) =>
+            {
+                attempted.Add(address);
+                return ValueTask.FromResult<Stream>(new MemoryStream());
+            });
+
+        var rejected = await Assert.ThrowsAsync<IOException>(async () =>
+            await policy.ConnectEndpointAsync(new DnsEndPoint("private.example", 80), CancellationToken.None)
+                .ConfigureAwait(false));
+
+        Assert.Contains("blocked", rejected.Message, StringComparison.Ordinal);
+        Assert.Empty(attempted);
+    }
+
+    [Fact]
+    public async Task AllowedAddressFailureNeverFallsBackToBlockedAnswer()
+    {
+        var publicAddress = IPAddress.Parse("8.8.8.8");
+        var attempted = new List<IPAddress>();
+        var policy = new UrlSourceEgressPolicy(
+            new SavaOptions(),
+            (_, _) => Task.FromResult(new[] { publicAddress, IPAddress.Loopback }),
+            (address, _, _) =>
+            {
+                attempted.Add(address);
+                throw new SocketException((int)SocketError.ConnectionRefused);
+            });
+
+        var rejected = await Assert.ThrowsAsync<IOException>(async () =>
+            await policy.ConnectEndpointAsync(new DnsEndPoint("mixed.example", 80), CancellationToken.None)
+                .ConfigureAwait(false));
+
+        Assert.Equal([publicAddress], attempted);
+        Assert.IsType<SocketException>(rejected.InnerException);
+    }
+
+    [Fact]
+    public async Task PrivateHostExceptionAppliesOnlyToTheExactHostAtConnectionTime()
+    {
+        var privateAddress = IPAddress.Parse("10.0.0.1");
+        var attempted = new List<IPAddress>();
+        var policy = new UrlSourceEgressPolicy(
+            new SavaOptions { UrlTransferAllowedPrivateHosts = ["trusted.internal"] },
+            (_, _) => Task.FromResult(new[] { privateAddress }),
+            (address, _, _) =>
+            {
+                attempted.Add(address);
+                return ValueTask.FromResult<Stream>(new MemoryStream());
+            });
+
+        using var stream = await policy.ConnectEndpointAsync(
+            new DnsEndPoint("TRUSTED.INTERNAL", 443), CancellationToken.None);
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await policy.ConnectEndpointAsync(new DnsEndPoint("trusted.internal.evil.example", 443), CancellationToken.None)
+                .ConfigureAwait(false));
+
+        Assert.Equal([privateAddress], attempted);
     }
 }

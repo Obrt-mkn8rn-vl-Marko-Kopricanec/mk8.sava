@@ -4,10 +4,26 @@ using Mk8.Sava.Configuration;
 
 namespace Mk8.Sava.Protocol;
 
-internal sealed class UrlSourceEgressPolicy(SavaOptions options)
+internal sealed class UrlSourceEgressPolicy
 {
-    private readonly HashSet<string> _allowedPrivateHosts =
-        new(options.UrlTransferAllowedPrivateHosts, StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _allowedPrivateHosts;
+    private readonly Func<string, CancellationToken, Task<IPAddress[]>> _resolveHost;
+    private readonly Func<IPAddress, int, CancellationToken, ValueTask<Stream>> _connectSocket;
+
+    public UrlSourceEgressPolicy(SavaOptions options)
+        : this(options, Dns.GetHostAddressesAsync, ConnectSocketAsync)
+    {
+    }
+
+    internal UrlSourceEgressPolicy(
+        SavaOptions options,
+        Func<string, CancellationToken, Task<IPAddress[]>> resolveHost,
+        Func<IPAddress, int, CancellationToken, ValueTask<Stream>> connectSocket)
+    {
+        _allowedPrivateHosts = new(options.UrlTransferAllowedPrivateHosts, StringComparer.OrdinalIgnoreCase);
+        _resolveHost = resolveHost;
+        _connectSocket = connectSocket;
+    }
 
     internal bool Allows(string host, IPAddress address) =>
         _allowedPrivateHosts.Contains(host) || IsPublicAddress(address);
@@ -43,14 +59,17 @@ internal sealed class UrlSourceEgressPolicy(SavaOptions options)
                !(bytes[0] == 0x20 && bytes[1] == 0x02);
     }
 
-    internal async ValueTask<Stream> ConnectAsync(
+    internal ValueTask<Stream> ConnectAsync(
         SocketsHttpConnectionContext context,
+        CancellationToken cancellationToken) => ConnectEndpointAsync(context.DnsEndPoint, cancellationToken);
+
+    internal async ValueTask<Stream> ConnectEndpointAsync(
+        DnsEndPoint endpoint,
         CancellationToken cancellationToken)
     {
-        var endpoint = context.DnsEndPoint;
         var addresses = IPAddress.TryParse(endpoint.Host, out var literal)
             ? [literal]
-            : await Dns.GetHostAddressesAsync(endpoint.Host, cancellationToken).ConfigureAwait(false);
+            : await _resolveHost(endpoint.Host, cancellationToken).ConfigureAwait(false);
         var permitted = addresses.Where(address => Allows(endpoint.Host, address)).ToArray();
         if (permitted.Length == 0)
             throw new IOException("The copy source resolves only to blocked private or non-routable addresses.");
@@ -59,24 +78,35 @@ internal sealed class UrlSourceEgressPolicy(SavaOptions options)
         foreach (var address in permitted)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            Socket? socket = new(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             try
             {
-                await socket.ConnectAsync(address, endpoint.Port, cancellationToken).ConfigureAwait(false);
-                var stream = new NetworkStream(socket, ownsSocket: true);
-                socket = null;
-                return stream;
+                return await _connectSocket(address, endpoint.Port, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception exception) when (exception is SocketException or IOException)
             {
                 lastFailure = exception;
             }
-            finally
-            {
-                socket?.Dispose();
-            }
         }
 
         throw new IOException("The copy source could not be reached at an allowed address.", lastFailure);
+    }
+
+    private static async ValueTask<Stream> ConnectSocketAsync(
+        IPAddress address,
+        int port,
+        CancellationToken cancellationToken)
+    {
+        Socket? socket = new(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+        try
+        {
+            await socket.ConnectAsync(address, port, cancellationToken).ConfigureAwait(false);
+            var stream = new NetworkStream(socket, ownsSocket: true);
+            socket = null;
+            return stream;
+        }
+        finally
+        {
+            socket?.Dispose();
+        }
     }
 }

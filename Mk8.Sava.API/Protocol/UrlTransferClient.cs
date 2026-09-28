@@ -239,7 +239,8 @@ internal sealed class UrlTransferClient(
                 "Source transactional CRC64 checksums require service version 2019-02-02 or later.");
         }
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
-            sourceUri.Scheme is not ("http" or "https"))
+            sourceUri.Scheme is not ("http" or "https") ||
+            sourceUri.UserInfo.Length != 0)
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }
