@@ -35,7 +35,8 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
         }
         catch (IOException exception)
         {
-            throw new StorageRootLeaseException(Root, exception);
+            throw new StorageRootLeaseException(
+                $"Unable to acquire the exclusive data-root lease for '{Root}'.", exception);
         }
     }
 
