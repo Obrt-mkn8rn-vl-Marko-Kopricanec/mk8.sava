@@ -135,8 +135,18 @@ if (operatorCommand is { Name: "validate" })
 }
 
 if (operatorCommand is not null)
-    await app.Services.GetRequiredService<StorageInitializationService>()
-        .InitializeAsync(CancellationToken.None).ConfigureAwait(false);
+{
+    try
+    {
+        await app.Services.GetRequiredService<StorageInitializationService>()
+            .InitializeAsync(CancellationToken.None).ConfigureAwait(false);
+    }
+    catch (StorageRootLeaseException exception)
+    {
+        ReportRootLeaseFailure(exception);
+        return;
+    }
+}
 
 if (operatorCommand is { Name: "create" })
 {
@@ -191,7 +201,20 @@ app.MapGet("/metrics", (IStorageTelemetry telemetry, ChunkStore chunks) =>
     Results.Text(telemetry.RenderPrometheus() + chunks.Admission.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
-await app.RunAsync().ConfigureAwait(false);
+try
+{
+    await app.RunAsync().ConfigureAwait(false);
+}
+catch (StorageRootLeaseException exception)
+{
+    ReportRootLeaseFailure(exception);
+}
+
+static void ReportRootLeaseFailure(StorageRootLeaseException exception)
+{
+    Console.Error.WriteLine(exception.Message);
+    Environment.ExitCode = 1;
+}
 
 static (string Name, string Path)? ParseOperatorCommand(string[] arguments)
 {
