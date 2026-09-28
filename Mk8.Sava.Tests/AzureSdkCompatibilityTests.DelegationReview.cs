@@ -176,6 +176,109 @@ public sealed partial class AzureSdkCompatibilityTests
             (await blob.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
     }
 
+    [Theory]
+    [InlineData("c", false)]
+    [InlineData("cw", true)]
+    public async Task DelegationCreateUsesIssuerParentAclWithoutPromotingCreateToWrite(
+        string signedPermissions, bool overwriteAllowed)
+    {
+        const string issuerId = "879acd19-52b5-486b-9754-6b9c8c1eeaec";
+        var application = new SavaWebApplicationFactory(new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            [$"Sava:BearerAuthentication:Principals:{issuerId}:Accounts:0"] = SavaWebApplicationFactory.AccountName,
+            [$"Sava:BearerAuthentication:Principals:{issuerId}:Permissions"] = "",
+            [$"Sava:BearerAuthentication:Principals:{issuerId}:CanGenerateUserDelegationKey"] = "true"
+        });
+        await using var disposal = application.ConfigureAwait(true);
+        await application.InitializeAsync().ConfigureAwait(true);
+        var container = CreateClient(application).GetBlobContainerClient($"review-acl-create-{Guid.NewGuid():N}");
+        await container.CreateAsync().ConfigureAwait(true);
+        await container.GetBlobClient("parent/seed.txt").UploadAsync(BinaryData.FromString("seed")).ConfigureAwait(true);
+        var root = new HierarchicalAclManifestEntry
+        {
+            Account = SavaWebApplicationFactory.AccountName,
+            Container = container.Name,
+            Path = "",
+            AccessAcl = $"user::rwx,user:{issuerId}:--x,group::---,mask::--x,other::---"
+        };
+        var parent = root with
+        {
+            Path = "parent",
+            AccessAcl = $"user::rwx,user:{issuerId}:-wx,group::---,mask::-wx,other::---"
+        };
+        await ApplyAclManifestAsync(application, root, parent).ConfigureAwait(true);
+        var bearer = CreateBearerClient(application,
+            CreateJwt(SavaWebApplicationFactory.AccountKey, issuerId, SavaWebApplicationFactory.TenantId));
+        var starts = DateTimeOffset.UtcNow.AddMinutes(-1);
+        var expires = DateTimeOffset.UtcNow.AddMinutes(5);
+        var key = (await bearer.GetUserDelegationKeyAsync(new BlobGetUserDelegationKeyOptions(expires)
+        {
+            StartsOn = starts
+        }).ConfigureAwait(true)).Value;
+        var permissions = overwriteAllowed
+            ? BlobSasPermissions.Create | BlobSasPermissions.Write : BlobSasPermissions.Create;
+        BlobClient Signed(string name) => CreateOrdinaryDelegationClient(
+            application, container, container.GetBlobClient(name), key, starts, expires, permissions);
+        var sdkNew = Signed("parent/sdk-new.txt");
+        Assert.Contains($"sp={signedPermissions}", sdkNew.Uri.Query, StringComparison.Ordinal);
+        await sdkNew.UploadAsync(BinaryData.FromString("sdk-created")).ConfigureAwait(true);
+        var rawNew = Signed("parent/raw-new.txt");
+        Assert.Equal(201, await SendRawPutBlobAsync(application, rawNew.Uri, "raw-created").ConfigureAwait(true));
+        var sdkExisting = Signed("parent/sdk-existing.txt");
+        var rawExisting = Signed("parent/raw-existing.txt");
+        await container.GetBlobClient(sdkExisting.Name).UploadAsync(BinaryData.FromString("sdk-seed")).ConfigureAwait(true);
+        await container.GetBlobClient(rawExisting.Name).UploadAsync(BinaryData.FromString("raw-seed")).ConfigureAwait(true);
+        if (overwriteAllowed)
+            await sdkExisting.UploadAsync(BinaryData.FromString("sdk-overwritten"), overwrite: true).ConfigureAwait(true);
+        else
+            Assert.Equal(403, (await Assert.ThrowsAsync<RequestFailedException>(() =>
+                sdkExisting.UploadAsync(BinaryData.FromString("forbidden"), overwrite: true)).ConfigureAwait(true)).Status);
+        Assert.Equal(overwriteAllowed ? 201 : 403,
+            await SendRawPutBlobAsync(application, rawExisting.Uri, "raw-overwritten").ConfigureAwait(true));
+        await AssertParentAclRevocationAsync(
+            application, parent, issuerId, Signed("parent/sdk-revoked.txt"),
+            Signed("parent/raw-revoked.txt"), sdkExisting, rawExisting).ConfigureAwait(true);
+        await AssertExistingBlobContentsAsync(container, sdkExisting, rawExisting, overwriteAllowed).ConfigureAwait(true);
+    }
+
+    private static async Task AssertExistingBlobContentsAsync(
+        BlobContainerClient container, BlobClient sdkExisting, BlobClient rawExisting, bool overwritten)
+    {
+        Assert.Equal(overwritten ? "sdk-overwritten" : "sdk-seed",
+            (await container.GetBlobClient(sdkExisting.Name).DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+        Assert.Equal(overwritten ? "raw-overwritten" : "raw-seed",
+            (await container.GetBlobClient(rawExisting.Name).DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+    }
+
+    private static async Task AssertParentAclRevocationAsync(
+        SavaWebApplicationFactory application, HierarchicalAclManifestEntry parent, string issuerId,
+        BlobClient sdkNew, BlobClient rawNew, BlobClient sdkExisting, BlobClient rawExisting)
+    {
+        await ApplyAclManifestAsync(application, parent with
+        {
+            AccessAcl = $"user::rwx,user:{issuerId}:--x,group::---,mask::--x,other::---"
+        }).ConfigureAwait(true);
+        Assert.Equal(403, (await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sdkNew.UploadAsync(BinaryData.FromString("forbidden"))).ConfigureAwait(true)).Status);
+        Assert.Equal(403, await SendRawPutBlobAsync(application, rawNew.Uri, "forbidden").ConfigureAwait(true));
+        Assert.Equal(403, (await Assert.ThrowsAsync<RequestFailedException>(() =>
+            sdkExisting.UploadAsync(BinaryData.FromString("forbidden"), overwrite: true)).ConfigureAwait(true)).Status);
+        Assert.Equal(403, await SendRawPutBlobAsync(application, rawExisting.Uri, "forbidden").ConfigureAwait(true));
+    }
+
+    private static async Task<int> SendRawPutBlobAsync(
+        SavaWebApplicationFactory application, Uri signedUri, string body)
+    {
+        using var transport = new HttpClient(application.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Put, signedUri);
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        request.Content = new ByteArrayContent(System.Text.Encoding.UTF8.GetBytes(body));
+        using var response = await transport.SendAsync(request).ConfigureAwait(false);
+        return (int)response.StatusCode;
+    }
+
     private static AppendBlobClient CreateDelegatedAppendClient(
         SavaWebApplicationFactory application, AppendBlobClient blob, string containerName,
         UserDelegationKey key, DateTimeOffset starts, DateTimeOffset expires, string signedPermissions)
