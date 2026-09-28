@@ -439,7 +439,8 @@ internal sealed class UrlTransferClient(
         bool allowed)
     {
         if (!Uri.TryCreate(sourceValue, UriKind.Absolute, out var sourceUri) ||
-            sourceUri.Scheme is not ("http" or "https"))
+            sourceUri.Scheme is not ("http" or "https") ||
+            sourceUri.UserInfo.Length != 0)
         {
             throw AzureStorageException.InvalidHeader("x-ms-copy-source");
         }

@@ -14,7 +14,8 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
         {
             await next(context).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        catch (OperationCanceledException exception) when (
+            context.RequestAborted.IsCancellationRequested && !ContainsCatastrophicException(exception))
         {
             context.Abort();
         }
@@ -39,9 +40,12 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
             return true;
 
         var remaining = new Stack<Exception>();
+        var visited = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
         remaining.Push(exception);
         while (remaining.TryPop(out var current))
         {
+            if (!visited.Add(current))
+                continue;
             if (current is OutOfMemoryException or AccessViolationException)
                 return true;
             if (current is AggregateException aggregate)

@@ -1,5 +1,6 @@
 using System.Text;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Logging.Abstractions;
 using Mk8.Sava.Protocol;
 
@@ -50,6 +51,22 @@ public sealed class AzureExceptionMiddlewareTests
         Assert.Equal("InternalError", context.Response.Headers["x-ms-error-code"]);
     }
 
+    [Fact]
+    public async Task AlreadyStartedResponseIsNotRewrittenAsAzureXml()
+    {
+        var context = new DefaultHttpContext();
+        using var body = new MemoryStream();
+        context.Features.Set<IHttpResponseFeature>(new StartedResponseFeature(body));
+        context.Response.Body = body;
+        var middleware = CreateMiddleware(_ => throw new InvalidOperationException("failure after headers"));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status200OK, context.Response.StatusCode);
+        Assert.Empty(body.ToArray());
+        Assert.False(context.Response.Headers.ContainsKey("x-ms-error-code"));
+    }
+
     [Theory]
     [MemberData(nameof(CatastrophicFailures))]
     public async Task CatastrophicFailureEscapesWithoutFormatting(Exception failure)
@@ -75,6 +92,24 @@ public sealed class AzureExceptionMiddlewareTests
 #pragma warning restore CA2201
     };
 
+    [Fact]
+    public async Task RequestAbortDoesNotSwallowNestedCatastrophicFailure()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync();
+        var context = CreateContext();
+        context.RequestAborted = cancellation.Token;
+#pragma warning disable CA2201 // Deliberately verify that a nested runtime-reserved failure escapes the canceled-request path.
+        var failure = new OperationCanceledException("aborted", new OutOfMemoryException(), cancellation.Token);
+#pragma warning restore CA2201
+        var middleware = CreateMiddleware(_ => throw failure);
+
+        var escaped = await Assert.ThrowsAsync<OperationCanceledException>(() => middleware.InvokeAsync(context));
+
+        Assert.Same(failure, escaped);
+        Assert.Equal(0, context.Response.Body.Length);
+    }
+
     private static AzureExceptionMiddleware CreateMiddleware(RequestDelegate next) =>
         new(next, NullLogger<AzureExceptionMiddleware>.Instance);
 
@@ -90,5 +125,18 @@ public sealed class AzureExceptionMiddlewareTests
         context.Response.Body.Position = 0;
         using var reader = new StreamReader(context.Response.Body, Encoding.UTF8, leaveOpen: true);
         return reader.ReadToEnd();
+    }
+
+    private sealed class StartedResponseFeature(Stream body) : IHttpResponseFeature
+    {
+        public int StatusCode { get; set; } = StatusCodes.Status200OK;
+        public string? ReasonPhrase { get; set; }
+        public IHeaderDictionary Headers { get; set; } = new HeaderDictionary();
+        public Stream Body { get; set; } = body;
+        public bool HasStarted => true;
+
+        public void OnStarting(Func<object, Task> callback, object state) { }
+
+        public void OnCompleted(Func<object, Task> callback, object state) { }
     }
 }
