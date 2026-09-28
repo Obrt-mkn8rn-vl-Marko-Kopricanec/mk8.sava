@@ -1085,6 +1085,9 @@ tier changes.
   lifecycle maintenance. These operator endpoints contain no credentials or
   blob names, but deployments should still restrict them to the monitoring
   network.
+- The HTTP request, duration, and 5xx metrics include health checks and metrics
+  scrapes as well as storage API requests. Unsupported paths under `/health`
+  and `/metrics`, including bare `/health`, return HTTP 404.
 
 ### Storage work admission
 

@@ -15,13 +15,6 @@ internal sealed class StorageTelemetryMiddleware(
 {
     public async Task InvokeAsync(HttpContext context)
     {
-        if (context.Request.Path.StartsWithSegments("/health", StringComparison.OrdinalIgnoreCase) ||
-            context.Request.Path.StartsWithSegments("/metrics", StringComparison.OrdinalIgnoreCase))
-        {
-            await next(context).ConfigureAwait(false);
-            return;
-        }
-
         var startedAt = timeProvider.GetUtcNow();
         var started = Stopwatch.GetTimestamp();
         try
@@ -33,12 +26,12 @@ internal sealed class StorageTelemetryMiddleware(
             var elapsed = Stopwatch.GetTimestamp() - started;
             telemetry.RecordRequest(context.Response.StatusCode, elapsed);
             var request = StorageRequestContext.TryGet(context);
-            if (logger.IsEnabled(LogLevel.Information))
+            if (request is not null && logger.IsEnabled(LogLevel.Information))
             {
-                var resourceKind = request?.ResourceKind.ToString() ?? "Unknown";
+                var resourceKind = request.ResourceKind.ToString();
                 StorageLogMessages.StorageRequestCompleted(
                     logger,
-                    request?.RequestId ?? context.TraceIdentifier,
+                    request.RequestId,
                     context.Request.Method,
                     resourceKind,
                     context.Response.StatusCode,

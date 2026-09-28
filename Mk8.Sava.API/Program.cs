@@ -199,6 +199,9 @@ app.MapGet("/health/ready", async (
 });
 app.MapGet("/metrics", (IStorageTelemetry telemetry, ChunkStore chunks) =>
     Results.Text(telemetry.RenderPrometheus() + chunks.Admission.RenderPrometheus(), "text/plain; version=0.0.4; charset=utf-8"));
+app.Map("/health", () => Results.NotFound());
+app.Map("/health/{**unmatchedPath}", () => Results.NotFound());
+app.Map("/metrics/{**unmatchedPath}", () => Results.NotFound());
 app.Map("/{**storagePath}", BlobProtocolEndpoint.HandleAsync);
 
 try

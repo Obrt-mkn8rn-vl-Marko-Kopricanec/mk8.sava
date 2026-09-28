@@ -86,10 +86,10 @@ public sealed class StorageTelemetry : IStorageTelemetry
     private void AppendRequestMetrics(StringBuilder builder)
     {
         var durationSeconds = Interlocked.Read(ref _requestDurationStopwatchTicks) / (double)Stopwatch.Frequency;
-        AppendMetric(builder, "mk8_sava_http_requests_total", "Storage protocol requests completed.", Interlocked.Read(ref _requestCount));
-        AppendMetric(builder, "mk8_sava_http_server_errors_total", "Storage protocol requests completed with a 5xx response.", Interlocked.Read(ref _serverErrorCount));
-        AppendMetric(builder, "mk8_sava_http_request_duration_seconds_sum", "Cumulative storage protocol request duration.", durationSeconds);
-        AppendMetric(builder, "mk8_sava_http_request_duration_seconds_count", "Storage protocol requests represented by the duration sum.", Interlocked.Read(ref _requestCount));
+        AppendMetric(builder, "mk8_sava_http_requests_total", "HTTP requests completed, including operator endpoints.", Interlocked.Read(ref _requestCount));
+        AppendMetric(builder, "mk8_sava_http_server_errors_total", "HTTP requests completed with a 5xx response, including operator endpoints.", Interlocked.Read(ref _serverErrorCount));
+        AppendMetric(builder, "mk8_sava_http_request_duration_seconds_sum", "Cumulative HTTP request duration, including operator endpoints.", durationSeconds);
+        AppendMetric(builder, "mk8_sava_http_request_duration_seconds_count", "HTTP requests represented by the duration sum, including operator endpoints.", Interlocked.Read(ref _requestCount));
     }
 
     private static void AppendStorageMetrics(StringBuilder builder, StorageUsageSnapshot usage)
