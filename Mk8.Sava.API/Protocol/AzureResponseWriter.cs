@@ -1296,7 +1296,8 @@ internal static partial class AzureResponseWriter
                     throw AzureStorageException.InvalidQuery("marker");
                 return new BlobListingMarker(cursor, 0);
             }
-            catch (Exception exception) when (exception is FormatException or JsonException)
+            catch (Exception exception) when (
+                (exception is FormatException or JsonException) && !CatastrophicExceptionPolicy.Contains(exception))
             {
                 throw AzureStorageException.InvalidQuery("marker");
             }

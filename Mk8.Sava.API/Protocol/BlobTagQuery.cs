@@ -101,7 +101,8 @@ internal static class BlobTagQuery
             }
             return cursor;
         }
-        catch (Exception exception) when (exception is FormatException or JsonException)
+        catch (Exception exception) when (
+            (exception is FormatException or JsonException) && !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw AzureStorageException.InvalidQuery("marker");
         }

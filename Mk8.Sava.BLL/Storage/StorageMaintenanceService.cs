@@ -2,6 +2,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
 
@@ -51,7 +52,7 @@ public sealed class StorageMaintenanceService(
             }
             // A maintenance pass must be isolated so a later pass can retry safely.
 #pragma warning disable CA1031
-            catch (Exception exception)
+            catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
             {
 #pragma warning restore CA1031
                 telemetry.RecordMaintenanceFailure();

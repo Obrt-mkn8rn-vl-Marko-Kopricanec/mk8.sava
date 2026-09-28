@@ -1,3 +1,5 @@
+using Mk8.Sava.Protocol;
+
 namespace Mk8.Sava.Storage;
 
 // A scan is a sampled inventory, not an atomic filesystem snapshot. Each pass
@@ -129,9 +131,9 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
                     _allocatedBytes = checked(_allocatedBytes!.Value + stat.AllocatedBytes);
                 }
             }
-            catch (Exception error) when (error is EntryPointNotFoundException or
-                                          DllNotFoundException or
-                                          PlatformNotSupportedException)
+            catch (Exception error) when (
+                (error is EntryPointNotFoundException or DllNotFoundException or PlatformNotSupportedException) &&
+                !CatastrophicExceptionPolicy.Contains(error))
             {
                 _measureAllocation = false;
                 _allocatedBytes = null;

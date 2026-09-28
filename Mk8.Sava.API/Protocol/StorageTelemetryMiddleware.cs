@@ -48,7 +48,7 @@ internal sealed class StorageTelemetryMiddleware(
                         CancellationToken.None).ConfigureAwait(false);
                 }
 #pragma warning disable CA1031 // Best-effort analytics must not fail the completed storage request.
-                catch (Exception exception)
+                catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
                 {
                     StorageLogMessages.StorageAnalyticsPersistenceFailed(logger, exception, request.RequestId);
                 }

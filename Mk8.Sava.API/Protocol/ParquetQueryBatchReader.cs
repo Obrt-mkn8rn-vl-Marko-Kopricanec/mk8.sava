@@ -71,14 +71,14 @@ internal static class ParquetQueryBatchReader
             cancellationToken.ThrowIfCancellationRequested();
             return new ParquetSharp.Arrow.FileReader(file, properties, arrowProperties);
         }
-        catch (ParquetSharp.ParquetException)
+        catch (ParquetSharp.ParquetException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             cancellationToken.ThrowIfCancellationRequested();
             throw InvalidInput();
         }
     }
 
-    private static async ValueTask<RecordBatch?> ReadBatchAsync(IArrowArrayStream batches, CancellationToken cancellationToken)
+    internal static async ValueTask<RecordBatch?> ReadBatchAsync(IArrowArrayStream batches, CancellationToken cancellationToken)
     {
         try
         {
@@ -89,7 +89,7 @@ internal static class ParquetQueryBatchReader
         {
             throw;
         }
-        catch (Exception)
+        catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             // The C data-interface bridge transports native errors as managed
             // exceptions; cancellation must not be mislabeled as corrupt data.
@@ -137,7 +137,9 @@ internal static class ParquetQueryBatchReader
             };
             return new QueryCell(value);
         }
-        catch (Exception exception) when (exception is ArgumentException or OverflowException or FormatException)
+        catch (Exception exception) when (
+            (exception is ArgumentException or OverflowException or FormatException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw InvalidInput();
         }

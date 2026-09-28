@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading.RateLimiting;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
 
@@ -145,7 +146,7 @@ public sealed class ChunkStore : IDisposable
                 await producer.ConfigureAwait(false);
             }
 #pragma warning disable CA1031 // Preserve the original storage failure after observing producer cancellation.
-            catch
+            catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
             {
                 // Preserve the transfer/storage exception that caused cancellation.
             }
@@ -1122,7 +1123,9 @@ public sealed class ChunkStore : IDisposable
         {
             return ChunkIntegrityStatus.Missing;
         }
-        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            (exception is InvalidDataException or IOException or UnauthorizedAccessException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             return ChunkIntegrityStatus.Corrupt;
         }
@@ -1142,7 +1145,9 @@ public sealed class ChunkStore : IDisposable
         {
             return ChunkIntegrityStatus.Missing;
         }
-        catch (Exception exception) when (exception is InvalidDataException or IOException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            (exception is InvalidDataException or IOException or UnauthorizedAccessException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             return ChunkIntegrityStatus.Corrupt;
         }
@@ -1203,7 +1208,9 @@ public sealed class ChunkStore : IDisposable
         {
             plaintext = await ReadVerifiedChunkAsync(id, domain, customerProvidedKey: null, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is InvalidDataException or FileNotFoundException or UnauthorizedAccessException)
+        catch (Exception exception) when (
+            (exception is InvalidDataException or FileNotFoundException or UnauthorizedAccessException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             return ChunkRecompressionResult.Examined;
         }

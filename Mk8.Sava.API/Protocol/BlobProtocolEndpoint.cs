@@ -996,7 +996,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             throw;
         }
 #pragma warning disable CA1031 // Blob Batch reports each subrequest failure as an independent protocol response.
-        catch (Exception exception)
+        catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             return CreateFailedBatchSubresponse(outer, inner, subrequestContext, resolved, exception);
         }

@@ -120,7 +120,9 @@ internal sealed class UrlTransferClient(
             {
                 await consume(limited, cancellationToken).ConfigureAwait(false);
             }
-            catch (Exception exception) when (exception is EndOfStreamException or RequestBodyTooLargeException)
+            catch (Exception exception) when (
+                (exception is EndOfStreamException or RequestBodyTooLargeException) &&
+                !CatastrophicExceptionPolicy.Contains(exception))
             {
                 throw CannotVerifyCopySource("The source page range body did not match the requested length.");
             }
@@ -291,11 +293,12 @@ internal sealed class UrlTransferClient(
                 HttpCompletionOption.ResponseHeadersRead,
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source could not be reached or did not complete a valid HTTP response.");
         }
-        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (TaskCanceledException exception) when (
+            !cancellationToken.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source did not complete the request before the transfer timeout.");
         }
@@ -690,11 +693,12 @@ internal sealed class UrlTransferClient(
         {
             response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source tags could not be read.");
         }
-        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (TaskCanceledException exception) when (
+            !cancellationToken.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source tag request did not complete before the transfer timeout.");
         }
@@ -920,11 +924,12 @@ internal sealed class UrlTransferClient(
         {
             response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         }
-        catch (HttpRequestException)
+        catch (HttpRequestException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source shape could not be read.");
         }
-        catch (TaskCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (TaskCanceledException exception) when (
+            !cancellationToken.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
             throw CannotVerifyCopySource("The source shape request did not complete before the transfer timeout.");
         }
@@ -948,7 +953,9 @@ internal sealed class UrlTransferClient(
                     return await XDocument.LoadAsync(reader, LoadOptions.None, cancellationToken).ConfigureAwait(false);
                 }
             }
-            catch (Exception exception) when (exception is XmlException or InvalidOperationException)
+            catch (Exception exception) when (
+                (exception is XmlException or InvalidOperationException) &&
+                !CatastrophicExceptionPolicy.Contains(exception))
             {
                 throw CannotVerifyCopySource("The source returned an invalid shape document.");
             }
@@ -1123,7 +1130,9 @@ internal sealed class UrlTransferClient(
                 return (code, message);
             }
         }
-        catch (Exception exception) when (exception is XmlException or InvalidOperationException or IOException)
+        catch (Exception exception) when (
+            (exception is XmlException or InvalidOperationException or IOException) &&
+            !CatastrophicExceptionPolicy.Contains(exception))
         {
             return (null, null);
         }
