@@ -312,6 +312,10 @@ internal static class HierarchicalAclAuthorization
         {
             throw AzureStorageException.AuthorizationFailure();
         }
+        if (authorization.SasIssuerAclObjectId is not null &&
+            (authorization.AclReadChecked || authorization.AclAppendChecked) &&
+            !string.Equals(authorization.SasIssuerAclGenerationId, generationId, StringComparison.Ordinal))
+            throw AzureStorageException.AuthorizationFailure();
     }
 
     internal static async Task<string?> EnsureReadAsync(
