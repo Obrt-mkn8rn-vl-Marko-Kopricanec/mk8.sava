@@ -139,4 +139,28 @@ public sealed class UrlSourceEgressPolicyTests
 
         Assert.Equal([privateAddress], attempted);
     }
+
+    [Fact]
+    public async Task EveryConnectionRechecksItsCurrentDnsAnswer()
+    {
+        var publicAddress = IPAddress.Parse("1.1.1.1");
+        var resolutions = 0;
+        var attempted = new List<IPAddress>();
+        var policy = new UrlSourceEgressPolicy(
+            new SavaOptions(),
+            (_, _) => Task.FromResult(++resolutions == 1 ? new[] { publicAddress } : new[] { IPAddress.Loopback }),
+            (address, _, _) =>
+            {
+                attempted.Add(address);
+                return ValueTask.FromResult<Stream>(new MemoryStream());
+            });
+
+        using var first = await policy.ConnectEndpointAsync(new DnsEndPoint("rebind.example", 443), CancellationToken.None);
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await policy.ConnectEndpointAsync(new DnsEndPoint("rebind.example", 443), CancellationToken.None)
+                .ConfigureAwait(false));
+
+        Assert.Equal(2, resolutions);
+        Assert.Equal([publicAddress], attempted);
+    }
 }

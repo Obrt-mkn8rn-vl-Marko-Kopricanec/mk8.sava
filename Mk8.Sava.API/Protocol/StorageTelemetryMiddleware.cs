@@ -111,7 +111,7 @@ internal sealed class StorageTelemetryMiddleware(
             LastModified = Header(http.Response.Headers, "Last-Modified"),
             Conditions = FormatConditions(http.Request.Headers),
             UserAgent = Header(http.Request.Headers, "User-Agent"),
-            Referrer = Header(http.Request.Headers, "Referer"),
+            Referrer = RedactReferrer(Header(http.Request.Headers, "Referer")),
             ClientRequestId = Header(http.Request.Headers, "x-ms-client-request-id"),
             UserObjectId = authorization.Kind == StorageAuthorizationKind.Bearer ? authorization.Identifier : null,
             TenantId = authorization.Kind == StorageAuthorizationKind.Bearer ? authorization.TenantId : null,
@@ -251,7 +251,7 @@ internal sealed class StorageTelemetryMiddleware(
                (response.StatusCode >= 500 ? "ServerOtherError" : "ClientOtherError");
     }
 
-    private static string BuildLoggedUrl(HttpRequest request)
+    internal static string BuildLoggedUrl(HttpRequest request)
     {
         var builder = new StringBuilder()
             .Append(request.Scheme)
@@ -263,6 +263,29 @@ internal sealed class StorageTelemetryMiddleware(
         if (string.IsNullOrEmpty(rawQuery))
             return builder.ToString();
 
+        return builder.Append('?').Append(MaskSignatureQuery(rawQuery)).ToString();
+    }
+
+    internal static string? RedactReferrer(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return value;
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+            uri.Scheme is not ("http" or "https"))
+            return null;
+
+        var builder = new UriBuilder(uri)
+        {
+            UserName = string.Empty,
+            Password = string.Empty,
+            Fragment = string.Empty,
+            Query = MaskSignatureQuery(uri.Query)
+        };
+        return builder.Uri.AbsoluteUri;
+    }
+
+    private static string MaskSignatureQuery(string rawQuery)
+    {
         var parts = rawQuery.TrimStart('?').Split('&');
         // The index is required to replace only the signed query value in its array slot.
 #pragma warning disable HLQ013
@@ -274,7 +297,7 @@ internal sealed class StorageTelemetryMiddleware(
                 parts[index] = encodedName + "=XXXXX";
         }
 #pragma warning restore HLQ013
-        return builder.Append('?').AppendJoin('&', parts).ToString();
+        return string.Join('&', parts);
     }
 
     private static long EstimateRequestHeaderSize(HttpRequest request)

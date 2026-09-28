@@ -62,6 +62,13 @@ Once the metadata transaction commits, the logical write is authoritative even
 if the client connection is lost or the server cannot return the response.
 Storage Analytics and ordinary request logging execute outside that transaction;
 their failure is logged but cannot roll back or replace the storage response.
+Analytics records mask every decoded `sig` query key in the request URL. An
+HTTP(S) `Referer` is recorded without userinfo, fragment, or `sig` values;
+unrecognized referrers are omitted. Client-supplied diagnostic fields
+(`Conditions`, `User-Agent`, `Referer`, and `x-ms-client-request-id`) are capped
+at 4096 characters each, and control characters are normalized so one request
+cannot forge extra log records. These are log-only transformations, not Blob
+request or response changes.
 The integration suite has deterministic checkpoints at extent publication,
 metadata pre-commit and post-commit, and the final reclamation delete so these
 boundaries can be exercised without making fault injection a deployment feature.
@@ -521,6 +528,9 @@ Source transfers connect directly rather than through an ambient HTTP proxy,
 which could bypass the local address policy. Operators using private Azure
 endpoints or a controlled egress proxy must account for this deployment setting;
 proxy support with an equivalent enforced destination policy remains open.
+Source URLs containing embedded userinfo are rejected before an outbound
+request. Public and private DNS answers are evaluated at socket connection;
+the exact-host private-source exception does not extend to lookalike suffixes.
 
 Version-aware Get Blob and Get Blob Properties responses expose both
 `x-ms-version-id` and `x-ms-is-current-version` from service version

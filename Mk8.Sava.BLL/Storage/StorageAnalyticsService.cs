@@ -11,6 +11,7 @@ public sealed class StorageAnalyticsService(
     public const string LogsContainerName = "$logs";
 
     private static readonly BlobEncryption Unencrypted = new(null, null);
+    private const int MaximumClientDiagnosticCharacters = 4096;
 
     public async Task RecordAsync(
         StorageAnalyticsRequest request,
@@ -175,7 +176,7 @@ public sealed class StorageAnalyticsService(
         return checked(lastCounter + 1);
     }
 
-    private static string FormatRecord(string version, StorageAnalyticsRequest request)
+    internal static string FormatRecord(string version, StorageAnalyticsRequest request)
     {
         var fields = new List<string>(string.Equals(version, "2.0", StringComparison.Ordinal) ? 38 : 30)
         {
@@ -205,10 +206,10 @@ public sealed class StorageAnalyticsService(
             Quote(request.ServerMd5),
             Quote(request.ETag),
             request.LastModified ?? string.Empty,
-            Quote(request.Conditions),
-            Quote(request.UserAgent),
-            Quote(request.Referrer),
-            Quote(request.ClientRequestId)
+            QuoteClientDiagnostic(request.Conditions),
+            QuoteClientDiagnostic(request.UserAgent),
+            QuoteClientDiagnostic(request.Referrer),
+            QuoteClientDiagnostic(request.ClientRequestId)
         };
         if (string.Equals(version, "2.0", StringComparison.Ordinal))
         {
@@ -224,9 +225,41 @@ public sealed class StorageAnalyticsService(
         return string.Join(';', fields) + '\n';
     }
 
+    private static string QuoteClientDiagnostic(string? value)
+    {
+        if (value is { Length: > MaximumClientDiagnosticCharacters })
+        {
+            var length = MaximumClientDiagnosticCharacters;
+            if (char.IsHighSurrogate(value[length - 1]))
+                length--;
+            value = value[..length];
+        }
+        return Quote(value);
+    }
+
     private static string Quote(string? value) => string.IsNullOrEmpty(value)
         ? string.Empty
-        : $"\"{WebUtility.HtmlEncode(value)}\"";
+        : $"\"{WebUtility.HtmlEncode(NormalizeControls(value))}\"";
+
+    private static string NormalizeControls(string value)
+    {
+        var first = 0;
+        while (first < value.Length && !char.IsControl(value[first]))
+            first++;
+        if (first == value.Length)
+            return value;
+
+        var characters = value.ToCharArray();
+        // The index is required to replace a control character in its array slot.
+#pragma warning disable HLQ013
+        for (var index = first; index < characters.Length; index++)
+        {
+            if (char.IsControl(characters[index]))
+                characters[index] = ' ';
+        }
+#pragma warning restore HLQ013
+        return new string(characters);
+    }
 
     private static string CategoryName(StorageAnalyticsOperationCategory category) => category switch
     {
