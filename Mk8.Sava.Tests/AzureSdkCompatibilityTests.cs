@@ -10802,7 +10802,9 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         });
         await using var applicationDisposal32 = application.ConfigureAwait(false);
         await application.InitializeAsync();
-        var owner = CreateClient(application);
+        // Keep the source's authority identical to the Bearer destination so this
+        // exercises internal reauthorization rather than external URL transfer.
+        var owner = CreateEncryptedClient(application, customerProvidedKey: null, encryptionScope: null);
         var allowed = owner.GetBlobContainerClient(allowedContainerName);
         var privateContainer = owner.GetBlobContainerClient(privateContainerName);
         await allowed.CreateAsync();
