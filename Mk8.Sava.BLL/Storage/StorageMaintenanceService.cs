@@ -46,7 +46,9 @@ public sealed class StorageMaintenanceService(
                     MaintenanceCompleted(logger, result, null);
                 }
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            catch (OperationCanceledException exception) when (
+                stoppingToken.IsCancellationRequested &&
+                !CatastrophicExceptionPolicy.Contains(exception))
             {
                 break;
             }
