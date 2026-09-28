@@ -11223,6 +11223,39 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
     }
 
     [Fact]
+    public async Task UrlTransferRejectsUserInfoBeforeContactingSource()
+    {
+        var source = await LoopbackSource.StartAsync("must not be read"u8.ToArray());
+        await using var sourceDisposal = source.ConfigureAwait(false);
+        var container = CreateClient(factory).GetBlobContainerClient($"url-userinfo-{Guid.NewGuid():N}");
+        await container.CreateAsync();
+        var destination = container.GetBlockBlobClient("rejected.bin");
+        var destinationUri = destination.GenerateSasUri(
+            BlobSasPermissions.Create | BlobSasPermissions.Write,
+            DateTimeOffset.UtcNow.AddMinutes(5));
+        var sourceWithUserInfo = new UriBuilder(source.Uri)
+        {
+            UserName = "username",
+            Password = "password"
+        }.Uri;
+        using var request = new HttpRequestMessage(HttpMethod.Put, destinationUri)
+        {
+            Content = new ByteArrayContent([])
+        };
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2025-07-05");
+        request.Headers.TryAddWithoutValidation("x-ms-blob-type", "BlockBlob");
+        request.Headers.TryAddWithoutValidation("x-ms-copy-source", sourceWithUserInfo.AbsoluteUri);
+        using var transport = new HttpClient(factory.Server.CreateHandler());
+
+        using var response = await transport.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("InvalidHeaderValue", response.Headers.GetValues("x-ms-error-code").Single());
+        Assert.Equal(0, source.SourceRequestCount);
+        Assert.False((await destination.ExistsAsync()).Value);
+    }
+
+    [Fact]
     public async Task FileRequestIntentIsValidatedAndForwardedForEverySupportedUrlOperation()
     {
         var sourceBytes = Enumerable.Range(0, 512).Select(index => (byte)(index % 251)).ToArray();
