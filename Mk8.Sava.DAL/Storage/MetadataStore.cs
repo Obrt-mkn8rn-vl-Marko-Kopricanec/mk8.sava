@@ -10,13 +10,14 @@ public sealed partial class MetadataStore(
     IStorageFaultInjector faultInjector,
     TimeProvider? timeProvider = null) : IDisposable
 {
-    public const int CurrentSchemaVersion = 7;
+    public const int CurrentSchemaVersion = 8;
     private const int RetainedWalLimitBytes = 1024 * 1024;
     private const int ChunkIndexSchemaVersion = 2;
     private const int TagIndexSchemaVersion = 3;
     private const int PackIndexSchemaVersion = 4;
     private const int ObjectReplicationSchemaVersion = 5;
     private const int DataKeyContinuitySchemaVersion = 6;
+    private const int NamespaceModesSchemaVersion = 7;
 
     private const string InitialSchemaSql = """
                 CREATE TABLE IF NOT EXISTS containers (
@@ -116,6 +117,26 @@ public sealed partial class MetadataStore(
                     account TEXT PRIMARY KEY,
                     hierarchical_namespace_enabled INTEGER NOT NULL CHECK (hierarchical_namespace_enabled IN (0, 1))
                 );
+
+                CREATE TABLE IF NOT EXISTS user_delegation_role_grants (
+                    key_fingerprint TEXT PRIMARY KEY,
+                    account TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL,
+                    start_text TEXT NOT NULL,
+                    expiry_text TEXT NOT NULL,
+                    service TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    delegated_user_tenant_id TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    roles_json TEXT NOT NULL,
+                    issued_permissions TEXT NOT NULL,
+                    expires_ticks INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_user_delegation_role_grants_identity
+                    ON user_delegation_role_grants(account, object_id, tenant_id, start_text, expiry_text);
+                CREATE INDEX IF NOT EXISTS ix_user_delegation_role_grants_expiry
+                    ON user_delegation_role_grants(expires_ticks);
 
                 CREATE TABLE IF NOT EXISTS chunk_packs (
                     pack_id TEXT PRIMARY KEY,
@@ -227,7 +248,7 @@ public sealed partial class MetadataStore(
                 schemaVersion = TagIndexSchemaVersion;
             }
             if (schemaVersion is TagIndexSchemaVersion or PackIndexSchemaVersion or
-                ObjectReplicationSchemaVersion or DataKeyContinuitySchemaVersion)
+                ObjectReplicationSchemaVersion or DataKeyContinuitySchemaVersion or NamespaceModesSchemaVersion)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken).ConfigureAwait(false);
             else if (schemaVersion == 0)
                 await ExecuteNonQueryAsync(connection, $"PRAGMA user_version={CurrentSchemaVersion};", cancellationToken).ConfigureAwait(false);
@@ -3144,7 +3165,7 @@ public sealed partial class MetadataStore(
         var schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken).ConfigureAwait(false);
         var inventory = await ReadVerifiedStorageInventoryAsync(connection, cancellationToken).ConfigureAwait(false);
         var namespaceModes = new Dictionary<string, bool>(StringComparer.Ordinal);
-        if (schemaVersion >= CurrentSchemaVersion)
+        if (schemaVersion >= NamespaceModesSchemaVersion)
         {
             var modes = connection.CreateCommand();
             await using var modesDisposal = modes.ConfigureAwait(false);
