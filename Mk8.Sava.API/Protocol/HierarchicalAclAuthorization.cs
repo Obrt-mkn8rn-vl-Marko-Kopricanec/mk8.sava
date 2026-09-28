@@ -1,3 +1,4 @@
+using System.Globalization;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -35,6 +36,38 @@ internal static class HierarchicalAclAuthorization
         http.Query["comp"].ToString().Equals("appendblock", StringComparison.OrdinalIgnoreCase) &&
         !http.Query.ContainsKey("snapshot") &&
         !http.Query.ContainsKey("versionid");
+
+    internal static async Task<bool> IsNewBlobCreationAsync(
+        MetadataStore metadata,
+        HttpRequest http,
+        StorageRequestContext request,
+        CancellationToken cancellationToken)
+    {
+        if (!IsNewBlobCreationOperation(http, request))
+            return false;
+        var existing = await metadata.GetBlobAsync(
+            request.Account, request.Container!, request.Blob!,
+            versionId: null, snapshot: null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        return existing is null;
+    }
+
+    internal static bool IsNewBlobCreationOperation(HttpRequest http, StorageRequestContext request)
+    {
+        if (request.ResourceKind != StorageResourceKind.Blob ||
+            request.Container is null || request.Blob is null ||
+            !HttpMethods.IsPut(http.Method) ||
+            http.Query.ContainsKey("snapshot") || http.Query.ContainsKey("versionid"))
+            return false;
+        var component = http.Query["comp"].ToString();
+        if (component.Length != 0 &&
+            (!(component.Equals("block", StringComparison.OrdinalIgnoreCase) ||
+               component.Equals("blocklist", StringComparison.OrdinalIgnoreCase)) ||
+             !DateOnly.TryParseExact(request.ServiceVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture,
+                 DateTimeStyles.None, out var serviceVersion) ||
+             serviceVersion < new DateOnly(2026, 4, 6)))
+            return false;
+        return true;
+    }
 
     internal static async Task<string> EnsureAppendAsync(
         MetadataStore metadata,
@@ -89,7 +122,11 @@ internal static class HierarchicalAclAuthorization
         CancellationToken cancellationToken)
     {
         var permission = GetParentMutationPermission(http, request);
-        if (permission is null || !signedPermissions.Contains(permission.Value, StringComparison.Ordinal))
+        if (permission is null ||
+            !signedPermissions.Contains(permission.Value, StringComparison.Ordinal) &&
+            (permission != 'w' ||
+             !signedPermissions.Contains('c', StringComparison.Ordinal) ||
+             !await IsNewBlobCreationAsync(metadata, http, request, cancellationToken).ConfigureAwait(false)))
             throw AzureStorageException.AuthorizationFailure();
 
         var root = await metadata.GetContainerAsync(

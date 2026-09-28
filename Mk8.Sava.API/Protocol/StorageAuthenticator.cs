@@ -584,10 +584,17 @@ internal sealed class StorageAuthenticator(
         var issuerPermission = issuerObjectId is null
             ? null
             : GetIssuerAclPermission(context.Request, request, signedPermissions, permissions);
-        if (issuerPermission == 'w' &&
-            await MayUseCreatePermissionInsteadAsync(context.Request, request, signedPermissions, permissions,
+        if (issuerPermission == 'w' && permissions.Contains('c', StringComparison.Ordinal) &&
+            await IsSignedNewBlobCreationAsync(context.Request, request, signedPermissions,
                 cancellationToken).ConfigureAwait(false))
             issuerPermission = null;
+        if (issuerPermission is null && issuerObjectId is not null &&
+            !permissions.Contains('c', StringComparison.Ordinal) &&
+            !permissions.Contains('w', StringComparison.Ordinal) &&
+            IsHierarchicalNamespaceEnabled(request.Account) &&
+            await IsSignedNewBlobCreationAsync(context.Request, request, signedPermissions,
+                cancellationToken).ConfigureAwait(false))
+            issuerPermission = 'c';
         if (issuerObjectId is not null && issuerPermission is { } neededPermission)
         {
             issuerAcl = await EvaluateIssuerAclAsync(
@@ -604,31 +611,16 @@ internal sealed class StorageAuthenticator(
         return (permissions, aclObjectId, acl, issuerAcl);
     }
 
-    private async Task<bool> MayUseCreatePermissionInsteadAsync(
+    private async Task<bool> IsSignedNewBlobCreationAsync(
         HttpRequest http, StorageRequestContext request, string signedPermissions,
-        string effectivePermissions, CancellationToken cancellationToken)
+        CancellationToken cancellationToken)
     {
-        if (request.ResourceKind != StorageResourceKind.Blob ||
-            request.Container is null || request.Blob is null ||
-            !HttpMethods.IsPut(http.Method) ||
-            !signedPermissions.Contains('c', StringComparison.Ordinal) ||
-            !effectivePermissions.Contains('c', StringComparison.Ordinal) ||
-            http.Query.ContainsKey("snapshot") || http.Query.ContainsKey("versionid"))
-            return false;
-        var component = http.Query["comp"].ToString();
-        if (component.Length != 0 &&
-            (!(component.Equals("block", StringComparison.OrdinalIgnoreCase) ||
-               component.Equals("blocklist", StringComparison.OrdinalIgnoreCase)) ||
-             !DateOnly.TryParseExact(request.ServiceVersion, "yyyy-MM-dd", CultureInfo.InvariantCulture,
-                 DateTimeStyles.None, out var serviceVersion) ||
-             serviceVersion < new DateOnly(2026, 4, 6)))
+        if (!signedPermissions.Contains('c', StringComparison.Ordinal))
             return false;
         if (!IsHierarchicalNamespaceEnabled(request.Account))
-            return true;
-        var existing = await metadata.GetBlobAsync(
-            request.Account, request.Container, request.Blob,
-            versionId: null, snapshot: null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
-        return existing is null;
+            return HierarchicalAclAuthorization.IsNewBlobCreationOperation(http, request);
+        return await HierarchicalAclAuthorization.IsNewBlobCreationAsync(
+            metadata, http, request, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<string> ApplyTrustedDelegationRoleGrantsAsync(
