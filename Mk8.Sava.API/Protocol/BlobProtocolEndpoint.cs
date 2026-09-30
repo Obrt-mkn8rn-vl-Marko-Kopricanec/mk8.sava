@@ -5895,6 +5895,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             expectedCrc64,
             structuredBody,
             structuredContentLength);
+        RequestBodyLimits.Apply(request, effectiveMaximumBodyBytes, structured: structuredBody is not null);
         if (structuredBody is not null)
         {
             var decodedLength = ValidateStructuredBodyHeaders(

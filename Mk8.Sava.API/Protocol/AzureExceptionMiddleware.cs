@@ -32,7 +32,8 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
     private static bool IsKnownStorageException(Exception exception) =>
         exception is AzureStorageException or RequestBodyTooLargeException or StorageConcurrencyException or
             StorageImmutabilityException or StoragePendingCopyException or StorageBlobTypeMismatchException or
-            StoragePathConflictException or XmlException;
+            StoragePathConflictException or XmlException or
+            BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge };
 
     private static AzureStorageException MapException(Exception exception) => exception switch
     {
@@ -41,6 +42,10 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
             StatusCodes.Status413PayloadTooLarge,
             "RequestBodyTooLarge",
             oversized.Message),
+        BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge } => new AzureStorageException(
+            StatusCodes.Status413PayloadTooLarge,
+            "RequestBodyTooLarge",
+            "The request body exceeds the maximum permissible limit."),
         StorageConcurrencyException => AzureStorageException.ConditionNotMet(),
         StorageImmutabilityException immutable => new AzureStorageException(
             StatusCodes.Status409Conflict,
