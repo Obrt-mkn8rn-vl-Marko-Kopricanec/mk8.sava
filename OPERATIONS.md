@@ -7,6 +7,26 @@ may be atomically replaced by background recompression or pack compaction. The
 configured `Sava:DataPath` is a single storage root; do not copy a live root with
 a generic filesystem command and assume the result is consistent.
 
+## Upload request limits
+
+`Sava:MaximumRequestBodyBytes` caps logical upload content; the default is
+5,000 MiB. Each operation also enforces the applicable Blob service-version
+limit. Authenticated body paths using logical size/integrity validation set the
+per-request HTTP transport limit before reading content, so Kestrel's unrelated
+30,000,000-byte default does not reject valid single-request uploads. Other
+request paths keep their existing limits.
+
+Structured XSM CRC64 bodies include framing outside the logical content budget.
+Their bounded transport allowance includes the 21-byte message overhead and up
+to 65,535 segment headers/checksums of 18 bytes each. Decoder length/checksum
+validation and logical upload limits still apply. Oversized logical content or
+a remaining server-side HTTP 413 is returned as Azure `RequestBodyTooLarge`,
+not `InternalError`.
+
+Any reverse proxy or ingress body-size limit is independent of this application
+setting. Configure it to permit the intended operation sizes plus structured
+framing; a lower upstream limit can reject a request before mk8.sava sees it.
+
 ## Publication and failure boundaries
 
 Blob content is staged, authenticated, flushed, and published before its logical

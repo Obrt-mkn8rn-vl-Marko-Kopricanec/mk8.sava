@@ -12,6 +12,9 @@ internal static class StructuredBodyDecoder
     private const int ChecksumLength = 8;
     private const ushort IncludeCrc64 = 0x0001;
 
+    internal const int MaximumEncodingOverhead =
+        HeaderLength + ushort.MaxValue * (SegmentHeaderLength + ChecksumLength) + ChecksumLength;
+
     public static async Task DecodeAsync(
         Stream source,
         Stream destination,

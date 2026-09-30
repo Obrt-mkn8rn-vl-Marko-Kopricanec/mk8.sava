@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   BlobClient,
   BlobSASPermissions,
@@ -49,6 +49,19 @@ try {
   assert.equal(upload._response.status, 201);
   assert.deepEqual(await block.downloadToBuffer(), content);
   assert.deepEqual(await block.downloadToBuffer(12_345, 7_777), content.subarray(12_345, 20_122));
+
+  // The default uploadData single-shot path must work above Kestrel's 30,000,000-byte default.
+  const largeContent = randomBytes(30 * 1024 * 1024);
+  const large = container.getBlockBlobClient("large-single-request.bin");
+  const largeUpload = await large.uploadData(largeContent);
+  assert.equal(largeUpload._response.status, 201);
+  const largeRead = await large.downloadToBuffer();
+  assert.equal(largeRead.length, largeContent.length);
+  assert.equal(
+    createHash("sha256").update(largeRead).digest("hex"),
+    createHash("sha256").update(largeContent).digest("hex"),
+  );
+  assert.deepEqual(await large.downloadToBuffer(4093, 8195), largeContent.subarray(4093, 12_288));
 
   const properties = await block.getProperties();
   assert.equal(properties.contentLength, content.length);
@@ -124,7 +137,7 @@ try {
   assert.deepEqual(await sasBlob.downloadToBuffer(), content);
 
   console.log(
-    `@azure/storage-blob ${sdkPackageVersion} compatibility passed for block, staged, append, page, snapshot, lease, list, tags, ranges, and SAS operations.`,
+    `@azure/storage-blob ${sdkPackageVersion} compatibility passed for block (including 30 MiB single-shot), staged, append, page, snapshot, lease, list, tags, ranges, and SAS operations.`,
   );
 } finally {
   if (created)

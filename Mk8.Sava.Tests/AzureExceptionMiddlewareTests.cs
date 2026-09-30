@@ -113,6 +113,42 @@ public sealed class AzureExceptionMiddlewareTests
     private static AzureExceptionMiddleware CreateMiddleware(RequestDelegate next) =>
         new(next, NullLogger<AzureExceptionMiddleware>.Instance);
 
+    [Theory]
+    [InlineData("PUT")]
+    [InlineData("HEAD")]
+    public async Task TransportBodyLimitIsAnAzure413WithoutLeakingServerDetails(string method)
+    {
+        var context = CreateContext();
+        context.Request.Method = method;
+        var middleware = CreateMiddleware(_ => throw new BadHttpRequestException(
+            "private transport details", StatusCodes.Status413PayloadTooLarge));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, context.Response.StatusCode);
+        Assert.Equal("RequestBodyTooLarge", context.Response.Headers["x-ms-error-code"]);
+        var body = ReadBody(context);
+        Assert.DoesNotContain("private transport details", body, StringComparison.Ordinal);
+        if (HttpMethods.IsHead(method))
+            Assert.Empty(body);
+        else
+            Assert.Contains("<Code>RequestBodyTooLarge</Code>", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task OtherTransportFailuresAreNotMisclassifiedAsOversizedBodies()
+    {
+        var context = CreateContext();
+        var middleware = CreateMiddleware(_ => throw new BadHttpRequestException(
+            "private malformed request details", StatusCodes.Status400BadRequest));
+
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+        Assert.Equal("InternalError", context.Response.Headers["x-ms-error-code"]);
+        Assert.DoesNotContain("private malformed request details", ReadBody(context), StringComparison.Ordinal);
+    }
+
     private static DefaultHttpContext CreateContext()
     {
         var context = new DefaultHttpContext();
