@@ -83,34 +83,48 @@ public sealed class ApplicationRpcClient : IDisposable
     internal async Task<HttpRequestMessage> CreateRequestAsync(
         RpcContract contract, RpcMethod method, object?[] arguments, CancellationToken cancellationToken)
     {
-        PageCopyPlan? pageCopy = null;
-        IPageCopySource? pageSource = null;
         var maximumInputBytes = RpcStreamLimits.InputLimit(method, arguments, storageOptions.MaximumRequestBodyBytes);
+        var lane = RpcControlLane.IsAllowed(contract, method) ? ApplicationRpcLane.Control : ApplicationRpcLane.Bulk;
+        RpcContent content;
         if (method.PageSourceIndex >= 0)
         {
-            pageSource = (IPageCopySource)arguments[method.PageSourceIndex]!;
+            var pageSource = (IPageCopySource)arguments[method.PageSourceIndex]!;
             var currentIndex = Array.FindIndex(method.Parameters, parameter => string.Equals(parameter.Name, "current", StringComparison.Ordinal));
             var current = currentIndex < 0 ? null : (BlobRecord?)arguments[currentIndex];
             var changes = await pageSource.ReadChangesAsync(current?.IncrementalCopySourceSnapshot,
                 current?.Content.Length ?? 0, cancellationToken).ConfigureAwait(false);
-            pageCopy = PageCopyPlan.Create(changes,
+            var pageCopy = PageCopyPlan.Create(changes,
                 ApplicationRpcEndpoint.ReadLongArgument(method, arguments, "sourceLength"));
-            maximumInputBytes = pageCopy.DataLength;
+            content = new PageRpcContent(contract, method, arguments, pageSource, pageCopy,
+                RpcControlLane.FrameLimit(options.MaximumControlFrameBytes, lane), cancellationToken);
         }
-        var input = method.InputIndex >= 0 ? (Stream?)arguments[method.InputIndex] : null;
-        var payload = new RpcRequestPayload(contract.Type.FullName!, method.Id,
-            arguments.Where((_, index) => method.IsControlParameter(index)).ToArray(),
-            input is not null || pageSource is not null, pageCopy?.Descriptor);
-        var lane = RpcControlLane.IsAllowed(contract, method) ? ApplicationRpcLane.Control : ApplicationRpcLane.Bulk;
-        var request = new HttpRequestMessage(HttpMethod.Post, RpcControlLane.GetEndpoint(options.Endpoint!, lane));
+        else
+        {
+            var input = method.InputIndex >= 0 ? (Stream?)arguments[method.InputIndex] : null;
+            var maximumControlBytes = RpcControlLane.FrameLimit(options.MaximumControlFrameBytes, lane);
+            content = input is null
+                ? new EmptyRpcContent(contract, method, arguments, maximumControlBytes, maximumInputBytes, cancellationToken)
+                : new StreamRpcContent(contract, method, arguments, input, maximumControlBytes, maximumInputBytes, cancellationToken);
+        }
+
+        HttpRequestMessage request;
         try
         {
+            request = new HttpRequestMessage(HttpMethod.Post, RpcControlLane.GetEndpoint(options.Endpoint!, lane));
+        }
+        catch
+        {
+            content.Dispose();
+            throw;
+        }
+        try
+        {
+            // Transfer content ownership before header setup, including its failure paths.
+            request.Content = content;
             request.Headers.Add(ApplicationTransportSecurity.AccessKeyHeader, Convert.ToBase64String(accessKey));
             request.Headers.Add(ApplicationTransportSecurity.ProtocolHeader, ApplicationTransportSecurity.ProtocolVersion);
             request.Headers.Add(ApplicationTransportSecurity.PolicyHeader, policy);
             request.Headers.Add(ContractsHeader, RpcContracts.Fingerprint);
-            request.Content = new RpcContent(payload, input, pageSource, pageCopy,
-                RpcControlLane.FrameLimit(options.MaximumControlFrameBytes, lane), maximumInputBytes, cancellationToken);
             return request;
         }
         catch
@@ -184,37 +198,36 @@ public sealed class ApplicationRpcClient : IDisposable
     private static AzureStorageException Unavailable() => new(
         503, "ServerBusy", "The storage application is unavailable or could not complete the operation.");
 
-    private sealed class RpcContent : HttpContent
+    private static RpcRequestPayload CreatePayload(
+        RpcContract contract, RpcMethod method, object?[] arguments, bool hasInput, PageRangeDiff? pageChanges = null) => new(
+            contract.Type.FullName!, method.Id, arguments.Where((_, index) => method.IsControlParameter(index)).ToArray(),
+            hasInput, pageChanges);
+
+    // Only the three private sealed cases select a producer/descriptor/bound.
+    // The content itself owns that choice; no extra per-request wrapper is needed.
+    private abstract class RpcContent : HttpContent
     {
         private readonly RpcRequestPayload request;
-#pragma warning disable CA2213 // Borrowed request stream: its Gateway owner retains and disposes it after RPC completion.
-        private readonly Stream? input;
-#pragma warning restore CA2213
-        private readonly IPageCopySource? pageSource;
-        private readonly PageCopyPlan? pageCopy;
         private readonly int maximumControlBytes;
         private readonly long maximumInputBytes;
         private readonly CancellationToken requestCancellation;
         private ExceptionDispatchInfo? producerFailure;
         private int serializationStarted;
 
-        public RpcContent(RpcRequestPayload request, Stream? input, IPageCopySource? pageSource, PageCopyPlan? pageCopy,
+        protected RpcContent(RpcRequestPayload request,
             int maximumControlBytes, long maximumInputBytes, CancellationToken requestCancellation)
         {
             this.request = request;
-            this.input = input;
-            this.pageSource = pageSource;
-            this.pageCopy = pageCopy;
             this.maximumControlBytes = maximumControlBytes;
             this.maximumInputBytes = maximumInputBytes;
             this.requestCancellation = requestCancellation;
             Headers.ContentType = new MediaTypeHeaderValue(ApplicationTransportSecurity.ContentType);
         }
 
-        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+        protected sealed override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
             WriteAsync(stream, requestCancellation);
 
-        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken) =>
+        protected sealed override Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken) =>
             WriteAsync(stream, cancellationToken);
 
         private async Task WriteAsync(Stream stream, CancellationToken cancellationToken)
@@ -229,10 +242,7 @@ public sealed class ApplicationRpcClient : IDisposable
             {
                 await RpcFrames.WriteControlAsync(trackedWire, request, maximumControlBytes, cancellationToken).ConfigureAwait(false);
                 using var framed = new FramedWriteStream(trackedWire, maximumInputBytes);
-                if (pageSource is not null)
-                    await PageCopyFrames.WriteAsync(pageSource, pageCopy!, framed, cancellationToken).ConfigureAwait(false);
-                else if (input is not null)
-                    await input.CopyToAsync(framed, RpcFrames.MaximumDataFrameBytes, cancellationToken).ConfigureAwait(false);
+                await WriteInputAsync(framed, cancellationToken).ConfigureAwait(false);
                 // This terminal proof is never written if the producer throws or
                 // is canceled, even after every expected payload byte arrived.
                 await framed.CompleteAsync(cancellationToken).ConfigureAwait(false);
@@ -245,6 +255,8 @@ public sealed class ApplicationRpcClient : IDisposable
             }
         }
 
+        protected abstract Task WriteInputAsync(FramedWriteStream destination, CancellationToken cancellationToken);
+
         internal void RethrowProducerFailure()
         {
             var failure = Volatile.Read(ref producerFailure);
@@ -253,10 +265,54 @@ public sealed class ApplicationRpcClient : IDisposable
                 failure.Throw();
         }
 
-        protected override bool TryComputeLength(out long length)
+        protected sealed override bool TryComputeLength(out long length)
         {
             length = 0;
             return false;
         }
+    }
+
+    private sealed class EmptyRpcContent(
+        RpcContract contract, RpcMethod method, object?[] arguments,
+        int maximumControlBytes, long maximumInputBytes, CancellationToken cancellationToken)
+        : RpcContent(CreatePayload(contract, method, arguments, hasInput: false),
+            maximumControlBytes, maximumInputBytes, cancellationToken)
+    {
+        protected override Task WriteInputAsync(FramedWriteStream destination, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class StreamRpcContent : RpcContent
+    {
+#pragma warning disable CA2213 // Borrowed request stream: its Gateway owner retains and disposes it after RPC completion.
+        private readonly Stream input;
+#pragma warning restore CA2213
+
+        internal StreamRpcContent(RpcContract contract, RpcMethod method, object?[] arguments, Stream input,
+            int maximumControlBytes, long maximumInputBytes, CancellationToken cancellationToken)
+            : base(CreatePayload(contract, method, arguments, hasInput: true), maximumControlBytes, maximumInputBytes, cancellationToken)
+        {
+            this.input = input;
+        }
+
+        protected override Task WriteInputAsync(FramedWriteStream destination, CancellationToken cancellationToken) =>
+            input.CopyToAsync(destination, RpcFrames.MaximumDataFrameBytes, cancellationToken);
+    }
+
+    private sealed class PageRpcContent : RpcContent
+    {
+        private readonly IPageCopySource source;
+        private readonly PageCopyPlan plan;
+
+        internal PageRpcContent(RpcContract contract, RpcMethod method, object?[] arguments, IPageCopySource source,
+            PageCopyPlan plan, int maximumControlBytes, CancellationToken cancellationToken)
+            : base(CreatePayload(contract, method, arguments, hasInput: true, plan.Descriptor),
+                maximumControlBytes, plan.DataLength, cancellationToken)
+        {
+            this.source = source;
+            this.plan = plan;
+        }
+
+        protected override Task WriteInputAsync(FramedWriteStream destination, CancellationToken cancellationToken) =>
+            PageCopyFrames.WriteAsync(source, plan, destination, cancellationToken);
     }
 }
