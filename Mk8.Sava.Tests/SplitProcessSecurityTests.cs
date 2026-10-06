@@ -534,22 +534,9 @@ public sealed class SplitProcessSecurityTests
     {
         using var process = Process.Start(start);
         Assert.NotNull(process);
-        var output = process.StandardOutput.ReadToEndAsync();
-        var error = process.StandardError.ReadToEndAsync();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
-        try
-        {
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(true);
-        }
-        finally
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync().ConfigureAwait(true);
-            }
-        }
-        return new OperatorResult(process.ExitCode, await output.ConfigureAwait(true), await error.ConfigureAwait(true));
+        var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(5))
+            .ConfigureAwait(true);
+        return new OperatorResult(result.ExitCode, result.StandardOutput, result.StandardError);
     }
 
     private sealed record DelegationIssue(UserDelegationKey Key, DateTimeOffset Starts, DateTimeOffset Expires);

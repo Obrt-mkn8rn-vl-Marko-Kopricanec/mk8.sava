@@ -4373,13 +4373,11 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         start.Environment[$"Sava__AccountCapabilities__{SavaWebApplicationFactory.AccountName}__HierarchicalNamespaceEnabled"] = "true";
         using var process = Process.Start(start);
         Assert.NotNull(process);
-        var output = process.StandardOutput.ReadToEndAsync();
-        var error = process.StandardError.ReadToEndAsync();
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-        Assert.True(process.ExitCode == 0, await error.ConfigureAwait(false));
+        var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))
+            .ConfigureAwait(false);
+        Assert.True(result.ExitCode == 0, result.StandardError);
         Assert.Contains("Applied HNS access ACLs to 1 existing targets.",
-            await output.ConfigureAwait(false), StringComparison.Ordinal);
+            result.StandardOutput, StringComparison.Ordinal);
     }
 
     [Fact]

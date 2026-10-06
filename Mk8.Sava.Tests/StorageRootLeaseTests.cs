@@ -65,26 +65,12 @@ public sealed class StorageRootLeaseTests
                 await ConfigureContenderAsync(start, dataPath).ConfigureAwait(true);
                 using var contender = Process.Start(start);
                 Assert.NotNull(contender);
-                var output = contender.StandardOutput.ReadToEndAsync();
-                var error = contender.StandardError.ReadToEndAsync();
-                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-                try
-                {
-                    await contender.WaitForExitAsync(timeout.Token).ConfigureAwait(true);
-                }
-                finally
-                {
-                    if (!contender.HasExited)
-                    {
-                        contender.Kill(entireProcessTree: true);
-                        await contender.WaitForExitAsync().ConfigureAwait(true);
-                    }
-                }
-                Assert.Equal(1, contender.ExitCode);
-                Assert.Contains("Unable to acquire the exclusive data-root lease", await error.ConfigureAwait(true),
+                var result = await TestProcessRunner.ObserveAsync(contender, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(true);
+                Assert.Equal(1, result.ExitCode);
+                Assert.Contains("Unable to acquire the exclusive data-root lease", result.StandardError,
                     StringComparison.Ordinal);
-                Assert.DoesNotContain("Unhandled exception", await error.ConfigureAwait(true), StringComparison.Ordinal);
-                _ = await output.ConfigureAwait(true);
+                Assert.DoesNotContain("Unhandled exception", result.StandardError, StringComparison.Ordinal);
                 Assert.True(await holder.Services.GetRequiredService<MetadataStore>()
                     .IsReadyAsync(CancellationToken.None).ConfigureAwait(true));
             }

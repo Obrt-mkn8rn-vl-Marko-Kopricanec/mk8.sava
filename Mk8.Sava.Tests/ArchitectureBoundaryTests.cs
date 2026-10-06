@@ -206,23 +206,9 @@ public sealed class ArchitectureBoundaryTests
         foreach (var argument in new[] { "msbuild", projectPath, "-t:" + target, "-nologo", "-v:quiet", "-nr:false" })
             start.ArgumentList.Add(argument);
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start MSBuild.");
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-        var stdout = process.StandardOutput.ReadToEndAsync();
-        var stderr = process.StandardError.ReadToEndAsync();
-        try
-        {
-            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-            return (process.ExitCode, await stdout.ConfigureAwait(false) + await stderr.ConfigureAwait(false));
-        }
-        finally
-        {
-            if (!process.HasExited)
-            {
-                process.Kill(entireProcessTree: true);
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            await Task.WhenAll(stdout, stderr).ConfigureAwait(false);
-        }
+        var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))
+            .ConfigureAwait(false);
+        return (result.ExitCode, result.StandardOutput + result.StandardError);
     }
 
     private static string FindRepositoryRoot()

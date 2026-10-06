@@ -32,26 +32,12 @@ public sealed class StorageAllocationBenchmarkTests(ITestOutputHelper output)
     {
         using var worker = new Process { StartInfo = CreateWorkerStartInfo() };
         Assert.True(worker.Start());
-        var standardOutput = worker.StandardOutput.ReadToEndAsync();
-        var standardError = worker.StandardError.ReadToEndAsync();
-        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-        try
-        {
-            await worker.WaitForExitAsync(deadline.Token).ConfigureAwait(false);
-        }
-        finally
-        {
-            if (!worker.HasExited)
-            {
-                worker.Kill(entireProcessTree: true);
-                await worker.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            await Task.WhenAll(standardOutput, standardError).ConfigureAwait(false);
-        }
-        var measuredOutput = await standardOutput.ConfigureAwait(false);
+        var result = await TestProcessRunner.ObserveAsync(worker, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5))
+            .ConfigureAwait(false);
+        var measuredOutput = result.StandardOutput;
         output.WriteLine(measuredOutput);
-        output.WriteLine(await standardError.ConfigureAwait(false));
-        Assert.Equal(0, worker.ExitCode);
+        output.WriteLine(result.StandardError);
+        Assert.Equal(0, result.ExitCode);
         foreach (var workload in new[] { "eight_exact_duplicates", "five_shifted_partials", "eight_versions",
                      "one_hundred_twenty_eight_small", "four_incompressible" })
             Assert.Contains(workload + ',', measuredOutput, StringComparison.Ordinal);
