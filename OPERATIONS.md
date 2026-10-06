@@ -197,8 +197,9 @@ on the actual two-process deployment before making those claims.
 
 ### Enforced service dependency boundaries
 
-`Directory.Build.targets` checks evaluated project references during ordinary
-restore/build, including conditional and imported items. Production projects
+`Directory.Build.targets` checks evaluated project references before SDK target
+prerequisites run, including ordinary restore/build and conditional/imported
+items. Production projects
 must retain their registered assembly identities and may reference only these
 root-child projects:
 
