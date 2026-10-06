@@ -5,7 +5,7 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class ApplicationTransportAllocationTests(ITestOutputHelper output)
+public sealed partial class ApplicationTransportAllocationTests(ITestOutputHelper output)
 {
     [Theory]
     [InlineData(0L)]
