@@ -136,9 +136,10 @@ public sealed class ApplicationRpcEndpoint : IDisposable
         HttpContext context, IApplicationRpcDispatcher dispatcher, RpcRequest request, RpcContract contract,
         RpcMethod method, object?[] arguments, CancellationToken cancellationToken)
     {
-        using var input = new FramedReadStream(context.Request.Body, GetMaximumInputBytes(method, request, arguments));
-        using var pageSource = method.PageSourceIndex >= 0
-            ? new PageCopyFrames.ServerSource(request.PageChanges!, input) : null;
+        var pageCopy = method.PageSourceIndex >= 0 ? PreparePageCopy(request, method, arguments) : null;
+        using var input = new FramedReadStream(context.Request.Body,
+            pageCopy?.DataLength ?? GetMaximumInputBytes(method, request, arguments));
+        using var pageSource = pageCopy is null ? null : new PageCopyFrames.ServerSource(pageCopy, input);
         if (pageSource is not null)
             arguments[method.PageSourceIndex] = pageSource;
         else if (method.InputIndex >= 0)
@@ -169,12 +170,6 @@ public sealed class ApplicationRpcEndpoint : IDisposable
 
     private long GetMaximumInputBytes(RpcMethod method, RpcRequest request, object?[] arguments)
     {
-        if (method.PageSourceIndex >= 0)
-        {
-            if (request.PageChanges is null || !request.HasInput)
-                throw new InvalidDataException("The application page-copy descriptor is missing.");
-            return PageCopyFrames.Validate(request.PageChanges, ReadLongArgument(method, arguments, "sourceLength"));
-        }
         if (request.PageChanges is not null || (request.HasInput && method.InputIndex < 0))
             throw new InvalidDataException("The application input does not match its operation.");
         if (method.InputIndex < 0)
@@ -186,6 +181,13 @@ public sealed class ApplicationRpcEndpoint : IDisposable
                 throw new InvalidDataException("A page-clear operation cannot carry an input stream.");
         }
         return RpcStreamLimits.InputLimit(method, arguments, storageOptions.MaximumRequestBodyBytes);
+    }
+
+    private static PageCopyPlan PreparePageCopy(RpcRequest request, RpcMethod method, object?[] arguments)
+    {
+        if (request.PageChanges is null || !request.HasInput)
+            throw new InvalidDataException("The application page-copy descriptor is missing.");
+        return PageCopyPlan.Create(request.PageChanges, ReadLongArgument(method, arguments, "sourceLength"));
     }
 
     private FramedWriteStream? CreateOutput(HttpContext context, RpcMethod method, object?[] arguments)

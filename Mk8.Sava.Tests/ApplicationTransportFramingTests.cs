@@ -263,8 +263,9 @@ public sealed class ApplicationTransportFramingTests
             await writer.WriteAsync(new byte[512]);
         wire.Position = 0;
         using var input = new FramedReadStream(wire, 512);
-        using var source = new PageCopyFrames.ServerSource(changes, input);
-        Assert.Same(changes, await source.ReadChangesAsync(null, 0, CancellationToken.None));
+        var plan = PageCopyPlan.Create(changes, 512);
+        using var source = new PageCopyFrames.ServerSource(plan, input);
+        Assert.Same(plan.Descriptor, await source.ReadChangesAsync(null, 0, CancellationToken.None));
         var consumed = false;
 
         await Assert.ThrowsAsync<EndOfStreamException>(() => source.ReadRangeAsync(new PageRange(0, 511),
@@ -282,7 +283,8 @@ public sealed class ApplicationTransportFramingTests
     {
         using var wire = new MemoryStream();
         using var input = new FramedReadStream(wire, 0);
-        using var source = new PageCopyFrames.ServerSource(new PageRangeDiff([], [new PageRange(0, 511)]), input);
+        using var source = new PageCopyFrames.ServerSource(
+            PageCopyPlan.Create(new PageRangeDiff([], [new PageRange(0, 511)]), 0), input);
 
         await Assert.ThrowsAsync<EndOfStreamException>(() => source.ReadChangesAsync(null, 512, CancellationToken.None));
     }
@@ -293,9 +295,10 @@ public sealed class ApplicationTransportFramingTests
         using var wire = await CreateWireAsync([]);
         using var input = new FramedReadStream(wire, 0);
         var changes = new PageRangeDiff([], [new PageRange(0, 511)]);
-        using var source = new PageCopyFrames.ServerSource(changes, input);
+        var plan = PageCopyPlan.Create(changes, 0);
+        using var source = new PageCopyFrames.ServerSource(plan, input);
 
-        Assert.Same(changes, await source.ReadChangesAsync(null, 512, CancellationToken.None));
+        Assert.Same(plan.Descriptor, await source.ReadChangesAsync(null, 512, CancellationToken.None));
         Assert.Equal(wire.Length, wire.Position);
     }
 
@@ -321,7 +324,7 @@ public sealed class ApplicationTransportFramingTests
         var bytes = RandomNumberGenerator.GetBytes(1024);
         using var wire = await CreateWireAsync(bytes);
         using var input = new FramedReadStream(wire, 1024);
-        using var source = new PageCopyFrames.ServerSource(changes, input);
+        using var source = new PageCopyFrames.ServerSource(PageCopyPlan.Create(changes, 1536), input);
         await source.ReadChangesAsync(null, 0, CancellationToken.None);
         using var received = new MemoryStream();
 
@@ -338,7 +341,7 @@ public sealed class ApplicationTransportFramingTests
         using var wire = await CreateWireAsync(new byte[1024]);
         using var input = new FramedReadStream(wire, 1024);
         using var source = new PageCopyFrames.ServerSource(
-            new PageRangeDiff([new PageRange(0, 511), new PageRange(1024, 1535)], []), input);
+            PageCopyPlan.Create(new PageRangeDiff([new PageRange(0, 511), new PageRange(1024, 1535)], []), 1536), input);
         await source.ReadChangesAsync(null, 0, CancellationToken.None);
 
         await Assert.ThrowsAsync<InvalidDataException>(() => source.ReadRangeAsync(new PageRange(1024, 1535),

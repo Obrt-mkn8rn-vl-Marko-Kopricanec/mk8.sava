@@ -12,7 +12,7 @@ using Mk8.Sava.Transport;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class ApplicationTransportSecurityTests : IDisposable
+public sealed partial class ApplicationTransportSecurityTests : IDisposable
 {
     private readonly DirectoryInfo directory = Directory.CreateTempSubdirectory("mk8-sava-rpc-security-");
     private readonly byte[] accessKey = RandomNumberGenerator.GetBytes(32);

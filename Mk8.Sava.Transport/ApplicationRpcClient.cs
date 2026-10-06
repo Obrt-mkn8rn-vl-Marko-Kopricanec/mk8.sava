@@ -83,7 +83,7 @@ public sealed class ApplicationRpcClient : IDisposable
     internal async Task<HttpRequestMessage> CreateRequestAsync(
         RpcContract contract, RpcMethod method, object?[] arguments, CancellationToken cancellationToken)
     {
-        PageRangeDiff? changes = null;
+        PageCopyPlan? pageCopy = null;
         IPageCopySource? pageSource = null;
         var maximumInputBytes = RpcStreamLimits.InputLimit(method, arguments, storageOptions.MaximumRequestBodyBytes);
         if (method.PageSourceIndex >= 0)
@@ -91,15 +91,16 @@ public sealed class ApplicationRpcClient : IDisposable
             pageSource = (IPageCopySource)arguments[method.PageSourceIndex]!;
             var currentIndex = Array.FindIndex(method.Parameters, parameter => string.Equals(parameter.Name, "current", StringComparison.Ordinal));
             var current = currentIndex < 0 ? null : (BlobRecord?)arguments[currentIndex];
-            changes = await pageSource.ReadChangesAsync(current?.IncrementalCopySourceSnapshot,
+            var changes = await pageSource.ReadChangesAsync(current?.IncrementalCopySourceSnapshot,
                 current?.Content.Length ?? 0, cancellationToken).ConfigureAwait(false);
-            maximumInputBytes = PageCopyFrames.Validate(changes,
+            pageCopy = PageCopyPlan.Create(changes,
                 ApplicationRpcEndpoint.ReadLongArgument(method, arguments, "sourceLength"));
+            maximumInputBytes = pageCopy.DataLength;
         }
         var input = method.InputIndex >= 0 ? (Stream?)arguments[method.InputIndex] : null;
         var payload = new RpcRequestPayload(contract.Type.FullName!, method.Id,
             arguments.Where((_, index) => method.IsControlParameter(index)).ToArray(),
-            input is not null || pageSource is not null, changes);
+            input is not null || pageSource is not null, pageCopy?.Descriptor);
         var lane = RpcControlLane.IsAllowed(contract, method) ? ApplicationRpcLane.Control : ApplicationRpcLane.Bulk;
         var request = new HttpRequestMessage(HttpMethod.Post, RpcControlLane.GetEndpoint(options.Endpoint!, lane));
         try
@@ -108,7 +109,7 @@ public sealed class ApplicationRpcClient : IDisposable
             request.Headers.Add(ApplicationTransportSecurity.ProtocolHeader, ApplicationTransportSecurity.ProtocolVersion);
             request.Headers.Add(ApplicationTransportSecurity.PolicyHeader, policy);
             request.Headers.Add(ContractsHeader, RpcContracts.Fingerprint);
-            request.Content = new RpcContent(payload, input, pageSource, changes,
+            request.Content = new RpcContent(payload, input, pageSource, pageCopy,
                 RpcControlLane.FrameLimit(options.MaximumControlFrameBytes, lane), maximumInputBytes, cancellationToken);
             return request;
         }
@@ -190,20 +191,20 @@ public sealed class ApplicationRpcClient : IDisposable
         private readonly Stream? input;
 #pragma warning restore CA2213
         private readonly IPageCopySource? pageSource;
-        private readonly PageRangeDiff? changes;
+        private readonly PageCopyPlan? pageCopy;
         private readonly int maximumControlBytes;
         private readonly long maximumInputBytes;
         private readonly CancellationToken requestCancellation;
         private ExceptionDispatchInfo? producerFailure;
         private int serializationStarted;
 
-        public RpcContent(RpcRequestPayload request, Stream? input, IPageCopySource? pageSource, PageRangeDiff? changes,
+        public RpcContent(RpcRequestPayload request, Stream? input, IPageCopySource? pageSource, PageCopyPlan? pageCopy,
             int maximumControlBytes, long maximumInputBytes, CancellationToken requestCancellation)
         {
             this.request = request;
             this.input = input;
             this.pageSource = pageSource;
-            this.changes = changes;
+            this.pageCopy = pageCopy;
             this.maximumControlBytes = maximumControlBytes;
             this.maximumInputBytes = maximumInputBytes;
             this.requestCancellation = requestCancellation;
@@ -229,7 +230,7 @@ public sealed class ApplicationRpcClient : IDisposable
                 await RpcFrames.WriteControlAsync(trackedWire, request, maximumControlBytes, cancellationToken).ConfigureAwait(false);
                 using var framed = new FramedWriteStream(trackedWire, maximumInputBytes);
                 if (pageSource is not null)
-                    await PageCopyFrames.WriteAsync(pageSource, changes!, framed, cancellationToken).ConfigureAwait(false);
+                    await PageCopyFrames.WriteAsync(pageSource, pageCopy!, framed, cancellationToken).ConfigureAwait(false);
                 else if (input is not null)
                     await input.CopyToAsync(framed, RpcFrames.MaximumDataFrameBytes, cancellationToken).ConfigureAwait(false);
                 // This terminal proof is never written if the producer throws or
