@@ -6,6 +6,10 @@ namespace Mk8.Sava.Storage;
 // advances at most the configured number of directory or entry operations.
 internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDisposable
 {
+    private readonly string _chunkPrefix = paths.Chunks + Path.DirectorySeparatorChar;
+    private readonly string _packPrefix = paths.Packs + Path.DirectorySeparatorChar;
+    private readonly string _databaseWal = paths.Database + "-wal";
+    private readonly string _databaseSharedMemory = paths.Database + "-shm";
     private readonly Stack<IEnumerator<FileSystemInfo>> _directories = new();
     private readonly HashSet<(uint Major, uint Minor, ulong Inode)> _hardLinks = [];
     private FileSystemInfo? _nextEntry = new DirectoryInfo(paths.Root);
@@ -184,24 +188,25 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
 
     private void ClassifyFile(string path, long length)
     {
-        if (path.StartsWith(paths.Chunks + Path.DirectorySeparatorChar, PathComparison) &&
+        if (path.StartsWith(_chunkPrefix, PathComparison) &&
             path.EndsWith(".chunk", StringComparison.Ordinal))
         {
             _chunkBytes = checked(_chunkBytes + length);
             _standaloneChunkCount++;
         }
-        else if (path.StartsWith(paths.Packs + Path.DirectorySeparatorChar, PathComparison) &&
+        else if (path.StartsWith(_packPrefix, PathComparison) &&
                  path.EndsWith(".pack", StringComparison.Ordinal))
         {
             _chunkBytes = checked(_chunkBytes + length);
         }
-        else if (string.Equals(Path.GetDirectoryName(path), paths.Staging, PathComparison))
+        // FileSystemInfo.FullName and StoragePaths are already canonical paths.
+        else if (Path.GetDirectoryName(path.AsSpan()).Equals(paths.Staging.AsSpan(), PathComparison))
         {
             _stagingBytes = checked(_stagingBytes + length);
         }
         else if (string.Equals(path, paths.Database, PathComparison) ||
-                 string.Equals(path, paths.Database + "-wal", PathComparison) ||
-                 string.Equals(path, paths.Database + "-shm", PathComparison))
+                 string.Equals(path, _databaseWal, PathComparison) ||
+                 string.Equals(path, _databaseSharedMemory, PathComparison))
         {
             _metadataBytes = checked(_metadataBytes + length);
         }

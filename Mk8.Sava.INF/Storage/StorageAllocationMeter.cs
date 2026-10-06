@@ -87,8 +87,7 @@ internal static class StorageAllocationMeter
 
     internal static bool TryStat(string path, out AllocationStat stat)
     {
-        var buffer = new byte[256];
-        if (Statx(AtFdcwd, path, AtSymlinkNoFollow, StatxBasicStats, buffer) != 0)
+        if (Statx(AtFdcwd, path, AtSymlinkNoFollow, StatxBasicStats, out var buffer) != 0)
         {
             var error = Marshal.GetLastPInvokeError();
             if (error is NoEntry or NotDirectory)
@@ -101,14 +100,14 @@ internal static class StorageAllocationMeter
             throw new IOException($"Cannot measure filesystem allocation (statx error {error}).");
         }
 
-        if ((BitConverter.ToUInt32(buffer, 0) & StatxBlocks) == 0)
+        if ((buffer.Mask & StatxBlocks) == 0)
             throw new PlatformNotSupportedException("This filesystem does not report allocated blocks.");
         stat = new AllocationStat(
-            checked((long)BitConverter.ToUInt64(buffer, 48) * 512),
-            BitConverter.ToUInt32(buffer, 16),
-            BitConverter.ToUInt64(buffer, 32),
-            BitConverter.ToUInt32(buffer, 136),
-            BitConverter.ToUInt32(buffer, 140));
+            checked((long)buffer.Blocks * 512),
+            buffer.LinkCount,
+            buffer.Inode,
+            buffer.DeviceMajor,
+            buffer.DeviceMinor);
         return true;
     }
 
@@ -120,6 +119,30 @@ internal static class StorageAllocationMeter
         uint DeviceMajor,
         uint DeviceMinor);
 
+    // Linux UAPI struct statx is 0x100 bytes, including reserved fields. Keep
+    // its complete native output size while naming only the fields we consume.
+    [StructLayout(LayoutKind.Explicit, Size = 256)]
+    private readonly struct StatxBuffer
+    {
+        [field: FieldOffset(0)]
+        public uint Mask { get; init; }
+
+        [field: FieldOffset(16)]
+        public uint LinkCount { get; init; }
+
+        [field: FieldOffset(32)]
+        public ulong Inode { get; init; }
+
+        [field: FieldOffset(48)]
+        public ulong Blocks { get; init; }
+
+        [field: FieldOffset(136)]
+        public uint DeviceMajor { get; init; }
+
+        [field: FieldOffset(140)]
+        public uint DeviceMinor { get; init; }
+    }
+
     [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
     [DllImport("libc", EntryPoint = "statx", CharSet = CharSet.Unicode, ExactSpelling = true,
         BestFitMapping = false, ThrowOnUnmappableChar = true, SetLastError = true)]
@@ -128,5 +151,5 @@ internal static class StorageAllocationMeter
         [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
         int flags,
         uint mask,
-        [Out] byte[] buffer);
+        out StatxBuffer buffer);
 }
