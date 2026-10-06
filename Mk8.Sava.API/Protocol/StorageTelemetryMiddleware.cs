@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text;
+using Mk8.Sava.Hosting;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -15,6 +16,8 @@ internal sealed class StorageTelemetryMiddleware(
 {
     public async Task InvokeAsync(HttpContext context)
     {
+        using var admissionScope = new GatewayRequestAdmissionScope();
+        context.Features.Set(admissionScope);
         var startedAt = timeProvider.GetUtcNow();
         var started = Stopwatch.GetTimestamp();
         try
@@ -42,10 +45,11 @@ internal sealed class StorageTelemetryMiddleware(
             {
                 try
                 {
+                    using var analyticsDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(5), timeProvider);
                     var completedAt = timeProvider.GetUtcNow();
                     await analytics.RecordAsync(
                         CaptureAnalyticsRequest(context, request, startedAt, completedAt, elapsed),
-                        CancellationToken.None).ConfigureAwait(false);
+                        analyticsDeadline.Token).ConfigureAwait(false);
                 }
 #pragma warning disable CA1031 // Best-effort analytics must not fail the completed storage request.
                 catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
