@@ -7,7 +7,7 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
 {
     private readonly IncrementalHash hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
     private readonly byte[] header = new byte[4];
-    private readonly byte[] frame = new byte[RpcFrames.MaximumDataFrameBytes];
+    private byte[] frame = [];
     private int frameOffset;
     private int frameLength;
     private long receivedBytes;
@@ -39,8 +39,12 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
                 await VerifyTerminalAsync(cancellationToken).ConfigureAwait(false);
                 return 0;
             }
-            if (length < 0 || length > frame.Length || length > maximumBytes - receivedBytes)
+            if (length < 0 || length > RpcFrames.MaximumDataFrameBytes || length > maximumBytes - receivedBytes)
                 throw new InvalidDataException("The application transport data frame exceeds its configured bound.");
+            // Empty/control RPCs require proof, not a 64 KiB data reservation.
+            // Validate an untrusted header before creating the bounded buffer.
+            if (frame.Length == 0)
+                frame = new byte[RpcFrames.MaximumDataFrameBytes];
             await source.ReadExactlyAsync(frame.AsMemory(0, length), cancellationToken).ConfigureAwait(false);
             hash.AppendData(frame.AsSpan(0, length));
             receivedBytes += length;
