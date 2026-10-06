@@ -37,8 +37,7 @@ internal static class TestProcessRunner
         {
             if (!completion.IsCompletedSuccessfully)
             {
-                timeout.Cancel();
-                cleanupState = await CleanUpAsync(process, completion, cleanupTimeout).ConfigureAwait(false);
+                cleanupState = await CleanUpAsync(process, completion, timeout, cleanupTimeout).ConfigureAwait(false);
             }
         }
 
@@ -53,9 +52,11 @@ internal static class TestProcessRunner
         throw new TimeoutException(diagnostic, interruption);
     }
 
-    private static async Task<string> CleanUpAsync(Process process, Task completion, TimeSpan cleanupTimeout)
+    private static async Task<string> CleanUpAsync(
+        Process process, Task completion, CancellationTokenSource observationTimeout, TimeSpan cleanupTimeout)
     {
         using var cleanup = new CancellationTokenSource(cleanupTimeout);
+        var cleanupCompletion = Task.WhenAll(completion, observationTimeout.CancelAsync());
         var errors = new StringBuilder();
         try
         {
@@ -74,7 +75,7 @@ internal static class TestProcessRunner
         try
         {
             await process.WaitForExitAsync(cleanup.Token).ConfigureAwait(false);
-            await completion.WaitAsync(cleanup.Token).ConfigureAwait(false);
+            await cleanupCompletion.WaitAsync(cleanup.Token).ConfigureAwait(false);
         }
         catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
@@ -83,17 +84,17 @@ internal static class TestProcessRunner
         finally
         {
             // Never wait without a deadline. Observe an eventual fault if native I/O outlives cleanup.
-            _ = completion.ContinueWith(static finished => _ = finished.Exception,
+            _ = cleanupCompletion.ContinueWith(static finished => _ = finished.Exception,
                 CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
         }
-        return $"Cleanup RootExited={process.HasExited}, ObservationSettled={completion.IsCompleted}" + errors;
+        return $"Cleanup RootExited={process.HasExited}, ObservationSettled={cleanupCompletion.IsCompleted}" + errors;
     }
 
     private sealed class CapturedOutput
     {
         private readonly StringBuilder text = new();
-        private readonly object gate = new();
+        private readonly Lock gate = new();
         private bool reachedEof;
 
         internal string Text { get { lock (gate) return text.ToString(); } }

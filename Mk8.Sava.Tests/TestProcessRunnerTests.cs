@@ -13,8 +13,9 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [InlineData("both")]
     public async Task ExitedRootWithInheritedPipesHasAWholeObservationDeadline(string inherited)
     {
-        await using var fixture = await ProcessFixture.StartAsync(inherited).ConfigureAwait(false);
-        await fixture.ReleaseRootAsync().ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync(inherited).ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
         Assert.True(fixture.Root.HasExited);
         Assert.NotNull(fixture.Descendant);
         Assert.False(fixture.Descendant.HasExited);
@@ -23,13 +24,13 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
         try
         {
             var failure = await Assert.ThrowsAsync<TimeoutException>(() => observation.WaitAsync(TimeSpan.FromSeconds(6)))
-                .ConfigureAwait(false);
+                .ConfigureAwait(true);
 
             Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("RootExited=True", failure.Message, StringComparison.Ordinal);
-            Assert.Contains($"StdoutEof={inherited == "stderr"}", failure.Message, StringComparison.Ordinal);
-            Assert.Contains($"StderrEof={inherited == "stdout"}", failure.Message, StringComparison.Ordinal);
+            Assert.Contains($"StdoutEof={string.Equals(inherited, "stderr", StringComparison.Ordinal)}", failure.Message, StringComparison.Ordinal);
+            Assert.Contains($"StderrEof={string.Equals(inherited, "stdout", StringComparison.Ordinal)}", failure.Message, StringComparison.Ordinal);
             Assert.Contains("descendant exit is not established", failure.Message, StringComparison.Ordinal);
             Assert.False(fixture.Descendant.HasExited);
             output.WriteLine($"{inherited}: bounded observation returned after {watch.Elapsed.TotalMilliseconds:F3} ms; " +
@@ -37,8 +38,8 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
         }
         finally
         {
-            await fixture.ReleaseDescendantAsync().ConfigureAwait(false);
-            await ObserveTestCompletionAsync(observation).ConfigureAwait(false);
+            await fixture.ReleaseDescendantAsync().ConfigureAwait(true);
+            await ObserveTestCompletionAsync(observation).ConfigureAwait(true);
         }
     }
 
@@ -47,11 +48,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [InlineData(23)]
     public async Task OrdinaryExitPreservesExitCodeAndBothUnterminatedOutputs(int exitCode)
     {
-        await using var fixture = await ProcessFixture.StartAsync("ordinary", exitCode).ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("ordinary", exitCode).ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
         var observation = TestProcessRunner.ObserveAsync(fixture.Root, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2));
-        await fixture.ReleaseRootAsync().ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
 
-        var result = await observation.ConfigureAwait(false);
+        var result = await observation.ConfigureAwait(true);
 
         Assert.Equal(exitCode, result.ExitCode);
         Assert.Equal("root-output-without-newline", result.StandardOutput);
@@ -61,11 +63,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task RootExitAndBothEofsDoNotProveDescendantExit()
     {
-        await using var fixture = await ProcessFixture.StartAsync("neither").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("neither").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
         var observation = TestProcessRunner.ObserveAsync(fixture.Root, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2));
-        await fixture.ReleaseRootAsync().ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
 
-        var result = await observation.ConfigureAwait(false);
+        var result = await observation.ConfigureAwait(true);
 
         Assert.Equal(0, result.ExitCode);
         Assert.NotNull(fixture.Descendant);
@@ -76,11 +79,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task TimeoutKillsAnOwnedLiveRootAndRetainsPartialOutput()
     {
-        await using var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
 
         var failure = await Assert.ThrowsAsync<TimeoutException>(() => TestProcessRunner.ObserveAsync(
             fixture.Root, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)).WaitAsync(TimeSpan.FromSeconds(6)))
-            .ConfigureAwait(false);
+            .ConfigureAwait(true);
 
         Assert.True(fixture.Root.HasExited);
         Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
@@ -91,14 +95,15 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task CallerCancellationUsesIndependentCleanupAndPreservesItsToken()
     {
-        await using var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
         using var cancellation = new CancellationTokenSource();
         var observation = TestProcessRunner.ObserveAsync(fixture.Root,
             TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2), cancellation.Token);
-        cancellation.Cancel();
+        await cancellation.CancelAsync().WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
 
         var failure = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => observation.WaitAsync(TimeSpan.FromSeconds(6)))
-            .ConfigureAwait(false);
+            .ConfigureAwait(true);
 
         Assert.Equal(cancellation.Token, failure.CancellationToken);
         Assert.True(fixture.Root.HasExited);
@@ -107,11 +112,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task BothEofsWithoutRootExitStillExpireTheAggregateDeadline()
     {
-        await using var fixture = await ProcessFixture.StartAsync("closed").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("closed").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
 
         var failure = await Assert.ThrowsAsync<TimeoutException>(() => TestProcessRunner.ObserveAsync(
             fixture.Root, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)).WaitAsync(TimeSpan.FromSeconds(6)))
-            .ConfigureAwait(false);
+            .ConfigureAwait(true);
 
         Assert.Contains("RootExited=False, StdoutEof=True, StderrEof=True", failure.Message, StringComparison.Ordinal);
         Assert.Contains("Cleanup RootExited=True", failure.Message, StringComparison.Ordinal);
@@ -121,15 +127,16 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task LiveRootTimeoutAttemptsOwnedTreeCleanupWithoutInferringAllDescendantExit()
     {
-        await using var fixture = await ProcessFixture.StartAsync("both").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("both").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
 
         var failure = await Assert.ThrowsAsync<TimeoutException>(() => TestProcessRunner.ObserveAsync(
             fixture.Root, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)).WaitAsync(TimeSpan.FromSeconds(6)))
-            .ConfigureAwait(false);
+            .ConfigureAwait(true);
 
         Assert.True(fixture.Root.HasExited);
         Assert.Contains("descendant exit is not established", failure.Message, StringComparison.Ordinal);
-        await fixture.ReleaseDescendantAsync().ConfigureAwait(false);
+        await fixture.ReleaseDescendantAsync().ConfigureAwait(true);
         Assert.NotNull(fixture.Descendant);
         Assert.True(fixture.Descendant.HasExited);
     }
@@ -137,11 +144,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task ConcurrentDrainsPreserveOutputsLargerThanEitherNativePipeBuffer()
     {
-        await using var fixture = await ProcessFixture.StartAsync("flood").ConfigureAwait(false);
+        var fixture = await ProcessFixture.StartAsync("flood").ConfigureAwait(true);
+        await using var fixtureLifetime = fixture.ConfigureAwait(false);
         var observation = TestProcessRunner.ObserveAsync(fixture.Root, TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2));
-        await fixture.ReleaseRootAsync().ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
 
-        var result = await observation.ConfigureAwait(false);
+        var result = await observation.ConfigureAwait(true);
 
         Assert.Equal(0, result.ExitCode);
         Assert.Equal("root-output-without-newline" + new string('o', 262144), result.StandardOutput);
@@ -160,25 +168,39 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
 
     private sealed class ProcessFixture : IAsyncDisposable
     {
-        private readonly DirectoryInfo directory;
+        private readonly DirectoryInfo temporaryDirectory;
         private readonly string releaseRoot;
         private readonly string releaseDescendant;
+        private Process? startedRoot;
 
-        private ProcessFixture(DirectoryInfo directory, Process root)
+        private ProcessFixture(DirectoryInfo directory)
         {
-            this.directory = directory;
-            Root = root;
+            temporaryDirectory = directory;
             releaseRoot = Path.Combine(directory.FullName, "release-root");
             releaseDescendant = Path.Combine(directory.FullName, "release-descendant");
         }
 
-        internal Process Root { get; }
+        internal Process Root => startedRoot ?? throw new InvalidOperationException("The fixture root has not started.");
         internal Process? Descendant { get; private set; }
 
         internal static async Task<ProcessFixture> StartAsync(string inherited, int exitCode = 0)
         {
-            var directory = Directory.CreateTempSubdirectory("sava-process-bound-");
-            var script = Path.Combine(directory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
+            var fixture = new ProcessFixture(Directory.CreateTempSubdirectory("sava-process-bound-"));
+            try
+            {
+                await fixture.InitializeAsync(inherited, exitCode).ConfigureAwait(false);
+                return fixture;
+            }
+            catch
+            {
+                await fixture.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        private async Task InitializeAsync(string inherited, int exitCode)
+        {
+            var script = Path.Combine(temporaryDirectory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
             await File.WriteAllTextAsync(script, OperatingSystem.IsWindows() ? WindowsScript : UnixScript)
                 .ConfigureAwait(false);
             var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "pwsh" : "bash")
@@ -192,41 +214,31 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                 : new[] { "--noprofile", "--norc", script })
                 start.ArgumentList.Add(argument);
             start.ArgumentList.Add("root");
-            start.ArgumentList.Add(directory.FullName);
+            start.ArgumentList.Add(temporaryDirectory.FullName);
             start.ArgumentList.Add(inherited);
             start.ArgumentList.Add(exitCode.ToString(CultureInfo.InvariantCulture));
-            var root = Process.Start(start) ?? throw new InvalidOperationException("The process fixture did not start.");
-            var fixture = new ProcessFixture(directory, root);
-            try
+            startedRoot = Process.Start(start) ?? throw new InvalidOperationException("The process fixture did not start.");
+            using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            while (!File.Exists(Path.Combine(temporaryDirectory.FullName, "ready")))
             {
-                using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-                while (!File.Exists(Path.Combine(directory.FullName, "ready")))
+                if (Root.HasExited)
                 {
-                    if (root.HasExited)
-                    {
-                        var failure = await TestProcessRunner.ObserveAsync(root, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1))
-                            .ConfigureAwait(false);
-                        throw new InvalidOperationException($"Fixture exited before readiness ({failure.ExitCode}): " +
-                            failure.StandardOutput + failure.StandardError);
-                    }
-                    await Task.Delay(20, startup.Token).ConfigureAwait(false);
+                    var failure = await TestProcessRunner.ObserveAsync(Root, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1))
+                        .ConfigureAwait(false);
+                    throw new InvalidOperationException($"Fixture exited before readiness ({failure.ExitCode}): " +
+                        failure.StandardOutput + failure.StandardError);
                 }
-                var childPath = Path.Combine(directory.FullName, "descendant-pid");
-                if (File.Exists(childPath))
-                {
-                    var childId = int.Parse(await File.ReadAllTextAsync(childPath, startup.Token).ConfigureAwait(false),
-                        CultureInfo.InvariantCulture);
-                    fixture.Descendant = Process.GetProcessById(childId);
-                    // Bind the known live child before its parent exits; do not rediscover it by PID during cleanup.
-                    _ = fixture.Descendant.SafeHandle;
-                    fixture.Descendant.EnableRaisingEvents = true;
-                }
-                return fixture;
+                await Task.Delay(20, startup.Token).ConfigureAwait(false);
             }
-            catch
+            var childPath = Path.Combine(temporaryDirectory.FullName, "descendant-pid");
+            if (File.Exists(childPath))
             {
-                await fixture.DisposeAsync().ConfigureAwait(false);
-                throw;
+                var childId = int.Parse(await File.ReadAllTextAsync(childPath, startup.Token).ConfigureAwait(false),
+                    CultureInfo.InvariantCulture);
+                Descendant = Process.GetProcessById(childId);
+                // Bind the known live child before its parent exits; do not rediscover it by PID during cleanup.
+                _ = Descendant.SafeHandle;
+                Descendant.EnableRaisingEvents = true;
             }
         }
 
@@ -254,13 +266,13 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             {
                 await File.WriteAllTextAsync(releaseDescendant, string.Empty).ConfigureAwait(false);
                 await StopOwnedProcessAsync(Descendant).ConfigureAwait(false);
-                await StopOwnedProcessAsync(Root).ConfigureAwait(false);
+                await StopOwnedProcessAsync(startedRoot).ConfigureAwait(false);
             }
             finally
             {
                 Descendant?.Dispose();
-                Root.Dispose();
-                directory.Delete(recursive: true);
+                startedRoot?.Dispose();
+                temporaryDirectory.Delete(recursive: true);
             }
         }
 
