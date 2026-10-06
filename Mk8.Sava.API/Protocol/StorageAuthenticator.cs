@@ -13,7 +13,7 @@ namespace Mk8.Sava.Protocol;
 
 internal sealed class StorageAuthenticator(
     IOptions<SavaOptions> options,
-    MetadataStore metadata,
+    IMetadataApplication metadata,
     IGroupMembershipResolver groupMembershipResolver,
     ILogger<StorageAuthenticator> logger)
 {
@@ -635,11 +635,11 @@ internal sealed class StorageAuthenticator(
         if (issued is null)
             return directlyGrantedPermissions;
         var effective = new HashSet<char>(directlyGrantedPermissions);
-        foreach (var role in issued.Value.Roles)
+        foreach (var role in issued.Roles)
         {
             if (_options.BearerAuthentication.RolePermissions.TryGetValue(role, out var currentPermissions))
             {
-                effective.UnionWith(currentPermissions.Where(issued.Value.IssuedPermissions.Contains));
+                effective.UnionWith(currentPermissions.Where(issued.IssuedPermissions.Contains));
             }
         }
         return new string(signedPermissions.Where(effective.Contains).ToArray());

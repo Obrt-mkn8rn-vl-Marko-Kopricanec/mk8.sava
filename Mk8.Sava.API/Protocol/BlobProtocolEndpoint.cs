@@ -19,7 +19,7 @@ internal static class BlobProtocolEndpoint
     public static async Task HandleAsync(HttpContext http)
     {
         var request = StorageRequestContext.Get(http);
-        var service = http.RequestServices.GetRequiredService<BlobService>();
+        var service = http.RequestServices.GetRequiredService<IBlobApplication>();
         var cancellationToken = http.RequestAborted;
 
         if (request.ResourceKind != StorageResourceKind.StaticWebsite &&
@@ -63,7 +63,7 @@ internal static class BlobProtocolEndpoint
     private static Task HandleAccountInformationAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service)
+        IBlobApplication service)
     {
         if (!string.Equals(
                 http.Request.Query["comp"].ToString(),
@@ -92,7 +92,7 @@ internal static class BlobProtocolEndpoint
     private static async Task HandleServiceAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
@@ -183,7 +183,7 @@ internal static class BlobProtocolEndpoint
     private static async Task ListContainersAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         Require(request, 'l');
@@ -192,7 +192,8 @@ internal static class BlobProtocolEndpoint
         var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
         var includes = SplitCsv(http.Request.Query["include"].ToString());
         ValidateContainerListFeatures(request, includes);
-        var containers = await service.ListContainersPageAsync(
+        var containers = await GatewayListing.ListContainersAsync(
+            service,
             request.Account,
             includes.Contains("deleted"),
             includes.Contains("system"),
@@ -214,7 +215,7 @@ internal static class BlobProtocolEndpoint
     private static async Task PutServicePropertiesAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         Require(request, 'w');
@@ -231,7 +232,7 @@ internal static class BlobProtocolEndpoint
     private static async Task HandleStaticWebsiteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         if (!HttpMethods.IsGet(http.Request.Method) && !HttpMethods.IsHead(http.Request.Method))
@@ -287,7 +288,7 @@ internal static class BlobProtocolEndpoint
 
         if (statusCode == StatusCodes.Status200OK)
             EvaluateReadConditions(http.Request, blob);
-        await WriteStaticWebsiteBlobAsync(http, service, blob, statusCode, cancellationToken).ConfigureAwait(false);
+        await WriteStaticWebsiteBlobAsync(http, blob, statusCode, cancellationToken).ConfigureAwait(false);
     }
 
     private static string CombineWebsitePath(string directory, string document) =>
@@ -296,7 +297,7 @@ internal static class BlobProtocolEndpoint
             : $"{directory.TrimEnd('/')}/{document.TrimStart('/')}";
 
     private static async Task<BlobRecord?> TryGetStaticWebsiteBlobAsync(
-        BlobService service,
+        IBlobApplication service,
         string account,
         string name,
         CancellationToken cancellationToken)
@@ -322,7 +323,6 @@ internal static class BlobProtocolEndpoint
 
     private static async Task WriteStaticWebsiteBlobAsync(
         HttpContext http,
-        BlobService service,
         BlobRecord blob,
         int statusCode,
         CancellationToken cancellationToken)
@@ -354,16 +354,13 @@ internal static class BlobProtocolEndpoint
         if (HttpMethods.IsHead(http.Request.Method))
             return;
 
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
-        if (length == 0)
-            return;
-        await service.WriteContentAsync(
-            blob,
-            new BlobEncryption(blob.EncryptionScope, CustomerProvidedKeySha256: null),
-            start,
-            length,
-            http.Response.Body,
-            cancellationToken).ConfigureAwait(false);
+        var read = await GatewayContentRead.OpenAsync(http, blob, query: false, cancellationToken).ConfigureAwait(false);
+        await using (read.ConfigureAwait(false))
+        {
+            if (length > 0)
+                await read.WriteRangeAsync(new BlobEncryption(blob.EncryptionScope, CustomerProvidedKeySha256: null),
+                    start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static void SetStaticWebsiteHeader(IHeaderDictionary headers, string name, string? value)
@@ -391,12 +388,12 @@ internal static class BlobProtocolEndpoint
     private static async Task HandleContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         var containerName = request.Container ?? throw AzureStorageException.ContainerNotFound();
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
-        if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
+        if (string.Equals(containerName, StorageAnalyticsConstants.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
             !(HttpMethods.IsPost(http.Request.Method) && string.Equals(comp, "batch", StringComparison.Ordinal)))
@@ -421,7 +418,7 @@ internal static class BlobProtocolEndpoint
     private static async Task<bool> HandleContainerWithoutFetchAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string comp,
         CancellationToken cancellationToken)
@@ -460,7 +457,7 @@ internal static class BlobProtocolEndpoint
     private static async Task HandleExistingContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         string comp,
         CancellationToken cancellationToken)
@@ -523,7 +520,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task CreateContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         CancellationToken cancellationToken)
     {
@@ -550,7 +547,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task RestoreContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         CancellationToken cancellationToken)
     {
@@ -575,7 +572,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task RenameContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         CancellationToken cancellationToken)
     {
@@ -599,7 +596,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task HandleContainerBatchAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         CancellationToken cancellationToken)
     {
@@ -611,7 +608,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task FindContainerBlobsByTagsAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         CancellationToken cancellationToken)
     {
@@ -629,7 +626,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task GetContainerPropertiesAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container)
     {
         RequireAccountSasForContainerOperation(request);
@@ -641,7 +638,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task GetContainerMetadataAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container)
     {
         RequireAccountSasForContainerOperation(request);
@@ -653,7 +650,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task SetContainerMetadataAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
@@ -696,7 +693,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task SetContainerAclAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
@@ -723,7 +720,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task LeaseContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
@@ -740,7 +737,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task DeleteContainerAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
@@ -758,7 +755,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task HandleContainerListAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
@@ -786,7 +783,8 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             throw AzureStorageException.BlobOperationNotSupported();
         ValidateBlobListEndBefore(http, request, startFrom, endBefore, arrow);
         var decodedMarker = DecodeContainerBlobMarker(http, includes);
-        var blobs = await service.ListBlobsPageAsync(
+        var blobs = await GatewayListing.ListBlobsAsync(
+            service,
             request.Account,
             container.Name,
             showOnly,
@@ -840,7 +838,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     {
         if (request.Authorization.AclListChecked)
         {
-            var metadata = http.RequestServices.GetRequiredService<MetadataStore>();
+            var metadata = http.RequestServices.GetRequiredService<IMetadataApplication>();
             await HierarchicalAclAuthorization.EnsureDirectoryListAsync(
                 metadata,
                 http.Request,
@@ -909,7 +907,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task HandleBatchAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string? scopedContainer,
         CancellationToken cancellationToken)
     {
@@ -976,7 +974,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<BlobBatchSubresponse> ExecuteBatchSubrequestAsync(
         HttpContext outer,
         StorageRequestContext outerRequest,
-        BlobService service,
+        IBlobApplication service,
         ResolvedBatchSubrequest resolved,
         CancellationToken cancellationToken)
     {
@@ -1047,7 +1045,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         HttpContext outer,
         HttpContext inner,
         StorageRequestContext subrequestContext,
-        BlobService service,
+        IBlobApplication service,
         ResolvedBatchSubrequest resolved,
         CancellationToken cancellationToken)
     {
@@ -1056,7 +1054,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         subrequestContext.Authorization = await authenticator.AuthenticateAsync(inner, subrequestContext, cancellationToken).ConfigureAwait(false);
         if (resolved.Snapshot is not null)
             RequireBlobSnapshots(subrequestContext, service);
-        if (string.Equals(resolved.Container, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
+        if (string.Equals(resolved.Container, StorageAnalyticsConstants.LogsContainerName, StringComparison.Ordinal) &&
             resolved.Request.Kind != BlobBatchOperationKind.Delete)
         {
             throw AzureStorageException.AuthorizationPermissionMismatch();
@@ -1104,7 +1102,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<BlobBatchSubresponse> ExecuteBatchDeleteAsync(
         HttpRequest request,
         StorageRequestContext context,
-        BlobService service,
+        IBlobApplication service,
         ResolvedBatchSubrequest resolved,
         BlobRecord blob,
         bool permanentDelete,
@@ -1147,7 +1145,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<BlobBatchSubresponse> ExecuteBatchSetTierAsync(
         HttpRequest request,
         StorageRequestContext context,
-        BlobService service,
+        IBlobApplication service,
         ResolvedBatchSubrequest resolved,
         BlobRecord blob,
         Dictionary<string, string> headers,
@@ -1314,7 +1312,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task HandleBlobAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         CancellationToken cancellationToken)
     {
         var route = ResolveBlobRoute(http, request, service);
@@ -1331,14 +1329,14 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static BlobRoute ResolveBlobRoute(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service)
+        IBlobApplication service)
     {
         var containerName = request.Container ?? "$root";
         var blobName = request.Blob ?? request.Container ?? throw AzureStorageException.BlobNotFound();
         if (request.Blob is null)
             containerName = "$root";
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
-        if (string.Equals(containerName, StorageAnalyticsService.LogsContainerName, StringComparison.Ordinal) &&
+        if (string.Equals(containerName, StorageAnalyticsConstants.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
             !HttpMethods.IsHead(http.Request.Method) &&
             !(HttpMethods.IsDelete(http.Request.Method) && string.IsNullOrEmpty(comp)))
@@ -1371,7 +1369,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<bool> TryHandleUnloadedBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRoute route,
         CancellationToken cancellationToken)
     {
@@ -1434,7 +1432,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<BlobRecord> LoadBlobForRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRoute route,
         CancellationToken cancellationToken)
     {
@@ -1465,7 +1463,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
     private static async Task<bool> TryHandleLoadedBlobFirstRoutesAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRoute route,
         BlobRecord blob,
         CancellationToken cancellationToken)
@@ -1530,7 +1528,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<bool> TryHandleLoadedBlobSecondRoutesAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRoute route,
         BlobRecord blob,
         CancellationToken cancellationToken)
@@ -1594,7 +1592,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobPutBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1606,7 +1604,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobPutBlockRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1672,7 +1670,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobPutBlockListRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1721,7 +1719,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobAppendBlockRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1781,7 +1779,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobPutPageRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1840,7 +1838,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<(BlobRecord Blob, TransactionalChecksums Checksums)> WriteUpdatedPageAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord current,
         long start,
         long end,
@@ -1893,7 +1891,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobIncrementalCopyRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -1954,7 +1952,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> BeginInternalIncrementalCopyAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -1980,7 +1978,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> BeginExternalIncrementalCopyAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -2028,7 +2026,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobGetBlockListRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         string? versionId,
@@ -2089,7 +2087,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobUndeleteBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -2121,7 +2119,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobDeleteUncommittedBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -2137,7 +2135,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobQueryBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2148,7 +2146,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetImmutabilityPolicyRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2182,7 +2180,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobDeleteImmutabilityPolicyRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2197,7 +2195,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetLegalHoldRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2215,7 +2213,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobAbortCopyRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2237,7 +2235,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobReadBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2258,7 +2256,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobReadBlobMetadataRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2278,7 +2276,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobGetBlobTagsRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2294,7 +2292,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetBlobMetadataRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2320,7 +2318,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetBlobTagsRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2344,7 +2342,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetBlobPropertiesRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2386,7 +2384,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSnapshotBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2424,7 +2422,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSealAppendBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2446,7 +2444,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetBlobTierRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string? snapshot,
         BlobRecord blob,
         CancellationToken cancellationToken)
@@ -2477,7 +2475,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobSetBlobExpiryRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2501,7 +2499,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobBlobLeaseRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -2516,7 +2514,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobGetPageListRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         string? snapshot,
@@ -2551,7 +2549,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<(IReadOnlyList<PageRange> Ranges, IReadOnlyList<PageRange> ClearRanges)> ResolvePageListRangesAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         string? snapshot,
@@ -2639,7 +2637,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobDeleteBlobRouteAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string? versionId,
         string? snapshot,
         bool permanentDelete,
@@ -2682,7 +2680,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandlePutBlobAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -2745,7 +2743,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord?> ValidatePutBlobDestinationAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         CancellationToken cancellationToken)
@@ -2769,7 +2767,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleLegacyCopyBlobAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -2814,7 +2812,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task CopyBlobFromUrlSynchronouslyAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -2860,7 +2858,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task BeginCopyBlobAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -2906,7 +2904,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task PutBlobFromUrlAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -2965,7 +2963,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> CopyBlockBlobFromInternalSourceAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3005,7 +3003,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> CopyBlockBlobFromExternalSourceAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3060,7 +3058,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> BeginCopyFromInternalSourceAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3096,7 +3094,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> BeginCopyFromExternalSourceAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3152,7 +3150,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task CreateBlobFromRequestAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3210,7 +3208,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<(BlobRecord Blob, TransactionalChecksums Checksums)> CreateBlockBlobFromRequestAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3245,7 +3243,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> CreateAppendBlobFromRequestAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3272,7 +3270,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> CreatePageBlobFromRequestAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string containerName,
         string blobName,
         BlobRecord? current,
@@ -3303,7 +3301,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task WriteBlobAsync(
         HttpContext http,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         BlobEncryption encryption,
         CancellationToken cancellationToken)
@@ -3380,7 +3378,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         return (start, end, rangeHeader);
     }
 
-    private static void WriteHeadBlobResponse(HttpContext http, BlobService service, BlobRecord blob, long length)
+    private static void WriteHeadBlobResponse(HttpContext http, IBlobApplication service, BlobRecord blob, long length)
     {
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
@@ -3420,7 +3418,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task WriteStructuredBlobAsync(
         HttpContext http,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         BlobEncryption encryption,
         long start,
@@ -3451,10 +3449,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
                 "Structured response bodies require service version 2025-01-05 or later.");
         }
 
-        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
-        using var pin = chunks.Pin(blob.Content);
-        using var readLease = await chunks.Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
+        var read = await GatewayContentRead.OpenAsync(http, blob, query: false, cancellationToken).ConfigureAwait(false);
+        await using var readDisposal = read.ConfigureAwait(false);
+        blob = read.Record;
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
             blob,
@@ -3467,9 +3464,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         await StructuredBodyEncoder.WriteAsync(
             length,
             async (rangeStart, rangeLength, destination, token) =>
-                await service.WriteContentUnderReadLeaseAsync(
-                    readLease,
-                    blob,
+                await read.WriteRangeAsync(
                     encryption,
                     start + rangeStart,
                     rangeLength,
@@ -3481,7 +3476,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task WriteRegularBlobAsync(
         HttpContext http,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         BlobEncryption encryption,
         long start,
@@ -3490,10 +3485,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         bool wantCrc64,
         CancellationToken cancellationToken)
     {
-        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
-        using var pin = chunks.Pin(blob.Content);
-        using var readLease = await chunks.Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
+        var read = await GatewayContentRead.OpenAsync(http, blob, query: false, cancellationToken).ConfigureAwait(false);
+        await using var readDisposal = read.ConfigureAwait(false);
+        blob = read.Record;
         AzureResponseWriter.AddBlobHeaders(
             http.Response,
             blob,
@@ -3506,7 +3500,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         if (wantMd5 || wantCrc64)
         {
             using var buffer = new MemoryStream((int)length);
-            await service.WriteContentUnderReadLeaseAsync(readLease, blob, encryption, start, length, buffer, cancellationToken).ConfigureAwait(false);
+            await read.WriteRangeAsync(encryption, start, length, buffer, cancellationToken).ConfigureAwait(false);
             var bytes = buffer.ToArray();
             if (wantMd5)
             {
@@ -3524,13 +3518,13 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             return;
         }
 
-        await service.WriteContentUnderReadLeaseAsync(readLease, blob, encryption, start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
+        await read.WriteRangeAsync(encryption, start, length, http.Response.Body, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task HandleQueryAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -3565,11 +3559,10 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         EvaluateReadConditions(http.Request, blob);
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
 
-        var chunks = http.RequestServices.GetRequiredService<ChunkStore>();
-        using var pin = chunks.Pin(blob.Content);
-        using var admission = await chunks.Admission.AcquireQueryAsync(cancellationToken).ConfigureAwait(false);
         var query = await BlobQueryProtocol.ReadRequestAsync(http.Request.Body, cancellationToken).ConfigureAwait(false);
-        blob = await service.RecordDataAccessAsync(blob, cancellationToken).ConfigureAwait(false);
+        var read = await GatewayContentRead.OpenAsync(http, blob, query: true, cancellationToken).ConfigureAwait(false);
+        await using var readDisposal = read.ConfigureAwait(false);
+        blob = read.Record;
         AzureResponseWriter.AddBlobQueryHeaders(http.Response, blob);
         http.Response.ContentType = "avro/binary";
         http.Response.StatusCode = StatusCodes.Status200OK;
@@ -3577,18 +3570,20 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var encryption = new BlobEncryption(blob.EncryptionScope, null);
         if (query.Input.Kind == BlobQueryFormatKind.Parquet)
         {
-            await ExecuteParquetQueryAsync(http, service, blob, query, encryption, cancellationToken).ConfigureAwait(false);
+            await ExecuteParquetQueryAsync(http, read, blob, query, encryption, cancellationToken).ConfigureAwait(false);
             return;
         }
 
-        await ExecuteTextQueryAsync(http, service, blob, query, encryption, cancellationToken).ConfigureAwait(false);
+        await ExecuteTextQueryAsync(http, read, blob, query, encryption, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task ExecuteParquetQueryAsync(
-        HttpContext http, BlobService service, BlobRecord blob, BlobQueryRequest query,
+        HttpContext http, GatewayContentRead read, BlobRecord blob, BlobQueryRequest query,
         BlobEncryption encryption, CancellationToken cancellationToken)
     {
-        var content = new BlobSeekableReadStream(service, blob, encryption, cancellationToken);
+        var content = new BlobSeekableReadStream(
+            (offset, length, destination, token) => read.WriteRangeAsync(encryption, offset, length, destination, token),
+            blob.Content.Length, cancellationToken);
         await using var disposal = content.ConfigureAwait(false);
         var options = http.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
         var prepared = BlobQueryPlan.Parse(query.Expression).LimitReached ? null :
@@ -3601,7 +3596,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task ExecuteTextQueryAsync(
         HttpContext http,
-        BlobService service,
+        GatewayContentRead read,
         BlobRecord blob,
         BlobQueryRequest query,
         BlobEncryption encryption,
@@ -3614,7 +3609,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             useSynchronizationContext: false));
         using var producerCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var producer = ProduceQueryInputAsync(
-            service,
+            read,
             blob,
             encryption,
             pipe.Writer,
@@ -3652,7 +3647,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     }
 
     private static async Task ProduceQueryInputAsync(
-        BlobService service,
+        GatewayContentRead read,
         BlobRecord blob,
         BlobEncryption encryption,
         PipeWriter writer,
@@ -3664,8 +3659,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             var destination = writer.AsStream(leaveOpen: true);
             await using (destination.ConfigureAwait(false))
             {
-                await service.WriteContentAsync(
-                blob,
+                await read.WriteRangeAsync(
                 encryption,
                 0,
                 blob.Content.Length,
@@ -3797,7 +3791,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task<BlobRecord> ResolveCopySourceAsync(
         HttpContext destination,
         StorageRequestContext destinationRequest,
-        BlobService service,
+        IBlobApplication service,
         ResolvedInternalCopySource source,
         CancellationToken cancellationToken,
         bool requireTagsPermission = false)
@@ -3914,7 +3908,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     }
 
     private static async Task AuthorizeCopySourceAsync(
-        BlobService service,
+        IBlobApplication service,
         ResolvedInternalCopySource source,
         StorageRequestContext sourceContext,
         bool requireTagsPermission,
@@ -3946,17 +3940,20 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleContainerLeaseAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         CancellationToken cancellationToken)
     {
-        var (action, transition) = ApplyLeaseAction(http.Request, container.Lease, useLegacySemantics: false);
+        var command = ParseLeaseAction(http.Request, useLegacySemantics: false);
+        var action = command.Action;
         var returnsProperties = IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15));
-        var updated = await service.SetContainerLeaseAsync(
-            container,
-            transition.Lease,
+        var applied = await service.ApplyContainerLeaseAsync(
+            container, action, command.DurationSeconds, command.BreakPeriodSeconds,
+            command.SuppliedId, command.ProposedId, useLegacySemantics: false,
             updateProperties: !returnsProperties,
             cancellationToken).ConfigureAwait(false);
+        var updated = applied.Record;
+        var transition = new LeaseTransition(updated.Lease, applied.RemainingSeconds);
         http.Response.StatusCode = LeaseStatusCode(action);
         if (returnsProperties)
         {
@@ -3969,13 +3966,17 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task HandleBlobLeaseAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
         var modernLease = IsServiceVersionAtLeast(request, new DateOnly(2012, 2, 12));
-        var (action, transition) = ApplyLeaseAction(http.Request, blob.Lease, useLegacySemantics: !modernLease);
-        var updated = await service.SetBlobLeaseAsync(blob, transition.Lease, cancellationToken).ConfigureAwait(false);
+        var command = ParseLeaseAction(http.Request, useLegacySemantics: !modernLease);
+        var action = command.Action;
+        var applied = await service.ApplyBlobLeaseAsync(blob, action, command.DurationSeconds, command.BreakPeriodSeconds,
+            command.SuppliedId, command.ProposedId, useLegacySemantics: !modernLease, cancellationToken).ConfigureAwait(false);
+        var updated = applied.Record;
+        var transition = new LeaseTransition(updated.Lease, applied.RemainingSeconds);
         http.Response.StatusCode = LeaseStatusCode(action);
         if (IsServiceVersionAtLeast(request, new DateOnly(2013, 8, 15)))
         {
@@ -3985,9 +3986,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         AddLeaseResponseHeaders(http.Response, action, transition);
     }
 
-    private static (LeaseAction Action, LeaseTransition Transition) ApplyLeaseAction(
+    private static (LeaseAction Action, int? DurationSeconds, int? BreakPeriodSeconds, string? SuppliedId, string? ProposedId) ParseLeaseAction(
         HttpRequest request,
-        LeaseRecord current,
         bool useLegacySemantics)
     {
         var actionValue = ProtocolParsing.First(request.Headers, "x-ms-lease-action")
@@ -4015,15 +4015,11 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var breakPeriod = action == LeaseAction.Break
             ? ParseLeaseIntegerHeader(request.Headers, "x-ms-lease-break-period", required: false)
             : null;
-        var leases = request.HttpContext.RequestServices.GetRequiredService<LeaseService>();
-        return (action, leases.Apply(
-            current,
-            action,
+        return (action,
             duration,
             breakPeriod,
             ProtocolParsing.First(request.Headers, "x-ms-lease-id"),
-            ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id"),
-            useLegacySemantics));
+            ProtocolParsing.First(request.Headers, "x-ms-proposed-lease-id"));
     }
 
     private static void AddLeaseResponseHeaders(
@@ -4142,7 +4138,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     private static async Task WriteFindByTagsAsync(
         HttpContext http,
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string? scopedContainer,
         CancellationToken cancellationToken)
     {
@@ -4166,7 +4162,8 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             throw AzureStorageException.InvalidQuery("marker");
         }
         var maxResults = ParseMaxResults(http.Request.Query["maxresults"].ToString(), 5000);
-        var page = await service.FindBlobsByTagsPageAsync(
+        var page = await GatewayListing.FindByTagsAsync(
+            service,
             request.Account,
             filter,
             marker,
@@ -4232,7 +4229,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task HandleCorsPreflightAsync(
         HttpContext http,
-        BlobService service,
+        IBlobApplication service,
         StorageRequestContext request,
         CancellationToken cancellationToken)
     {
@@ -4257,7 +4254,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task ApplyCorsResponseHeadersAsync(
         HttpContext http,
-        BlobService service,
+        IBlobApplication service,
         StorageRequestContext request,
         CancellationToken cancellationToken)
     {
@@ -4322,7 +4319,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             return;
 
         var generation = await HierarchicalAclAuthorization.EnsureAppendAsync(
-            http.RequestServices.GetRequiredService<MetadataStore>(),
+            http.RequestServices.GetRequiredService<IMetadataApplication>(),
             http.Request,
             request,
             request.Authorization.AclAppendObjectId!,
@@ -4333,7 +4330,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         if (request.Authorization.SasIssuerAclObjectId is { } issuerId)
         {
             var issuerGeneration = await HierarchicalAclAuthorization.EnsureAppendAsync(
-                http.RequestServices.GetRequiredService<MetadataStore>(), http.Request, request,
+                http.RequestServices.GetRequiredService<IMetadataApplication>(), http.Request, request,
                 issuerId, request.Authorization.SasIssuerAclGroups!, request.Authorization.Permissions,
                 cancellationToken).ConfigureAwait(false);
             if (!string.Equals(issuerGeneration, generation, StringComparison.Ordinal))
@@ -4348,7 +4345,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     {
         if (!request.Authorization.AclMutationChecked)
             return;
-        var metadata = http.RequestServices.GetRequiredService<MetadataStore>();
+        var metadata = http.RequestServices.GetRequiredService<IMetadataApplication>();
         await HierarchicalAclAuthorization.EnsureParentMutationAsync(
             metadata, http.Request, request, request.Authorization.AclMutationObjectId!,
             request.Authorization.AclMutationGroups!, request.Authorization.Permissions,
@@ -4363,7 +4360,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task AuthorizeBlobReadAsync(
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         CancellationToken cancellationToken)
     {
@@ -4381,7 +4378,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static Task AuthorizeContainerReadAsync(
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container,
         bool allowContainerPublic)
     {
@@ -4399,7 +4396,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static Task AuthorizeContainerListAsync(
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         ContainerRecord container)
     {
         if (request.Authorization.Kind != StorageAuthorizationKind.Anonymous)
@@ -4462,13 +4459,13 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         Require(request, 'w');
     }
 
-    private static void RequireFlatNamespace(BlobService service, string account)
+    private static void RequireFlatNamespace(IBlobApplication service, string account)
     {
         if (service.IsHierarchicalNamespaceEnabled(account))
             throw AzureStorageException.BlobOperationNotSupported();
     }
 
-    private static void RequireHierarchicalNamespace(BlobService service, string account)
+    private static void RequireHierarchicalNamespace(IBlobApplication service, string account)
     {
         if (!service.IsHierarchicalNamespaceEnabled(account))
             throw AzureStorageException.BlobOperationNotSupported();
@@ -4613,7 +4610,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     }
 
     private static async Task<BlobRecord?> TryGetCurrentBlobAsync(
-        BlobService service,
+        IBlobApplication service,
         string account,
         string container,
         string name,
@@ -4663,7 +4660,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static string? ReadEncryptionContext(
         HttpRequest request,
-        BlobService service,
+        IBlobApplication service,
         string account)
     {
         const string headerName = "x-ms-encryption-context";
@@ -4682,7 +4679,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static DateTimeOffset? ReadWriteExpiry(
         HttpRequest request,
-        BlobService service,
+        IBlobApplication service,
         string account,
         DateTimeOffset? fallback)
     {
@@ -4757,7 +4754,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             var context = StorageRequestContext.Get(request.HttpContext);
             RequireBlobIndexTags(
                 context,
-                request.HttpContext.RequestServices.GetRequiredService<BlobService>(),
+                request.HttpContext.RequestServices.GetRequiredService<IBlobApplication>(),
                 "Blob index tags");
             Require(context, 't');
         }
@@ -4835,7 +4832,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var context = StorageRequestContext.Get(request.HttpContext);
         RequireBlobSnapshots(
             context,
-            request.HttpContext.RequestServices.GetRequiredService<BlobService>());
+            request.HttpContext.RequestServices.GetRequiredService<IBlobApplication>());
         if (hasExplicitSnapshot)
             throw new AzureStorageException(
                 StatusCodes.Status400BadRequest,
@@ -5453,7 +5450,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         var context = StorageRequestContext.Get(request.HttpContext);
         RequireBlobIndexTags(
             context,
-            request.HttpContext.RequestServices.GetRequiredService<BlobService>(),
+            request.HttpContext.RequestServices.GetRequiredService<IBlobApplication>(),
             "Copy source tags");
         Require(context, 't');
         return true;
@@ -5470,7 +5467,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         if (!hasCustomerKeyHeader)
             return new BlobEncryption(scope, null);
         var context = StorageRequestContext.Get(request.HttpContext);
-        var service = request.HttpContext.RequestServices.GetRequiredService<BlobService>();
+        var service = request.HttpContext.RequestServices.GetRequiredService<IBlobApplication>();
         if (service.IsHierarchicalNamespaceEnabled(context.Account))
             throw AzureStorageException.BlobOperationNotSupported();
         return ReadCustomerProvidedKey(request, write, scope, encodedKey, encodedHash, algorithm);
@@ -5643,7 +5640,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static async Task<BlobEncryption> EnsureBlobEncryptionAsync(
         HttpRequest request,
-        BlobService service,
+        IBlobApplication service,
         BlobRecord blob,
         bool write,
         CancellationToken cancellationToken)
@@ -5794,7 +5791,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             return;
 
         var context = StorageRequestContext.Get(request.HttpContext);
-        var service = request.HttpContext.RequestServices.GetRequiredService<BlobService>();
+        var service = request.HttpContext.RequestServices.GetRequiredService<IBlobApplication>();
         RequireBlobIndexTags(context, service, $"The {headerName} condition", blob?.Account);
 
         if (requirePermission && !context.Authorization.Allows('t'))
@@ -5810,7 +5807,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static void RequireBlobIndexTags(
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string feature,
         string? account = null)
     {
@@ -5839,7 +5836,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static void RequireBlobSnapshots(
         StorageRequestContext request,
-        BlobService service,
+        IBlobApplication service,
         string? account = null)
     {
         var resolvedAccount = account ?? request.Account;
@@ -6000,17 +5997,11 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
     {
         var encodedLength = request.ContentLength
                             ?? throw AzureStorageException.InvalidHeader("Content-Length");
-        var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
+        var structuredPaths = request.HttpContext.RequestServices.GetRequiredService<GatewayStagingPaths>();
         var structuredTemporaryPath = Path.Combine(structuredPaths.Staging, $"structured-{Guid.NewGuid():N}.tmp");
         try
         {
-            var temporary = new FileStream(
-                structuredTemporaryPath,
-                FileMode.CreateNew,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var temporary = structuredPaths.OpenTemporaryFile(structuredTemporaryPath);
             await using (temporary.ConfigureAwait(false))
             {
                 await StructuredBodyDecoder.DecodeAsync(
@@ -6046,17 +6037,11 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             expectedMd5 ?? expectedCrc64!,
             expectedMd5 is null ? 8 : 16,
             expectedMd5 is null ? "x-ms-content-crc64" : expectedMd5HeaderName);
-        var paths = request.HttpContext.RequestServices.GetRequiredService<StoragePaths>();
+        var paths = request.HttpContext.RequestServices.GetRequiredService<GatewayStagingPaths>();
         var temporaryPath = Path.Combine(paths.Staging, $"validated-{Guid.NewGuid():N}.tmp");
         try
         {
-            var temporary = new FileStream(
-                temporaryPath,
-                FileMode.CreateNew,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var temporary = paths.OpenTemporaryFile(temporaryPath);
             await using (temporary.ConfigureAwait(false))
             {
                 using var md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);

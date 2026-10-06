@@ -140,7 +140,10 @@ public sealed class ParquetBatchingTests(SavaWebApplicationFactory application) 
             blob.Name, versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
         using var cancellation = new CancellationTokenSource();
         await cancellation.CancelAsync().ConfigureAwait(false);
-        var stream = new BlobSeekableReadStream(service, record, new BlobEncryption(null, null), cancellation.Token);
+        var stream = new BlobSeekableReadStream(
+            (offset, length, destination, token) => service.WriteContentAsync(
+                record, new BlobEncryption(null, null), offset, length, destination, token),
+            record.Content.Length, cancellation.Token);
         await using var disposal = stream.ConfigureAwait(false);
         var bytes = new byte[4];
         Assert.ThrowsAny<OperationCanceledException>(() => stream.Read(bytes, 0, bytes.Length));

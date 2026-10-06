@@ -4,9 +4,8 @@ using Mk8.Sava.Storage;
 namespace Mk8.Sava.Protocol;
 
 internal sealed class BlobSeekableReadStream(
-    BlobService service,
-    BlobRecord blob,
-    BlobEncryption encryption,
+    Func<long, long, Stream, CancellationToken, Task> readRange,
+    long length,
     CancellationToken requestCancellationToken = default) : Stream
 {
     private long _position;
@@ -14,7 +13,7 @@ internal sealed class BlobSeekableReadStream(
     public override bool CanRead => true;
     public override bool CanSeek => true;
     public override bool CanWrite => false;
-    public override long Length => blob.Content.Length;
+    public override long Length => length;
     public override long Position
     {
         get => _position;
@@ -64,9 +63,7 @@ internal sealed class BlobSeekableReadStream(
             return 0;
         var count = checked((int)Math.Min(buffer.Length, Length - _position));
         using var destination = new FixedMemoryWriteStream(buffer[..count]);
-        await service.WriteContentAsync(
-            blob,
-            encryption,
+        await readRange(
             _position,
             count,
             destination,

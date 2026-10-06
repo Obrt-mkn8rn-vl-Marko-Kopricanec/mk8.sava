@@ -5,3 +5,6 @@ using System.Runtime.CompilerServices;
 [assembly: InternalsVisibleTo("Mk8.Sava.DAL")]
 [assembly: InternalsVisibleTo("Mk8.Sava.INF")]
 [assembly: InternalsVisibleTo("Mk8.Sava.Tests")]
+[assembly: InternalsVisibleTo("Mk8.Sava.Application")]
+[assembly: InternalsVisibleTo("Mk8.Sava.Gateway")]
+[assembly: InternalsVisibleTo("Mk8.Sava.Transport")]

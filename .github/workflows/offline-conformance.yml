@@ -27,6 +27,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2025]
+        include:
+          - os: ubuntu-24.04
+            rid: linux-x64
+          - os: windows-2025
+            rid: win-x64
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-dotnet@v6
@@ -36,8 +41,8 @@ jobs:
         run: dotnet restore Mk8.Sava.slnx -p:Mk8StrictAnalyzers=true
       - name: Strict Release build
         run: dotnet build Mk8.Sava.slnx --no-restore -c Release -p:Mk8StrictAnalyzers=true -m:1
-      - name: Offline .NET SDK and REST tests
-        run: dotnet test Mk8.Sava.slnx --no-build --no-restore -c Release --filter "Category!=LiveAzure&Category!=Azurite"
+      - name: Offline .NET SDK, REST and split-process tests
+        run: dotnet test Mk8.Sava.slnx --no-build --no-restore -c Release --filter "Category!=LiveAzure&Category!=Azurite" --logger "trx;LogFileName=offline-${{ matrix.rid }}.trx"
       - name: Verify formatting
         if: runner.os == 'Linux'
         run: dotnet format Mk8.Sava.slnx --verify-no-changes --no-restore --verbosity quiet
@@ -52,3 +57,29 @@ jobs:
       - name: Independent JavaScript Blob SDK
         if: runner.os == 'Linux'
         run: bash Mk8.Sava.Tests/SdkCompatibility/javascript/run.sh
+      - name: Publish Application and Gateway
+        shell: pwsh
+        run: |
+          dotnet publish Mk8.Sava.Application/Mk8.Sava.Application.csproj -c Release -r ${{ matrix.rid }} --self-contained false -p:Mk8StrictAnalyzers=true -o artifacts/publish/Application
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish Mk8.Sava.Gateway/Mk8.Sava.Gateway.csproj -c Release -r ${{ matrix.rid }} --self-contained false -p:Mk8StrictAnalyzers=true -o artifacts/publish/Gateway
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Execute published Application and Gateway
+        shell: pwsh
+        run: ./deploy/Test-PublishedHosts.ps1 -PublishRoot artifacts/publish -EvidencePath artifacts/published-smoke
+      - name: Freeze published release manifest
+        shell: pwsh
+        run: ./deploy/Write-ReleaseManifest.ps1 -PublishRoot artifacts/publish -RuntimeIdentifier ${{ matrix.rid }} -OutputPath artifacts/release-manifest.json
+      - name: Retain source-bound release and test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mk8-sava-${{ github.sha }}-${{ matrix.rid }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            artifacts/publish/
+            artifacts/release-manifest.json
+            artifacts/published-smoke/
+            **/TestResults/**/*.trx
+            **/TestResults/split-process-logs/*.log

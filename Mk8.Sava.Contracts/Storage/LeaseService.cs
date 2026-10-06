@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Http;
+using System.Net;
 using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Storage;
@@ -358,5 +358,5 @@ public sealed class LeaseService(TimeProvider timeProvider)
         Guid.TryParse(lease.Id, out var current) && current == id;
 
     private static AzureStorageException LeaseConflict(string code, string message) =>
-        new(StatusCodes.Status409Conflict, code, message);
+        new((int)HttpStatusCode.Conflict, code, message);
 }

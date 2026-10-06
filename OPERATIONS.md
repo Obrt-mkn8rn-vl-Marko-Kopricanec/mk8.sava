@@ -1,11 +1,23 @@
 # mk8.sava operations
 
-The service keeps its authoritative metadata in `metadata.db` and encrypted,
+Deploy two independently running executables: `Mk8.Sava.Gateway` is the Azure
+Blob HTTP boundary; `Mk8.Sava.Application` is the exclusive storage owner.
+`Mk8.Sava.API` is a protocol library, not a third server. See the
+[matched host deployment guide](deploy/README.md) for protected configuration,
+Linux units, portable Linux/Windows launch, published-artifact qualification
+and existing-root upgrade/rollback.
+
+Application keeps its authoritative metadata in `metadata.db` and encrypted,
 content-addressed extents under `chunks/` or append-only small-object packs under
 `packs/`. Chunk identities are immutable, while their verified physical encoding
 may be atomically replaced by background recompression or pack compaction. The
 configured `Sava:DataPath` is a single storage root; do not copy a live root with
-a generic filesystem command and assume the result is consistent.
+a generic filesystem command and assume the result is consistent. Gateway
+has only bounded private ephemeral staging and must never receive access to
+this durable root or Application's separately configured data-encryption keys.
+Account signing keys still reside in Gateway; legacy account-key-as-data-key
+roots do not gain cryptographic key isolation merely by splitting the processes.
+Preserve effective data keys and follow the deployment guide's rotation caveat.
 
 ## Upload request limits
 
@@ -22,6 +34,14 @@ to 65,535 segment headers/checksums of 18 bytes each. Decoder length/checksum
 validation and logical upload limits still apply. Oversized logical content or
 a remaining server-side HTTP 413 is returned as Azure `RequestBodyTooLarge`,
 not `InternalError`.
+
+Gateway validates and streams logical content across an authenticated private
+Application transport. Application must see the successful framed terminal
+integrity boundary before it can publish; connection loss or a failed checksum
+cannot be mistaken for a complete upload. Its data-root admission controls are
+shared by all Gateways. Private control-frame size, request deadline and Gateway
+ephemeral staging budgets are separate deployment limits; see the deployment
+guide before sizing large/slow transfers.
 
 Any reverse proxy or ingress body-size limit is independent of this application
 setting. Configure it to permit the intended operation sizes plus structured
@@ -56,13 +76,14 @@ boundary and truncates any unindexed tail left by an interrupted append before
 writing another record. Pack compaction still removes dead records inside packs
 left by interrupted publication or other historical failures.
 
-Only one mk8.sava process may open a data root at a time. The service holds an
+Only one mk8.sava Application process may open a data root at a time. It holds an
 exclusive `.mk8-sava.lock` file handle for its lifetime and fails startup if
 another instance holds it. Leave the file in place: a process crash releases the
 operating-system lock, so the next instance can reopen the root and recover.
 Do not use a filesystem that does not reliably propagate exclusive file locks
 between hosts for a shared data root; multi-writer shared-root deployment is
-not supported.
+not supported. Multiple Gateway instances do not own that root and can use the
+same authenticated Application without becoming extra filesystem writers.
 On graceful shutdown, the metadata store clears only its own SQLite connection
 pool. This releases pooled `metadata.db` file handles before a stopped root is
 removed or relocated on Windows, without disabling pooling for live requests.
@@ -156,14 +177,23 @@ dotnet test Mk8.Sava.slnx --no-build --no-restore -c Release --filter "Category!
 
 The [offline conformance workflow](.github/workflows/offline-conformance.yml)
 builds with strict analyzers and runs the .NET SDK/REST suite on Linux and
-Windows 2025 hosted runners. Its Linux job also verifies formatting, runs the
+Windows 2025 hosted runners, including the offline two-process boundary suite.
+It publishes matched Application/Gateway outputs for each runner's own RID,
+executes those native apphosts with a disposable protected backend and storage
+root, then retains source/tree/RID-bound file hashes and test evidence.
+Its Linux job also verifies formatting, runs the
 pinned Azurite differential, and exercises an independent JavaScript Blob SDK
-against a disposable loopback service. Live Azure connection-string variables
+against disposable independently running loopback Gateway/Application hosts.
+Live Azure connection-string variables
 are explicitly empty and the ordinary test command excludes live and Azurite
 categories; Azurite is run separately against only its local emulator.
 The Linux-only ENOSPC and process-termination harnesses remain separate local
 release gates. A CI pass does not establish Windows power-loss durability or
 full Azure operation/version/account/auth conformance.
+Historical storage/compression measurements below predate the independently
+running Gateway/Application boundary. They are not latency, memory or staging
+budgets for the new private-transport topology; rerun representative workloads
+on the actual two-process deployment before making those claims.
 
 ## SDK substitution checks
 
@@ -203,8 +233,13 @@ and resolves dependencies into a disposable Maven repository. The C++ harness
 requires a Linux x86-64 C/C++ toolchain and kernel headers; it hash-verifies a
 pinned vcpkg catalog and `pkgconf-lite` source release, asserts the official
 Azure client version, and builds every native dependency in disposable download,
-binary-cache, install, and build roots. Each harness starts a real loopback
-mk8.sava process with a disposable storage root rather than routing the client
+binary-cache, install, and build roots. Each SDK process harness requires
+`openssl` for its private random transport key and starts a real Application
+and a separate Gateway on distinct loopback ports, with a disposable
+Application-only storage root and Gateway-only staging directory. Cleanup stops
+both children; failures retain both host logs for inspection. The existing
+ten-second startup budget applies to each host separately, and the SDK payload,
+checksum and timeout assertions are unchanged. These lanes do not route clients
 through ASP.NET's in-memory test server.
 
 For target-RID publish qualification, the JavaScript
@@ -910,7 +945,7 @@ run the following command with the same account, data-root, and encryption-key
 configuration used by the service:
 
 ```bash
-dotnet Mk8.Sava.API.dll --hns-acl-apply /path/to/hns-acls.json
+dotnet Mk8.Sava.Application.dll --hns-acl-apply /path/to/hns-acls.json
 ```
 
 ```json
@@ -1110,13 +1145,20 @@ tier changes.
 
 ## Health and metrics
 
-- `GET /health/live` reports that the process is running.
-- `GET /health/ready` checks SQLite availability and the last incremental
+- Both components' `GET /health/live` reports that the respective process is
+  running. Gateway liveness does not depend on Application.
+- Application's `GET /health/ready` checks SQLite availability and the last incremental
   reachable-chunk integrity cycle. It returns HTTP 503 after a reachable chunk
   is found missing or fails authenticated decoding.
-- `GET /metrics` emits Prometheus text for request count and duration, 5xx
-  responses, logical and physical storage, staging use, integrity findings, and
-  lifecycle maintenance. These operator endpoints contain no credentials or
+- Gateway's `GET /health/ready` performs an authenticated Application readiness
+  request with the same protocol and policy checks as ordinary RPC. Missing,
+  unready or mismatched Application returns 503 while Gateway stays live.
+- Both components expose `GET /metrics`. Gateway records HTTP request count,
+  duration and 5xx responses plus active/queued/rejected requests and its
+  quota-accounted temporary bytes/limit/rejections; Application owns storage usage, integrity,
+  work-admission and lifecycle-maintenance observations. Scrape each component
+  distinctly and do not sum a backend storage series duplicated through a
+  Gateway projection. These operator endpoints contain no credentials or
   blob names, but deployments should still restrict them to the monitoring
   network.
 - The HTTP request, duration, and 5xx metrics include health checks and metrics
@@ -1125,7 +1167,8 @@ tier changes.
 
 ### Storage work admission
 
-The process shares four independently bounded FIFO work lanes. Configure them
+Application shares four independently bounded FIFO work lanes across its
+Gateways. Configure them
 under `Sava`:
 
 | Setting | Default | Accepted range |
@@ -1339,7 +1382,10 @@ using them to set such budgets.
 
 ## Create and validate a backup
 
-The backup command runs without starting the HTTP listener. It takes a
+The Application backup command runs without starting the private listener.
+Gateway never runs storage-operator commands. Stop the root-owning Application
+before backup creation; the standalone command must acquire the same exclusive
+root lease. It takes a
 transactionally consistent SQLite snapshot while all reachable immutable
 chunks are pinned against garbage collection, verifies their storage integrity,
 copies exactly that root set, and publishes the backup directory only after a
@@ -1350,8 +1396,8 @@ uses write-through publication for the final rename, but directory-entry
 durability remains unverified, as it does for live chunks.
 
 ```bash
-dotnet Mk8.Sava.API.dll --backup-create /srv/backups/mk8-sava-2026-09-21
-dotnet Mk8.Sava.API.dll --backup-validate /srv/backups/mk8-sava-2026-09-21
+dotnet Mk8.Sava.Application.dll --backup-create /srv/backups/mk8-sava-2026-09-21
+dotnet Mk8.Sava.Application.dll --backup-validate /srv/backups/mk8-sava-2026-09-21
 ```
 
 The destination must not already exist and must be outside `Sava:DataPath`.
@@ -1381,7 +1427,7 @@ then run:
 
 ```bash
 Sava__DataPath=/srv/mk8-sava-restored \
-  dotnet Mk8.Sava.API.dll --restore-from /srv/backups/mk8-sava-2026-09-21
+  dotnet Mk8.Sava.Application.dll --restore-from /srv/backups/mk8-sava-2026-09-21
 ```
 
 The command fully validates the source, copies into a private sibling staging
@@ -1398,12 +1444,18 @@ good durability copy. Deduplicated extents can affect multiple logical blobs.
 ## Format upgrades and rollback
 
 Metadata uses an explicit SQLite `user_version`; the current metadata schema is
-version 7 and the backup container format is version 1. Schema 2 adds
+version 8 and the backup container format is version 1. Schema 2 adds
 transactionally maintained chunk-reference indexes and logical-length counters;
 schema 3 adds a transactional blob-tag search index; schema 4 adds authoritative
 pack and packed-chunk locator tables; schema 5 adds object-replication state;
 schema 6 adds durable data-key fingerprints for reachable encryption domains;
-schema 7 records each configured account's hierarchical-namespace mode.
+schema 7 records each configured account's hierarchical-namespace mode;
+schema 8 adds durable user-delegation key role-grant snapshots.
+The Gateway/Application split itself requires no additional storage-format
+migration. Preserve the existing root and effective data-encryption keys, stop
+the old server before the new Application opens that root, and use matched
+Gateway/Application policy and release artifacts. See the deployment guide for
+the ownership and two-host rollback sequence.
 The JSON blob/block manifests remain
 authoritative and startup and backup validation check the derived indexes against
 them. The service migrates schema 1, 2, or 3 on startup and can validate or

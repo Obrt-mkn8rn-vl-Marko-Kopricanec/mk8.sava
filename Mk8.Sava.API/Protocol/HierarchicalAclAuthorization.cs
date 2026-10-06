@@ -38,7 +38,7 @@ internal static class HierarchicalAclAuthorization
         !http.Query.ContainsKey("versionid");
 
     internal static async Task<bool> IsNewBlobCreationAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         CancellationToken cancellationToken)
@@ -70,7 +70,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     internal static async Task<string> EnsureAppendAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         string objectId,
@@ -113,7 +113,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     internal static async Task EnsureParentMutationAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         string objectId,
@@ -175,7 +175,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     private static async Task EnsureDirectoryDeletePermissionsAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         StorageRequestContext request,
         string objectId,
         IReadOnlySet<string> groups,
@@ -195,7 +195,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     private static async Task EnsureStickyDeleteAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         StorageRequestContext request,
         string objectId,
         string parentOwner,
@@ -237,7 +237,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     internal static async Task EnsureDirectoryListAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         string objectId,
@@ -288,7 +288,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     internal static async Task EnsureRecursiveListPageAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         BlobListPage page,
@@ -356,7 +356,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     internal static async Task<string?> EnsureReadAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         HttpRequest http,
         StorageRequestContext request,
         string objectId,
@@ -419,7 +419,7 @@ internal static class HierarchicalAclAuthorization
     }
 
     private static async Task<bool> EnsureReadableParentsAsync(
-        MetadataStore metadata,
+        IMetadataApplication metadata,
         string account,
         string container,
         string blobName,

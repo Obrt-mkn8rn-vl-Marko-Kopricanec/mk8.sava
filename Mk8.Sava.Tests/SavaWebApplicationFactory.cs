@@ -9,6 +9,9 @@ using Microsoft.Extensions.Hosting;
 using Mk8.Sava.Identity;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
+using Mk8.Sava.Application;
+using Mk8.Sava.Hosting;
+using Mk8.Sava.Transport;
 
 namespace Mk8.Sava.Tests;
 
@@ -228,12 +231,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
-        builder.ConfigureServices(services =>
-        {
-            services.RemoveAll<IHostLifetime>();
-            services.AddSingleton(new SavaTestHostLifetime());
-            services.AddSingleton<IHostLifetime>(provider => provider.GetRequiredService<SavaTestHostLifetime>());
-        });
+        builder.ConfigureServices(AddInProcessApplication);
         builder.ConfigureAppConfiguration((_, configuration) =>
         {
             configuration.AddInMemoryCollection(CreateBaseConfiguration());
@@ -286,6 +284,26 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         }
     }
 
+    private static void AddInProcessApplication(IServiceCollection services)
+    {
+        services.RemoveAll<IStorageAnalyticsSink>();
+        services.RemoveAll<IApplicationReadSessions>();
+        services.RemoveAll<IApplicationReadiness>();
+        services.AddSavaApplication();
+        services.RemoveAll<IBlobApplication>();
+        services.AddSingleton<IBlobApplication>(provider => InProcessApplicationProxy.Create<IBlobApplication>(
+            provider.GetRequiredService<IApplicationRpcDispatcher>(), provider.GetRequiredService<GatewayBlobCapabilities>()));
+        services.RemoveAll<IMetadataApplication>();
+        services.AddSingleton<IMetadataApplication>(provider => InProcessApplicationProxy.Create<IMetadataApplication>(
+            provider.GetRequiredService<IApplicationRpcDispatcher>()));
+        services.RemoveAll<IApplicationReadSessions>();
+        services.AddSingleton<IApplicationReadSessions>(provider => InProcessApplicationProxy.Create<IApplicationReadSessions>(
+            provider.GetRequiredService<IApplicationRpcDispatcher>()));
+        services.RemoveAll<IHostLifetime>();
+        services.AddSingleton(new SavaTestHostLifetime());
+        services.AddSingleton<IHostLifetime>(provider => provider.GetRequiredService<SavaTestHostLifetime>());
+    }
+
     private void ConfigureGraphResolverServices(IWebHostBuilder builder)
     {
         if (_graphHandlerFactory is null || _graphCredential is null)
@@ -302,6 +320,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private Dictionary<string, string?> CreateBaseConfiguration() => new(StringComparer.Ordinal)
     {
         ["Sava:DataPath"] = DataPath,
+        ["Gateway:StagingPath"] = DataPath + ".gateway",
+        ["ApplicationTransport:AccessKeyFile"] = Path.Combine(DataPath, "unused-in-process-access-key"),
         ["Sava:DefaultAccount"] = AccountName,
         [$"Sava:Accounts:{AccountName}"] = AccountKey,
         [$"Sava:Accounts:{SecondAccountName}"] = SecondAccountKey,
@@ -354,6 +374,8 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         _chunkStore?.Dispose();
         _metadataStore?.Dispose();
         _storagePaths?.Dispose();
+        if (Directory.Exists(DataPath + ".gateway") && !Directory.EnumerateFileSystemEntries(DataPath + ".gateway").Any())
+            Directory.Delete(DataPath + ".gateway", recursive: false);
         if (_deleteDataPath)
             await DeleteDataPathAsync(DataPath).ConfigureAwait(false);
     }

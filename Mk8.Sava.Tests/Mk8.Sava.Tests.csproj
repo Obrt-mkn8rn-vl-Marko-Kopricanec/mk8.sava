@@ -19,6 +19,9 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Mk8.Sava.API/Mk8.Sava.API.csproj" />
+    <ProjectReference Include="../Mk8.Sava.Gateway/Mk8.Sava.Gateway.csproj" />
+    <ProjectReference Include="../Mk8.Sava.Application/Mk8.Sava.Application.csproj" />
+    <ProjectReference Include="../Mk8.Sava.Transport/Mk8.Sava.Transport.csproj" />
     <ProjectReference Include="../Mk8.Sava.BLL/Mk8.Sava.BLL.csproj" />
     <ProjectReference Include="../Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
     <ProjectReference Include="../Mk8.Sava.DAL/Mk8.Sava.DAL.csproj" />

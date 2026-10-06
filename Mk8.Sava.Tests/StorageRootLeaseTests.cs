@@ -56,14 +56,13 @@ public sealed class StorageRootLeaseTests
                     RedirectStandardError = true,
                     UseShellExecute = false
                 };
-                start.ArgumentList.Add(typeof(Program).Assembly.Location);
+                start.ArgumentList.Add(typeof(Mk8.Sava.Application.ApplicationProgram).Assembly.Location);
                 if (operatorCommand)
                 {
                     start.ArgumentList.Add("--backup-create");
                     start.ArgumentList.Add(Path.Combine(dataPath, "rejected-backup"));
                 }
-                start.Environment["Sava__DataPath"] = dataPath;
-                start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
+                await ConfigureContenderAsync(start, dataPath).ConfigureAwait(true);
                 using var contender = Process.Start(start);
                 Assert.NotNull(contender);
                 var output = contender.StandardOutput.ReadToEndAsync();
@@ -95,6 +94,21 @@ public sealed class StorageRootLeaseTests
             if (Directory.Exists(dataPath))
                 await SavaWebApplicationFactory.DeleteDataPathAsync(dataPath).ConfigureAwait(true);
         }
+    }
+
+    private static async Task ConfigureContenderAsync(ProcessStartInfo start, string dataPath)
+    {
+        start.Environment["Sava__DataPath"] = dataPath;
+        start.Environment["Sava__DefaultAccount"] = SavaWebApplicationFactory.AccountName;
+        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
+        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
+        var keyPath = Path.Combine(dataPath, "contender.key");
+        start.Environment["ApplicationTransport__AccessKeyFile"] = keyPath;
+        await File.WriteAllTextAsync(keyPath,
+            Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32))).ConfigureAwait(true);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
     }
 
     [Fact]

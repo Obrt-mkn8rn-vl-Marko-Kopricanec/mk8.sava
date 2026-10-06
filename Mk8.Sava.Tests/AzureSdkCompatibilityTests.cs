@@ -4363,10 +4363,13 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             RedirectStandardError = true,
             UseShellExecute = false
         };
-        start.ArgumentList.Add(typeof(Program).Assembly.Location);
+        start.ArgumentList.Add(typeof(Mk8.Sava.Application.ApplicationProgram).Assembly.Location);
         start.ArgumentList.Add("--hns-acl-apply");
         start.ArgumentList.Add(manifestPath);
         start.Environment["Sava__DataPath"] = dataPath;
+        start.Environment["Sava__DefaultAccount"] = SavaWebApplicationFactory.AccountName;
+        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
+        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
         start.Environment[$"Sava__AccountCapabilities__{SavaWebApplicationFactory.AccountName}__HierarchicalNamespaceEnabled"] = "true";
         using var process = Process.Start(start);
         Assert.NotNull(process);
@@ -8023,8 +8026,8 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             (await customerBlob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
 
         using var operatorClient = application.CreateClient();
-        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
-            .ConfigureAwait(false);
+        var metrics = await application.Services.GetRequiredService<Mk8.Sava.Application.IApplicationReadiness>()
+            .RenderStorageMetricsAsync(CancellationToken.None).ConfigureAwait(false);
         Assert.Contains("mk8_sava_maintenance_recompressed_chunks_total", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_maintenance_recompression_bytes_saved_total", metrics, StringComparison.Ordinal);
     }
@@ -13556,7 +13559,7 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
 
         await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
         using var operatorClient = application.CreateClient();
-        await AssertCorruptChunkStatusAndRecoveryAsync(blobService, blob, chunkPath, operatorClient).ConfigureAwait(false);
+        await AssertCorruptChunkStatusAndRecoveryAsync(application, blobService, blob, chunkPath, operatorClient).ConfigureAwait(false);
         await AssertMissingChunkStatusAndRecoveryAsync(application, blobService, container, containerName, operatorClient).ConfigureAwait(false);
 
         File.Delete(freshPath);
@@ -13623,20 +13626,23 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
     }
 
     private static async Task AssertCorruptChunkStatusAndRecoveryAsync(
-        BlobService blobService, BlobClient blob, string chunkPath, HttpClient operatorClient)
+        SavaWebApplicationFactory application, BlobService blobService, BlobClient blob, string chunkPath, HttpClient operatorClient)
     {
         using var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
             .ConfigureAwait(false);
         Assert.Equal(HttpStatusCode.ServiceUnavailable, unavailable.StatusCode);
-        var metrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
-            .ConfigureAwait(false);
+        var metrics = await application.Services.GetRequiredService<Mk8.Sava.Application.IApplicationReadiness>()
+            .RenderStorageMetricsAsync(CancellationToken.None).ConfigureAwait(false);
         Assert.Contains("mk8_sava_integrity_corrupt_chunks 1", metrics, StringComparison.Ordinal);
         Assert.Contains("mk8_sava_storage_physical_chunk_bytes", metrics, StringComparison.Ordinal);
         Assert.Contains($"mk8_sava_storage_allocation_available {(OperatingSystem.IsLinux() ? 1 : 0)}",
             metrics, StringComparison.Ordinal);
         if (OperatingSystem.IsLinux())
             Assert.Contains("mk8_sava_storage_allocated_root_bytes", metrics, StringComparison.Ordinal);
-        Assert.Contains("mk8_sava_http_request_duration_seconds_sum", metrics, StringComparison.Ordinal);
+        var gatewayMetrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
+            .ConfigureAwait(false);
+        Assert.Contains("mk8_sava_http_request_duration_seconds_sum", gatewayMetrics, StringComparison.Ordinal);
+        Assert.DoesNotContain("mk8_sava_storage_physical_chunk_bytes", gatewayMetrics, StringComparison.Ordinal);
 
         await blob.DeleteAsync().ConfigureAwait(false);
         await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
@@ -13660,8 +13666,8 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             !item.Id.EndsWith("/$zero", StringComparison.Ordinal));
         File.Delete(ChunkPath(application.DataPath, missingChunk.Id));
         await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
-        var missingMetrics = await operatorClient.GetStringAsync(new Uri("/metrics", UriKind.RelativeOrAbsolute))
-            .ConfigureAwait(false);
+        var missingMetrics = await application.Services.GetRequiredService<Mk8.Sava.Application.IApplicationReadiness>()
+            .RenderStorageMetricsAsync(CancellationToken.None).ConfigureAwait(false);
         Assert.Contains("mk8_sava_integrity_missing_chunks 1", missingMetrics, StringComparison.Ordinal);
         using var unavailable = await operatorClient.GetAsync(new Uri("/health/ready", UriKind.RelativeOrAbsolute))
             .ConfigureAwait(false);
