@@ -1,7 +1,8 @@
-<Project>
+<Project InitialTargets="Mk8ValidateProjectBoundaries">
   <!-- Enforce evaluated references (including imported/conditional items), not
-       just text in a .csproj. Tests intentionally compose both host graphs. -->
-  <Target Name="Mk8ValidateProjectBoundaries" BeforeTargets="CollectPackageReferences;ResolveProjectReferences"
+       just text in a .csproj. Run before SDK target prerequisites can resolve
+       references. Tests intentionally compose both host graphs. -->
+  <Target Name="Mk8ValidateProjectBoundaries"
           Condition="$([System.String]::Copy('$(MSBuildProjectName)').StartsWith('Mk8.Sava.')) and '$(MSBuildProjectName)' != 'Mk8.Sava.Tests'">
     <ItemGroup>
       <_Mk8ProductionProject Include="Mk8.Sava.API;Mk8.Sava.Application;Mk8.Sava.BLL;Mk8.Sava.Contracts;Mk8.Sava.DAL;Mk8.Sava.Gateway;Mk8.Sava.INF;Mk8.Sava.Transport" />

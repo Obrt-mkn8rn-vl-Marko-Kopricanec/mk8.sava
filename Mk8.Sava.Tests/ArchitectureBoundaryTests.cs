@@ -68,6 +68,17 @@ public sealed class ArchitectureBoundaryTests
         Assert.Contains("MK8ARCH003", result.Output, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("CollectPackageReferences")]
+    [InlineData("ResolveProjectReferences")]
+    public async Task SdkRestoreAndBuildHooksRejectForbiddenReferences(string target)
+    {
+        var result = await CheckBuildPolicyAsync("Mk8.Sava.Gateway", "Mk8.Sava.BLL", sdkTarget: target);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.True(result.Output.Contains("MK8ARCH002", StringComparison.Ordinal), result.Output);
+    }
+
     [Fact]
     public async Task ApprovedReferencesKeepBothHostsAndLowerLayersBuildable()
     {
@@ -151,7 +162,7 @@ public sealed class ArchitectureBoundaryTests
 
     private static async Task<(int ExitCode, string Output)> CheckBuildPolicyAsync(
         string project, string dependency, bool imported = false, bool foreign = false, bool enabled = true,
-        string? assemblyName = null)
+        string? assemblyName = null, string? sdkTarget = null)
     {
         var directory = Directory.CreateTempSubdirectory("sava-architecture-");
         try
@@ -160,8 +171,11 @@ public sealed class ArchitectureBoundaryTests
             var referencePath = Path.Combine(foreign ? directory.FullName : root, dependency, dependency + ".csproj");
             var references = new XElement("ItemGroup", new XElement("ProjectReference", new XAttribute("Include", referencePath)));
             var document = new XDocument(new XElement("Project",
-                new XElement("PropertyGroup", new XElement("AssemblyName", assemblyName ?? project), new XElement("EnableLeak", enabled ? "true" : "false")),
+                new XElement("PropertyGroup", new XElement("AssemblyName", assemblyName ?? project),
+                    new XElement("EnableLeak", enabled ? "true" : "false"), new XElement("TargetFramework", "net10.0")),
                 new XElement("Import", new XAttribute("Project", Path.Combine(root, "Directory.Build.targets")))));
+            if (sdkTarget is not null)
+                document.Root!.SetAttributeValue("Sdk", "Microsoft.NET.Sdk");
             if (imported)
             {
                 references.SetAttributeValue("Condition", "'$(EnableLeak)' == 'true'");
@@ -173,7 +187,7 @@ public sealed class ArchitectureBoundaryTests
                 document.Root!.Add(references);
             var projectPath = Path.Combine(directory.FullName, project + ".proj");
             await File.WriteAllTextAsync(projectPath, document.ToString()).ConfigureAwait(false);
-            return await RunBuildPolicyAsync(projectPath).ConfigureAwait(false);
+            return await RunBuildPolicyAsync(projectPath, sdkTarget ?? "Mk8ValidateProjectBoundaries").ConfigureAwait(false);
         }
         finally
         {
@@ -181,7 +195,7 @@ public sealed class ArchitectureBoundaryTests
         }
     }
 
-    private static async Task<(int ExitCode, string Output)> RunBuildPolicyAsync(string projectPath)
+    private static async Task<(int ExitCode, string Output)> RunBuildPolicyAsync(string projectPath, string target)
     {
         var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
         {
@@ -189,7 +203,7 @@ public sealed class ArchitectureBoundaryTests
             RedirectStandardError = true,
             UseShellExecute = false,
         };
-        foreach (var argument in new[] { "msbuild", projectPath, "-t:Mk8ValidateProjectBoundaries", "-nologo", "-v:quiet", "-nr:false" })
+        foreach (var argument in new[] { "msbuild", projectPath, "-t:" + target, "-nologo", "-v:quiet", "-nr:false" })
             start.ArgumentList.Add(argument);
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start MSBuild.");
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
