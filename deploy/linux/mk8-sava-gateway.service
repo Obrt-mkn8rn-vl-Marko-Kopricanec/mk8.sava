@@ -1,0 +1,39 @@
+[Unit]
+Description=mk8.sava Gateway Azure Blob protocol
+After=network-online.target mk8-sava-application.service
+Wants=network-online.target
+# Ordering is not a dependency: Gateway remains live when Application is down.
+
+[Service]
+Type=simple
+User=mk8sava-gateway
+Group=mk8sava-gateway
+SupplementaryGroups=mk8sava-rpc
+WorkingDirectory=/opt/mk8-sava/current/Gateway
+EnvironmentFile=/etc/mk8-sava/policy.env
+EnvironmentFile=/etc/mk8-sava/gateway.env
+ExecStart=/opt/mk8-sava/current/Gateway/Mk8.Sava.Gateway
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=60
+KillMode=control-group
+UMask=0077
+CacheDirectory=mk8-sava-gateway
+CacheDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+InaccessiblePaths=-/var/lib/mk8-sava-application
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 namespace Mk8.Sava.Storage;
 
-internal enum BlobTagComparison
+public enum BlobTagComparison
 {
     Equal,
     GreaterThan,

@@ -1,6 +1,6 @@
 namespace Mk8.Sava.Storage;
 
-internal sealed record BlobListEntry(
+public sealed record BlobListEntry(
     BlobRecord? Blob,
     string? Prefix,
     string? UncommittedBlobName = null,

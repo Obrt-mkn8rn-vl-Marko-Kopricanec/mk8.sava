@@ -54,8 +54,8 @@ public sealed class StorageAdmissionSdkTests
             Assert.Equal(before.LastModified, after.LastModified);
             Assert.Equal("original", after.Metadata["marker"]);
             Assert.Equal("original", (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToString());
-            using var monitoring = application.CreateClient();
-            var metrics = await monitoring.GetStringAsync(new Uri("/metrics", UriKind.Relative)).ConfigureAwait(false);
+            var metrics = await application.Services.GetRequiredService<Mk8.Sava.Application.IApplicationReadiness>()
+                .RenderStorageMetricsAsync(CancellationToken.None).ConfigureAwait(false);
             Assert.Contains("mk8_sava_storage_work_active{lane=\"writes\"} 1\n", metrics, StringComparison.Ordinal);
             Assert.Contains("mk8_sava_storage_work_rejected_total{lane=\"writes\"} 1\n", metrics, StringComparison.Ordinal);
         }

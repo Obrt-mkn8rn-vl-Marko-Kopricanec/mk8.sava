@@ -159,6 +159,59 @@ public sealed class KestrelUploadTests
         return content;
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task InvalidTransactionalChecksumsAcrossRpcPreserveAzureErrorsAndNeverPublish(bool crc64, bool existing)
+    {
+        var server = await RunningServer.StartAsync().ConfigureAwait(true);
+        await using var lifetime = server.ConfigureAwait(false);
+        var container = server.Client.GetBlobContainerClient("bad-checksum");
+        await container.CreateAsync().ConfigureAwait(true);
+        var blob = container.GetBlobClient("target");
+        if (existing)
+            await blob.UploadAsync(BinaryData.FromString("before-checksum-failure")).ConfigureAwait(true);
+        var before = existing ? (await blob.GetPropertiesAsync().ConfigureAwait(true)).Value.ETag : (ETag?)null;
+        var content = CreateContent(65537);
+        using var client = new HttpClient();
+        using var request = CreateUpload(blob, content, "raw");
+        AddInvalidChecksum(request, content, crc64);
+        using var response = await client.SendAsync(request).ConfigureAwait(true);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains(crc64 ? "<Code>Crc64Mismatch</Code>" : "<Code>Md5Mismatch</Code>",
+            await response.Content.ReadAsStringAsync().ConfigureAwait(true), StringComparison.Ordinal);
+        if (existing)
+        {
+            Assert.Equal(before, (await blob.GetPropertiesAsync().ConfigureAwait(true)).Value.ETag);
+            Assert.Equal("before-checksum-failure", (await blob.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+        }
+        else
+            Assert.False((await blob.ExistsAsync().ConfigureAwait(true)).Value);
+    }
+
+    private static void AddInvalidChecksum(HttpRequestMessage request, byte[] content, bool useCrc64)
+    {
+        if (useCrc64)
+        {
+            var checksum = new StorageCrc64();
+            checksum.Append(content);
+            var invalid = checksum.GetHash();
+            invalid[0] ^= 1;
+            request.Headers.Add("x-ms-content-crc64", Convert.ToBase64String(invalid));
+        }
+        else
+        {
+#pragma warning disable CA5351 // Azure transactional MD5 compatibility; flip one bit to prove a mismatch, not for security or deduplication.
+            var invalid = MD5.HashData(content);
+#pragma warning restore CA5351
+            invalid[0] ^= 1;
+            request.Content!.Headers.ContentMD5 = invalid;
+        }
+    }
+
     [Fact]
     public async Task StructuredUploadsAllowAlternativeSegmentLayoutsAtTheLogicalLimit()
     {
@@ -294,98 +347,18 @@ public sealed class KestrelUploadTests
         Assert.Equal("RequestBodyTooLarge", exception.ErrorCode);
     }
 
-    private sealed class RunningServer : IAsyncDisposable
+    private sealed class RunningServer(SplitProcessHost host) : IAsyncDisposable
     {
-        private readonly Process _process;
-        private readonly string _dataPath;
-        private readonly Task<string> _output;
-        private readonly Task<string> _error;
-        private readonly TaskCompletionSource<Uri> _address = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        private RunningServer(Process process, string dataPath)
-        {
-            _process = process;
-            _dataPath = dataPath;
-            _output = CaptureOutputAsync();
-            _error = process.StandardError.ReadToEndAsync();
-        }
-
-        public BlobServiceClient Client { get; private set; } = null!;
+        public BlobServiceClient Client => host.Client;
 
         public static async Task<RunningServer> StartAsync(long? maximumBodyBytes = null)
         {
-            var dataPath = Directory.CreateTempSubdirectory("mk8-sava-kestrel-").FullName;
-            var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
-            {
-                WorkingDirectory = AppContext.BaseDirectory,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false
-            };
-            start.ArgumentList.Add(typeof(Program).Assembly.Location);
-            foreach (var key in start.Environment.Keys.Where(key => key.StartsWith("Sava__", StringComparison.OrdinalIgnoreCase))
-                         .ToArray())
-                start.Environment.Remove(key);
-            start.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
-            start.Environment["DOTNET_ENVIRONMENT"] = "Production";
-            start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
-            start.Environment["Logging__LogLevel__Microsoft.Hosting.Lifetime"] = "Information";
-            start.Environment["Sava__DataPath"] = dataPath;
-            start.Environment["Sava__DefaultAccount"] = SavaWebApplicationFactory.AccountName;
-            start.Environment["Sava__Accounts__devstoreaccount1"] = SavaWebApplicationFactory.AccountKey;
+            var settings = new Dictionary<string, string?>(StringComparer.Ordinal);
             if (maximumBodyBytes.HasValue)
-                start.Environment["Sava__MaximumRequestBodyBytes"] = maximumBodyBytes.Value.ToString(CultureInfo.InvariantCulture);
-            var process = Process.Start(start) ?? throw new InvalidOperationException("The Kestrel test host could not start.");
-            var server = new RunningServer(process, dataPath);
-            try
-            {
-                var address = await server._address.Task.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
-                using var transport = new HttpClient();
-                using var readiness = await transport.GetAsync(new Uri(address, "/health/ready")).ConfigureAwait(false);
-                Assert.Equal(HttpStatusCode.OK, readiness.StatusCode);
-                var options = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03);
-                options.Retry.MaxRetries = 0;
-                server.Client = new BlobServiceClient(new Uri(address, "/" + SavaWebApplicationFactory.AccountName),
-                    new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
-                    options);
-                return server;
-            }
-            catch
-            {
-                await server.DisposeAsync().ConfigureAwait(false);
-                throw;
-            }
+                settings["Sava:MaximumRequestBodyBytes"] = maximumBodyBytes.Value.ToString(CultureInfo.InvariantCulture);
+            return new RunningServer(await SplitProcessHost.StartAsync(settings: settings).ConfigureAwait(false));
         }
 
-        private async Task<string> CaptureOutputAsync()
-        {
-            var output = new StringBuilder();
-            while (await _process.StandardOutput.ReadLineAsync().ConfigureAwait(false) is { } line)
-            {
-                output.AppendLine(line);
-                const string prefix = "Now listening on: ";
-                var start = line.IndexOf(prefix, StringComparison.Ordinal);
-                if (start >= 0 && Uri.TryCreate(line[(start + prefix.Length)..].Trim(), UriKind.Absolute, out var uri))
-                    _address.TrySetResult(uri);
-            }
-            _address.TrySetException(new InvalidOperationException($"The Kestrel test host exited before publishing an address: {output}"));
-            return output.ToString();
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            try
-            {
-                if (!_process.HasExited)
-                    _process.Kill(entireProcessTree: true);
-                await _process.WaitForExitAsync().ConfigureAwait(false);
-                _ = await Task.WhenAll(_output, _error).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
-            }
-            finally
-            {
-                _process.Dispose();
-                await SavaWebApplicationFactory.DeleteDataPathAsync(_dataPath).ConfigureAwait(false);
-            }
-        }
+        public ValueTask DisposeAsync() => host.DisposeAsync();
     }
 }

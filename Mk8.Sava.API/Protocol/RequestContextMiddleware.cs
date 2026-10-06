@@ -8,7 +8,7 @@ internal sealed class RequestContextMiddleware(
     RequestDelegate next,
     IOptions<SavaOptions> options,
     StorageAuthenticator authenticator,
-    MetadataStore metadata)
+    IMetadataApplication metadata)
 {
     private enum ServiceVersionSource
     {

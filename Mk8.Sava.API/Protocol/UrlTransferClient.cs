@@ -11,7 +11,7 @@ namespace Mk8.Sava.Protocol;
 
 internal sealed class UrlTransferClient(
     HttpClient client,
-    StoragePaths paths,
+    GatewayStagingPaths paths,
     IOptions<SavaOptions> configuredOptions)
 {
     private readonly SavaOptions _options = configuredOptions.Value;
@@ -377,13 +377,7 @@ internal sealed class UrlTransferClient(
         var temporaryPath = Path.Combine(paths.Staging, $"url-source-{Guid.NewGuid():N}.tmp");
         try
         {
-            var temporary = new FileStream(
-                temporaryPath,
-                FileMode.CreateNew,
-                FileAccess.ReadWrite,
-                FileShare.None,
-                128 * 1024,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+            var temporary = paths.OpenTemporaryFile(temporaryPath);
             await using (temporary.ConfigureAwait(false))
             {
                 var (checksums, length) = await CopyAndVerifySourceAsync(

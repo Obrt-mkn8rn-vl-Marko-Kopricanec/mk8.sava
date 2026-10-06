@@ -8,6 +8,7 @@
 TestResults/
 artifacts/
 data/
+.gateway-staging/
 *.db
 *.db-shm
 *.db-wal

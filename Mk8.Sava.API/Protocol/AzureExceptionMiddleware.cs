@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Text;
 using System.Xml;
-using Microsoft.Data.Sqlite;
 using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Protocol;
@@ -30,44 +29,16 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
     }
 
     private static bool IsKnownStorageException(Exception exception) =>
-        exception is AzureStorageException or RequestBodyTooLargeException or StorageConcurrencyException or
-            StorageImmutabilityException or StoragePendingCopyException or StorageBlobTypeMismatchException or
-            StoragePathConflictException or XmlException or
-            BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge };
+        StorageExceptionMapper.IsKnown(exception) ||
+        exception is BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge };
 
     private static AzureStorageException MapException(Exception exception) => exception switch
     {
-        AzureStorageException storage => storage,
-        RequestBodyTooLargeException oversized => new AzureStorageException(
-            StatusCodes.Status413PayloadTooLarge,
-            "RequestBodyTooLarge",
-            oversized.Message),
         BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge } => new AzureStorageException(
             StatusCodes.Status413PayloadTooLarge,
             "RequestBodyTooLarge",
             "The request body exceeds the maximum permissible limit."),
-        StorageConcurrencyException => AzureStorageException.ConditionNotMet(),
-        StorageImmutabilityException immutable => new AzureStorageException(
-            StatusCodes.Status409Conflict,
-            immutable.LegalHold ? "BlobImmutableDueToLegalHold" : "BlobImmutableDueToPolicy",
-            immutable.Message),
-        StoragePendingCopyException pending => new AzureStorageException(
-            StatusCodes.Status409Conflict,
-            "PendingCopyOperation",
-            pending.Message),
-        StorageBlobTypeMismatchException mismatch => new AzureStorageException(
-            StatusCodes.Status409Conflict,
-            "InvalidBlobType",
-            mismatch.Message),
-        StoragePathConflictException => AzureStorageException.PathAlreadyExists(),
-        XmlException => new AzureStorageException(
-            StatusCodes.Status400BadRequest,
-            "InvalidXmlDocument",
-            "The specified XML is not syntactically valid."),
-        _ => new AzureStorageException(
-            StatusCodes.Status500InternalServerError,
-            "InternalError",
-            "The server encountered an internal error. Please retry the request.")
+        _ => StorageExceptionMapper.Map(exception)
     };
 
     private static async Task WriteErrorAsync(HttpContext context, AzureStorageException exception)

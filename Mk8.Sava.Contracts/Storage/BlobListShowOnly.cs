@@ -1,6 +1,6 @@
 namespace Mk8.Sava.Storage;
 
-internal enum BlobListShowOnly
+public enum BlobListShowOnly
 {
     None,
     Deleted,

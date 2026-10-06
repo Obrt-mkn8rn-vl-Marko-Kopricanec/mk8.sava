@@ -83,6 +83,22 @@ public sealed class StorageTelemetry : IStorageTelemetry
         return builder.ToString();
     }
 
+    public string RenderRequestPrometheus()
+    {
+        var builder = new StringBuilder(1024);
+        AppendRequestMetrics(builder);
+        return builder.ToString();
+    }
+
+    public string RenderStoragePrometheus()
+    {
+        var builder = new StringBuilder(4096);
+        AppendStorageMetrics(builder, Usage);
+        AppendIntegrityMetrics(builder, Integrity);
+        AppendMaintenanceMetrics(builder);
+        return builder.ToString();
+    }
+
     private void AppendRequestMetrics(StringBuilder builder)
     {
         var durationSeconds = Interlocked.Read(ref _requestDurationStopwatchTicks) / (double)Stopwatch.Frequency;

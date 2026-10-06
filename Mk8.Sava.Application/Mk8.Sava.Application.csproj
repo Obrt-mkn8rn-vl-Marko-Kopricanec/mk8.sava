@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <AssemblyName>Mk8.Sava.Application</AssemblyName>
+    <RootNamespace>Mk8.Sava.Application</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
+    <ProjectReference Include="../Mk8.Sava.Transport/Mk8.Sava.Transport.csproj" />
+    <ProjectReference Include="../Mk8.Sava.BLL/Mk8.Sava.BLL.csproj" />
+    <ProjectReference Include="../Mk8.Sava.DAL/Mk8.Sava.DAL.csproj" />
+    <ProjectReference Include="../Mk8.Sava.INF/Mk8.Sava.INF.csproj" />
+  </ItemGroup>
+</Project>

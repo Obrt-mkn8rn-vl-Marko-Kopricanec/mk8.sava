@@ -1,6 +1,6 @@
 namespace Mk8.Sava.Protocol;
 
-internal sealed class BlobQueryDataException : Exception
+public sealed class BlobQueryDataException : Exception
 {
     public BlobQueryDataException()
         : base("Blob query data is invalid.")
