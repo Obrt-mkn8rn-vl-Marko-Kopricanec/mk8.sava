@@ -195,6 +195,32 @@ running Gateway/Application boundary. They are not latency, memory or staging
 budgets for the new private-transport topology; rerun representative workloads
 on the actual two-process deployment before making those claims.
 
+### Enforced service dependency boundaries
+
+`Directory.Build.targets` checks evaluated project references during ordinary
+restore/build, including conditional and imported items. Production projects
+must retain their registered assembly identities and may reference only these
+root-child projects:
+
+| Project | Allowed project references |
+| --- | --- |
+| Contracts | None |
+| DAL | Contracts |
+| INF | DAL, Contracts |
+| BLL | DAL, INF, Contracts |
+| Transport | Contracts |
+| API | Transport, Contracts |
+| Gateway | API, Transport, Contracts |
+| Application | BLL, DAL, INF, Transport, Contracts |
+
+Tests intentionally compose both host graphs and are exempt from this reference
+policy. `ArchitectureBoundaryTests` also inspects each host's actual compiled
+assembly closure and runtime dependency manifest, and exercises prohibited,
+conditional/imported, foreign-path and renamed-assembly cases. A new production
+project requires an explicit policy and corresponding tests. These development
+guards supplement, rather than replace, runtime authentication and the
+installation's separate accounts/filesystem permissions.
+
 ## SDK substitution checks
 
 The normal .NET integration suite uses the official Azure Storage client.

@@ -1,0 +1,30 @@
+<Project>
+  <!-- Enforce evaluated references (including imported/conditional items), not
+       just text in a .csproj. Tests intentionally compose both host graphs. -->
+  <Target Name="Mk8ValidateProjectBoundaries" BeforeTargets="CollectPackageReferences;ResolveProjectReferences"
+          Condition="$([System.String]::Copy('$(MSBuildProjectName)').StartsWith('Mk8.Sava.')) and '$(MSBuildProjectName)' != 'Mk8.Sava.Tests'">
+    <ItemGroup>
+      <_Mk8ProductionProject Include="Mk8.Sava.API;Mk8.Sava.Application;Mk8.Sava.BLL;Mk8.Sava.Contracts;Mk8.Sava.DAL;Mk8.Sava.Gateway;Mk8.Sava.INF;Mk8.Sava.Transport" />
+      <_Mk8KnownProject Include="@(_Mk8ProductionProject)" Condition="'%(_Mk8ProductionProject.Identity)' == '$(MSBuildProjectName)'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj"
+                                   Condition="'$(MSBuildProjectName)' != 'Mk8.Sava.Contracts'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.Transport/Mk8.Sava.Transport.csproj"
+                                   Condition="'$(MSBuildProjectName)' == 'Mk8.Sava.API' or '$(MSBuildProjectName)' == 'Mk8.Sava.Gateway' or '$(MSBuildProjectName)' == 'Mk8.Sava.Application'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.API/Mk8.Sava.API.csproj"
+                                   Condition="'$(MSBuildProjectName)' == 'Mk8.Sava.Gateway'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.BLL/Mk8.Sava.BLL.csproj"
+                                   Condition="'$(MSBuildProjectName)' == 'Mk8.Sava.Application'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.INF/Mk8.Sava.INF.csproj"
+                                   Condition="'$(MSBuildProjectName)' == 'Mk8.Sava.Application' or '$(MSBuildProjectName)' == 'Mk8.Sava.BLL'" />
+      <_Mk8AllowedProjectReference Include="$(MSBuildThisFileDirectory)Mk8.Sava.DAL/Mk8.Sava.DAL.csproj"
+                                   Condition="'$(MSBuildProjectName)' == 'Mk8.Sava.Application' or '$(MSBuildProjectName)' == 'Mk8.Sava.BLL' or '$(MSBuildProjectName)' == 'Mk8.Sava.INF'" />
+      <_Mk8RejectedProjectReference Include="@(ProjectReference->'%(FullPath)')" Exclude="@(_Mk8AllowedProjectReference->'%(FullPath)')" />
+    </ItemGroup>
+    <Error Code="MK8ARCH001" Condition="'@(_Mk8KnownProject)' == ''"
+           Text="Production project $(MSBuildProjectName) needs an explicit architecture policy." />
+    <Error Code="MK8ARCH002" Condition="'@(_Mk8RejectedProjectReference)' != ''"
+           Text="$(MSBuildProjectName) violates its dependency boundary: @(_Mk8RejectedProjectReference, ', ')." />
+    <Error Code="MK8ARCH003" Condition="'$(AssemblyName)' != '' and '$(AssemblyName)' != '$(MSBuildProjectName)'"
+           Text="$(MSBuildProjectName) must retain its architecture-policy assembly identity." />
+  </Target>
+</Project>

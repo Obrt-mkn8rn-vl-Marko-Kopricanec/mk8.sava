@@ -4,50 +4,11 @@ namespace Mk8.Sava.Transport;
 
 internal static class PageCopyFrames
 {
-    private const long MaximumPageBlobBytes = 8L * 1024 * 1024 * 1024 * 1024;
-    private const long RangeFrameBytes = 4 * 1024 * 1024;
-
-    internal static long Validate(PageRangeDiff changes, long sourceLength)
-    {
-        if (sourceLength < 0 || sourceLength > MaximumPageBlobBytes || sourceLength % 512 != 0)
-            throw new InvalidDataException("The application page-copy source length is invalid.");
-        ValidateRanges(changes.ClearRanges, MaximumPageBlobBytes);
-        return ValidateRanges(changes.PageRanges, sourceLength);
-    }
-
-    private static long ValidateRanges(IReadOnlyList<PageRange> ranges, long maximumLength)
-    {
-        long total = 0;
-        long lastEnd = -1;
-        foreach (var range in ranges)
-        {
-            if (range.Start < 0 || range.Start <= lastEnd || range.End < range.Start ||
-                range.End >= maximumLength || range.Start % 512 != 0 || (range.End + 1) % 512 != 0)
-                throw new InvalidDataException("The application page-copy ranges are invalid or out of order.");
-            total = checked(total + range.End - range.Start + 1);
-            lastEnd = range.End;
-        }
-        return total;
-    }
-
-    internal static IEnumerable<PageRange> EnumerateRanges(PageRangeDiff changes)
-    {
-        foreach (var range in changes.PageRanges)
-        {
-            for (var start = range.Start; start <= range.End;)
-            {
-                var end = Math.Min(range.End, start + RangeFrameBytes - 1);
-                yield return new PageRange(start, end);
-                start = end + 1;
-            }
-        }
-    }
-
     internal static async Task WriteAsync(
-        IPageCopySource source, PageRangeDiff changes, FramedWriteStream destination,
+        IPageCopySource source, PageCopyPlan plan, FramedWriteStream destination,
         CancellationToken cancellationToken)
     {
-        foreach (var range in EnumerateRanges(changes))
+        foreach (var range in plan.EnumerateRanges())
         {
             var callbacks = 0;
             await source.ReadRangeAsync(range, async (input, token) =>
@@ -67,9 +28,9 @@ internal static class PageCopyFrames
         }
     }
 
-    internal sealed class ServerSource(PageRangeDiff changes, FramedReadStream input) : IPageCopySource, IDisposable
+    internal sealed class ServerSource(PageCopyPlan plan, FramedReadStream input) : IPageCopySource, IDisposable
     {
-        private readonly IEnumerator<PageRange> ranges = EnumerateRanges(changes).GetEnumerator();
+        private readonly IEnumerator<PageRange> ranges = plan.EnumerateRanges().GetEnumerator();
         private bool initialized;
         private PageRange? next;
 
@@ -82,7 +43,7 @@ internal static class PageCopyFrames
             next = ranges.MoveNext() ? ranges.Current : null;
             if (next is null)
                 await input.EnsureCompletedAsync(cancellationToken).ConfigureAwait(false);
-            return changes;
+            return plan.Descriptor;
         }
 
         public async Task ReadRangeAsync(
