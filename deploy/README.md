@@ -92,6 +92,12 @@ active owners, links, nested or unrelated directories are never swept. Its
 metrics separately expose admission occupancy/rejections and staging
 quota-accounted bytes/limit/rejections. Scrape Application for authoritative
 storage gauges, not Gateway.
+An admitted storage request keeps its Gateway permit through final metrics,
+logging and best-effort analytics persistence, not just the Blob endpoint.
+Analytics has an independent five-second cancellation deadline, including for
+failed or disconnected client requests; ordinary analytics failures do not
+rewrite the completed Blob response. Health/metrics remain outside public
+storage admission, and saturation still produces a mapped, counted 503.
 
 ## Linux systemd templates
 

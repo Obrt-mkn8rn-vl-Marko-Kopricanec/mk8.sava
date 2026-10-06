@@ -1165,6 +1165,14 @@ tier changes.
   scrapes as well as storage API requests. Unsupported paths under `/health`
   and `/metrics`, including bare `/health`, return HTTP 404.
 
+Gateway's public storage admission covers the endpoint and its final metrics,
+logging and best-effort analytics persistence. The active-request gauge retains
+the permit while analytics is pending. Analytics uses an independent five-second
+cancellation deadline even after client failure/disconnection; ordinary analytics
+errors or timeout do not replace an already completed Blob response. Health and
+metrics bypass this admission, while saturated storage requests return a mapped
+503 that is included in HTTP request/error counters.
+
 ### Storage work admission
 
 Application shares four independently bounded FIFO work lanes across its

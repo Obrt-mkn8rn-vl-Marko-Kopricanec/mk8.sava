@@ -125,9 +125,10 @@ function Invoke-TestOperator([string] $Name, [string] $Argument, [string] $DataR
     finally { Stop-TestHost $process }
 }
 
-function Get-HttpStatus([string] $Address, [string] $Method = 'GET') {
+function Get-HttpStatus([string] $Address, [string] $Method = 'GET',
+    [TimeSpan] $Budget = [TimeSpan]::FromSeconds(1)) {
     $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::new($Method), $Address)
-    $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(1))
+    $deadline = [Threading.CancellationTokenSource]::new($Budget)
     try {
         $response = $client.SendAsync($request, $deadline.Token).GetAwaiter().GetResult()
         try { return [int] $response.StatusCode }
@@ -140,17 +141,26 @@ function Get-HttpStatus([string] $Address, [string] $Method = 'GET') {
 }
 
 function Wait-TestStatus([string] $Address, [int] $Expected, $Process) {
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    $startupBudget = [TimeSpan]::FromSeconds(10)
     do {
         $Process.Refresh()
         if ($Process.HasExited) { throw "Published host exited before $Address was available." }
         try {
-            if ((Get-HttpStatus $Address) -eq $Expected) { return }
+            $remaining = $startupBudget - $elapsed.Elapsed
+            if ($remaining -le [TimeSpan]::Zero) { break }
+            # Backend readiness has a five-second RPC deadline. A one-second probe
+            # cancels correct 503 responses on Windows before connection refusal.
+            $probeBudget = [TimeSpan]::FromSeconds([Math]::Min(6, $remaining.TotalSeconds))
+            if ((Get-HttpStatus $Address 'GET' $probeBudget) -eq $Expected) { return }
         }
         catch [Net.Http.HttpRequestException] { }
         catch [OperationCanceledException] { }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
+        $remaining = $startupBudget - $elapsed.Elapsed
+        if ($remaining -gt [TimeSpan]::Zero) {
+            Start-Sleep -Milliseconds ([Math]::Min(100, $remaining.TotalMilliseconds))
+        }
+    } while ($elapsed.Elapsed -lt $startupBudget)
     throw "$Address did not return $Expected within the existing 10-second startup budget."
 }
 
