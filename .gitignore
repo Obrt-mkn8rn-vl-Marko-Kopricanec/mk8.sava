@@ -11,3 +11,5 @@ data/
 *.db
 *.db-shm
 *.db-wal
+**/[Aa][Gg][Ee][Nn][Tt].[Mm][Dd]
+**/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
