@@ -50,7 +50,8 @@ public sealed class GatewayAdmissionPipelineTests
             await pipeline.InvokeAsync(rejected).ConfigureAwait(true);
             Assert.Equal(StatusCodes.Status503ServiceUnavailable, rejected.Response.StatusCode);
             Assert.Equal("ServerBusy", rejected.Response.Headers["x-ms-error-code"]);
-            Assert.Contains("mk8_sava_gateway_rejected_requests_total 1\n", admission.RenderMetrics(), StringComparison.Ordinal);
+            Assert.Contains("mk8_sava_gateway_rejected_requests_total 1",
+                admission.RenderMetrics().Split('\n', StringSplitOptions.TrimEntries), StringComparer.Ordinal);
 
             await AssertOperatorsBypassAsync(pipeline).ConfigureAwait(true);
             Assert.Equal(1, analytics.Attempts);
@@ -243,7 +244,8 @@ public sealed class GatewayAdmissionPipelineTests
         Assert.Equal("InternalError", context.Response.Headers["x-ms-error-code"]);
         Assert.Equal(0, endpointCalls);
         AssertActive(admission, 0);
-        Assert.Contains("mk8_sava_gateway_rejected_requests_total 0\n", admission.RenderMetrics(), StringComparison.Ordinal);
+        Assert.Contains("mk8_sava_gateway_rejected_requests_total 0",
+            admission.RenderMetrics().Split('\n', StringSplitOptions.TrimEntries), StringComparer.Ordinal);
     }
 
     [Fact]
@@ -317,8 +319,8 @@ public sealed class GatewayAdmissionPipelineTests
     });
 
     private static void AssertActive(GatewayAdmission admission, int expected) =>
-        Assert.Contains(FormattableString.Invariant($"mk8_sava_gateway_active_requests {expected}\n"),
-            admission.RenderMetrics(), StringComparison.Ordinal);
+        Assert.Contains(FormattableString.Invariant($"mk8_sava_gateway_active_requests {expected}"),
+            admission.RenderMetrics().Split('\n', StringSplitOptions.TrimEntries), StringComparer.Ordinal);
 
     private sealed class ControlledAnalyticsSink(Exception? failure = null) : IStorageAnalyticsSink
     {
