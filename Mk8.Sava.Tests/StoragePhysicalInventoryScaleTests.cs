@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Microsoft.Extensions.DependencyInjection;
 using Mk8.Sava.Storage;
 using Xunit.Abstractions;
@@ -98,6 +99,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             ReportControl("after", after);
             output.WriteLine(FormattableString.Invariant(
                 $"inventory_concurrent_writes,passes={measured.Passes},overlapping_passes={measured.OverlappingPasses},mutations={measured.WriteCount},max_pass_ms={measured.MaxPass.TotalMilliseconds:F3},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
+            ReportMutationTail("concurrent", measured);
             Assert.InRange(measured.Passes, 1, 110);
             Assert.True(measured.OverlappingPasses > 0, "The scan did not overlap any completed staging mutations.");
             Assert.Equal(ConcurrentWriteCount, measured.WriteCount);
@@ -115,7 +117,19 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     {
         output.WriteLine(FormattableString.Invariant(
             $"inventory_control_writes,phase={phase},passes={measured.Passes},mutations={measured.WriteCount},p99_mutation_ms={measured.P99Write.TotalMilliseconds:F3}"));
+        ReportMutationTail(phase, measured);
         Assert.Equal(ConcurrentWriteCount, measured.WriteCount);
+    }
+
+    private void ReportMutationTail(string phase, ConcurrentScanMeasurements measured)
+    {
+        // Correlated rows retain whole-operation latency, not sums of unrelated phase quantiles.
+        for (var index = Math.Max(0, measured.Mutations.Length - 8); index < measured.Mutations.Length; index++)
+        {
+            var mutation = measured.Mutations[index];
+            output.WriteLine(FormattableString.Invariant(
+                $"inventory_mutation_tail,phase={phase},index={mutation.Index},total_ms={mutation.Total.TotalMilliseconds:F3},create_ms={Stopwatch.GetElapsedTime(mutation.Started, mutation.Opened).TotalMilliseconds:F3},write_ms={Stopwatch.GetElapsedTime(mutation.Opened, mutation.Written).TotalMilliseconds:F3},flush_ms={Stopwatch.GetElapsedTime(mutation.Written, mutation.Flushed).TotalMilliseconds:F3},close_ms={Stopwatch.GetElapsedTime(mutation.Flushed, mutation.Closed).TotalMilliseconds:F3},delete_ms={Stopwatch.GetElapsedTime(mutation.Closed, mutation.Finished).TotalMilliseconds:F3}"));
+        }
     }
 
     [Theory]
@@ -218,13 +232,14 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         var latencies = await writer.ConfigureAwait(false);
         var scanResult = await scan.ConfigureAwait(false);
         Assert.NotEmpty(latencies);
-        Array.Sort(latencies);
+        Array.Sort(latencies, static (left, right) => left.Total.CompareTo(right.Total));
         return new ConcurrentScanMeasurements(
             scanResult.Passes,
             scanResult.OverlappingPasses,
             latencies.Length,
             scanResult.MaxPass,
-            latencies[(int)Math.Ceiling(latencies.Length * 0.99) - 1]);
+            latencies[(int)Math.Ceiling(latencies.Length * 0.99) - 1].Total,
+            latencies);
     }
 
     private static (int Passes, int OverlappingPasses, TimeSpan MaxPass) ScanWhileWriting(
@@ -264,11 +279,11 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         }
     }
 
-    private static TimeSpan[] WriteStagingFiles(
+    private static StagingMutation[] WriteStagingFiles(
         Barrier rendezvous, string stagingDirectory, long[] batchTimes,
         int[] scanFinished, CancellationTokenSource abort)
     {
-        var latencies = new TimeSpan[ConcurrentWriteCount];
+        var latencies = new StagingMutation[ConcurrentWriteCount];
         var index = 0;
         try
         {
@@ -293,19 +308,26 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         }
     }
 
-    private static TimeSpan WriteStagingFile(string stagingDirectory, int index)
+    private static StagingMutation WriteStagingFile(string stagingDirectory, int index)
     {
         var path = Path.Combine(stagingDirectory,
             $"inventory-writer-{index.ToString("D4", System.Globalization.CultureInfo.InvariantCulture)}.tmp");
         var started = Stopwatch.GetTimestamp();
+        long opened;
+        long written;
+        long flushed;
         using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write,
                    FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, FileOptions.WriteThrough))
         {
+            opened = Stopwatch.GetTimestamp();
             file.Write([0x5a]);
+            written = Stopwatch.GetTimestamp();
             file.Flush(flushToDisk: true);
+            flushed = Stopwatch.GetTimestamp();
         }
+        var closed = Stopwatch.GetTimestamp();
         File.Delete(path);
-        return Stopwatch.GetElapsedTime(started);
+        return new StagingMutation(index, started, opened, written, flushed, closed, Stopwatch.GetTimestamp());
     }
 
     private static void WaitForPhase(Barrier rendezvous, CancellationToken cancellationToken)
@@ -315,7 +337,14 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     }
 
     private sealed record ConcurrentScanMeasurements(
-        int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write);
+        int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write, StagingMutation[] Mutations);
+
+    [StructLayout(LayoutKind.Auto)]
+    private readonly record struct StagingMutation(
+        int Index, long Started, long Opened, long Written, long Flushed, long Closed, long Finished)
+    {
+        internal TimeSpan Total => Stopwatch.GetElapsedTime(Started, Finished);
+    }
 
     private static SavaWebApplicationFactory CreateApplication() => new(
         Path.Combine(Path.GetTempPath(), $"mk8-sava-inventory-scale-{Guid.NewGuid():N}"),
