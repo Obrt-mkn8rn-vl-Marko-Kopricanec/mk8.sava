@@ -4066,12 +4066,17 @@ public sealed class BlobService(
         CancellationToken cancellationToken)
     {
         const int comparisonBatchBytes = 4 * 1024 * 1024;
+        var capacity = checked((int)Math.Min(comparisonBatchBytes, endExclusive - start));
+        using var currentBytes = new MemoryStream(capacity);
+        using var previousBytes = new MemoryStream(capacity);
         var cursor = start;
         while (cursor < endExclusive)
         {
             var length = checked((int)Math.Min(comparisonBatchBytes, endExclusive - cursor));
-            using var currentBytes = new MemoryStream(length);
-            using var previousBytes = new MemoryStream(length);
+            // SetLength(0) also resets MemoryStream's position. Both buffers stay
+            // owned by this comparison and never grow past one bounded batch.
+            currentBytes.SetLength(0);
+            previousBytes.SetLength(0);
             await chunks.WriteRangeAsync(current.Content, encryption, cursor, length, currentBytes, cancellationToken).ConfigureAwait(false);
             await chunks.WriteRangeAsync(previous.Content, encryption, cursor, length, previousBytes, cancellationToken).ConfigureAwait(false);
 
