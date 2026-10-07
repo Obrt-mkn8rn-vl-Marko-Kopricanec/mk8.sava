@@ -21,7 +21,7 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
     private readonly ApplicationRpcEndpoint endpoint;
     private readonly DirectoryInfo directory;
     private ApplicationRpcClient? client;
-    private int requests;
+    private int verifiedPeerRequests;
 
     private RpcOutputTestHost(WebApplication application, DirectoryInfo directory, string keyPath, SavaOptions options)
     {
@@ -31,15 +31,15 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
     }
 
     public IApplicationReadSessions Sessions { get; private set; } = null!;
-    public int RequestCount => Volatile.Read(ref requests);
+    public int VerifiedPeerRequests => Volatile.Read(ref verifiedPeerRequests);
 
     public static Task<RpcOutputTestHost> StartAsync(byte[] content) =>
-        StartCoreAsync((context, endpoint) => endpoint.HandleAsync(context, new OutputDispatcher(content)));
+        StartCoreAsync((context, host) => host.endpoint.HandleAsync(context, new OutputDispatcher(content)));
 
     public static Task<RpcOutputTestHost> StartPeerAsync(Func<HttpContext, Task> writeResponse) =>
-        StartCoreAsync(async (context, endpoint) =>
+        StartCoreAsync(async (context, host) =>
         {
-            Assert.True(endpoint.IsAuthenticated(context));
+            Assert.True(host.endpoint.IsAuthenticated(context));
             Assert.Equal(ApplicationTransportSecurity.ProtocolVersion,
                 context.Request.Headers[ApplicationTransportSecurity.ProtocolHeader].ToString());
             Assert.Equal(ApplicationTransportSecurity.CreatePolicyFingerprint(new SavaOptions()),
@@ -55,6 +55,9 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
             Assert.False(request.HasInput);
             using var input = new FramedReadStream(context.Request.Body, 0);
             await input.EnsureCompletedAsync(context.RequestAborted).ConfigureAwait(false);
+            // A client can reject the response before this handler finishes.
+            // Count the authenticated, proof-verified request, not response completion.
+            Interlocked.Increment(ref host.verifiedPeerRequests);
             context.Response.ContentType = ApplicationTransportSecurity.ContentType;
             context.Response.Headers[ApplicationTransportSecurity.ProtocolHeader] = ApplicationTransportSecurity.ProtocolVersion;
             context.Response.Headers[ApplicationTransportSecurity.PolicyHeader] =
@@ -63,7 +66,7 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
             await writeResponse(context).ConfigureAwait(false);
         });
 
-    private static async Task<RpcOutputTestHost> StartCoreAsync(Func<HttpContext, ApplicationRpcEndpoint, Task> handle)
+    private static async Task<RpcOutputTestHost> StartCoreAsync(Func<HttpContext, RpcOutputTestHost, Task> handle)
     {
         var hostDirectory = Directory.CreateTempSubdirectory("mk8-sava-rpc-output-");
         WebApplication? webApplication = null;
@@ -92,11 +95,7 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
             webApplication = builder.Build();
             host = new RpcOutputTestHost(webApplication, hostDirectory, keyPath, options);
             var ownedHost = host;
-            webApplication.MapPost("/internal/application", async context =>
-            {
-                await handle(context, ownedHost.endpoint).ConfigureAwait(false);
-                Interlocked.Increment(ref ownedHost.requests);
-            });
+            webApplication.MapPost("/internal/application", context => handle(context, ownedHost));
             using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await webApplication.StartAsync(startup.Token).ConfigureAwait(false);
             var address = webApplication.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!

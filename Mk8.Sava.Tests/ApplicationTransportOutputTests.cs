@@ -95,7 +95,7 @@ public sealed class ApplicationTransportOutputTests(ITestOutputHelper output)
         Assert.Equal(503, failure.StatusCode);
         Assert.Equal("ServerBusy", failure.ErrorCode);
         Assert.False(destination.WasDisposed);
-        Assert.Equal(1, host.RequestCount);
+        Assert.Equal(1, host.VerifiedPeerRequests);
         Assert.True(destination.Length <= length);
     }
 
@@ -116,7 +116,56 @@ public sealed class ApplicationTransportOutputTests(ITestOutputHelper output)
         Assert.Equal("ServerBusy", failure.ErrorCode);
         Assert.Equal(0, destination.Length);
         Assert.False(destination.WasDisposed);
-        Assert.Equal(1, host.RequestCount);
+        Assert.Equal(1, host.VerifiedPeerRequests);
+    }
+
+    [Fact]
+    public async Task EarlyRejectedOutputRecordsTheVerifiedPeerBeforeHandlerCompletion()
+    {
+        var packet = await CreateResponseAsync([], hasOutput: false).ConfigureAwait(true);
+        var requestVerified = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new SemaphoreSlim(0, 1);
+        var host = await RpcOutputTestHost.StartPeerAsync(async context =>
+        {
+            requestVerified.SetResult();
+            await context.Response.Body.WriteAsync(packet, context.RequestAborted).ConfigureAwait(false);
+            await context.Response.Body.FlushAsync(context.RequestAborted).ConfigureAwait(false);
+            await release.WaitAsync(context.RequestAborted).ConfigureAwait(false);
+        }).ConfigureAwait(true);
+        await using var hostLifetime = host.ConfigureAwait(false);
+        using var destination = new TrackingDestination(0);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await AssertEarlyRejectionAsync(host, destination, requestVerified, release, cancellation.Token).ConfigureAwait(true);
+    }
+
+    private static async Task AssertEarlyRejectionAsync(RpcOutputTestHost host, TrackingDestination destination,
+        TaskCompletionSource requestVerified, SemaphoreSlim release, CancellationToken cancellationToken)
+    {
+        var operation = ReadAsync(host, 0, destination, cancellationToken);
+        try
+        {
+            await requestVerified.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
+            var failure = await Assert.ThrowsAsync<AzureStorageException>(() => operation.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken))
+                .ConfigureAwait(false);
+            Assert.Equal("ServerBusy", failure.ErrorCode);
+            Assert.Equal(1, host.VerifiedPeerRequests);
+            Assert.False(destination.WasDisposed);
+            Assert.Equal(0, destination.Writes);
+        }
+        finally
+        {
+            release.Release();
+            try
+            {
+                // Cleanup has its own observation budget, independent of caller cancellation.
+                await operation.WaitAsync(TimeSpan.FromSeconds(5), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (AzureStorageException exception) when (string.Equals(exception.ErrorCode, "ServerBusy", StringComparison.Ordinal) &&
+                !CatastrophicExceptionPolicy.Contains(exception))
+            {
+                // The expected failed operation is joined before disposing its borrowed destination.
+            }
+        }
     }
 
     [Fact]
