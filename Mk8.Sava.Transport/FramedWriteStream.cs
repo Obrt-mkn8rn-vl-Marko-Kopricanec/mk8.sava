@@ -74,13 +74,14 @@ internal sealed class FramedWriteStream(
 
     private void EnsureActive()
     {
-        ThrowIfFailed();
+        EnsureAvailable();
         if (state == WriteState.Completed)
             throw new InvalidOperationException("The application transport output is already complete.");
     }
 
-    private void ThrowIfFailed()
+    private void EnsureAvailable()
     {
+        ObjectDisposedException.ThrowIf(state == WriteState.Disposed, this);
         if (state == WriteState.Failed)
             throw new InvalidDataException("The application transport output is permanently failed.");
     }
@@ -90,7 +91,7 @@ internal sealed class FramedWriteStream(
 
     public override async Task FlushAsync(CancellationToken cancellationToken)
     {
-        ThrowIfFailed();
+        EnsureAvailable();
         try
         {
             await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
@@ -105,7 +106,10 @@ internal sealed class FramedWriteStream(
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
+            state = WriteState.Disposed;
             hash.Dispose();
+        }
         base.Dispose(disposing);
     }
 
@@ -121,5 +125,6 @@ internal sealed class FramedWriteStream(
         Started,
         Completed,
         Failed,
+        Disposed,
     }
 }
