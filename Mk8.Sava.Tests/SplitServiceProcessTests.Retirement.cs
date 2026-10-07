@@ -39,7 +39,12 @@ public sealed partial class SplitServiceProcessTests
             // The failure is retirement-only: successful owned disposal has observed its root/drain/callback completion.
             Assert.True(root.HasExited);
             if (descendant is not null)
+            {
+                // Root/tree kill completion does not certify child exit. Observe this independently bound child.
+                using var childObservation = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await descendant.WaitForExitAsync(childObservation.Token).ConfigureAwait(true);
                 Assert.True(descendant.HasExited);
+            }
             Assert.Contains("root-output-without-newline", fixture.Service.Logs, StringComparison.Ordinal);
             await fixture.Service.DisposeAsync().ConfigureAwait(true);
         }
