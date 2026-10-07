@@ -154,7 +154,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
         internal Process Root { get; }
         internal Process? Descendant { get; private set; }
 
-        internal static async Task<ServiceFixture> StartAsync(string mode)
+        internal static async Task<ServiceFixture> StartAsync(string mode, Action<ServiceFixture>? writerReady = null)
         {
             var fixtureDirectory = Directory.CreateTempSubdirectory("sava-service-observation-");
             var script = Path.Combine(fixtureDirectory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
@@ -167,7 +167,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             try
             {
                 fixture = new ServiceFixture(fixtureDirectory, service);
-                await fixture.BindReadyProcessesAsync(mode).ConfigureAwait(false);
+                await fixture.BindReadyProcessesAsync(mode, writerReady).ConfigureAwait(false);
                 return fixture;
             }
             catch
@@ -200,7 +200,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             return start;
         }
 
-        private async Task BindReadyProcessesAsync(string mode)
+        private async Task BindReadyProcessesAsync(string mode, Action<ServiceFixture>? writerReady)
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             while (!File.Exists(Path.Combine(directory.FullName, "ready")))
@@ -218,7 +218,32 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 Descendant.EnableRaisingEvents = true;
                 Assert.False(Descendant.HasExited);
             }
+            writerReady?.Invoke(this);
+            while (!CapturedExpectedOutput(mode))
+            {
+                if (Root.HasExited)
+                    throw new InvalidOperationException($"Service fixture exited before capture acknowledgement.\n{Service.Logs}");
+                await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+            }
+            if (Root.HasExited)
+                throw new InvalidOperationException("Service fixture exited before capture readiness completed.");
         }
+
+        private bool CapturedExpectedOutput(string mode)
+        {
+            // A writer's ready file proves neither asynchronous drain has received its bytes.
+            var logs = Service.Logs;
+            if (!logs.Contains("root-output-without-newline", StringComparison.Ordinal) ||
+                !logs.Contains("root-error-without-newline", StringComparison.Ordinal))
+                return false;
+            if (string.Equals(mode, "stderr", StringComparison.Ordinal))
+                return logs.Contains("Now listening on: http://127.0.0.1:12345/", StringComparison.Ordinal);
+            if (string.Equals(mode, "fragmented", StringComparison.Ordinal))
+                return logs.Contains("Now listening on: http://127.0.0.1:", StringComparison.Ordinal);
+            return true;
+        }
+
+        internal Task ReleaseOutputAsync() => File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-output"), string.Empty);
 
         internal Task CompleteListenerAsync() => File.WriteAllTextAsync(Path.Combine(directory.FullName, "complete-listener"), string.Empty);
 
@@ -331,8 +356,8 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 done
                 exit 91
             fi
-            printf root-output-without-newline
-            printf root-error-without-newline >&2
+            [ "$mode" != delayed-stdout ] && printf root-output-without-newline
+            [ "$mode" != delayed-stderr ] && printf root-error-without-newline >&2
             if [ "$mode" = inherited ]; then
                 bash --noprofile --norc "$0" "$directory" descendant &
                 printf %s "$!" > "$directory/descendant-pid"
@@ -347,7 +372,13 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             if [ "$mode" = closed ]; then exec 1>&- 2>&-; fi
             printf ready > "$directory/ready"
             output_flushed=0
+            output_released=0
             for ((i=0; i<1200; i++)); do
+                if [ "$output_released" = 0 ] && [ -f "$directory/release-output" ]; then
+                    [ "$mode" = delayed-stdout ] && printf root-output-without-newline
+                    [ "$mode" = delayed-stderr ] && printf root-error-without-newline >&2
+                    output_released=1
+                fi
                 if [ "$output_flushed" = 0 ] && [ -f "$directory/flush-output" ]; then
                     printf '\n'
                     printf '\n' >&2
@@ -374,10 +405,14 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 }
                 exit 91
             }
-            [Console]::Out.Write('root-output-without-newline')
-            [Console]::Out.Flush()
-            [Console]::Error.Write('root-error-without-newline')
-            [Console]::Error.Flush()
+            if ($mode -ne 'delayed-stdout') {
+                [Console]::Out.Write('root-output-without-newline')
+                [Console]::Out.Flush()
+            }
+            if ($mode -ne 'delayed-stderr') {
+                [Console]::Error.Write('root-error-without-newline')
+                [Console]::Error.Flush()
+            }
             if ($mode -eq 'inherited') {
                 $start = [Diagnostics.ProcessStartInfo]::new('pwsh')
                 $start.UseShellExecute = $false
@@ -413,7 +448,19 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             }
             [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
             $outputFlushed = $false
+            $outputReleased = $false
             for ($i = 0; $i -lt 1200; $i++) {
+                if (-not $outputReleased -and (Test-Path (Join-Path $directory 'release-output') -PathType Leaf)) {
+                    if ($mode -eq 'delayed-stdout') {
+                        [Console]::Out.Write('root-output-without-newline')
+                        [Console]::Out.Flush()
+                    }
+                    if ($mode -eq 'delayed-stderr') {
+                        [Console]::Error.Write('root-error-without-newline')
+                        [Console]::Error.Flush()
+                    }
+                    $outputReleased = $true
+                }
                 if (-not $outputFlushed -and (Test-Path (Join-Path $directory 'flush-output'))) {
                     [Console]::Out.Write("`n")
                     [Console]::Out.Flush()
