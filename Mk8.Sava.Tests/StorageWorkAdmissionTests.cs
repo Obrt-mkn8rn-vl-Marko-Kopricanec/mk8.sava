@@ -5,7 +5,7 @@ using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class StorageWorkAdmissionTests
+public sealed partial class StorageWorkAdmissionTests
 {
     [Fact]
     public async Task QueuedUploadDoesNotReadOrStageItsBodyAndCancellationReleasesTheQueue() =>
@@ -146,28 +146,36 @@ public sealed class StorageWorkAdmissionTests
         // This is a deadlock guard, not a disk-throughput assertion: Windows CI
         // must durably flush the source and six copies while the full suite runs.
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
-        using var stored = await chunks.StorePinnedAsync(SavaWebApplicationFactory.AccountName, encryption, source, cancellation.Token).ConfigureAwait(false);
+        var progress = new StorageWorkProgressProbe(chunks.Admission, 6, TimeSpan.FromSeconds(1), cancellation.Token);
+        await using var progressDisposal = progress.ConfigureAwait(false);
         try
         {
-            await Task.WhenAll(Enumerable.Range(0, 6).Select(_ =>
-                CopyAndAssertAsync(chunks, stored.Manifest, encryption, bytes, cancellation.Token))).ConfigureAwait(false);
+            progress.SetSourcePhase(StorageWorkProgressProbe.SourcePhase.Storing);
+            using var stored = await chunks.StorePinnedAsync(SavaWebApplicationFactory.AccountName, encryption, source, cancellation.Token).ConfigureAwait(false);
+            progress.SetSourcePhase(StorageWorkProgressProbe.SourcePhase.Stored);
+            await Task.WhenAll(Enumerable.Range(0, 6).Select(copy =>
+                CopyAndAssertAsync(chunks, stored.Manifest, encryption, bytes, progress, copy, cancellation.Token))).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        catch (OperationCanceledException exception) when (cancellation.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
-            Assert.Fail($"Cross-domain copies exceeded the deadlock guard. Admission state:\n{chunks.Admission.RenderPrometheus()}");
+            Assert.Fail($"Cross-domain copies exceeded the unchanged 90-second deadlock guard.\n{progress.RenderDiagnostics()}");
         }
         Assert.Contains("mk8_sava_storage_work_active{lane=\"writes\"} 0\n", chunks.Admission.RenderPrometheus(), StringComparison.Ordinal);
     }
 
     private static async Task CopyAndAssertAsync(
-        ChunkStore chunks, ContentManifest manifest, BlobEncryption encryption, byte[] bytes, CancellationToken cancellationToken)
+        ChunkStore chunks, ContentManifest manifest, BlobEncryption encryption, byte[] bytes,
+        StorageWorkProgressProbe progress, int copy, CancellationToken cancellationToken)
     {
+        progress.SetCopyPhase(copy, StorageWorkProgressProbe.CopyPhase.Copying);
         using var copied = await chunks.CopyToDomainPinnedAsync(
             SavaWebApplicationFactory.SecondAccountName, encryption, encryption, manifest, cancellationToken).ConfigureAwait(false);
         Assert.Equal(SavaWebApplicationFactory.SecondAccountName, copied.Manifest.Domain);
         using var output = new MemoryStream();
+        progress.SetCopyPhase(copy, StorageWorkProgressProbe.CopyPhase.Reading);
         await chunks.WriteRangeAsync(copied.Manifest, encryption, 0, bytes.Length, output, cancellationToken).ConfigureAwait(false);
         Assert.Equal(bytes, output.ToArray());
+        progress.SetCopyPhase(copy, StorageWorkProgressProbe.CopyPhase.Verified);
     }
 
     private static SavaWebApplicationFactory CreateApplication(int queued) => new(new Dictionary<string, string?>(StringComparer.Ordinal)
