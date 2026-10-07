@@ -7,6 +7,48 @@ namespace Mk8.Sava.Tests;
 
 public sealed class TestProcessRunnerTests(ITestOutputHelper output)
 {
+    [Fact]
+    public async Task RootReadinessAloneCannotCertifyAnUnreadyDescendant()
+    {
+        ProcessFixture? returnedFixture = null;
+        try
+        {
+            var failure = await Assert.ThrowsAnyAsync<Exception>(async () =>
+            {
+                returnedFixture = await ProcessFixture.StartAsync("both",
+                    fault: FixtureFault.WithheldDescendantReadiness).ConfigureAwait(false);
+            }).ConfigureAwait(true);
+            Assert.True(failure is TimeoutException or InvalidOperationException,
+                $"Unexpected startup failure kind: {failure.GetType().Name}");
+            Assert.Contains("RootReady=True", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("DescendantReady=False", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
+            output.WriteLine($"Controlled startup rejection: {failure.GetType().Name}: {failure.Message}");
+        }
+        finally
+        {
+            if (returnedFixture is not null)
+                await returnedFixture.DisposeAsync().ConfigureAwait(true);
+        }
+    }
+
+    [Fact]
+    public async Task DescendantExitBeforeReadinessReportsStartupFailureAndPartialOutputs()
+    {
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            var fixture = await ProcessFixture.StartAsync("both",
+                fault: FixtureFault.ExitedDescendantBeforeReadiness).ConfigureAwait(false);
+            await fixture.DisposeAsync().ConfigureAwait(false);
+        }).ConfigureAwait(true);
+        Assert.Contains("RootReady=False", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("DescendantReady=False", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("injected-descendant-startup-error", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
+        output.WriteLine($"Controlled startup rejection: {failure.GetType().Name}: {failure.Message}");
+    }
+
     [Theory]
     [InlineData("stdout")]
     [InlineData("stderr")]
@@ -166,6 +208,13 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
         catch (OperationCanceledException exception) when (observation.IsCompleted && !CatastrophicExceptionPolicy.Contains(exception)) { }
     }
 
+    private enum FixtureFault
+    {
+        None,
+        WithheldDescendantReadiness,
+        ExitedDescendantBeforeReadiness,
+    }
+
     private sealed class ProcessFixture : IAsyncDisposable
     {
         private readonly DirectoryInfo temporaryDirectory;
@@ -183,12 +232,13 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
         internal Process Root => startedRoot ?? throw new InvalidOperationException("The fixture root has not started.");
         internal Process? Descendant { get; private set; }
 
-        internal static async Task<ProcessFixture> StartAsync(string inherited, int exitCode = 0)
+        internal static async Task<ProcessFixture> StartAsync(
+            string inherited, int exitCode = 0, FixtureFault fault = FixtureFault.None)
         {
             var fixture = new ProcessFixture(Directory.CreateTempSubdirectory("sava-process-bound-"));
             try
             {
-                await fixture.InitializeAsync(inherited, exitCode).ConfigureAwait(false);
+                await fixture.InitializeAsync(inherited, exitCode, fault).ConfigureAwait(false);
                 return fixture;
             }
             catch
@@ -198,7 +248,7 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             }
         }
 
-        private async Task InitializeAsync(string inherited, int exitCode)
+        private async Task InitializeAsync(string inherited, int exitCode, FixtureFault fault)
         {
             var script = Path.Combine(temporaryDirectory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
             await File.WriteAllTextAsync(script, OperatingSystem.IsWindows() ? WindowsScript : UnixScript)
@@ -217,29 +267,80 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             start.ArgumentList.Add(temporaryDirectory.FullName);
             start.ArgumentList.Add(inherited);
             start.ArgumentList.Add(exitCode.ToString(CultureInfo.InvariantCulture));
+            start.ArgumentList.Add(fault.ToString());
             startedRoot = Process.Start(start) ?? throw new InvalidOperationException("The process fixture did not start.");
             using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-            while (!File.Exists(Path.Combine(temporaryDirectory.FullName, "ready")))
+            var requiresDescendant = inherited is "stdout" or "stderr" or "both" or "neither";
+            try
             {
-                if (Root.HasExited)
+                var state = ReadStartupState();
+                while (!state.IsReady(requiresDescendant))
                 {
-                    var failure = await TestProcessRunner.ObserveAsync(Root, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1))
-                        .ConfigureAwait(false);
-                    throw new InvalidOperationException($"Fixture exited before readiness ({failure.ExitCode}): " +
-                        failure.StandardOutput + failure.StandardError);
+                    if (state.RootExited)
+                        throw new InvalidOperationException($"Fixture root exited before readiness ({Root.ExitCode}).");
+                    await Task.Delay(20, startup.Token).ConfigureAwait(false);
+                    state = ReadStartupState();
                 }
-                await Task.Delay(20, startup.Token).ConfigureAwait(false);
+                startup.Token.ThrowIfCancellationRequested();
+                if (requiresDescendant)
+                {
+                    var childPath = Path.Combine(temporaryDirectory.FullName, "descendant-pid");
+                    var childId = int.Parse(await File.ReadAllTextAsync(childPath, startup.Token).ConfigureAwait(false),
+                        CultureInfo.InvariantCulture);
+                    Descendant = Process.GetProcessById(childId);
+                    // Bind the known live child before its parent exits; never rediscover it during cleanup.
+                    _ = Descendant.SafeHandle;
+                    Descendant.EnableRaisingEvents = true;
+                    if (Descendant.HasExited)
+                        throw new InvalidOperationException("The fixture descendant exited before binding completed.");
+                }
             }
-            var childPath = Path.Combine(temporaryDirectory.FullName, "descendant-pid");
-            if (File.Exists(childPath))
+            catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
             {
-                var childId = int.Parse(await File.ReadAllTextAsync(childPath, startup.Token).ConfigureAwait(false),
-                    CultureInfo.InvariantCulture);
-                Descendant = Process.GetProcessById(childId);
-                // Bind the known live child before its parent exits; do not rediscover it by PID during cleanup.
-                _ = Descendant.SafeHandle;
-                Descendant.EnableRaisingEvents = true;
+                // Capture handshake state before diagnostic observation attempts owned-root cleanup.
+                var state = ReadStartupState().ToDiagnostic();
+                var captured = await CaptureStartupFailureAsync().ConfigureAwait(false);
+                if (failure is OperationCanceledException && startup.IsCancellationRequested)
+                    throw new TimeoutException($"Fixture startup exceeded 20 seconds. {state}. {captured}", failure);
+                throw new InvalidOperationException($"Fixture startup failed: {failure.Message}. {state}. {captured}", failure);
             }
+        }
+
+        private StartupState ReadStartupState() => new(
+            Root.HasExited,
+            File.Exists(Path.Combine(temporaryDirectory.FullName, "ready")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-starting")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-ready")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-pid")));
+
+        private async Task<string> CaptureStartupFailureAsync()
+        {
+            try
+            {
+                // Let an unready child consume its release signal before observing pipes or deleting the fixture directory.
+                await File.WriteAllTextAsync(releaseDescendant, string.Empty).ConfigureAwait(false);
+                // No reader is started on success; the helper under test still owns its drains.
+                var captured = await TestProcessRunner.ObserveAsync(Root, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(1))
+                    .ConfigureAwait(false);
+                return $"Diagnostic root exit code={captured.ExitCode}. " +
+                    "Root exit and EOF do not establish arbitrary descendant exit.\n" +
+                    $"stdout:\n{captured.StandardOutput}\nstderr:\n{captured.StandardError}";
+            }
+            catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
+            {
+                return $"Startup diagnostic observation: {failure.GetType().Name}: {failure.Message}";
+            }
+        }
+
+        private readonly record struct StartupState(
+            bool RootExited, bool RootReady, bool DescendantStarting, bool DescendantReady, bool DescendantPidPublished)
+        {
+            internal bool IsReady(bool requiresDescendant) => !RootExited && RootReady &&
+                (!requiresDescendant || (DescendantReady && DescendantPidPublished));
+
+            internal string ToDiagnostic() => $"RootExited={RootExited}, RootReady={RootReady}, " +
+                $"DescendantStarting={DescendantStarting}, DescendantReady={DescendantReady}, " +
+                $"DescendantPidPublished={DescendantPidPublished}";
         }
 
         internal async Task ReleaseRootAsync()
@@ -291,8 +392,16 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             directory=$2
             inherited=$3
             exit_code=$4
+            fault=$5
             if [ "$role" = descendant ]; then
-                printf ready > "$directory/descendant-ready"
+                printf starting > "$directory/descendant-starting"
+                if [ "$fault" = ExitedDescendantBeforeReadiness ]; then
+                    printf injected-descendant-startup-error >&2
+                    exit 97
+                fi
+                if [ "$fault" != WithheldDescendantReadiness ]; then
+                    printf ready > "$directory/descendant-ready"
+                fi
                 for ((attempt=0; attempt<1200; attempt++)); do
                     [ -f "$directory/release-descendant" ] && exit 0
                     sleep 0.05
@@ -303,16 +412,29 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             printf root-error-without-newline >&2
             if [ "$inherited" = stdout ] || [ "$inherited" = stderr ] || [ "$inherited" = both ] || [ "$inherited" = neither ]; then
                 case "$inherited" in
-                    stdout) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 2>/dev/null & ;;
-                    stderr) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 >/dev/null & ;;
-                    both) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 & ;;
-                    neither) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 >/dev/null 2>&1 & ;;
+                    stdout) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 "$fault" 2>/dev/null & ;;
+                    stderr) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 "$fault" >/dev/null & ;;
+                    both) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 "$fault" & ;;
+                    neither) bash --noprofile --norc "$0" descendant "$directory" "$inherited" 0 "$fault" >/dev/null 2>&1 & ;;
                 esac
-                printf %s "$!" > "$directory/descendant-pid"
+                descendant_pid=$!
+                printf %s "$descendant_pid" > "$directory/descendant-pid"
+                if [ "$fault" = WithheldDescendantReadiness ]; then
+                    printf ready > "$directory/ready"
+                fi
                 for ((attempt=0; attempt<400; attempt++)); do
                     [ -f "$directory/descendant-ready" ] && break
+                    if ! kill -0 "$descendant_pid" 2>/dev/null; then
+                        if wait "$descendant_pid"; then descendant_exit=0; else descendant_exit=$?; fi
+                        printf 'Descendant fixture exited before readiness (%s).' "$descendant_exit" >&2
+                        exit 93
+                    fi
                     sleep 0.05
                 done
+                if [ ! -f "$directory/descendant-ready" ]; then
+                    printf 'Descendant fixture never became ready.' >&2
+                    exit 94
+                fi
             fi
             if [ "$inherited" = closed ]; then
                 exec 1>&- 2>&-
@@ -332,8 +454,16 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             """;
 
         private const string WindowsScript = """
-            param($role, $directory, $inherited, [int]$exitCode)
+            param($role, $directory, $inherited, [int]$exitCode, $fault)
             $ErrorActionPreference = 'Stop'
+            if ($role -eq 'descendant') {
+                [IO.File]::WriteAllText((Join-Path $directory 'descendant-starting'), 'starting')
+                if ($fault -eq 'ExitedDescendantBeforeReadiness') {
+                    [Console]::Error.Write('injected-descendant-startup-error')
+                    [Console]::Error.Flush()
+                    exit 97
+                }
+            }
             if ($role -eq 'descendant' -or $inherited -eq 'closed') {
                 Add-Type -TypeDefinition '
                     using System;
@@ -350,7 +480,9 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                 if ($inherited -notin @('stderr', 'both')) {
                     [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-12))
                 }
-                [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
+                if ($fault -ne 'WithheldDescendantReadiness') {
+                    [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
+                }
                 for ($attempt = 0; $attempt -lt 1200; $attempt++) {
                     if (Test-Path (Join-Path $directory 'release-descendant')) { exit 0 }
                     Start-Sleep -Milliseconds 50
@@ -365,12 +497,25 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                 $start = [Diagnostics.ProcessStartInfo]::new('pwsh')
                 $start.UseShellExecute = $false
                 foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath,
-                    'descendant', $directory, $inherited, '0')) { $start.ArgumentList.Add($argument) }
+                    'descendant', $directory, $inherited, '0', $fault)) { $start.ArgumentList.Add($argument) }
                 $child = [Diagnostics.Process]::Start($start)
                 [IO.File]::WriteAllText((Join-Path $directory 'descendant-pid'), [string]$child.Id)
+                if ($fault -eq 'WithheldDescendantReadiness') {
+                    [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
+                }
                 for ($attempt = 0; $attempt -lt 400; $attempt++) {
                     if (Test-Path (Join-Path $directory 'descendant-ready')) { break }
+                    if ($child.HasExited) {
+                        [Console]::Error.Write("Descendant fixture exited before readiness ($($child.ExitCode)).")
+                        [Console]::Error.Flush()
+                        exit 93
+                    }
                     Start-Sleep -Milliseconds 50
+                }
+                if (-not (Test-Path (Join-Path $directory 'descendant-ready'))) {
+                    [Console]::Error.Write('Descendant fixture never became ready.')
+                    [Console]::Error.Flush()
+                    exit 94
                 }
             }
             if ($inherited -eq 'closed') {
