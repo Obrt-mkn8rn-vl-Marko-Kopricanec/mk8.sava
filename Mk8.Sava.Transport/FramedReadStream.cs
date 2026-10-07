@@ -44,7 +44,9 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
             // Empty/control RPCs require proof, not a 64 KiB data reservation.
             // Validate an untrusted header before creating the bounded buffer.
             if (frame.Length == 0)
-                frame = new byte[RpcFrames.MaximumDataFrameBytes];
+                // A valid positive header proves the total is positive; keep
+                // capacity for later frames, not merely the first short frame.
+                frame = new byte[(int)Math.Min(maximumBytes, RpcFrames.MaximumDataFrameBytes)];
             await source.ReadExactlyAsync(frame.AsMemory(0, length), cancellationToken).ConfigureAwait(false);
             hash.AppendData(frame.AsSpan(0, length));
             receivedBytes += length;
