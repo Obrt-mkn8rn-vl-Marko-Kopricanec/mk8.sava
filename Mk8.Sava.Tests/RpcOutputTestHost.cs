@@ -36,6 +36,12 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
     public static Task<RpcOutputTestHost> StartAsync(byte[] content) =>
         StartCoreAsync((context, host) => host.endpoint.HandleAsync(context, new OutputDispatcher(content)));
 
+    public static Task<RpcOutputTestHost> StartDispatcherAsync(IApplicationRpcDispatcher dispatcher)
+    {
+        ArgumentNullException.ThrowIfNull(dispatcher);
+        return StartCoreAsync((context, host) => host.endpoint.HandleAsync(context, dispatcher));
+    }
+
     public static Task<RpcOutputTestHost> StartPeerAsync(Func<HttpContext, Task> writeResponse) =>
         StartCoreAsync(async (context, host) =>
         {
