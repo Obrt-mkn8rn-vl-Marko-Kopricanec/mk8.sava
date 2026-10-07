@@ -167,13 +167,14 @@ public sealed class ArchitectureBoundaryTests
         var directory = Directory.CreateTempSubdirectory("sava-architecture-");
         try
         {
-            var root = FindRepositoryRoot();
+            var source = RepositoryTestSource.FromAssembly(typeof(ArchitectureBoundaryTests).Assembly);
+            var root = source.Root;
             var referencePath = Path.Combine(foreign ? directory.FullName : root, dependency, dependency + ".csproj");
             var references = new XElement("ItemGroup", new XElement("ProjectReference", new XAttribute("Include", referencePath)));
             var document = new XDocument(new XElement("Project",
                 new XElement("PropertyGroup", new XElement("AssemblyName", assemblyName ?? project),
                     new XElement("EnableLeak", enabled ? "true" : "false"), new XElement("TargetFramework", "net10.0")),
-                new XElement("Import", new XAttribute("Project", Path.Combine(root, "Directory.Build.targets")))));
+                new XElement("Import", new XAttribute("Project", source.BuildPolicyPath))));
             if (sdkTarget is not null)
                 document.Root!.SetAttributeValue("Sdk", "Microsoft.NET.Sdk");
             if (imported)
@@ -209,15 +210,5 @@ public sealed class ArchitectureBoundaryTests
         var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))
             .ConfigureAwait(false);
         return (result.ExitCode, result.StandardOutput + result.StandardError);
-    }
-
-    private static string FindRepositoryRoot()
-    {
-        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "Mk8.Sava.slnx")))
-                return directory.FullName;
-        }
-        throw new DirectoryNotFoundException("The architecture test needs its repository's solution and build policy.");
     }
 }

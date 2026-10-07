@@ -4,6 +4,14 @@
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
   <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Mk8.Sava.Tests.RepositoryRoot</_Parameter1>
+      <_Parameter2>$(MSBuildThisFileDirectory)..</_Parameter2>
+    </AssemblyAttribute>
+    <EmbeddedResource Include="../Mk8.Sava.slnx" LogicalName="Mk8.Sava.Tests.Source.Mk8.Sava.slnx" />
+    <EmbeddedResource Include="../Directory.Build.targets" LogicalName="Mk8.Sava.Tests.Source.Directory.Build.targets" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="22.1.0" />
     <PackageReference Include="Azure.Storage.Blobs" Version="12.30.0-beta.2" />
     <PackageReference Include="Azure.Storage.Blobs.Batch" Version="12.27.0-beta.2" />
