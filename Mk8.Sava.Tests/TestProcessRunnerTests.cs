@@ -139,18 +139,20 @@ public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
     [Fact]
     public async Task CallerCancellationUsesIndependentCleanupAndPreservesItsToken()
     {
+        using var cancellation = new CancellationTokenSource();
         var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(true);
         await using var fixtureLifetime = fixture.ConfigureAwait(false);
-        using var cancellation = new CancellationTokenSource();
         var observation = TestProcessRunner.ObserveAsync(fixture.Root,
             TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2), cancellation.Token);
-        await cancellation.CancelAsync().WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(true);
+        var work = new CancellationWork(cancellation.CancelAsync(), observation);
+        await RunWithCleanupAsync(async () =>
+        {
+            await work.ObserveCallbacksAsync(fixture, cancellation, output.WriteLine).ConfigureAwait(false);
+            var failure = await work.ObserveCancellationAsync().ConfigureAwait(false);
 
-        var failure = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => observation.WaitAsync(TimeSpan.FromSeconds(6)))
-            .ConfigureAwait(true);
-
-        Assert.Equal(cancellation.Token, failure.CancellationToken);
-        Assert.True(fixture.Root.HasExited);
+            Assert.Equal(cancellation.Token, failure.CancellationToken);
+            Assert.True(fixture.Root.HasExited);
+        }, () => work.RetireAsync(fixture)).ConfigureAwait(true);
     }
 
     [Fact]
