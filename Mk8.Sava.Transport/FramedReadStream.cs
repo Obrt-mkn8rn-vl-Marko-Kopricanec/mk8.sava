@@ -13,7 +13,7 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
     private long receivedBytes;
     private ReadState state;
 
-    public override bool CanRead => true;
+    public override bool CanRead => state != ReadState.Disposed;
     public override bool CanSeek => false;
     public override bool CanWrite => false;
     public override long Length => throw new NotSupportedException();
@@ -28,6 +28,7 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(state == ReadState.Disposed, this);
         if (state == ReadState.Failed)
             throw new InvalidDataException("The application transport input previously failed and cannot be resumed.");
         if (buffer.Length == 0 || state == ReadState.Verified)
@@ -89,7 +90,10 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
     protected override void Dispose(bool disposing)
     {
         if (disposing)
+        {
+            state = ReadState.Disposed;
             hash.Dispose();
+        }
         base.Dispose(disposing);
     }
 
@@ -99,5 +103,5 @@ internal sealed class FramedReadStream(Stream source, long maximumBytes) : Strea
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 
-    private enum ReadState { Active, Verified, Failed }
+    private enum ReadState { Active, Verified, Failed, Disposed }
 }
