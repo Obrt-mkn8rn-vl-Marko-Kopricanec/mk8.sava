@@ -68,6 +68,8 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             var failure = await Assert.ThrowsAsync<TimeoutException>(() => observation.WaitAsync(TimeSpan.FromSeconds(6)))
                 .ConfigureAwait(true);
 
+            output.WriteLine($"{inherited}: observation rejection after {watch.Elapsed.TotalMilliseconds:F3} ms:\n{failure.Message}");
+
             Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("RootExited=True", failure.Message, StringComparison.Ordinal);
