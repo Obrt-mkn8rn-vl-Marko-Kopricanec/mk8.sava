@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Mk8.Sava.Protocol;
 
@@ -144,26 +145,50 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         // Own read-end closure also covers a descendant retaining the write ends after the root exited.
         _process.StandardOutput.Dispose();
         _process.StandardError.Dispose();
-        var completion = Task.WhenAll(_output, _error, _rootExit, callbacks, _process.WaitForExitAsync(cleanup.Token));
+        var rootWait = _process.WaitForExitAsync(cleanup.Token);
+        await ObserveCleanupAsync([_output, _error, _rootExit, callbacks, rootWait],
+            () => $"Split service cleanup observation failed. Before cleanup: {beforeCleanup} " +
+                $"After cleanup: {Snapshot()} {killDiagnostic}\n{Logs}", cleanup.Token).ConfigureAwait(false);
+    }
+
+    internal static async Task ObserveCleanupAsync(IEnumerable<Task> operations, Func<string> diagnostic,
+        CancellationToken cancellationToken)
+    {
+        var tasks = operations.ToArray();
+        var completion = Task.WhenAll(tasks);
         try
         {
-            await completion.WaitAsync(cleanup.Token).ConfigureAwait(false);
+            await completion.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
         {
-            // Await unwraps only one failure; do not hide a fatal graph elsewhere in the joined tasks.
-            if (completion.Exception is { } joinedFailure && CatastrophicExceptionPolicy.Contains(joinedFailure))
-                throw joinedFailure;
-            var diagnostic = $"Split service cleanup observation failed. Before cleanup: {beforeCleanup} " +
-                $"After cleanup: {Snapshot()} {killDiagnostic}\n{Logs}";
-            if (failure is OperationCanceledException && cleanup.IsCancellationRequested)
-                throw new TimeoutException(diagnostic, failure);
-            throw new InvalidOperationException(diagnostic, failure);
+            // WhenAll remains pending until every task settles; its Exception cannot reveal earlier constituent faults.
+            ThrowKnownFatalFaults(tasks);
+            var message = diagnostic();
+            // Diagnostic capture can overlap task completion. Recheck before normalizing the ordinary/deadline failure.
+            ThrowKnownFatalFaults(tasks);
+            if (failure is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                throw new TimeoutException(message, failure);
+            throw new InvalidOperationException(message, failure);
         }
         finally
         {
             // Bounded observation is not a guarantee that native reads/callbacks or arbitrary descendants have ended.
             ObserveEventualFault(completion);
+        }
+    }
+
+    private static void ThrowKnownFatalFaults(Task[] tasks)
+    {
+        foreach (var task in tasks)
+        {
+            if (task.Exception is not { } failures)
+                continue;
+            foreach (var failure in failures.InnerExceptions)
+            {
+                if (CatastrophicExceptionPolicy.Contains(failure))
+                    ExceptionDispatchInfo.Throw(failure);
+            }
         }
     }
 
