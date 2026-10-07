@@ -18,8 +18,8 @@ namespace Mk8.Sava.Tests;
 internal sealed class SplitProcessHost : IAsyncDisposable
 {
     private readonly IReadOnlyDictionary<string, string?> _settings;
-    private ChildProcess? _application;
-    private ChildProcess? _gateway;
+    private SplitServiceProcess? _application;
+    private SplitServiceProcess? _gateway;
     private readonly StringBuilder _completedLogs = new();
     private string? _gatewayCertificateHash;
     private HttpClient? _gatewayTransportClient;
@@ -130,8 +130,8 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         _applicationOverrides = overrides ?? new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var pair in _applicationOverrides)
             start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
-        _application = new ChildProcess(start);
-        ApplicationAddress = await _application.Address.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+        _application = new SplitServiceProcess(start);
+        ApplicationAddress = await _application.WaitForAddressAsync("Application", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         await AssertStatusAsync(ApplicationAddress, "/health/ready", HttpStatusCode.OK).ConfigureAwait(false);
     }
 
@@ -183,8 +183,8 @@ internal sealed class SplitProcessHost : IAsyncDisposable
             foreach (var pair in overrides)
                 start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
         }
-        _gateway = new ChildProcess(start);
-        GatewayAddress = await _gateway.Address.WaitAsync(TimeSpan.FromSeconds(60)).ConfigureAwait(false);
+        _gateway = new SplitServiceProcess(start);
+        GatewayAddress = await _gateway.WaitForAddressAsync("Gateway", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         using var probe = CreateHttpClient();
         probe.Timeout = TimeSpan.FromSeconds(15);
         using var response = await probe.GetAsync(new Uri(GatewayAddress, "/health/live")).ConfigureAwait(false);
@@ -265,48 +265,5 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         socket.Bind(new IPEndPoint(IPAddress.Loopback, 0));
         return ((IPEndPoint)socket.LocalEndPoint!).Port;
-    }
-
-    private sealed class ChildProcess : IAsyncDisposable
-    {
-        private readonly Process _process;
-        private readonly Task _output;
-        private readonly Task _error;
-        private readonly StringBuilder _logs = new();
-        private readonly TaskCompletionSource<Uri> _address = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        public ChildProcess(ProcessStartInfo start)
-        {
-            _process = Process.Start(start) ?? throw new InvalidOperationException("A split service could not start.");
-            _output = CaptureAsync(_process.StandardOutput, publishAddress: true);
-            _error = CaptureAsync(_process.StandardError, publishAddress: false);
-        }
-
-        public int Id => _process.Id;
-        public Task<Uri> Address => _address.Task;
-        public string Logs { get { lock (_logs) return _logs.ToString(); } }
-
-        private async Task CaptureAsync(StreamReader reader, bool publishAddress)
-        {
-            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
-            {
-                lock (_logs) _logs.AppendLine(line);
-                const string prefix = "Now listening on: ";
-                var offset = line.IndexOf(prefix, StringComparison.Ordinal);
-                if (publishAddress && offset >= 0 && Uri.TryCreate(line[(offset + prefix.Length)..].Trim(), UriKind.Absolute, out var address))
-                    _address.TrySetResult(address);
-            }
-            if (publishAddress)
-                _address.TrySetException(new InvalidOperationException("Service exited before publishing its listener: " + Logs));
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            if (!_process.HasExited)
-                _process.Kill(entireProcessTree: true);
-            await _process.WaitForExitAsync().ConfigureAwait(false);
-            await Task.WhenAll(_output, _error).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
-            _process.Dispose();
-        }
     }
 }

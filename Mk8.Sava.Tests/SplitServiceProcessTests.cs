@@ -1,0 +1,370 @@
+using System.Diagnostics;
+using System.Globalization;
+using Xunit.Abstractions;
+
+namespace Mk8.Sava.Tests;
+
+public sealed class SplitServiceProcessTests(ITestOutputHelper output)
+{
+    [Fact]
+    public async Task ListenerTimeoutIncludesUnterminatedOutputsAndPreCleanupState()
+    {
+        var fixture = await ServiceFixture.StartAsync("ordinary").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+
+        var failure = await Assert.ThrowsAsync<TimeoutException>(() => fixture.Service.WaitForAddressAsync(
+            "Application", TimeSpan.FromSeconds(1))).ConfigureAwait(true);
+
+        Assert.IsType<TimeoutException>(failure.InnerException);
+        Assert.Contains("Application listener observation", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("RootExited=False, StdoutEof=False, StderrEof=False", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
+        Assert.False(fixture.Root.HasExited);
+        output.WriteLine(failure.Message);
+    }
+
+    [Fact]
+    public async Task RootExitRejectsStartupEvenWhenDescendantRetainsBothPipes()
+    {
+        var fixture = await ServiceFixture.StartAsync("inherited").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
+        Assert.NotNull(fixture.Descendant);
+        Assert.False(fixture.Descendant.HasExited);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.WaitForAddressAsync(
+            "Application", TimeSpan.FromSeconds(5)).WaitAsync(TimeSpan.FromSeconds(8))).ConfigureAwait(true);
+
+        Assert.Contains("RootExited=True, StdoutEof=False, StderrEof=False", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("descendant exit is not established", failure.Message, StringComparison.Ordinal);
+        Assert.IsType<InvalidOperationException>(failure.InnerException);
+        Assert.False(fixture.Descendant.HasExited);
+        output.WriteLine(failure.Message);
+    }
+
+    [Fact]
+    public async Task ExitedRootCleanupClosesOwnedReadEndsWithoutCertifyingDescendantExit()
+    {
+        var fixture = await ServiceFixture.StartAsync("inherited").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+        await fixture.ReleaseRootAsync().ConfigureAwait(true);
+
+        await fixture.Service.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(6)).ConfigureAwait(true);
+
+        Assert.NotNull(fixture.Descendant);
+        Assert.False(fixture.Descendant.HasExited);
+        Assert.Contains("root-error-without-newline", fixture.Service.Logs, StringComparison.Ordinal);
+        output.WriteLine("Owned service disposal completed while the independently bound descendant remained alive.");
+    }
+
+    [Fact]
+    public async Task CallerCancellationRetainsTokenInnerFailureAndLiveRootSnapshot()
+    {
+        var fixture = await ServiceFixture.StartAsync("ordinary").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+        using var cancellation = new CancellationTokenSource();
+        await cancellation.CancelAsync().ConfigureAwait(true);
+
+        var failure = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => fixture.Service.WaitForAddressAsync(
+            "Gateway", TimeSpan.FromSeconds(10), cancellation.Token)).ConfigureAwait(true);
+
+        Assert.Equal(cancellation.Token, failure.CancellationToken);
+        Assert.IsAssignableFrom<OperationCanceledException>(failure.InnerException);
+        Assert.Contains("Gateway listener observation", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("RootExited=False", failure.Message, StringComparison.Ordinal);
+        Assert.False(fixture.Root.HasExited);
+    }
+
+    [Fact]
+    public async Task PipeEofBeforeListenerDoesNotMisreportLiveRootAsExited()
+    {
+        var fixture = await ServiceFixture.StartAsync("closed").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.WaitForAddressAsync(
+            "Application", TimeSpan.FromSeconds(5))).ConfigureAwait(true);
+
+        Assert.Contains("RootExited=False, StdoutEof=True", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
+        Assert.False(fixture.Root.HasExited);
+        output.WriteLine(failure.Message);
+    }
+
+    [Fact]
+    public async Task StderrCannotPublishTheStdoutListener()
+    {
+        var fixture = await ServiceFixture.StartAsync("stderr").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+
+        var failure = await Assert.ThrowsAsync<TimeoutException>(() => fixture.Service.WaitForAddressAsync(
+            "Gateway", TimeSpan.FromSeconds(1))).ConfigureAwait(true);
+
+        Assert.Contains("Now listening on: http://127.0.0.1:12345/", failure.Message, StringComparison.Ordinal);
+        Assert.False(fixture.Root.HasExited);
+    }
+
+    [Fact]
+    public async Task FragmentedListenerRequiresCompleteLineAndCanSucceedAfterAnObservationTimeout()
+    {
+        var fixture = await ServiceFixture.StartAsync("fragmented").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+
+        var failure = await Assert.ThrowsAsync<TimeoutException>(() => fixture.Service.WaitForAddressAsync(
+            "Gateway", TimeSpan.FromSeconds(1))).ConfigureAwait(true);
+        Assert.Contains("Now listening on: http://127.0.0.1:", failure.Message, StringComparison.Ordinal);
+        await fixture.CompleteListenerAsync().ConfigureAwait(true);
+
+        var address = await fixture.Service.WaitForAddressAsync("Gateway", TimeSpan.FromSeconds(5)).ConfigureAwait(true);
+
+        Assert.Equal(new Uri("http://127.0.0.1:12345/"), address);
+        Assert.False(fixture.Root.HasExited);
+    }
+
+    [Fact]
+    public async Task LiveRootCleanupPreservesLogsAndRepeatedDisposalIsHarmless()
+    {
+        var fixture = await ServiceFixture.StartAsync("ordinary").ConfigureAwait(true);
+        await using var lifetime = fixture.ConfigureAwait(false);
+
+        await fixture.Service.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(6)).ConfigureAwait(true);
+        await fixture.Service.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(6)).ConfigureAwait(true);
+
+        Assert.True(fixture.Root.HasExited);
+        Assert.Contains("root-output-without-newline", fixture.Service.Logs, StringComparison.Ordinal);
+        Assert.Contains("root-error-without-newline", fixture.Service.Logs, StringComparison.Ordinal);
+    }
+
+    private sealed class ServiceFixture : IAsyncDisposable
+    {
+        private readonly DirectoryInfo directory;
+
+        private ServiceFixture(DirectoryInfo directory, SplitServiceProcess service)
+        {
+            this.directory = directory;
+            Service = service;
+            Root = Process.GetProcessById(service.Id);
+            _ = Root.SafeHandle;
+            Root.EnableRaisingEvents = true;
+        }
+
+        internal SplitServiceProcess Service { get; }
+        internal Process Root { get; }
+        internal Process? Descendant { get; private set; }
+
+        internal static async Task<ServiceFixture> StartAsync(string mode)
+        {
+            var fixtureDirectory = Directory.CreateTempSubdirectory("sava-service-observation-");
+            var script = Path.Combine(fixtureDirectory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
+            await File.WriteAllTextAsync(script, OperatingSystem.IsWindows() ? WindowsScript : UnixScript).ConfigureAwait(false);
+            var start = CreateStart(script, fixtureDirectory.FullName, mode);
+#pragma warning disable CA2000 // Returned fixture owns this service in its readonly field; the catch disposes it if constructor transfer fails.
+            var service = new SplitServiceProcess(start, TimeSpan.FromSeconds(1));
+#pragma warning restore CA2000
+            ServiceFixture? fixture = null;
+            try
+            {
+                fixture = new ServiceFixture(fixtureDirectory, service);
+                await fixture.BindReadyProcessesAsync(mode).ConfigureAwait(false);
+                return fixture;
+            }
+            catch
+            {
+                if (fixture is null)
+                {
+                    await service.DisposeAsync().ConfigureAwait(false);
+                    fixtureDirectory.Delete(recursive: true);
+                }
+                else
+                    await fixture.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+        }
+
+        private static ProcessStartInfo CreateStart(string script, string directory, string mode)
+        {
+            var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "pwsh" : "bash")
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            foreach (var argument in OperatingSystem.IsWindows()
+                ? new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script }
+                : new[] { "--noprofile", "--norc", script })
+                start.ArgumentList.Add(argument);
+            start.ArgumentList.Add(directory);
+            start.ArgumentList.Add(mode);
+            return start;
+        }
+
+        private async Task BindReadyProcessesAsync(string mode)
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            while (!File.Exists(Path.Combine(directory.FullName, "ready")))
+            {
+                if (Root.HasExited)
+                    throw new InvalidOperationException("Service fixture exited before its readiness proof.");
+                await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+            }
+            if (string.Equals(mode, "inherited", StringComparison.Ordinal))
+            {
+                var pid = int.Parse(await File.ReadAllTextAsync(Path.Combine(directory.FullName, "descendant-pid"),
+                    timeout.Token).ConfigureAwait(false), CultureInfo.InvariantCulture);
+                Descendant = Process.GetProcessById(pid);
+                _ = Descendant.SafeHandle;
+                Descendant.EnableRaisingEvents = true;
+                Assert.False(Descendant.HasExited);
+            }
+        }
+
+        internal Task CompleteListenerAsync() => File.WriteAllTextAsync(Path.Combine(directory.FullName, "complete-listener"), string.Empty);
+
+        internal async Task ReleaseRootAsync()
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await File.WriteAllTextAsync(Path.Combine(directory.FullName, "flush-output"), string.Empty, timeout.Token)
+                .ConfigureAwait(false);
+            // Root/child file readiness is not proof that our two independent drains received their known outputs.
+            while (!Service.Logs.Contains("root-output-without-newline", StringComparison.Ordinal) ||
+                !Service.Logs.Contains("root-error-without-newline", StringComparison.Ordinal))
+                await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+            await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-root"), string.Empty, timeout.Token)
+                .ConfigureAwait(false);
+            await Root.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-descendant"), string.Empty).ConfigureAwait(false);
+                if (Descendant is not null)
+                {
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await Descendant.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+                }
+                await Service.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                Descendant?.Dispose();
+                Root.Dispose();
+                directory.Delete(recursive: true);
+            }
+        }
+
+        private const string UnixScript = """
+            directory=$1
+            mode=$2
+            if [ "$mode" = descendant ]; then
+                printf ready > "$directory/descendant-ready"
+                for ((i=0; i<1200; i++)); do
+                    [ -f "$directory/release-descendant" ] && exit 0
+                    sleep 0.05
+                done
+                exit 91
+            fi
+            printf root-output-without-newline
+            printf root-error-without-newline >&2
+            if [ "$mode" = inherited ]; then
+                bash --noprofile --norc "$0" "$directory" descendant &
+                printf %s "$!" > "$directory/descendant-pid"
+                for ((i=0; i<400; i++)); do
+                    [ -f "$directory/descendant-ready" ] && break
+                    sleep 0.05
+                done
+                [ -f "$directory/descendant-ready" ] || exit 93
+            fi
+            [ "$mode" = stderr ] && printf '\nNow listening on: http://127.0.0.1:12345/\n' >&2
+            [ "$mode" = fragmented ] && printf '\nNow listening on: http://127.0.0.1:'
+            if [ "$mode" = closed ]; then exec 1>&- 2>&-; fi
+            printf ready > "$directory/ready"
+            output_flushed=0
+            for ((i=0; i<1200; i++)); do
+                if [ "$output_flushed" = 0 ] && [ -f "$directory/flush-output" ]; then
+                    printf '\n'
+                    printf '\n' >&2
+                    output_flushed=1
+                fi
+                if [ "$mode" = fragmented ] && [ -f "$directory/complete-listener" ]; then
+                    printf '12345/\r\n'
+                    mode=ordinary
+                fi
+                [ -f "$directory/release-root" ] && exit 23
+                sleep 0.05
+            done
+            exit 92
+            """;
+
+        private const string WindowsScript = """
+            param($directory, $mode)
+            $ErrorActionPreference = 'Stop'
+            if ($mode -eq 'descendant') {
+                [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
+                for ($i = 0; $i -lt 1200; $i++) {
+                    if (Test-Path (Join-Path $directory 'release-descendant')) { exit 0 }
+                    Start-Sleep -Milliseconds 50
+                }
+                exit 91
+            }
+            [Console]::Out.Write('root-output-without-newline')
+            [Console]::Out.Flush()
+            [Console]::Error.Write('root-error-without-newline')
+            [Console]::Error.Flush()
+            if ($mode -eq 'inherited') {
+                $start = [Diagnostics.ProcessStartInfo]::new('pwsh')
+                $start.UseShellExecute = $false
+                foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath, $directory, 'descendant')) {
+                    $start.ArgumentList.Add($argument)
+                }
+                $child = [Diagnostics.Process]::Start($start)
+                [IO.File]::WriteAllText((Join-Path $directory 'descendant-pid'), [string]$child.Id)
+                for ($i = 0; $i -lt 400; $i++) {
+                    if (Test-Path (Join-Path $directory 'descendant-ready')) { break }
+                    Start-Sleep -Milliseconds 50
+                }
+                if (-not (Test-Path (Join-Path $directory 'descendant-ready'))) { exit 93 }
+            }
+            if ($mode -eq 'stderr') {
+                [Console]::Error.Write("`nNow listening on: http://127.0.0.1:12345/`n")
+                [Console]::Error.Flush()
+            }
+            if ($mode -eq 'fragmented') {
+                [Console]::Out.Write("`nNow listening on: http://127.0.0.1:")
+                [Console]::Out.Flush()
+            }
+            if ($mode -eq 'closed') {
+                Add-Type -TypeDefinition '
+                    using System;
+                    using System.Runtime.InteropServices;
+                    public static class ServicePipeHandles {
+                        [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int kind);
+                        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
+                    }'
+                [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-11))
+                [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-12))
+            }
+            [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
+            $outputFlushed = $false
+            for ($i = 0; $i -lt 1200; $i++) {
+                if (-not $outputFlushed -and (Test-Path (Join-Path $directory 'flush-output'))) {
+                    [Console]::Out.Write("`n")
+                    [Console]::Out.Flush()
+                    [Console]::Error.Write("`n")
+                    [Console]::Error.Flush()
+                    $outputFlushed = $true
+                }
+                if ($mode -eq 'fragmented' -and (Test-Path (Join-Path $directory 'complete-listener'))) {
+                    [Console]::Out.Write("12345/`r`n")
+                    [Console]::Out.Flush()
+                    $mode = 'ordinary'
+                }
+                if (Test-Path (Join-Path $directory 'release-root')) { exit 23 }
+                Start-Sleep -Milliseconds 50
+            }
+            exit 92
+            """;
+    }
+}
