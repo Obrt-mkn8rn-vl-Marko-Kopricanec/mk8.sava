@@ -4,7 +4,7 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class SplitServiceProcessTests(ITestOutputHelper output)
+public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
 {
     [Fact]
     public async Task ListenerTimeoutIncludesUnterminatedOutputsAndPreCleanupState()
@@ -139,6 +139,7 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
     private sealed class ServiceFixture : IAsyncDisposable
     {
         private readonly DirectoryInfo directory;
+        private int disposalStarted;
 
         private ServiceFixture(DirectoryInfo directory, SplitServiceProcess service)
         {
@@ -221,6 +222,8 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
 
         internal Task CompleteListenerAsync() => File.WriteAllTextAsync(Path.Combine(directory.FullName, "complete-listener"), string.Empty);
 
+        internal void BlockRetirementSignal(string signal) => Directory.CreateDirectory(Path.Combine(directory.FullName, signal));
+
         internal async Task ReleaseRootAsync()
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -237,30 +240,83 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
 
         public async ValueTask DisposeAsync()
         {
+            if (Interlocked.Exchange(ref disposalStarted, 1) != 0)
+                return;
+            Exception? workflowFailure = null;
+            var resourcesReleased = false;
             try
             {
-                await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-descendant"), string.Empty).ConfigureAwait(false);
-                if (Descendant is not null)
+                try
                 {
-                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    await Descendant.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+                    await RetireAndDisposeAsync(RetireAsync, Service.DisposeAsync).ConfigureAwait(false);
                 }
-                if (!Root.HasExited)
+                catch (Exception failure)
                 {
-                    // Unrelated listener/cancellation tests do not require forceful live-root cleanup.
-                    // Retire the controlled root cooperatively; the dedicated cleanup test still calls Dispose while live.
-                    using var rootRetirement = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-root"), string.Empty,
-                        rootRetirement.Token).ConfigureAwait(false);
-                    await Root.WaitForExitAsync(rootRetirement.Token).ConfigureAwait(false);
+                    workflowFailure = failure;
+                    throw;
                 }
-                await Service.DisposeAsync().ConfigureAwait(false);
+                finally
+                {
+                    Descendant?.Dispose();
+                    Root.Dispose();
+                    directory.Delete(recursive: true);
+                    resourcesReleased = true;
+                }
             }
-            finally
+            catch (Exception releaseFailure)
             {
-                Descendant?.Dispose();
-                Root.Dispose();
-                directory.Delete(recursive: true);
+                // Catch bodies run after the nested finally; filters would inspect resourcesReleased before unwinding.
+                if (workflowFailure is not null && !resourcesReleased)
+                    throw new AggregateException("Fixture resource release also failed.", workflowFailure, releaseFailure);
+                throw;
+            }
+        }
+
+        private async Task RetireAsync()
+        {
+            await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-descendant"), string.Empty).ConfigureAwait(false);
+            if (Descendant is not null)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await Descendant.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            if (!Root.HasExited)
+            {
+                // Unrelated listener/cancellation tests do not require forceful live-root cleanup.
+                // Retire the controlled root cooperatively; the dedicated cleanup test still calls Dispose while live.
+                using var rootRetirement = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-root"), string.Empty,
+                    rootRetirement.Token).ConfigureAwait(false);
+                await Root.WaitForExitAsync(rootRetirement.Token).ConfigureAwait(false);
+            }
+        }
+
+        internal static async ValueTask RetireAndDisposeAsync(Func<Task> retirement, Func<ValueTask> cleanup)
+        {
+            Exception? retirementFailure = null;
+            var cleanupCompleted = false;
+            try
+            {
+                try
+                {
+                    await retirement().ConfigureAwait(false);
+                }
+                catch (Exception failure)
+                {
+                    retirementFailure = failure;
+                    throw;
+                }
+                finally
+                {
+                    await cleanup().ConfigureAwait(false);
+                    cleanupCompleted = true;
+                }
+            }
+            catch (Exception cleanupFailure)
+            {
+                if (retirementFailure is not null && !cleanupCompleted)
+                    throw new AggregateException("Retirement and owned service cleanup both failed.", retirementFailure, cleanupFailure);
+                throw;
             }
         }
 
@@ -301,7 +357,7 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
                     printf '12345/\r\n'
                     mode=ordinary
                 fi
-                [ -f "$directory/release-root" ] && exit 23
+                [ "$mode" != uncooperative ] && [ -f "$directory/release-root" ] && exit 23
                 sleep 0.05
             done
             exit 92
@@ -313,7 +369,7 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
             if ($mode -eq 'descendant') {
                 [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
                 for ($i = 0; $i -lt 1200; $i++) {
-                    if (Test-Path (Join-Path $directory 'release-descendant')) { exit 0 }
+                    if (Test-Path (Join-Path $directory 'release-descendant') -PathType Leaf) { exit 0 }
                     Start-Sleep -Milliseconds 50
                 }
                 exit 91
@@ -370,7 +426,7 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
                     [Console]::Out.Flush()
                     $mode = 'ordinary'
                 }
-                if (Test-Path (Join-Path $directory 'release-root')) { exit 23 }
+                if ($mode -ne 'uncooperative' -and (Test-Path (Join-Path $directory 'release-root') -PathType Leaf)) { exit 23 }
                 Start-Sleep -Milliseconds 50
             }
             exit 92
