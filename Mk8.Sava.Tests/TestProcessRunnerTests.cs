@@ -5,7 +5,7 @@ using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class TestProcessRunnerTests(ITestOutputHelper output)
+public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
 {
     [Fact]
     public async Task RootReadinessAloneCannotCertifyAnUnreadyDescendant()
@@ -215,6 +215,8 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
         None,
         WithheldDescendantReadiness,
         ExitedDescendantBeforeReadiness,
+        RejectedNativePreparation,
+        ExitedDescendantAfterPreparation,
     }
 
     private sealed class ProcessFixture : IAsyncDisposable
@@ -233,6 +235,7 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
 
         internal Process Root => startedRoot ?? throw new InvalidOperationException("The fixture root has not started.");
         internal Process? Descendant { get; private set; }
+        internal string StartupDiagnostic => ReadStartupDiagnostic();
 
         internal static async Task<ProcessFixture> StartAsync(
             string inherited, int exitCode = 0, FixtureFault fault = FixtureFault.None)
@@ -300,7 +303,7 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
             {
                 // Capture handshake state before diagnostic observation attempts owned-root cleanup.
-                var state = ReadStartupState().ToDiagnostic();
+                var state = ReadStartupDiagnostic();
                 var captured = await CaptureStartupFailureAsync().ConfigureAwait(false);
                 if (failure is OperationCanceledException && startup.IsCancellationRequested)
                     throw new TimeoutException($"Fixture startup exceeded 20 seconds. {state}. {captured}", failure);
@@ -314,6 +317,17 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-starting")),
             File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-ready")),
             File.Exists(Path.Combine(temporaryDirectory.FullName, "descendant-pid")));
+
+        // Do not add diagnostic marker probes to the successful readiness polling loop.
+        private string ReadStartupDiagnostic() => $"{ReadStartupState().ToDiagnostic()}, " +
+            $"RootPreparation=[{ReadPreparationState("root").ToDiagnostic()}], " +
+            $"DescendantPreparation=[{ReadPreparationState("descendant").ToDiagnostic()}]";
+
+        private PreparationState ReadPreparationState(string role) => new(
+            File.Exists(Path.Combine(temporaryDirectory.FullName, role + "-native-type-started")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, role + "-native-type-completed")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, role + "-native-type-skipped")),
+            File.Exists(Path.Combine(temporaryDirectory.FullName, role + "-pipes-prepared")));
 
         private async Task<string> CaptureStartupFailureAsync()
         {
@@ -343,6 +357,14 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             internal string ToDiagnostic() => $"RootExited={RootExited}, RootReady={RootReady}, " +
                 $"DescendantStarting={DescendantStarting}, DescendantReady={DescendantReady}, " +
                 $"DescendantPidPublished={DescendantPidPublished}";
+        }
+
+        private readonly record struct PreparationState(
+            bool NativeTypeStarted, bool NativeTypeCompleted, bool NativeTypeSkipped, bool PipesPrepared)
+        {
+            // Immutable per-stage files avoid shared-file partial reads/sharing violations. This is not an atomic phase snapshot.
+            internal string ToDiagnostic() => $"NativeTypeStarted={NativeTypeStarted}, NativeTypeCompleted={NativeTypeCompleted}, " +
+                $"NativeTypeSkipped={NativeTypeSkipped}, PipesPrepared={PipesPrepared}";
         }
 
         internal async Task ReleaseRootAsync()
@@ -395,11 +417,18 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             inherited=$3
             exit_code=$4
             fault=$5
+            : > "$directory/$role-native-type-skipped"
             if [ "$role" = descendant ]; then
                 printf starting > "$directory/descendant-starting"
                 if [ "$fault" = ExitedDescendantBeforeReadiness ]; then
                     printf injected-descendant-startup-error >&2
                     exit 97
+                fi
+                # Shell redirections were applied when the parent launched this process; no native type is needed.
+                : > "$directory/descendant-pipes-prepared"
+                if [ "$fault" = ExitedDescendantAfterPreparation ]; then
+                    printf injected-after-preparation-error >&2
+                    exit 98
                 fi
                 if [ "$fault" != WithheldDescendantReadiness ]; then
                     printf ready > "$directory/descendant-ready"
@@ -441,6 +470,7 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
             if [ "$inherited" = closed ]; then
                 exec 1>&- 2>&-
             fi
+            : > "$directory/root-pipes-prepared"
             printf ready > "$directory/ready"
             for ((attempt=0; attempt<1200; attempt++)); do
                 if [ -f "$directory/release-root" ]; then
@@ -466,7 +496,14 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                     exit 97
                 }
             }
-            if ($role -eq 'descendant' -or $inherited -eq 'closed') {
+            $needsNativeType = $inherited -eq 'closed' -or ($role -eq 'descendant' -and $inherited -ne 'both')
+            if ($needsNativeType) {
+                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-started"), '')
+                if ($fault -eq 'RejectedNativePreparation') {
+                    [Console]::Error.Write('injected-native-preparation-error')
+                    [Console]::Error.Flush()
+                    exit 96
+                }
                 Add-Type -TypeDefinition '
                     using System;
                     using System.Runtime.InteropServices;
@@ -474,6 +511,10 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                         [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int kind);
                         [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
                     }'
+                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-completed"), '')
+            }
+            else {
+                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-skipped"), '')
             }
             if ($role -eq 'descendant') {
                 if ($inherited -notin @('stdout', 'both')) {
@@ -481,6 +522,12 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                 }
                 if ($inherited -notin @('stderr', 'both')) {
                     [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-12))
+                }
+                [IO.File]::WriteAllText((Join-Path $directory 'descendant-pipes-prepared'), '')
+                if ($fault -eq 'ExitedDescendantAfterPreparation') {
+                    [Console]::Error.Write('injected-after-preparation-error')
+                    [Console]::Error.Flush()
+                    exit 98
                 }
                 if ($fault -ne 'WithheldDescendantReadiness') {
                     [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
@@ -524,6 +571,7 @@ public sealed class TestProcessRunnerTests(ITestOutputHelper output)
                 [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-11))
                 [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-12))
             }
+            [IO.File]::WriteAllText((Join-Path $directory 'root-pipes-prepared'), '')
             [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
             for ($attempt = 0; $attempt -lt 1200; $attempt++) {
                 if (Test-Path (Join-Path $directory 'release-root')) {
