@@ -178,7 +178,8 @@ public sealed class ApplicationRpcClient : IDisposable
         var length = ApplicationRpcEndpoint.ReadLongArgument(method, arguments, "length");
         using var output = new FramedReadStream(body, length);
         var destination = (Stream)arguments[method.OutputIndex]!;
-        var buffer = new byte[RpcFrames.MaximumDataFrameBytes];
+        // Even empty output needs a positive read to verify terminal proof and EOF.
+        var buffer = new byte[(int)Math.Clamp(length, 1, RpcFrames.MaximumDataFrameBytes)];
         long written = 0;
         while (true)
         {
