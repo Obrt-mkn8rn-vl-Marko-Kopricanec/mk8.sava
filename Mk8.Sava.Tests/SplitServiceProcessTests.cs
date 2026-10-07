@@ -245,6 +245,15 @@ public sealed class SplitServiceProcessTests(ITestOutputHelper output)
                     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                     await Descendant.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
                 }
+                if (!Root.HasExited)
+                {
+                    // Unrelated listener/cancellation tests do not require forceful live-root cleanup.
+                    // Retire the controlled root cooperatively; the dedicated cleanup test still calls Dispose while live.
+                    using var rootRetirement = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await File.WriteAllTextAsync(Path.Combine(directory.FullName, "release-root"), string.Empty,
+                        rootRetirement.Token).ConfigureAwait(false);
+                    await Root.WaitForExitAsync(rootRetirement.Token).ConfigureAwait(false);
+                }
                 await Service.DisposeAsync().ConfigureAwait(false);
             }
             finally
