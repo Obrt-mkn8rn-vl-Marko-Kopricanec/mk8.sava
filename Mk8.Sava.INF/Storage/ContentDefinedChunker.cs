@@ -39,6 +39,8 @@ internal sealed class ContentDefinedChunker
             if (total > maximumLength)
                 throw new RequestBodyTooLargeException(maximumLength);
 
+            var pendingStart = 0;
+            var chunkLength = checked((int)chunk.Length);
 #pragma warning disable HLQ013 // Only the bytes actually read from the reused buffer are valid input.
             for (var index = 0; index < read; index++)
 #pragma warning restore HLQ013
@@ -48,17 +50,24 @@ internal sealed class ContentDefinedChunker
                 window[windowPosition] = value;
                 windowPosition = (windowPosition + 1) % WindowSize;
                 fingerprint = BitOperations.RotateLeft(fingerprint, 1) ^ Gear[value] ^ BitOperations.RotateLeft(Gear[outgoing], WindowSize);
-                chunk.WriteByte(value);
+                chunkLength++;
 
-                if (chunk.Length >= _minimum && ((fingerprint & _mask) == 0 || chunk.Length >= _maximum))
+                if (chunkLength >= _minimum && ((fingerprint & _mask) == 0 || chunkLength >= _maximum))
                 {
+                    // Private in-memory accumulation; like WriteByte, it does not add cancellation inside an already-read buffer.
+                    await chunk.WriteAsync(buffer.AsMemory(pendingStart, index - pendingStart + 1), CancellationToken.None)
+                        .ConfigureAwait(false);
                     yield return chunk.ToArray();
                     chunk.SetLength(0);
+                    pendingStart = index + 1;
+                    chunkLength = 0;
                     Array.Clear(window);
                     windowPosition = 0;
                     fingerprint = 0;
                 }
             }
+            await chunk.WriteAsync(buffer.AsMemory(pendingStart, read - pendingStart), CancellationToken.None)
+                .ConfigureAwait(false);
         }
 
         if (chunk.Length > 0)
@@ -81,4 +90,3 @@ internal sealed class ContentDefinedChunker
         return table;
     }
 }
-
