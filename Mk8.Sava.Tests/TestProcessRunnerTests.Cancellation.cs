@@ -67,14 +67,13 @@ public sealed partial class TestProcessRunnerTests
         string? snapshot = null;
         await RunWithCleanupAsync(async () =>
         {
-            var failure = await Assert.ThrowsAsync<AggregateException>(() => work.ObserveCallbacksAsync(
-                fixture, cancellation, value => snapshot = value)).ConfigureAwait(false);
+            var failure = await AssertCallbackFaultAsync(work, fixture, cancellation,
+                value => snapshot = value).ConfigureAwait(false);
 
             Assert.Contains(original, failure.InnerExceptions);
             Assert.NotNull(snapshot);
             Assert.Contains("CancellationRequested=True", snapshot, StringComparison.Ordinal);
             Assert.Contains("CallbacksStatus=Faulted", snapshot, StringComparison.Ordinal);
-            output.WriteLine(snapshot);
         }, async () =>
         {
             // Join both actual tasks; retain, rather than replace, the deliberately faulted callback operation.
@@ -85,6 +84,16 @@ public sealed partial class TestProcessRunnerTests
         Assert.True(work.CallbacksFaulted);
         Assert.True(work.ObservationCanceled);
     }
+
+    private Task<AggregateException> AssertCallbackFaultAsync(
+        CancellationWork work, ProcessFixture fixture, CancellationTokenSource cancellation, Action<string> retain)
+        => Assert.ThrowsAsync<AggregateException>(() => work.ObserveCallbacksAsync(
+            fixture, cancellation, value =>
+            {
+                retain(value);
+                // Report before the expected-type assertion can reject an unexpected timeout.
+                output.WriteLine(value);
+            }));
 
     [Theory]
     [InlineData(false)]
