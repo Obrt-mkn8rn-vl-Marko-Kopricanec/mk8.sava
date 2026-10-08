@@ -21,6 +21,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     private bool _processDisposed;
     private bool _exitedAtDisposal;
     private int _stopping;
+    private Task? _captureCallbacks;
 
     public SplitServiceProcess(ProcessStartInfo start, TimeSpan? cleanupTimeout = null)
     {
@@ -36,6 +37,9 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
 
     public int Id { get; }
     public string Logs => $"stdout:\n{_stdout.Text}\nstderr:\n{_stderr.Text}";
+    internal CancellationToken CaptureCancellation => _captureLifetime.Token;
+    internal Task CaptureCallbackCompletion => _captureCallbacks ??
+        throw new InvalidOperationException("Capture cancellation has not started.");
 
     public async Task<Uri> WaitForAddressAsync(string role, TimeSpan timeout, CancellationToken cancellationToken = default)
     {
@@ -138,9 +142,10 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     private async Task CleanUpAsync(string beforeCleanup)
     {
         using var cleanup = new CancellationTokenSource(_cleanupTimeout);
+        var started = Stopwatch.GetTimestamp();
         var killDiagnostic = TryKillRoot();
         _address.TrySetException(new InvalidOperationException("Service stopped before listener publication."));
-        var callbacks = _captureLifetime.CancelAsync();
+        var callbacks = _captureCallbacks = _captureLifetime.CancelAsync();
         ObserveEventualFault(callbacks);
         // Own read-end closure also covers a descendant retaining the write ends after the root exited.
         _process.StandardOutput.Dispose();
@@ -148,7 +153,11 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         var rootWait = _process.WaitForExitAsync(cleanup.Token);
         await ObserveCleanupAsync([_output, _error, _rootExit, callbacks, rootWait],
             () => $"Split service cleanup observation failed. Before cleanup: {beforeCleanup} " +
-                $"After cleanup: {Snapshot()} {killDiagnostic}\n{Logs}", cleanup.Token).ConfigureAwait(false);
+                $"After cleanup: {Snapshot()} {killDiagnostic}\n" +
+                $"Cleanup elapsed={Stopwatch.GetElapsedTime(started)}, CaptureCancellationRequested={_captureLifetime.IsCancellationRequested}. " +
+                $"Task states (sequential observations): Stdout={_output.Status}, Stderr={_error.Status}, " +
+                $"RootObserver={_rootExit.Status}, CaptureCallbacks={callbacks.Status}, RootWait={rootWait.Status}.\n{Logs}",
+            cleanup.Token).ConfigureAwait(false);
     }
 
     internal static async Task ObserveCleanupAsync(IEnumerable<Task> operations, Func<string> diagnostic,
