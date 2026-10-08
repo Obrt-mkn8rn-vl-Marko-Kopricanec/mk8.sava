@@ -45,6 +45,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
 
     public int Id { get; }
     public string Logs => $"stdout:\n{_stdout.Text}\nstderr:\n{_stderr.Text}";
+    internal string DiagnosticSnapshot => Snapshot();
     internal CancellationToken CaptureCancellation => _captureLifetime.Token;
     internal Task RootExitCompletion => _ownedRootExit;
     internal CancellationToken RootExitCancellation => _exitLifetime.Token;

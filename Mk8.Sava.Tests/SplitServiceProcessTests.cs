@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using Mk8.Sava.Protocol;
 using Xunit.Abstractions;
 
 namespace Mk8.Sava.Tests;
@@ -173,15 +174,21 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 await fixture.BindReadyProcessesAsync(mode, writerReady).ConfigureAwait(false);
                 return fixture;
             }
-            catch
+            catch (Exception failure)
             {
-                if (fixture is null)
+                // Retain the startup graph AND independently failed cleanup. The owned
+                // service must be attempted before wrappers/signaling state are released.
+                await RetireAndDisposeAsync(() => Task.FromException(failure), async () =>
                 {
-                    await service.DisposeAsync().ConfigureAwait(false);
-                    fixtureDirectory.Delete(recursive: true);
-                }
-                else
-                    await fixture.DisposeAsync().ConfigureAwait(false);
+                    if (fixture is not null)
+                        await fixture.DisposeAsync().ConfigureAwait(false);
+                    else
+                        await RetireAndDisposeAsync(() => service.DisposeAsync().AsTask(), () =>
+                        {
+                            fixtureDirectory.Delete(recursive: true);
+                            return ValueTask.CompletedTask;
+                        }).ConfigureAwait(false);
+                }).ConfigureAwait(false);
                 throw;
             }
         }
@@ -206,30 +213,72 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
         private async Task BindReadyProcessesAsync(string mode, Action<ServiceFixture>? writerReady)
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
-            while (!File.Exists(Path.Combine(directory.FullName, "ready")))
+            var observation = Stopwatch.StartNew();
+            var phase = "AwaitingReadyProof";
+            try
             {
+                while (!File.Exists(Path.Combine(directory.FullName, "ready")))
+                {
+                    if (Root.HasExited)
+                        throw new InvalidOperationException("Service fixture exited before its readiness proof.");
+                    await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+                }
+                phase = "BindingDescendant";
+                if (string.Equals(mode, "inherited", StringComparison.Ordinal))
+                {
+                    var pid = int.Parse(await File.ReadAllTextAsync(Path.Combine(directory.FullName, "descendant-pid"),
+                        timeout.Token).ConfigureAwait(false), CultureInfo.InvariantCulture);
+                    Descendant = Process.GetProcessById(pid);
+                    _ = Descendant.SafeHandle;
+                    Descendant.EnableRaisingEvents = true;
+                    Assert.False(Descendant.HasExited);
+                }
+                phase = "WriterReadyCallback";
+                writerReady?.Invoke(this);
+                phase = "AwaitingCapturedOutput";
+                while (!CapturedExpectedOutput(mode))
+                {
+                    if (Root.HasExited)
+                        throw new InvalidOperationException($"Service fixture exited before capture acknowledgement.\n{Service.Logs}");
+                    await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+                }
+                phase = "CheckingRootLiveness";
                 if (Root.HasExited)
-                    throw new InvalidOperationException("Service fixture exited before its readiness proof.");
-                await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+                    throw new InvalidOperationException("Service fixture exited before capture readiness completed.");
             }
-            if (string.Equals(mode, "inherited", StringComparison.Ordinal))
+            catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
             {
-                var pid = int.Parse(await File.ReadAllTextAsync(Path.Combine(directory.FullName, "descendant-pid"),
-                    timeout.Token).ConfigureAwait(false), CultureInfo.InvariantCulture);
-                Descendant = Process.GetProcessById(pid);
-                _ = Descendant.SafeHandle;
-                Descendant.EnableRaisingEvents = true;
-                Assert.False(Descendant.HasExited);
+                throw CaptureStartupFailure(failure, mode, phase, observation.Elapsed, timeout.IsCancellationRequested);
             }
-            writerReady?.Invoke(this);
-            while (!CapturedExpectedOutput(mode))
+        }
+
+        private Exception CaptureStartupFailure(Exception failure, string mode, string phase, TimeSpan elapsed, bool cancellationRequested)
+        {
+            string diagnostic;
+            try
             {
-                if (Root.HasExited)
-                    throw new InvalidOperationException($"Service fixture exited before capture acknowledgement.\n{Service.Logs}");
-                await Task.Delay(20, timeout.Token).ConfigureAwait(false);
+                // Failure-only sequential observations, before retirement. Marker existence
+                // is not readiness admission, atomic progress, or a native-operation proof.
+                diagnostic = $"Service fixture startup failed. Mode={mode}, Phase={phase}, Elapsed={elapsed}, " +
+                    $"StartupCancellationRequested={cancellationRequested}. Pre-cleanup producer markers: " +
+                    $"Started={Marker("producer-started")}, PipePreparationStarted={Marker("pipe-preparation-started")}, " +
+                    $"PipePreparationCompleted={Marker("pipe-preparation-completed")}, ReadyWithheld={Marker("ready-withheld")}, " +
+                    $"ReadyPublishStarted={Marker("ready-publish-started")}, ReadyPublishCompleted={Marker("ready-publish-completed")}, " +
+                    $"ReadyProof={Marker("ready")}, DescendantPidPublished={Marker("descendant-pid")}, " +
+                    $"DescendantReady={Marker("descendant-ready")}, DescendantBound={Descendant is not null}.\n" +
+                    $"{Service.DiagnosticSnapshot}\n{Service.Logs}";
             }
-            if (Root.HasExited)
-                throw new InvalidOperationException("Service fixture exited before capture readiness completed.");
+#pragma warning disable CA1031 // Preserve the independent diagnostic failure graph, including fatal graphs, rather than erase the startup failure.
+            catch (Exception diagnosticFailure)
+#pragma warning restore CA1031
+            {
+                return new AggregateException("Startup and pre-cleanup diagnostic capture both failed.", failure, diagnosticFailure);
+            }
+            return failure is OperationCanceledException canceled
+                ? new OperationCanceledException(diagnostic, failure, canceled.CancellationToken)
+                : new InvalidOperationException(diagnostic, failure);
+
+            bool Marker(string name) => File.Exists(Path.Combine(directory.FullName, name));
         }
 
         private bool CapturedExpectedOutput(string mode)
@@ -359,6 +408,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 done
                 exit 91
             fi
+            printf started > "$directory/producer-started"
             [ "$mode" != delayed-stdout ] && printf root-output-without-newline
             [ "$mode" != delayed-stderr ] && printf root-error-without-newline >&2
             if [ "$mode" = inherited ]; then
@@ -372,8 +422,17 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             fi
             [ "$mode" = stderr ] && printf '\nNow listening on: http://127.0.0.1:12345/\n' >&2
             [ "$mode" = fragmented ] && printf '\nNow listening on: http://127.0.0.1:'
+            printf started > "$directory/pipe-preparation-started"
             if [ "$mode" = closed ]; then exec 1>&- 2>&-; fi
-            printf ready > "$directory/ready"
+            printf completed > "$directory/pipe-preparation-completed"
+            [ "$mode" = exit-before-ready ] && exit 23
+            if [ "$mode" = withheld-ready ]; then
+                printf withheld > "$directory/ready-withheld"
+            else
+                printf started > "$directory/ready-publish-started"
+                printf ready > "$directory/ready"
+                printf completed > "$directory/ready-publish-completed"
+            fi
             output_flushed=0
             output_released=0
             for ((i=0; i<1200; i++)); do
@@ -408,6 +467,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 }
                 exit 91
             }
+            [IO.File]::WriteAllText((Join-Path $directory 'producer-started'), 'started')
             if ($mode -ne 'delayed-stdout') {
                 [Console]::Out.Write('root-output-without-newline')
                 [Console]::Out.Flush()
@@ -438,6 +498,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 [Console]::Out.Write("`nNow listening on: http://127.0.0.1:")
                 [Console]::Out.Flush()
             }
+            [IO.File]::WriteAllText((Join-Path $directory 'pipe-preparation-started'), 'started')
             if ($mode -eq 'closed') {
                 Add-Type -TypeDefinition '
                     using System;
@@ -449,7 +510,15 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-11))
                 [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-12))
             }
-            [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
+            [IO.File]::WriteAllText((Join-Path $directory 'pipe-preparation-completed'), 'completed')
+            if ($mode -eq 'exit-before-ready') { exit 23 }
+            if ($mode -eq 'withheld-ready') {
+                [IO.File]::WriteAllText((Join-Path $directory 'ready-withheld'), 'withheld')
+            } else {
+                [IO.File]::WriteAllText((Join-Path $directory 'ready-publish-started'), 'started')
+                [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
+                [IO.File]::WriteAllText((Join-Path $directory 'ready-publish-completed'), 'completed')
+            }
             $outputFlushed = $false
             $outputReleased = $false
             for ($i = 0; $i -lt 1200; $i++) {
