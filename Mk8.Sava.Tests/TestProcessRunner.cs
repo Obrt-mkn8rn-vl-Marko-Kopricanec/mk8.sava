@@ -14,10 +14,10 @@ internal static class TestProcessRunner
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(cleanupTimeout, TimeSpan.Zero);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(completionTimeout);
-        var output = new CapturedOutput();
-        var error = new CapturedOutput();
-        var stdout = output.ReadAsync(process.StandardOutput, timeout.Token);
-        var stderr = error.ReadAsync(process.StandardError, timeout.Token);
+        var output = new ProcessOutputCapture();
+        var error = new ProcessOutputCapture();
+        var stdout = output.ReadAsync(process.StandardOutput, onLine: null, timeout.Token);
+        var stderr = error.ReadAsync(process.StandardError, onLine: null, timeout.Token);
         var completion = Task.WhenAll(process.WaitForExitAsync(timeout.Token), stdout, stderr);
         OperationCanceledException? interruption = null;
         var interruptedState = string.Empty;
@@ -91,31 +91,4 @@ internal static class TestProcessRunner
         return $"Cleanup RootExited={process.HasExited}, ObservationSettled={cleanupCompletion.IsCompleted}" + errors;
     }
 
-    private sealed class CapturedOutput
-    {
-        private readonly StringBuilder text = new();
-        private readonly Lock gate = new();
-        private bool reachedEof;
-
-        internal string Text { get { lock (gate) return text.ToString(); } }
-        internal bool ReachedEof { get { lock (gate) return reachedEof; } }
-
-        internal async Task ReadAsync(StreamReader reader, CancellationToken cancellationToken)
-        {
-            var buffer = new char[4096];
-            while (true)
-            {
-                var count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
-                lock (gate)
-                {
-                    if (count == 0)
-                    {
-                        reachedEof = true;
-                        return;
-                    }
-                    text.Append(buffer, 0, count);
-                }
-            }
-        }
-    }
 }
