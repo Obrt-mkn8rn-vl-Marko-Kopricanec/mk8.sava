@@ -11,10 +11,14 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     private readonly Process _process;
     private readonly Lock _processGate = new();
     private readonly CancellationTokenSource _captureLifetime = new();
+#pragma warning disable CA2213 // DisposeOwnedResources owns a guaranteed using scope for this source; real success/timeout controls assert its disposal. Async-disposal dataflow misses this field.
+    private readonly CancellationTokenSource _exitLifetime = new();
+#pragma warning restore CA2213
     private readonly CapturedStream _stdout = new();
     private readonly CapturedStream _stderr = new();
     private readonly Task _output;
     private readonly Task _error;
+    private readonly Task _ownedRootExit;
     private readonly Task _rootExit;
     private readonly TimeSpan _cleanupTimeout;
     private readonly TaskCompletionSource<Uri> _address = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -22,6 +26,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     private bool _exitedAtDisposal;
     private int _stopping;
     private Task? _captureCallbacks;
+    private Task? _cleanupRootExit;
 
     public SplitServiceProcess(ProcessStartInfo start, TimeSpan? cleanupTimeout = null)
     {
@@ -31,6 +36,10 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         Id = _process.Id;
         _output = CaptureAsync(_stdout, _process.StandardOutput, publishAddress: true);
         _error = CaptureAsync(_stderr, _process.StandardError, publishAddress: false);
+        // One underlying wait owns this Process's Exited subscription. Observers cancel their
+        // WaitAsync wrappers, not the underlying operation while another observer starts.
+        _ownedRootExit = _process.WaitForExitAsync(_exitLifetime.Token);
+        ObserveEventualFault(_ownedRootExit);
         _rootExit = ObserveRootExitAsync();
         ObserveEventualFault(_address.Task);
     }
@@ -38,6 +47,10 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     public int Id { get; }
     public string Logs => $"stdout:\n{_stdout.Text}\nstderr:\n{_stderr.Text}";
     internal CancellationToken CaptureCancellation => _captureLifetime.Token;
+    internal Task RootExitCompletion => _ownedRootExit;
+    internal CancellationToken RootExitCancellation => _exitLifetime.Token;
+    internal Task CleanupRootExitCompletion => _cleanupRootExit ??
+        throw new InvalidOperationException("Cleanup has not started observing root exit.");
     internal Task CaptureCallbackCompletion => _captureCallbacks ??
         throw new InvalidOperationException("Capture cancellation has not started.");
 
@@ -79,7 +92,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     {
         try
         {
-            await _process.WaitForExitAsync(_captureLifetime.Token).ConfigureAwait(false);
+            await _ownedRootExit.WaitAsync(_captureLifetime.Token).ConfigureAwait(false);
             _address.TrySetException(new InvalidOperationException("Service root exited before listener publication."));
         }
         catch (OperationCanceledException failure) when (_captureLifetime.IsCancellationRequested &&
@@ -129,13 +142,23 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         }
         finally
         {
-            lock (_processGate)
-            {
-                _exitedAtDisposal = _process.HasExited;
-                _process.Dispose();
-                _processDisposed = true;
-            }
-            _captureLifetime.Dispose();
+            DisposeOwnedResources();
+        }
+    }
+
+    private void DisposeOwnedResources()
+    {
+        using var captureDisposal = _captureLifetime;
+        using var exitDisposal = _exitLifetime;
+        // Cancel only after the independent cleanup budget has attempted to observe exit.
+        // Do not join an event/native operation without a deadline or infer descendant exit.
+        var exitCallbacks = _exitLifetime.CancelAsync();
+        ObserveEventualFault(exitCallbacks);
+        lock (_processGate)
+        {
+            _exitedAtDisposal = _process.HasExited;
+            _process.Dispose();
+            _processDisposed = true;
         }
     }
 
@@ -150,13 +173,14 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         // Own read-end closure also covers a descendant retaining the write ends after the root exited.
         _process.StandardOutput.Dispose();
         _process.StandardError.Dispose();
-        var rootWait = _process.WaitForExitAsync(cleanup.Token);
+        var rootWait = _cleanupRootExit = _ownedRootExit;
         await ObserveCleanupAsync([_output, _error, _rootExit, callbacks, rootWait],
             () => $"Split service cleanup observation failed. Before cleanup: {beforeCleanup} " +
                 $"After cleanup: {Snapshot()} {killDiagnostic}\n" +
                 $"Cleanup elapsed={Stopwatch.GetElapsedTime(started)}, CaptureCancellationRequested={_captureLifetime.IsCancellationRequested}. " +
                 $"Task states (sequential observations): Stdout={_output.Status}, Stderr={_error.Status}, " +
-                $"RootObserver={_rootExit.Status}, CaptureCallbacks={callbacks.Status}, RootWait={rootWait.Status}.\n{Logs}",
+                $"RootObserver={_rootExit.Status}, CaptureCallbacks={callbacks.Status}, RootWait={rootWait.Status}, " +
+                $"OwnedRootExit={_ownedRootExit.Status}, ExitCancellationRequested={_exitLifetime.IsCancellationRequested}.\n{Logs}",
             cleanup.Token).ConfigureAwait(false);
     }
 
