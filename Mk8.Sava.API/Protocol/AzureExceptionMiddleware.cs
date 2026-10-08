@@ -94,7 +94,9 @@ internal sealed class AzureExceptionMiddleware(RequestDelegate next, ILogger<Azu
             await writer.WriteEndElementAsync().ConfigureAwait(false);
         }
 
-        await context.Response.WriteAsync(builder.ToString(), context.RequestAborted).ConfigureAwait(false);
+        var error = builder.ToString();
+        context.Response.ContentLength = Encoding.UTF8.GetByteCount(error);
+        await context.Response.WriteAsync(error, context.RequestAborted).ConfigureAwait(false);
     }
 
     private static bool SupportsErrorCodeHeader(HttpContext context)

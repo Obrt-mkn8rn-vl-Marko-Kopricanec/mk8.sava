@@ -6,7 +6,7 @@ using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class AzureExceptionMiddlewareTests
+public sealed partial class AzureExceptionMiddlewareTests
 {
     [Fact]
     public async Task UnexpectedFailureIsAzureShapedWithoutExposingDetails()
