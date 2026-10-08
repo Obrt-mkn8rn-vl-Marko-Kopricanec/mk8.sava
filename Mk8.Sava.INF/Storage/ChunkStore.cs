@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.IO.Compression;
 using System.IO.Pipelines;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.RateLimiting;
@@ -36,6 +37,7 @@ public sealed class ChunkStore : IDisposable
     private readonly Dictionary<string, ChunkMutationReservation> _mutationReservations = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _packGates = new(StringComparer.Ordinal);
     private readonly Lock _physicalInventoryGate = new();
+    private readonly StagingReclaimer _stagingReclaimer;
     private string? _orphanPackCursor;
     private StoragePhysicalInventoryScanner? _physicalInventoryScanner;
 
@@ -52,13 +54,54 @@ public sealed class ChunkStore : IDisposable
 
     public void Dispose()
     {
-        lock (_physicalInventoryGate)
+        List<Exception> failures = [];
+        try
         {
-            _physicalInventoryScanner?.Dispose();
-            _physicalInventoryScanner = null;
+            lock (_physicalInventoryGate)
+            {
+                try
+                {
+                    _physicalInventoryScanner?.Dispose();
+                }
+                finally
+                {
+                    _physicalInventoryScanner = null;
+                }
+            }
         }
-        Admission.Dispose();
+#pragma warning disable CA1031 // Delay rethrow until all three owned resources are retired; preserve catastrophic graphs without normalization.
+        catch (Exception failure)
+        {
+            failures.Add(failure);
+        }
+#pragma warning restore CA1031
+        try
+        {
+            _stagingReclaimer.Dispose();
+        }
+#pragma warning disable CA1031 // Preserve this independent cleanup graph, then attempt admission retirement before rethrowing.
+        catch (Exception failure)
+        {
+            failures.Add(failure);
+        }
+#pragma warning restore CA1031
+        try
+        {
+            Admission.Dispose();
+        }
+#pragma warning disable CA1031 // The immediately following failure dispatch preserves identity/graphs after all cleanup attempts.
+        catch (Exception failure)
+        {
+            failures.Add(failure);
+        }
+#pragma warning restore CA1031
         GC.SuppressFinalize(this);
+        if (failures.Count == 1)
+            ExceptionDispatchInfo.Throw(failures[0]);
+        if (failures.Count > 1)
+#pragma warning disable CA1065 // Multiple independent retirement errors must retain every graph, including fatal ones, rather than mask an earlier failure in finally.
+            throw new AggregateException("Independent storage resource retirement failures.", failures);
+#pragma warning restore CA1065
     }
 
     public ChunkStore(
@@ -68,10 +111,12 @@ public sealed class ChunkStore : IDisposable
         IOptions<SavaOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(paths);
         _paths = paths;
         _metadata = metadata;
         _faultInjector = faultInjector;
         _options = options.Value;
+        _stagingReclaimer = new StagingReclaimer(paths.Staging);
         Admission = new StorageWorkAdmission(_options);
         _chunkDigest = SHA256.HashData;
         _chunker = new ContentDefinedChunker(
@@ -1065,46 +1110,7 @@ public sealed class ChunkStore : IDisposable
     }
 
     public int DeleteAbandonedStagingFiles(DateTimeOffset olderThan, int maximumFiles)
-    {
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumFiles);
-
-        var deleted = 0;
-        foreach (var path in Directory.EnumerateFiles(_paths.Staging, "*.tmp", SearchOption.TopDirectoryOnly))
-        {
-            if (deleted >= maximumFiles)
-                break;
-            try
-            {
-                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != FileAttributes.None ||
-                    File.GetLastWriteTimeUtc(path) > olderThan.UtcDateTime)
-                {
-                    continue;
-                }
-
-                using var abandoned = new FileStream(
-                    path,
-                    FileMode.Open,
-                    FileAccess.ReadWrite,
-                    FileShare.None,
-                    bufferSize: 1,
-                    FileOptions.DeleteOnClose);
-                deleted++;
-            }
-            catch (FileNotFoundException)
-            {
-                // The owning request completed after enumeration.
-            }
-            catch (IOException)
-            {
-                // An active request still owns the file, or another pass won the race.
-            }
-            catch (UnauthorizedAccessException)
-            {
-                // Leave a file that cannot be opened safely and report it through staging bytes.
-            }
-        }
-        return deleted;
-    }
+        => _stagingReclaimer.Advance(olderThan, maximumFiles).ReclaimedFiles;
 
     public async Task<ChunkIntegrityStatus> VerifyChunkAsync(string id, CancellationToken cancellationToken)
     {

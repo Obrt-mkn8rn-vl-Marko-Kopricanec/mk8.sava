@@ -1307,8 +1307,13 @@ are deferred rather than lost.
 
 Crash-abandoned `.tmp` files are removed after
 `Sava:AbandonedStagingRetention`, up to
-`Sava:MaximumStagingFilesPerMaintenancePass` deletions per pass. A file still
-held by an active request cannot be reclaimed.
+`Sava:MaximumStagingFilesPerMaintenancePass` examined top-level entries per
+pass (and therefore no more than that many deletions). Fresh, locked, linked,
+directory and non-`.tmp` entries consume the same budget. A sampled cursor
+resumes between passes and restarts after its directory cycle ends, so a busy
+prefix cannot permanently hide later abandoned files. New or changed entries
+may wait for a later cycle; this is not an atomic snapshot or a native I/O time
+guarantee. A file still held by an active request cannot be reclaimed.
 
 Unreachable immutable chunks are considered in filesystem key order, up to
 `Sava:GarbageCollectionChunksPerMaintenancePass` per pass. Reachability is
