@@ -24,6 +24,9 @@ internal static partial class TestProcessFixtureProgram
 
     private static async Task<int> Main(string[] arguments)
     {
+        if (arguments.Length > 0 && arguments[0] is "--split-service-closed-fixture")
+            return await SplitServiceClosedFixtureProgram.RunAsync(arguments).ConfigureAwait(false);
+
         if (arguments.Length != 6 || arguments[0] is not "--process-fixture" ||
             arguments[1] is not ("root" or "descendant") ||
             !Path.IsPathFullyQualified(arguments[2]) || !Directory.Exists(arguments[2]) ||
@@ -164,7 +167,7 @@ internal static partial class TestProcessFixtureProgram
         return timeoutExitCode;
     }
 
-    private static void CloseStandardHandle(int kind)
+    internal static void CloseStandardHandle(int kind)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("Actual standard-handle closure is a Windows-only fixture operation.");
