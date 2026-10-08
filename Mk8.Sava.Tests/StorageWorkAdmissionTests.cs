@@ -136,7 +136,8 @@ public sealed partial class StorageWorkAdmissionTests
 
     private static async Task AssertDomainCopiesAsync()
     {
-        var application = CreateApplication(8);
+        var checkpoints = new StorageCopyCheckpointProbe();
+        var application = CreateApplication(8, checkpoints);
         await using var disposal = application.ConfigureAwait(false);
         await application.InitializeAsync().ConfigureAwait(false);
         var chunks = application.Services.GetRequiredService<ChunkStore>();
@@ -146,19 +147,21 @@ public sealed partial class StorageWorkAdmissionTests
         // This is a deadlock guard, not a disk-throughput assertion: Windows CI
         // must durably flush the source and six copies while the full suite runs.
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+        checkpoints.Start(cancellation.Token);
         var progress = new StorageWorkProgressProbe(chunks.Admission, 6, TimeSpan.FromSeconds(1), cancellation.Token);
         await using var progressDisposal = progress.ConfigureAwait(false);
         try
         {
             progress.SetSourcePhase(StorageWorkProgressProbe.SourcePhase.Storing);
             using var stored = await chunks.StorePinnedAsync(SavaWebApplicationFactory.AccountName, encryption, source, cancellation.Token).ConfigureAwait(false);
+            checkpoints.SourceStored();
             progress.SetSourcePhase(StorageWorkProgressProbe.SourcePhase.Stored);
             await Task.WhenAll(Enumerable.Range(0, 6).Select(copy =>
                 CopyAndAssertAsync(chunks, stored.Manifest, encryption, bytes, progress, copy, cancellation.Token))).ConfigureAwait(false);
         }
         catch (OperationCanceledException exception) when (cancellation.IsCancellationRequested && !CatastrophicExceptionPolicy.Contains(exception))
         {
-            Assert.Fail($"Cross-domain copies exceeded the unchanged 90-second deadlock guard.\n{progress.RenderDiagnostics()}");
+            Assert.Fail($"Cross-domain copies exceeded the unchanged 90-second deadlock guard.\n{progress.RenderDiagnostics()}\n{checkpoints.RenderDiagnostics()}");
         }
         Assert.Contains("mk8_sava_storage_work_active{lane=\"writes\"} 0\n", chunks.Admission.RenderPrometheus(), StringComparison.Ordinal);
     }
@@ -178,14 +181,20 @@ public sealed partial class StorageWorkAdmissionTests
         progress.SetCopyPhase(copy, StorageWorkProgressProbe.CopyPhase.Verified);
     }
 
-    private static SavaWebApplicationFactory CreateApplication(int queued) => new(new Dictionary<string, string?>(StringComparer.Ordinal)
+    private static SavaWebApplicationFactory CreateApplication(int queued, IStorageFaultInjector? injector = null)
     {
-        ["Sava:MaximumConcurrentStorageReads"] = "1",
-        ["Sava:MaximumConcurrentStorageWrites"] = "1",
-        ["Sava:MaximumConcurrentChunkCodecs"] = "1",
-        ["Sava:MaximumQueuedStorageOperations"] = queued.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        ["Sava:MaintenanceScanInterval"] = "01:00:00"
-    });
+        var configuration = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:MaximumConcurrentStorageReads"] = "1",
+            ["Sava:MaximumConcurrentStorageWrites"] = "1",
+            ["Sava:MaximumConcurrentChunkCodecs"] = "1",
+            ["Sava:MaximumQueuedStorageOperations"] = queued.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ["Sava:MaintenanceScanInterval"] = "01:00:00"
+        };
+        return injector is null ? new SavaWebApplicationFactory(configuration) : new SavaWebApplicationFactory(
+            Path.Combine(Path.GetTempPath(), $"mk8-sava-tests-{Guid.NewGuid():N}"), injector,
+            analyticsSink: null, configurationOverrides: configuration, deleteDataPath: true);
+    }
 
     private sealed class ControlledWriteStream : MemoryStream
     {
