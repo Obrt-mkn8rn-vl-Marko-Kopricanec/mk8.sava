@@ -22,7 +22,8 @@ internal sealed class ContentDefinedChunker
         long maximumLength,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var chunk = new MemoryStream(_maximum);
+        // Preserve the original MemoryStream capacity validation before any source read.
+        using var chunk = new MemoryStream(Math.Min(_maximum, 0));
         var buffer = new byte[64 * 1024];
         var window = new byte[WindowSize];
         var windowPosition = 0;
@@ -38,6 +39,10 @@ internal sealed class ContentDefinedChunker
             total = checked(total + read);
             if (total > maximumLength)
                 throw new RequestBodyTooLargeException(maximumLength);
+
+            // Empty/rejected input needs no data reserve; admitted input keeps the original maximum capacity.
+            if (chunk.Capacity == 0)
+                chunk.Capacity = _maximum;
 
             var pendingStart = 0;
             var chunkLength = checked((int)chunk.Length);
