@@ -455,12 +455,7 @@ public sealed class SplitProcessSecurityTests
         await AssertGatewayReadyAsync(host).ConfigureAwait(true);
     }
 
-    private static async Task AssertGatewayReadyAsync(SplitProcessHost host)
-    {
-        using var client = host.CreateHttpClient();
-        using var response = await client.GetAsync(new Uri(host.GatewayAddress, "/health/ready")).ConfigureAwait(true);
-        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
-    }
+    private static Task AssertGatewayReadyAsync(SplitProcessHost host) => host.AssertGatewayReadyAsync();
 
     private static async Task AssertAclOverwriteAsync(SplitProcessHost host, BlobContainerClient container,
         DelegationIssue issued, string permissions, bool suoid)
