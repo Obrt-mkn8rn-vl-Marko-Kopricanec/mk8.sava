@@ -102,12 +102,36 @@ public sealed class StagingReclamationTests
         foreach (var name in new[] { "plain.tmp", "upper.TMP", ".tmp", "space name.tmp", "unicode-分類.tmp", "suffix.tmp.more", "keep.bin" })
             fixture.Create(name, abandoned: true);
         var expected = Directory.EnumerateFiles(fixture.Root, "*.tmp", SearchOption.TopDirectoryOnly)
-            .ToHashSet(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+            .ToHashSet(StringComparer.Ordinal);
         using var reclaimer = new StagingReclaimer(fixture.Root);
         Assert.Equal(expected.Count, CompleteCycle(reclaimer, fixture.Cutoff));
         foreach (var path in expected)
             Assert.False(File.Exists(path));
         Assert.All(Directory.EnumerateFiles(fixture.Root), path => Assert.DoesNotContain(path, expected));
+    }
+
+    [Theory]
+    [InlineData(MatchCasing.CaseSensitive, false)]
+    [InlineData(MatchCasing.CaseInsensitive, true)]
+    public void PerEntryMatchingAgreesWithBothDirectoryCasingContracts(MatchCasing casing, bool ignoreCase)
+    {
+        using var fixture = new Fixture();
+        var names = new[] { "plain.tmp", "upper.TMP", "mixed.TmP", ".tmp", "space name.tmp", "unicode-分類.tmp", "suffix.tmp.more", "keep.bin" };
+        foreach (var name in names)
+            fixture.Create(name, abandoned: true);
+        var expected = Directory.EnumerateFiles(fixture.Root, "*.tmp", new EnumerationOptions
+        {
+            MatchCasing = casing,
+            MatchType = MatchType.Win32,
+            AttributesToSkip = FileAttributes.None,
+            IgnoreInaccessible = false,
+        }).Select(Path.GetFileName).ToHashSet(StringComparer.Ordinal);
+
+        // Exercise the production per-entry matcher against the BCL oracle on either host.
+        foreach (var name in names)
+            Assert.Equal(expected.Contains(name), StagingReclaimer.MatchesTemporaryFileName(name, ignoreCase));
+        Assert.Equal(ignoreCase, expected.Contains("upper.TMP"));
+        Assert.Equal(ignoreCase, expected.Contains("mixed.TmP"));
     }
 
     [Fact]

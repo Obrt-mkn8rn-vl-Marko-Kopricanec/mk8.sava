@@ -8,6 +8,9 @@ namespace Mk8.Sava.Storage;
 internal sealed class StagingReclaimer(string directory) : IDisposable
 {
     private static readonly string TemporaryPattern = FileSystemName.TranslateWin32Expression("*.tmp");
+    // Match Directory's .NET 10 PlatformDefault rule, not a particular volume's casing.
+    private static readonly bool IgnoreCase = OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ||
+        OperatingSystem.IsIOS() || OperatingSystem.IsTvOS();
     private readonly Lock _gate = new();
     private readonly string _directory = Path.GetFullPath(directory);
     private IEnumerator<string>? _entries;
@@ -54,8 +57,7 @@ internal sealed class StagingReclaimer(string directory) : IDisposable
 
     private static bool TryReclaim(string path, DateTime olderThan)
     {
-        if (!FileSystemName.MatchesWin32Expression(TemporaryPattern, Path.GetFileName(path.AsSpan()),
-                ignoreCase: OperatingSystem.IsWindows()))
+        if (!MatchesTemporaryFileName(Path.GetFileName(path.AsSpan()), IgnoreCase))
             return false;
         try
         {
@@ -78,6 +80,9 @@ internal sealed class StagingReclaimer(string directory) : IDisposable
             return false;
         }
     }
+
+    internal static bool MatchesTemporaryFileName(ReadOnlySpan<char> name, bool ignoreCase) =>
+        FileSystemName.MatchesWin32Expression(TemporaryPattern, name, ignoreCase);
 
     private void Reset()
     {
