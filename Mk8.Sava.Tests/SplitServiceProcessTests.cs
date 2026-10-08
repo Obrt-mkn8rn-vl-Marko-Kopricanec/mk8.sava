@@ -195,6 +195,11 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
 
         private static ProcessStartInfo CreateStart(string script, string directory, string mode)
         {
+            if (string.Equals(mode, "closed-preparation-rejected", StringComparison.Ordinal))
+                return SplitServiceClosedFixtureProgram.CreateStartInfo(directory, "RejectedPreparation");
+            if (OperatingSystem.IsWindows() && string.Equals(mode, "closed", StringComparison.Ordinal))
+                return SplitServiceClosedFixtureProgram.CreateStartInfo(directory);
+
             var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "pwsh" : "bash")
             {
                 UseShellExecute = false,
@@ -459,6 +464,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
         private const string WindowsScript = """
             param($directory, $mode)
             $ErrorActionPreference = 'Stop'
+            if ($mode -eq 'closed') { throw 'Closed service fixtures must use the compiled command.' }
             if ($mode -eq 'descendant') {
                 [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
                 for ($i = 0; $i -lt 1200; $i++) {
@@ -499,17 +505,6 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 [Console]::Out.Flush()
             }
             [IO.File]::WriteAllText((Join-Path $directory 'pipe-preparation-started'), 'started')
-            if ($mode -eq 'closed') {
-                Add-Type -TypeDefinition '
-                    using System;
-                    using System.Runtime.InteropServices;
-                    public static class ServicePipeHandles {
-                        [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int kind);
-                        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-                    }'
-                [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-11))
-                [void][ServicePipeHandles]::CloseHandle([ServicePipeHandles]::GetStdHandle(-12))
-            }
             [IO.File]::WriteAllText((Join-Path $directory 'pipe-preparation-completed'), 'completed')
             if ($mode -eq 'exit-before-ready') { exit 23 }
             if ($mode -eq 'withheld-ready') {
