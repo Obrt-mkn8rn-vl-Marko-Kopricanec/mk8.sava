@@ -2,6 +2,7 @@ using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Azure.Storage.Sas;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Storage;
@@ -12,12 +13,9 @@ namespace Mk8.Sava.Tests;
 public sealed partial class AzureSdkCompatibilityTests
 {
     private static SavaWebApplicationFactory CreateArchiveClockApplication(AdjustableTimeProvider clock) =>
-        new(clock, new Dictionary<string, string?>(StringComparer.Ordinal)
-        {
-            // Clock advancement is explicit; maintenance may observe the same
-            // clock but cannot move a rehydration deadline on its own.
-            ["Sava:MaintenanceScanInterval"] = "01:00:00"
-        });
+        // Remove the hosted worker, including its startup pass. Only the
+        // explicitly awaited request or manual pass may consume a transition.
+        new(clock, new Dictionary<string, string?>(StringComparer.Ordinal), disableMaintenance: true);
 
     private static void AssertArchiveClockConfiguration(
         SavaWebApplicationFactory application, AdjustableTimeProvider clock)
@@ -26,6 +24,8 @@ public sealed partial class AzureSdkCompatibilityTests
         Assert.Equal(TimeSpan.FromSeconds(5), options.StandardRehydrationDelay);
         Assert.Equal(TimeSpan.FromMilliseconds(200), options.HighPriorityRehydrationDelay);
         Assert.Equal(clock.GetUtcNow(), application.Services.GetRequiredService<MetadataStore>().GetUtcNow());
+        Assert.DoesNotContain(application.Services.GetServices<IHostedService>(),
+            service => service is StorageMaintenanceService);
     }
 
     [Theory]
