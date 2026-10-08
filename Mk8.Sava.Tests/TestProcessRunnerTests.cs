@@ -240,12 +240,12 @@ public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
         internal string StartupDiagnostic => ReadStartupDiagnostic();
 
         internal static async Task<ProcessFixture> StartAsync(
-            string inherited, int exitCode = 0, FixtureFault fault = FixtureFault.None)
+            string inherited, int exitCode = 0, FixtureFault fault = FixtureFault.None, bool compiled = false)
         {
             var fixture = new ProcessFixture(Directory.CreateTempSubdirectory("sava-process-bound-"));
             try
             {
-                await fixture.InitializeAsync(inherited, exitCode, fault).ConfigureAwait(false);
+                await fixture.InitializeAsync(inherited, exitCode, fault, compiled).ConfigureAwait(false);
                 return fixture;
             }
             catch
@@ -255,26 +255,24 @@ public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
             }
         }
 
-        private async Task InitializeAsync(string inherited, int exitCode, FixtureFault fault)
+        private async Task InitializeAsync(string inherited, int exitCode, FixtureFault fault, bool compiled)
         {
-            var script = Path.Combine(temporaryDirectory.FullName, OperatingSystem.IsWindows() ? "fixture.ps1" : "fixture.sh");
-            await File.WriteAllTextAsync(script, OperatingSystem.IsWindows() ? WindowsScript : UnixScript)
-                .ConfigureAwait(false);
-            var start = new ProcessStartInfo(OperatingSystem.IsWindows() ? "pwsh" : "bash")
+            ProcessStartInfo start;
+            if (OperatingSystem.IsWindows() || compiled)
             {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-            foreach (var argument in OperatingSystem.IsWindows()
-                ? new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script }
-                : new[] { "--noprofile", "--norc", script })
-                start.ArgumentList.Add(argument);
-            start.ArgumentList.Add("root");
-            start.ArgumentList.Add(temporaryDirectory.FullName);
-            start.ArgumentList.Add(inherited);
-            start.ArgumentList.Add(exitCode.ToString(CultureInfo.InvariantCulture));
-            start.ArgumentList.Add(fault.ToString());
+                start = TestProcessFixtureProgram.CreateStartInfo("root", temporaryDirectory.FullName, inherited, exitCode, fault.ToString());
+            }
+            else
+            {
+                var script = Path.Combine(temporaryDirectory.FullName, "fixture.sh");
+                await File.WriteAllTextAsync(script, UnixScript).ConfigureAwait(false);
+                start = new ProcessStartInfo("bash") { UseShellExecute = false };
+                foreach (var argument in new[] { "--noprofile", "--norc", script, "root", temporaryDirectory.FullName,
+                    inherited, exitCode.ToString(CultureInfo.InvariantCulture), fault.ToString() })
+                    start.ArgumentList.Add(argument);
+            }
+            start.RedirectStandardOutput = true;
+            start.RedirectStandardError = true;
             startedRoot = Process.Start(start) ?? throw new InvalidOperationException("The process fixture did not start.");
             using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             var requiresDescendant = inherited is "stdout" or "stderr" or "both" or "neither";
@@ -484,109 +482,6 @@ public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
                 fi
                 sleep 0.05
             done
-            exit 92
-            """;
-
-        private const string WindowsScript = """
-            param($role, $directory, $inherited, [int]$exitCode, $fault)
-            $ErrorActionPreference = 'Stop'
-            if ($role -eq 'descendant') {
-                [IO.File]::WriteAllText((Join-Path $directory 'descendant-starting'), 'starting')
-                if ($fault -eq 'ExitedDescendantBeforeReadiness') {
-                    [Console]::Error.Write('injected-descendant-startup-error')
-                    [Console]::Error.Flush()
-                    exit 97
-                }
-            }
-            $needsNativeType = $inherited -eq 'closed' -or ($role -eq 'descendant' -and $inherited -ne 'both')
-            if ($needsNativeType) {
-                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-started"), '')
-                if ($fault -eq 'RejectedNativePreparation') {
-                    [Console]::Error.Write('injected-native-preparation-error')
-                    [Console]::Error.Flush()
-                    exit 96
-                }
-                Add-Type -TypeDefinition '
-                    using System;
-                    using System.Runtime.InteropServices;
-                    public static class FixturePipeHandles {
-                        [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int kind);
-                        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
-                    }'
-                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-completed"), '')
-            }
-            else {
-                [IO.File]::WriteAllText((Join-Path $directory "$role-native-type-skipped"), '')
-            }
-            if ($role -eq 'descendant') {
-                if ($inherited -notin @('stdout', 'both')) {
-                    [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-11))
-                }
-                if ($inherited -notin @('stderr', 'both')) {
-                    [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-12))
-                }
-                [IO.File]::WriteAllText((Join-Path $directory 'descendant-pipes-prepared'), '')
-                if ($fault -eq 'ExitedDescendantAfterPreparation') {
-                    [Console]::Error.Write('injected-after-preparation-error')
-                    [Console]::Error.Flush()
-                    exit 98
-                }
-                if ($fault -ne 'WithheldDescendantReadiness') {
-                    [IO.File]::WriteAllText((Join-Path $directory 'descendant-ready'), 'ready')
-                }
-                for ($attempt = 0; $attempt -lt 1200; $attempt++) {
-                    if (Test-Path (Join-Path $directory 'release-descendant')) { exit 0 }
-                    Start-Sleep -Milliseconds 50
-                }
-                exit 91
-            }
-            [Console]::Out.Write('root-output-without-newline')
-            [Console]::Out.Flush()
-            [Console]::Error.Write('root-error-without-newline')
-            [Console]::Error.Flush()
-            if ($inherited -in @('stdout', 'stderr', 'both', 'neither')) {
-                $start = [Diagnostics.ProcessStartInfo]::new('pwsh')
-                $start.UseShellExecute = $false
-                foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $PSCommandPath,
-                    'descendant', $directory, $inherited, '0', $fault)) { $start.ArgumentList.Add($argument) }
-                $child = [Diagnostics.Process]::Start($start)
-                [IO.File]::WriteAllText((Join-Path $directory 'descendant-pid'), [string]$child.Id)
-                if ($fault -eq 'WithheldDescendantReadiness') {
-                    [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
-                }
-                for ($attempt = 0; $attempt -lt 400; $attempt++) {
-                    if (Test-Path (Join-Path $directory 'descendant-ready')) { break }
-                    if ($child.HasExited) {
-                        [Console]::Error.Write("Descendant fixture exited before readiness ($($child.ExitCode)).")
-                        [Console]::Error.Flush()
-                        exit 93
-                    }
-                    Start-Sleep -Milliseconds 50
-                }
-                if (-not (Test-Path (Join-Path $directory 'descendant-ready'))) {
-                    [Console]::Error.Write('Descendant fixture never became ready.')
-                    [Console]::Error.Flush()
-                    exit 94
-                }
-            }
-            if ($inherited -eq 'closed') {
-                [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-11))
-                [void][FixturePipeHandles]::CloseHandle([FixturePipeHandles]::GetStdHandle(-12))
-            }
-            [IO.File]::WriteAllText((Join-Path $directory 'root-pipes-prepared'), '')
-            [IO.File]::WriteAllText((Join-Path $directory 'ready'), 'ready')
-            for ($attempt = 0; $attempt -lt 1200; $attempt++) {
-                if (Test-Path (Join-Path $directory 'release-root')) {
-                    if ($inherited -eq 'flood') {
-                        [Console]::Out.Write([string]::new([char]'o', 262144))
-                        [Console]::Out.Flush()
-                        [Console]::Error.Write([string]::new([char]'e', 262144))
-                        [Console]::Error.Flush()
-                    }
-                    exit $exitCode
-                }
-                Start-Sleep -Milliseconds 50
-            }
             exit 92
             """;
     }
