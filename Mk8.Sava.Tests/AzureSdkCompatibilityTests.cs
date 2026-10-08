@@ -12238,49 +12238,75 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
     [Fact]
     public async Task ArchiveTierBlocksReadsAndRehydratesThroughPendingState()
     {
-        var service = CreateClient(factory);
+        var clock = new AdjustableTimeProvider(DateTimeOffset.UtcNow);
+        await using var application = CreateArchiveClockApplication(clock);
+        await application.InitializeAsync().ConfigureAwait(true);
+        AssertArchiveClockConfiguration(application, clock);
+        await AssertArchiveTierLifecycleAsync(application, clock).ConfigureAwait(true);
+    }
+
+    private static async Task AssertArchiveTierLifecycleAsync(
+        SavaWebApplicationFactory application, AdjustableTimeProvider clock)
+    {
+        var service = CreateClient(application);
         var container = service.GetBlobContainerClient($"archive-{Guid.NewGuid():N}");
-        await container.CreateAsync();
+        await container.CreateAsync().ConfigureAwait(false);
         var blob = container.GetBlobClient("cold.bin");
         var content = Enumerable.Range(0, 32 * 1024).Select(index => (byte)(index % 251)).ToArray();
-        await blob.UploadAsync(BinaryData.FromBytes(content));
+        await blob.UploadAsync(BinaryData.FromBytes(content)).ConfigureAwait(false);
 
-        var archived = await blob.SetAccessTierAsync(AccessTier.Archive);
+        var archived = await blob.SetAccessTierAsync(AccessTier.Archive).ConfigureAwait(false);
         Assert.Equal(200, archived.Status);
-        var archivedProperties = (await blob.GetPropertiesAsync()).Value;
+        var archivedProperties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(AccessTier.Archive, archivedProperties.AccessTier);
         Assert.Null(archivedProperties.ArchiveStatus);
-        var offline = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DownloadContentAsync());
+        var offline = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DownloadContentAsync()).ConfigureAwait(false);
         Assert.Equal(409, offline.Status);
         Assert.Equal("BlobArchived", offline.ErrorCode);
 
         var pending = await blob.SetAccessTierAsync(
             AccessTier.Hot,
-            rehydratePriority: RehydratePriority.Standard);
+            rehydratePriority: RehydratePriority.Standard).ConfigureAwait(false);
         Assert.Equal(202, pending.Status);
-        var pendingProperties = (await blob.GetPropertiesAsync()).Value;
+        var pendingProperties = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(AccessTier.Archive, pendingProperties.AccessTier);
         Assert.Equal("rehydrate-pending-to-hot", pendingProperties.ArchiveStatus);
         Assert.Equal("Standard", pendingProperties.RehydratePriority);
 
         var wrongTarget = await Assert.ThrowsAsync<RequestFailedException>(() =>
-            blob.SetAccessTierAsync(AccessTier.Cool, rehydratePriority: RehydratePriority.High));
+            blob.SetAccessTierAsync(AccessTier.Cool, rehydratePriority: RehydratePriority.High)).ConfigureAwait(false);
         Assert.Equal("BlobBeingRehydrated", wrongTarget.ErrorCode);
 
         var prioritized = await blob.SetAccessTierAsync(
             AccessTier.Hot,
-            rehydratePriority: RehydratePriority.High);
+            rehydratePriority: RehydratePriority.High).ConfigureAwait(false);
         Assert.Equal(202, prioritized.Status);
-        Assert.Equal("High", (await blob.GetPropertiesAsync()).Value.RehydratePriority);
+        Assert.Equal("High", (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value.RehydratePriority);
 
-        await Task.Delay(300);
-        var online = (await blob.GetPropertiesAsync()).Value;
+        await AssertArchiveCompletionBoundaryAsync(blob, clock, content).ConfigureAwait(false);
+        await AssertSmartTierPropertiesAsync(container, blob).ConfigureAwait(false);
+        await AssertSmartTierVersionBoundaryAsync(application, blob).ConfigureAwait(false);
+    }
+
+    private static async Task AssertArchiveCompletionBoundaryAsync(
+        BlobClient blob, AdjustableTimeProvider clock, byte[] content)
+    {
+        clock.Advance(TimeSpan.FromMilliseconds(200) - TimeSpan.FromTicks(1));
+        var beforeCompletion = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
+        Assert.Equal(AccessTier.Archive, beforeCompletion.AccessTier);
+        Assert.Equal("rehydrate-pending-to-hot", beforeCompletion.ArchiveStatus);
+        Assert.Equal("High", beforeCompletion.RehydratePriority);
+        var stillOffline = await Assert.ThrowsAsync<RequestFailedException>(() => blob.DownloadContentAsync()).ConfigureAwait(false);
+        Assert.Equal(409, stillOffline.Status);
+        Assert.Equal("BlobArchived", stillOffline.ErrorCode);
+
+        clock.Advance(TimeSpan.FromTicks(1));
+        var online = (await blob.GetPropertiesAsync().ConfigureAwait(false)).Value;
         Assert.Equal(AccessTier.Hot, online.AccessTier);
         Assert.Null(online.ArchiveStatus);
-        Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
+        Assert.Null(online.RehydratePriority);
+        Assert.Equal(content, (await blob.DownloadContentAsync().ConfigureAwait(false)).Value.Content.ToArray());
 
-        await AssertSmartTierPropertiesAsync(container, blob);
-        await AssertSmartTierVersionBoundaryAsync(factory, blob);
     }
 
     private static async Task AssertSmartTierPropertiesAsync(
