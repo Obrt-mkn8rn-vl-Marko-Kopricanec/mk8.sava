@@ -54,6 +54,11 @@ public sealed partial class TestProcessRunnerTests
         Assert.Same(failure, escaped);
         Assert.Equal(prefix, capture.Text);
         Assert.False(capture.ReachedEof);
+        var progress = capture.Progress;
+        Assert.Equal(prefix.Length + 1, progress.ReadRequests);
+        Assert.Equal(prefix.Length, progress.ReadReturns);
+        Assert.Equal(prefix.Length, progress.CapturedCharacters);
+        Assert.False(progress.ReachedEof);
         Assert.True(input.CanRead);
     }
 
