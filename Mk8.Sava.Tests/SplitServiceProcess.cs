@@ -1,7 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
-using System.Text;
 using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Tests;
@@ -14,8 +13,8 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
 #pragma warning disable CA2213 // DisposeOwnedResources owns a guaranteed using scope for this source; real success/timeout controls assert its disposal. Async-disposal dataflow misses this field.
     private readonly CancellationTokenSource _exitLifetime = new();
 #pragma warning restore CA2213
-    private readonly CapturedStream _stdout = new();
-    private readonly CapturedStream _stderr = new();
+    private readonly ProcessOutputCapture _stdout = new();
+    private readonly ProcessOutputCapture _stderr = new();
     private readonly Task _output;
     private readonly Task _error;
     private readonly Task _ownedRootExit;
@@ -105,7 +104,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
         }
     }
 
-    private async Task CaptureAsync(CapturedStream capture, StreamReader reader, bool publishAddress)
+    private async Task CaptureAsync(ProcessOutputCapture capture, StreamReader reader, bool publishAddress)
     {
         try
         {
@@ -245,52 +244,4 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously | TaskContinuationOptions.OnlyOnFaulted,
             TaskScheduler.Default);
 
-    private sealed class CapturedStream
-    {
-        private readonly Lock gate = new();
-        private readonly StringBuilder text = new();
-        private bool reachedEof;
-
-        internal string Text { get { lock (gate) return text.ToString(); } }
-        internal bool ReachedEof { get { lock (gate) return reachedEof; } }
-
-        internal async Task ReadAsync(StreamReader reader, Action<string>? onLine, CancellationToken cancellationToken)
-        {
-            var buffer = new char[4096];
-            var line = new StringBuilder();
-            while (true)
-            {
-                var count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
-                lock (gate)
-                {
-                    text.Append(buffer, 0, count);
-                    reachedEof = count == 0;
-                }
-                if (count == 0)
-                {
-                    if (line.Length > 0)
-                        onLine?.Invoke(line.ToString());
-                    return;
-                }
-                if (onLine is not null)
-                    PublishCompleteLines(buffer.AsSpan(0, count), line, onLine);
-            }
-        }
-
-        private static void PublishCompleteLines(ReadOnlySpan<char> buffer, StringBuilder line, Action<string> onLine)
-        {
-            foreach (var character in buffer)
-            {
-                if (character == '\n')
-                {
-                    onLine(line.ToString());
-                    line.Clear();
-                }
-                else
-                {
-                    line.Append(character);
-                }
-            }
-        }
-    }
 }
