@@ -1389,7 +1389,7 @@ public sealed class ChunkStore : IDisposable
         IncrementalHash? hash,
         CancellationToken cancellationToken)
     {
-        var buffer = new byte[128 * 1024];
+        var buffer = new byte[(int)Math.Min(length, 128 * 1024L)];
         while (length > 0)
         {
             var count = (int)Math.Min(buffer.Length, length);
