@@ -109,6 +109,16 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         }
     }
 
+    internal async Task AssertGatewayReadyAsync()
+    {
+        using var client = CreateHttpClient();
+        await SplitProcessReadinessProbe.AssertReadyAsync(client, GatewayAddress,
+            () => $"Application={(_application is null ? "wrapper absent" : $"owned PID={_application.Id}")}, " +
+                $"Gateway={(_gateway is null ? "wrapper absent" : $"owned PID={_gateway.Id}")}. " +
+                $"Owned IDs and captured output do not establish current liveness or descendant exit.\n{CapturedLogs}")
+            .ConfigureAwait(false);
+    }
+
     public BlobClientOptions CreateBlobClientOptions()
     {
         var options = new BlobClientOptions(BlobClientOptions.ServiceVersion.V2023_11_03);
