@@ -83,9 +83,16 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
             return _processDisposed ? _exitedAtDisposal : _process.HasExited;
     }
 
-    private string Snapshot() => $"PID={Id}, RootExited={RootExited()}, StdoutEof={_stdout.ReachedEof}, " +
-        $"StderrEof={_stderr.ReachedEof}, ListenerPublished={_address.Task.IsCompletedSuccessfully}. " +
-        "Root exit and pipe EOFs describe only the observed root/streams; descendant exit is not established.";
+    private string Snapshot()
+    {
+        var stdout = _stdout.Progress;
+        var stderr = _stderr.Progress;
+        return $"PID={Id}, RootExited={RootExited()}, StdoutEof={stdout.ReachedEof}, " +
+            $"StderrEof={stderr.ReachedEof}, ListenerPublished={_address.Task.IsCompletedSuccessfully}. " +
+            "Logical capture progress (sequential stream/task observations, not native I/O): " +
+            $"Stdout=[{stdout.ToDiagnostic()}, Task={_output.Status}], Stderr=[{stderr.ToDiagnostic()}, Task={_error.Status}]. " +
+            "Root exit and pipe EOFs describe only the observed root/streams; descendant exit is not established.";
+    }
 
     private async Task ObserveRootExitAsync()
     {

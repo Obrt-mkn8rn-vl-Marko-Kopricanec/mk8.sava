@@ -18,6 +18,9 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
         Assert.IsType<TimeoutException>(failure.InnerException);
         Assert.Contains("Application listener observation", failure.Message, StringComparison.Ordinal);
         Assert.Contains("RootExited=False, StdoutEof=False, StderrEof=False", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("Logical capture progress (sequential stream/task observations, not native I/O)", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("Stdout=[ReadRequests=", failure.Message, StringComparison.Ordinal);
+        Assert.Contains("Stderr=[ReadRequests=", failure.Message, StringComparison.Ordinal);
         Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
         Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
         Assert.False(fixture.Root.HasExited);

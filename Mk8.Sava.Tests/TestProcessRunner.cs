@@ -31,7 +31,11 @@ internal static class TestProcessRunner
             !CatastrophicExceptionPolicy.Contains(exception))
         {
             interruption = exception;
-            interruptedState = $"RootExited={process.HasExited}, StdoutEof={output.ReachedEof}, StderrEof={error.ReachedEof}";
+            var outputProgress = output.Progress;
+            var errorProgress = error.Progress;
+            interruptedState = $"RootExited={process.HasExited}, StdoutEof={outputProgress.ReachedEof}, StderrEof={errorProgress.ReachedEof}. " +
+                "Logical capture progress (sequential stream/task observations, not native I/O): " +
+                $"Stdout=[{outputProgress.ToDiagnostic()}, Task={stdout.Status}], Stderr=[{errorProgress.ToDiagnostic()}, Task={stderr.Status}]";
         }
         finally
         {

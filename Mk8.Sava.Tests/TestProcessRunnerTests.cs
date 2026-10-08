@@ -73,6 +73,9 @@ public sealed partial class TestProcessRunnerTests(ITestOutputHelper output)
             Assert.Contains("root-output-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("root-error-without-newline", failure.Message, StringComparison.Ordinal);
             Assert.Contains("RootExited=True", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("Logical capture progress (sequential stream/task observations, not native I/O)", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("Stdout=[ReadRequests=", failure.Message, StringComparison.Ordinal);
+            Assert.Contains("Stderr=[ReadRequests=", failure.Message, StringComparison.Ordinal);
             Assert.Contains($"StdoutEof={string.Equals(inherited, "stderr", StringComparison.Ordinal)}", failure.Message, StringComparison.Ordinal);
             Assert.Contains($"StderrEof={string.Equals(inherited, "stdout", StringComparison.Ordinal)}", failure.Message, StringComparison.Ordinal);
             Assert.Contains("descendant exit is not established", failure.Message, StringComparison.Ordinal);
