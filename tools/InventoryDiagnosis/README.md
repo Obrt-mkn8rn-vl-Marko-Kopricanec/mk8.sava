@@ -36,8 +36,9 @@ the retained ticks. For printed-field verification **only**, the parser models
 the pinned runtime's double-based Stopwatch conversion, truncation to 100ns
 TimeSpan ticks, TotalMilliseconds and invariant F3 formatting. It requires that
 numeric printed value, rather than widening a raw-tick error tolerance. Durations
-outside the producer TimeSpan representation are rejected. Exact fractional
-timestamp-derived milliseconds remain separately available in the output.
+outside the producer TimeSpan representation are rejected. A separate 64-digit
+Decimal projection of timestamp-derived milliseconds remains in the output;
+integer ticks are exact, but arbitrary-frequency fractions need not terminate.
 The comparison model follows the pinned [Stopwatch](https://raw.githubusercontent.com/dotnet/runtime/v10.0.12/src/libraries/System.Private.CoreLib/src/System/Diagnostics/Stopwatch.cs)
 and [TimeSpan](https://raw.githubusercontent.com/dotnet/runtime/v10.0.12/src/libraries/System.Private.CoreLib/src/System/TimeSpan.cs)
 sources and the [numeric formatting contract](https://learn.microsoft.com/en-us/dotnet/standard/base-types/standard-numeric-format-strings).
