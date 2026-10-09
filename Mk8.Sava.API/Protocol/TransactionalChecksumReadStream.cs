@@ -7,8 +7,9 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
     private readonly IncrementalHash _md5 = IncrementalHash.CreateHash(HashAlgorithmName.MD5);
     private readonly StorageCrc64 _crc64 = new();
     private TransactionalChecksums? _completed;
+    private bool _disposed;
 
-    public override bool CanRead => true;
+    public override bool CanRead => !_disposed;
     public override bool CanSeek => false;
     public override bool CanWrite => false;
     public override long Length => throw new NotSupportedException();
@@ -21,6 +22,7 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
 
     public TransactionalChecksums Complete()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         _completed ??= new TransactionalChecksums(_md5.GetHashAndReset(), _crc64.GetHash());
         return _completed;
     }
@@ -30,6 +32,7 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
 
     public override int Read(Span<byte> buffer)
     {
+        EnsureReadable();
         var read = inner.Read(buffer);
         Append(buffer[..read]);
         return read;
@@ -39,6 +42,7 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
         Memory<byte> buffer,
         CancellationToken cancellationToken = default)
     {
+        EnsureReadable();
         var read = await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         Append(buffer.Span[..read]);
         return read;
@@ -58,9 +62,19 @@ internal sealed class TransactionalChecksumReadStream(Stream inner) : Stream
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing)
+        if (disposing && !_disposed)
+        {
+            _disposed = true;
             _md5.Dispose();
+        }
         base.Dispose(disposing);
+    }
+
+    private void EnsureReadable()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_completed is not null)
+            throw new InvalidOperationException("The transactional checksum has already been completed.");
     }
 
     private void Append(ReadOnlySpan<byte> bytes)
