@@ -9,14 +9,26 @@ internal sealed class BlobSeekableReadStream(
     CancellationToken requestCancellationToken = default) : Stream
 {
     private long _position;
+    private bool _disposed;
 
-    public override bool CanRead => true;
-    public override bool CanSeek => true;
+    public override bool CanRead => !_disposed;
+    public override bool CanSeek => !_disposed;
     public override bool CanWrite => false;
-    public override long Length => length;
+    public override long Length
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return length;
+        }
+    }
     public override long Position
     {
-        get => _position;
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _position;
+        }
         set => Seek(value, SeekOrigin.Begin);
     }
 
@@ -30,6 +42,7 @@ internal sealed class BlobSeekableReadStream(
 
     public override int Read(Span<byte> buffer)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (buffer.IsEmpty)
             return 0;
         var rented = ArrayPool<byte>.Shared.Rent(buffer.Length);
@@ -59,6 +72,7 @@ internal sealed class BlobSeekableReadStream(
         Memory<byte> buffer,
         CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (buffer.IsEmpty || _position >= Length)
             return 0;
         var count = checked((int)Math.Min(buffer.Length, Length - _position));
@@ -76,6 +90,7 @@ internal sealed class BlobSeekableReadStream(
 
     public override long Seek(long offset, SeekOrigin origin)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var next = origin switch
         {
             SeekOrigin.Begin => offset,
@@ -91,11 +106,24 @@ internal sealed class BlobSeekableReadStream(
 
     public override void Flush()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
     }
 
-    public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public override Task FlushAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return Task.CompletedTask;
+    }
     public override void SetLength(long value) => throw new NotSupportedException();
     public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+            _disposed = true;
+        // Retire this adapter only; the range callback's session/pin belongs to its caller.
+        base.Dispose(disposing);
+    }
 
     private sealed class FixedMemoryWriteStream(Memory<byte> destination) : Stream
     {
