@@ -19,6 +19,7 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
     private long _stagingBytes;
     private long _metadataBytes;
     private int _standaloneChunkCount;
+    private bool _disposed;
 
     private static StringComparison PathComparison => OperatingSystem.IsWindows()
         ? StringComparison.OrdinalIgnoreCase
@@ -29,6 +30,7 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
     public bool Advance(int maximumSteps)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maximumSteps);
+        ObjectDisposedException.ThrowIf(_disposed, this);
 
         LastPassSteps = 0;
         while (LastPassSteps < maximumSteps && (_nextEntry is not null || _directories.Count > 0))
@@ -50,6 +52,7 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
 
     public StoragePhysicalUsage ToPhysicalUsage(int packedChunkCount)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (_nextEntry is not null || _directories.Count > 0)
             throw new InvalidOperationException("The physical inventory is incomplete.");
 
@@ -214,6 +217,8 @@ internal sealed class StoragePhysicalInventoryScanner(StoragePaths paths) : IDis
 
     public void Dispose()
     {
+        _disposed = true;
+        _nextEntry = null;
         while (_directories.TryPop(out var entries))
             entries.Dispose();
     }

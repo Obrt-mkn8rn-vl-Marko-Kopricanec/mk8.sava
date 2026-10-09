@@ -57,6 +57,104 @@ public sealed class StoragePhysicalInventoryTests(ITestOutputHelper output)
             Assert.Null(usage.AllocatedRootBytes);
     }
 
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void RetirementRefusesPendingEntriesAndCannotResumeEnumeration(int steps)
+    {
+        using var fixture = new InventoryFixture();
+        WriteFile(Path.Combine(fixture.Paths.Chunks, "shard", "payload.chunk"), 3);
+        using var scanner = new StoragePhysicalInventoryScanner(fixture.Paths);
+        if (steps > 0)
+        {
+            Assert.False(scanner.Advance(steps));
+            Assert.Equal(steps, scanner.LastPassSteps);
+        }
+
+        scanner.Dispose();
+        scanner.Dispose();
+
+        var failure = Assert.Throws<ObjectDisposedException>(() => scanner.Advance(maximumSteps: 1));
+        Assert.Equal(typeof(StoragePhysicalInventoryScanner).FullName, failure.ObjectName);
+        Assert.Equal(steps, scanner.LastPassSteps);
+        Assert.Throws<ObjectDisposedException>(() => scanner.ToPhysicalUsage(packedChunkCount: 0));
+
+        // The data root and its lease are borrowed, not retired by this scanner.
+        WriteFile(Path.Combine(fixture.Paths.Chunks, "later.chunk"), 5);
+        var fresh = Scan(fixture.Paths, entriesPerPass: 1, out _);
+        Assert.Equal(2, fresh.ChunkCount);
+        Assert.Equal(8, fresh.ChunkBytes);
+    }
+
+    [Fact]
+    public void RetirementCannotTurnAPartialInventoryIntoACompletedUsage()
+    {
+        using var fixture = new InventoryFixture();
+        WriteFile(Path.Combine(fixture.Paths.Chunks, "payload.chunk"), 7);
+        using var scanner = new StoragePhysicalInventoryScanner(fixture.Paths);
+        Assert.False(scanner.Advance(maximumSteps: 1));
+        Assert.Throws<InvalidOperationException>(() => scanner.ToPhysicalUsage(packedChunkCount: 0));
+
+        scanner.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => scanner.ToPhysicalUsage(packedChunkCount: 0));
+        Assert.Throws<ObjectDisposedException>(() => scanner.Advance(maximumSteps: 1024));
+        Assert.Equal(1, scanner.LastPassSteps);
+    }
+
+    [Fact]
+    public void CompletedUsageRemainsIndependentAfterScannerRetirement()
+    {
+        using var fixture = new InventoryFixture();
+        WriteFile(Path.Combine(fixture.Paths.Chunks, "payload.chunk"), 3);
+        WriteFile(Path.Combine(fixture.Paths.Packs, "payload.pack"), 5);
+        WriteFile(Path.Combine(fixture.Paths.Staging, "payload.tmp"), 7);
+        WriteFile(fixture.Paths.Database, 11);
+        using var scanner = new StoragePhysicalInventoryScanner(fixture.Paths);
+        var passes = 0;
+        while (!scanner.Advance(maximumSteps: 1))
+            Assert.True(++passes < 100);
+        var usage = scanner.ToPhysicalUsage(packedChunkCount: 2);
+        Assert.Equal(8, usage.ChunkBytes);
+        Assert.Equal(3, usage.ChunkCount);
+        Assert.Equal(7, usage.StagingBytes);
+        Assert.Equal(11, usage.MetadataBytes);
+        Assert.True(scanner.Advance(maximumSteps: 1));
+        Assert.Equal(0, scanner.LastPassSteps);
+        Assert.Equal(usage, scanner.ToPhysicalUsage(packedChunkCount: 2));
+
+        scanner.Dispose();
+        scanner.Dispose();
+        WriteFile(Path.Combine(fixture.Paths.Chunks, "later.chunk"), 13);
+
+        Assert.Throws<ObjectDisposedException>(() => scanner.Advance(maximumSteps: 1));
+        Assert.Throws<ObjectDisposedException>(() => scanner.ToPhysicalUsage(packedChunkCount: 2));
+        Assert.Equal(0, scanner.LastPassSteps);
+        Assert.Equal(8, usage.ChunkBytes);
+        Assert.Equal(3, usage.ChunkCount);
+        var fresh = Scan(fixture.Paths, entriesPerPass: 1, out _);
+        Assert.Equal(21, fresh.ChunkBytes);
+        Assert.Equal(2, fresh.ChunkCount);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void InvalidPassBudgetsStillRejectBeforeAccessingActiveOrRetiredStorage(int budget)
+    {
+        using var fixture = new InventoryFixture();
+        using var scanner = new StoragePhysicalInventoryScanner(fixture.Paths);
+        var active = Assert.Throws<ArgumentOutOfRangeException>(() => scanner.Advance(budget));
+        Assert.Equal("maximumSteps", active.ParamName);
+        Assert.Equal(0, scanner.LastPassSteps);
+        scanner.Dispose();
+
+        var retired = Assert.Throws<ArgumentOutOfRangeException>(() => scanner.Advance(budget));
+        Assert.Equal("maximumSteps", retired.ParamName);
+        Assert.Equal(0, scanner.LastPassSteps);
+    }
+
     [Fact]
     public void MixedInventoryHasABoundedMeasuredAllocationCost()
     {
