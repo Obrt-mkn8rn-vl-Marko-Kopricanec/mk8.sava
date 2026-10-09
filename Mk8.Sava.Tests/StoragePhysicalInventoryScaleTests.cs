@@ -123,12 +123,24 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
 
     private void ReportMutationTail(string phase, ConcurrentScanMeasurements measured)
     {
+        output.WriteLine(FormattableString.Invariant(
+            $"inventory_scan_timeline,phase={phase},timestamp_frequency={Stopwatch.Frequency},passes={measured.Timeline.Passes.Count}"));
+        for (var index = 0; index < measured.Timeline.Passes.Count; index++)
+        {
+            var pass = measured.Timeline.Passes[index];
+            output.WriteLine(FormattableString.Invariant(
+                $"inventory_scan_pass,phase={phase},index={index},started_ticks={pass.Started},finished_ticks={pass.Finished}"));
+        }
+        // These are intersections of observed call intervals, not native execution,
+        // scheduling or causality proof. Controls have no actual scanner intervals.
         // Correlated rows retain whole-operation latency, not sums of unrelated phase quantiles.
         for (var index = Math.Max(0, measured.Mutations.Length - 8); index < measured.Mutations.Length; index++)
         {
             var mutation = measured.Mutations[index];
+            var total = measured.Timeline.Correlate(mutation.Started, mutation.Finished);
+            var flush = measured.Timeline.Correlate(mutation.Written, mutation.Flushed);
             output.WriteLine(FormattableString.Invariant(
-                $"inventory_mutation_tail,phase={phase},index={mutation.Index},total_ms={mutation.Total.TotalMilliseconds:F3},create_ms={Stopwatch.GetElapsedTime(mutation.Started, mutation.Opened).TotalMilliseconds:F3},write_ms={Stopwatch.GetElapsedTime(mutation.Opened, mutation.Written).TotalMilliseconds:F3},flush_ms={Stopwatch.GetElapsedTime(mutation.Written, mutation.Flushed).TotalMilliseconds:F3},close_ms={Stopwatch.GetElapsedTime(mutation.Flushed, mutation.Closed).TotalMilliseconds:F3},delete_ms={Stopwatch.GetElapsedTime(mutation.Closed, mutation.Finished).TotalMilliseconds:F3}"));
+                $"inventory_mutation_tail,phase={phase},index={mutation.Index},total_ms={mutation.Total.TotalMilliseconds:F3},create_ms={Stopwatch.GetElapsedTime(mutation.Started, mutation.Opened).TotalMilliseconds:F3},write_ms={Stopwatch.GetElapsedTime(mutation.Opened, mutation.Written).TotalMilliseconds:F3},flush_ms={Stopwatch.GetElapsedTime(mutation.Written, mutation.Flushed).TotalMilliseconds:F3},close_ms={Stopwatch.GetElapsedTime(mutation.Flushed, mutation.Closed).TotalMilliseconds:F3},delete_ms={Stopwatch.GetElapsedTime(mutation.Closed, mutation.Finished).TotalMilliseconds:F3},started_ticks={mutation.Started},opened_ticks={mutation.Opened},written_ticks={mutation.Written},flushed_ticks={mutation.Flushed},closed_ticks={mutation.Closed},finished_ticks={mutation.Finished},scan_overlapping_passes={total.PassCount},scan_overlap_ms={total.Elapsed.TotalMilliseconds:F3},flush_scan_overlapping_passes={flush.PassCount},flush_scan_overlap_ms={flush.Elapsed.TotalMilliseconds:F3}"));
         }
     }
 
@@ -239,16 +251,18 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             latencies.Length,
             scanResult.MaxPass,
             latencies[(int)Math.Ceiling(latencies.Length * 0.99) - 1].Total,
-            latencies);
+            latencies,
+            scanResult.Timeline);
     }
 
-    private static (int Passes, int OverlappingPasses, TimeSpan MaxPass) ScanWhileWriting(
+    private static (int Passes, int OverlappingPasses, TimeSpan MaxPass, InventoryScanTimeline Timeline) ScanWhileWriting(
         StoragePhysicalInventoryScanner? scanner, Barrier rendezvous, long[] batchTimes,
         int[] scanFinished, CancellationTokenSource abort)
     {
         var passes = 0;
         var overlappingPasses = 0;
         var maximum = TimeSpan.Zero;
+        var intervals = new InventoryScanTimeline.ScanInterval[InventoryScanTimeline.MaximumPasses];
         try
         {
             bool complete;
@@ -268,9 +282,12 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
                 if (scanner is not null)
                     Assert.InRange(scanner.LastPassSteps, 1, EntriesPerPass);
                 Assert.True(++passes <= 110, "The concurrent scan did not finish within the pass budget.");
+                if (scanner is not null)
+                    intervals[passes - 1] = new InventoryScanTimeline.ScanInterval(started, finished);
             }
             while (!complete);
-            return (passes, overlappingPasses, maximum);
+            return (passes, overlappingPasses, maximum,
+                new InventoryScanTimeline(scanner is null ? [] : intervals.AsSpan(0, passes)));
         }
         catch
         {
@@ -337,7 +354,8 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
     }
 
     private sealed record ConcurrentScanMeasurements(
-        int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write, StagingMutation[] Mutations);
+        int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write,
+        StagingMutation[] Mutations, InventoryScanTimeline Timeline);
 
     [StructLayout(LayoutKind.Auto)]
     private readonly record struct StagingMutation(
