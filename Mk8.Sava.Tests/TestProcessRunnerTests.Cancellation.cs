@@ -61,9 +61,10 @@ public sealed partial class TestProcessRunnerTests
         var observation = TestProcessRunner.ObserveAsync(fixture.Root,
             TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2), cancellation.Token);
         var original = new IOException("controlled cancellation callback failure");
-        var registration = cancellation.Token.Register(() => throw original);
+        var callbackProgress = new CancellationCallbackProbe(() => throw original);
+        var registration = cancellation.Token.Register(callbackProgress.Invoke);
         await using var registrationLifetime = registration.ConfigureAwait(false);
-        var work = new CancellationWork(cancellation.CancelAsync(), observation);
+        var work = new CancellationWork(cancellation.CancelAsync(), observation, callbackProgress);
         string? snapshot = null;
         await RunWithCleanupAsync(async () =>
         {
@@ -74,6 +75,7 @@ public sealed partial class TestProcessRunnerTests
             Assert.NotNull(snapshot);
             Assert.Contains("CancellationRequested=True", snapshot, StringComparison.Ordinal);
             Assert.Contains("CallbacksStatus=Faulted", snapshot, StringComparison.Ordinal);
+            Assert.Contains("ControlledCallback=[Entered=True, BodyExited=True, ReturnedNormally=False]", snapshot, StringComparison.Ordinal);
         }, async () =>
         {
             // Join both actual tasks; retain, rather than replace, the deliberately faulted callback operation.
@@ -140,7 +142,7 @@ public sealed partial class TestProcessRunnerTests
         }
     }
 
-    private sealed class CancellationWork(Task callbacks, Task observation)
+    private sealed class CancellationWork(Task callbacks, Task observation, CancellationCallbackProbe? callbackProgress = null)
     {
         internal bool CallbacksCompleted => callbacks.IsCompleted;
         internal bool ObservationCompleted => observation.IsCompleted;
@@ -159,7 +161,9 @@ public sealed partial class TestProcessRunnerTests
                 report($"Caller cancellation callback observation failed: {failure.GetType().Name}. " +
                     $"CancellationRequested={cancellation.IsCancellationRequested}, CallbacksStatus={callbacks.Status}, " +
                     $"CallbacksCompleted={callbacks.IsCompleted}, ObservationStatus={observation.Status}, " +
-                    $"ObservationCompleted={observation.IsCompleted}. {fixture.StartupDiagnostic}");
+                    $"ObservationCompleted={observation.IsCompleted}. " +
+                    $"ControlledCallback=[{callbackProgress?.Progress.ToDiagnostic() ?? "NotInstrumented"}]. " +
+                    $"{fixture.StartupDiagnostic}");
                 throw;
             }
         }
