@@ -15,7 +15,7 @@ using Mk8.Sava.Protocol;
 
 namespace Mk8.Sava.Tests;
 
-public sealed class KestrelUploadTests
+public sealed partial class KestrelUploadTests
 {
     private const int LargeContentLength = 30 * 1024 * 1024;
 

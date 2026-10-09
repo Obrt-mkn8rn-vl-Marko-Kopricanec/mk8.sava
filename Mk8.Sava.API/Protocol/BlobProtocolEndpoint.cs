@@ -2753,6 +2753,9 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         ValidateBlobTypeVersion(request, current?.Kind);
         RequireAny(request, current is null ? 'c' : 'w', 'w');
         await RecheckParentMutationAclAsync(http, request, cancellationToken).ConfigureAwait(false);
+        var options = http.RequestServices.GetRequiredService<IOptions<SavaOptions>>().Value;
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(
+            http.Request, Math.Min(GetMaximumPutBlobBytes(request), options.MaximumRequestBodyBytes));
         EvaluateWriteConditions(http.Request, current);
         if (current is not null ||
             http.Request.Headers.ContainsKey("x-ms-lease-id") &&

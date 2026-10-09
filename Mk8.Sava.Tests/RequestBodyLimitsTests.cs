@@ -46,6 +46,106 @@ public sealed class RequestBodyLimitsTests
         Assert.Null(context.Features.Get<IHttpMaxRequestBodySizeFeature>());
     }
 
+    [Theory]
+    [InlineData(0L, 1024L, 0L)]
+    [InlineData(30_000_001L, 30_000_001L, 30_000_001L)]
+    [InlineData(31_457_280L, 5_242_880_000L, 31_457_280L)]
+    [InlineData(31_457_281L, 31_457_280L, 30_000_000L)]
+    [InlineData(long.MaxValue, long.MaxValue, long.MaxValue)]
+    public void OrdinaryPreparationUsesOnlyTheDeclaredLengthWithinTheSuppliedBudget(
+        long declared, long maximum, long expected)
+    {
+        var context = CreateOrdinaryRequest(declared);
+        var feature = new BodySizeFeature();
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, maximum);
+
+        Assert.Equal(expected, feature.MaxRequestBodySize);
+    }
+
+    [Theory]
+    [InlineData("x-ms-copy-source", "")]
+    [InlineData("x-ms-copy-source", "https://example.invalid/source")]
+    [InlineData("x-ms-structured-body", "")]
+    [InlineData("x-ms-structured-body", StructuredBodyDecoder.ContentType)]
+    [InlineData("x-ms-structured-content-length", "")]
+    [InlineData("x-ms-structured-content-length", "1")]
+    public void CopyAndStructuredHeaderPresenceNeverGetsOrdinaryPreparation(string header, string value)
+    {
+        var context = CreateOrdinaryRequest(31_457_280);
+        context.Request.Headers[header] = value;
+        var feature = new BodySizeFeature();
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, 5_242_880_000);
+
+        Assert.Equal(30_000_000L, feature.MaxRequestBodySize);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("AppendBlob")]
+    [InlineData("PageBlob")]
+    [InlineData("blockblob")]
+    public void MissingOrOtherBlobTypesKeepTheExistingTransportLimit(string? blobType)
+    {
+        var context = CreateOrdinaryRequest(31_457_280);
+        if (blobType is null)
+            context.Request.Headers.Remove("x-ms-blob-type");
+        else
+            context.Request.Headers["x-ms-blob-type"] = blobType;
+        var feature = new BodySizeFeature();
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, 5_242_880_000);
+
+        Assert.Equal(30_000_000L, feature.MaxRequestBodySize);
+    }
+
+    [Fact]
+    public void OrdinaryPreparationRequiresAKnownLength()
+    {
+        var context = CreateOrdinaryRequest(contentLength: null);
+        var feature = new BodySizeFeature();
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, 5_242_880_000);
+
+        Assert.Equal(30_000_000L, feature.MaxRequestBodySize);
+    }
+
+    [Fact]
+    public void OrdinaryPreparationDoesNotChangeAnAlreadyReadRequest()
+    {
+        var context = CreateOrdinaryRequest(31_457_280);
+        var feature = new BodySizeFeature { IsReadOnly = true };
+        context.Features.Set<IHttpMaxRequestBodySizeFeature>(feature);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, 5_242_880_000);
+
+        Assert.Equal(30_000_000L, feature.MaxRequestBodySize);
+    }
+
+    [Fact]
+    public void OrdinaryPreparationDoesNotInventAHostFeature()
+    {
+        var context = CreateOrdinaryRequest(31_457_280);
+
+        RequestBodyLimits.PrepareOrdinaryBlockBlob(context.Request, 5_242_880_000);
+
+        Assert.Null(context.Features.Get<IHttpMaxRequestBodySizeFeature>());
+    }
+
+    private static DefaultHttpContext CreateOrdinaryRequest(long? contentLength)
+    {
+        var context = new DefaultHttpContext();
+        context.Request.Method = HttpMethods.Put;
+        context.Request.Headers["x-ms-blob-type"] = "BlockBlob";
+        context.Request.ContentLength = contentLength;
+        return context;
+    }
+
     private sealed class BodySizeFeature : IHttpMaxRequestBodySizeFeature
     {
         public bool IsReadOnly { get; init; }
