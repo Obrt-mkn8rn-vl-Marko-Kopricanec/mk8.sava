@@ -131,6 +131,16 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             output.WriteLine(FormattableString.Invariant(
                 $"inventory_scan_pass,phase={phase},index={index},started_ticks={pass.Started},finished_ticks={pass.Finished}"));
         }
+        output.WriteLine(FormattableString.Invariant(
+            $"inventory_scan_gc,phase={phase},passes={measured.GcObservations.Passes.Count},pause_ticks_per_second={TimeSpan.TicksPerSecond}"));
+        for (var index = 0; index < measured.GcObservations.Passes.Count; index++)
+        {
+            var observation = measured.GcObservations.Passes[index];
+            var before = observation.Before;
+            var after = observation.After;
+            output.WriteLine(FormattableString.Invariant(
+                $"inventory_scan_gc_pass,phase={phase},index={index},before_started_ticks={before.Started},before_finished_ticks={before.Finished},before_pause_timespan_ticks={before.PauseTicks},before_gen0={before.Generation0},before_gen1={before.Generation1},before_gen2={before.Generation2},after_started_ticks={after.Started},after_finished_ticks={after.Finished},after_pause_timespan_ticks={after.PauseTicks},after_gen0={after.Generation0},after_gen1={after.Generation1},after_gen2={after.Generation2},pause_timespan_ticks_difference={observation.PauseTicksDifference},gen0_difference={observation.Generation0Difference},gen1_difference={observation.Generation1Difference},gen2_difference={observation.Generation2Difference}"));
+        }
         // These are intersections of observed call intervals, not native execution,
         // scheduling or causality proof. Controls have no actual scanner intervals.
         // Correlated rows retain whole-operation latency, not sums of unrelated phase quantiles.
@@ -252,10 +262,12 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
             scanResult.MaxPass,
             latencies[(int)Math.Ceiling(latencies.Length * 0.99) - 1].Total,
             latencies,
-            scanResult.Timeline);
+            scanResult.Timeline,
+            scanResult.GcObservations);
     }
 
-    private static (int Passes, int OverlappingPasses, TimeSpan MaxPass, InventoryScanTimeline Timeline) ScanWhileWriting(
+    private static (int Passes, int OverlappingPasses, TimeSpan MaxPass, InventoryScanTimeline Timeline,
+        InventoryScanGcObservations GcObservations) ScanWhileWriting(
         StoragePhysicalInventoryScanner? scanner, Barrier rendezvous, long[] batchTimes,
         int[] scanFinished, CancellationTokenSource abort)
     {
@@ -263,15 +275,19 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
         var overlappingPasses = 0;
         var maximum = TimeSpan.Zero;
         var intervals = new InventoryScanTimeline.ScanInterval[InventoryScanTimeline.MaximumPasses];
+        InventoryScanGcObservations.Observation[] gcObservations = scanner is null ? [] :
+            new InventoryScanGcObservations.Observation[InventoryScanTimeline.MaximumPasses];
         try
         {
             bool complete;
             do
             {
                 WaitForPhase(rendezvous, abort.Token);
+                var gcBefore = scanner is null ? default : InventoryScanGcObservations.Capture();
                 var started = Stopwatch.GetTimestamp();
                 complete = scanner?.Advance(EntriesPerPass) ?? passes + 1 >= ConcurrentWriteCount / WritesPerPass;
                 var finished = Stopwatch.GetTimestamp();
+                var gcAfter = scanner is null ? default : InventoryScanGcObservations.Capture();
                 var elapsed = Stopwatch.GetElapsedTime(started, finished);
                 if (elapsed > maximum)
                     maximum = elapsed;
@@ -283,11 +299,15 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
                     Assert.InRange(scanner.LastPassSteps, 1, EntriesPerPass);
                 Assert.True(++passes <= 110, "The concurrent scan did not finish within the pass budget.");
                 if (scanner is not null)
+                {
                     intervals[passes - 1] = new InventoryScanTimeline.ScanInterval(started, finished);
+                    gcObservations[passes - 1] = new InventoryScanGcObservations.Observation(gcBefore, gcAfter);
+                }
             }
             while (!complete);
-            return (passes, overlappingPasses, maximum,
-                new InventoryScanTimeline(scanner is null ? [] : intervals.AsSpan(0, passes)));
+            var timeline = new InventoryScanTimeline(scanner is null ? [] : intervals.AsSpan(0, passes));
+            return (passes, overlappingPasses, maximum, timeline,
+                new InventoryScanGcObservations(timeline, scanner is null ? [] : gcObservations.AsSpan(0, passes)));
         }
         catch
         {
@@ -355,7 +375,7 @@ public sealed class StoragePhysicalInventoryScaleTests(ITestOutputHelper output)
 
     private sealed record ConcurrentScanMeasurements(
         int Passes, int OverlappingPasses, int WriteCount, TimeSpan MaxPass, TimeSpan P99Write,
-        StagingMutation[] Mutations, InventoryScanTimeline Timeline);
+        StagingMutation[] Mutations, InventoryScanTimeline Timeline, InventoryScanGcObservations GcObservations);
 
     [StructLayout(LayoutKind.Auto)]
     private readonly record struct StagingMutation(
