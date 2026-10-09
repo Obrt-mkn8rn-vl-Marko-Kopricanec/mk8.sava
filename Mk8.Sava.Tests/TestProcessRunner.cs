@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Mk8.Sava.Protocol;
 
@@ -18,7 +19,10 @@ internal static class TestProcessRunner
         var error = new ProcessOutputCapture();
         var stdout = output.ReadAsync(process.StandardOutput, onLine: null, timeout.Token);
         var stderr = error.ReadAsync(process.StandardError, onLine: null, timeout.Token);
-        var completion = Task.WhenAll(process.WaitForExitAsync(timeout.Token), stdout, stderr);
+        var rootExit = process.WaitForExitAsync(timeout.Token);
+        Task[] observations = [rootExit, stdout, stderr];
+        var operations = observations;
+        var completion = Task.WhenAll(observations);
         OperationCanceledException? interruption = null;
         var interruptedState = string.Empty;
         var cleanupState = string.Empty;
@@ -41,26 +45,33 @@ internal static class TestProcessRunner
         {
             if (!completion.IsCompletedSuccessfully)
             {
-                cleanupState = await CleanUpAsync(process, completion, timeout, cleanupTimeout).ConfigureAwait(false);
+                var cleanup = await CleanUpAsync(process, completion, observations, timeout, cleanupTimeout).ConfigureAwait(false);
+                cleanupState = cleanup.Diagnostic;
+                operations = cleanup.Operations;
             }
         }
 
+        ThrowKnownFatalFaults(operations);
         if (interruption is null)
             return (process.ExitCode, output.Text, error.Text);
 
         var diagnostic = $"Process observation interrupted. {interruptedState}. {cleanupState}. " +
             "Root exit and pipe EOFs describe only the observed root/streams; descendant exit is not established.\n" +
             $"stdout (partial):\n{output.Text}\nstderr (partial):\n{error.Text}";
+        // Snapshot construction can overlap a constituent fault; do not normalize one already available here.
+        ThrowKnownFatalFaults(operations);
         if (cancellationToken.IsCancellationRequested)
             throw new OperationCanceledException(diagnostic, interruption, cancellationToken);
         throw new TimeoutException(diagnostic, interruption);
     }
 
-    private static async Task<string> CleanUpAsync(
-        Process process, Task completion, CancellationTokenSource observationTimeout, TimeSpan cleanupTimeout)
+    private static async Task<(string Diagnostic, Task[] Operations)> CleanUpAsync(
+        Process process, Task completion, Task[] observations, CancellationTokenSource observationTimeout, TimeSpan cleanupTimeout)
     {
         using var cleanup = new CancellationTokenSource(cleanupTimeout);
-        var cleanupCompletion = Task.WhenAll(completion, observationTimeout.CancelAsync());
+        var callbacks = observationTimeout.CancelAsync();
+        var cleanupCompletion = Task.WhenAll(completion, callbacks);
+        Task[] operations = [.. observations, callbacks];
         var errors = new StringBuilder();
         try
         {
@@ -78,21 +89,65 @@ internal static class TestProcessRunner
         process.StandardError.Dispose();
         try
         {
-            await process.WaitForExitAsync(cleanup.Token).ConfigureAwait(false);
-            await cleanupCompletion.WaitAsync(cleanup.Token).ConfigureAwait(false);
+            var rootWait = process.WaitForExitAsync(cleanup.Token);
+            operations = [.. operations, rootWait];
+            errors.Append(await ObserveCleanupAsync(rootWait, cleanupCompletion, operations, cleanup.Token).ConfigureAwait(false));
         }
         catch (Exception exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
-            errors.Append(" Cleanup observation: ").Append(exception.GetType().Name).Append(": ").Append(exception.Message);
+            errors.Append(DescribeCleanupFailure(exception, operations));
         }
         finally
         {
             // Never wait without a deadline. Observe an eventual fault if native I/O outlives cleanup.
-            _ = cleanupCompletion.ContinueWith(static finished => _ = finished.Exception,
-                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-                TaskScheduler.Default);
+            ObserveEventualFault(cleanupCompletion);
+            foreach (var operation in operations)
+                ObserveEventualFault(operation);
         }
-        return $"Cleanup RootExited={process.HasExited}, ObservationSettled={cleanupCompletion.IsCompleted}" + errors;
+        var diagnostic = $"Cleanup RootExited={process.HasExited}, ObservationSettled={cleanupCompletion.IsCompleted}" + errors;
+        ThrowKnownFatalFaults(operations);
+        return (diagnostic, operations);
     }
+
+    internal static async Task<string> ObserveCleanupAsync(
+        Task rootWait, Task completion, Task[] operations, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await rootWait.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await completion.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return string.Empty;
+        }
+        catch (Exception failure) when (!CatastrophicExceptionPolicy.Contains(failure))
+        {
+            return DescribeCleanupFailure(failure, operations);
+        }
+    }
+
+    private static string DescribeCleanupFailure(Exception failure, Task[] operations)
+    {
+        // WhenAll has no Exception until every constituent settles; inspect the actual available fault graphs.
+        ThrowKnownFatalFaults(operations);
+        var diagnostic = $" Cleanup observation: {failure.GetType().Name}: {failure.Message}";
+        ThrowKnownFatalFaults(operations);
+        return diagnostic;
+    }
+
+    private static void ThrowKnownFatalFaults(Task[] operations)
+    {
+        foreach (var operation in operations)
+        {
+            if (operation.Exception is not { } failures)
+                continue;
+            foreach (var failure in failures.InnerExceptions)
+                if (CatastrophicExceptionPolicy.Contains(failure))
+                    ExceptionDispatchInfo.Throw(failure);
+        }
+    }
+
+    private static void ObserveEventualFault(Task task)
+        => _ = task.ContinueWith(static finished => _ = finished.Exception,
+            CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
 }
