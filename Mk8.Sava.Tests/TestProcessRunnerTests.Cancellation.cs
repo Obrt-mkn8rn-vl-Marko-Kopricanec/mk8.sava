@@ -58,13 +58,19 @@ public sealed partial class TestProcessRunnerTests
         using var cancellation = new CancellationTokenSource();
         var fixture = await ProcessFixture.StartAsync("ordinary").ConfigureAwait(true);
         await using var lifetime = fixture.ConfigureAwait(false);
+        var beforeObserver = new CancellationCallbackProbe(static () => { });
+        var beforeRegistration = cancellation.Token.Register(beforeObserver.Invoke);
+        await using var beforeLifetime = beforeRegistration.ConfigureAwait(false);
         var observation = TestProcessRunner.ObserveAsync(fixture.Root,
             TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(2), cancellation.Token);
+        var afterObserver = new CancellationCallbackProbe(static () => { });
+        var afterRegistration = cancellation.Token.Register(afterObserver.Invoke);
+        await using var afterLifetime = afterRegistration.ConfigureAwait(false);
         var original = new IOException("controlled cancellation callback failure");
         var callbackProgress = new CancellationCallbackProbe(() => throw original);
         var registration = cancellation.Token.Register(callbackProgress.Invoke);
         await using var registrationLifetime = registration.ConfigureAwait(false);
-        var work = new CancellationWork(cancellation.CancelAsync(), observation, callbackProgress);
+        var work = new CancellationWork(cancellation.CancelAsync(), observation, callbackProgress, beforeObserver, afterObserver);
         string? snapshot = null;
         await RunWithCleanupAsync(async () =>
         {
@@ -76,6 +82,8 @@ public sealed partial class TestProcessRunnerTests
             Assert.Contains("CancellationRequested=True", snapshot, StringComparison.Ordinal);
             Assert.Contains("CallbacksStatus=Faulted", snapshot, StringComparison.Ordinal);
             Assert.Contains("ControlledCallback=[Entered=True, BodyExited=True, ReturnedNormally=False]", snapshot, StringComparison.Ordinal);
+            Assert.Contains("ObserverRegistrations=[BeforeObserve=Entered=True, BodyExited=True, ReturnedNormally=True; " +
+                "AfterObserve=Entered=True, BodyExited=True, ReturnedNormally=True]", snapshot, StringComparison.Ordinal);
         }, async () =>
         {
             // Join both actual tasks; retain, rather than replace, the deliberately faulted callback operation.
@@ -142,7 +150,8 @@ public sealed partial class TestProcessRunnerTests
         }
     }
 
-    private sealed class CancellationWork(Task callbacks, Task observation, CancellationCallbackProbe? callbackProgress = null)
+    private sealed class CancellationWork(Task callbacks, Task observation, CancellationCallbackProbe? callbackProgress = null,
+        CancellationCallbackProbe? beforeObserver = null, CancellationCallbackProbe? afterObserver = null)
     {
         internal bool CallbacksCompleted => callbacks.IsCompleted;
         internal bool ObservationCompleted => observation.IsCompleted;
@@ -163,6 +172,9 @@ public sealed partial class TestProcessRunnerTests
                     $"CallbacksCompleted={callbacks.IsCompleted}, ObservationStatus={observation.Status}, " +
                     $"ObservationCompleted={observation.IsCompleted}. " +
                     $"ControlledCallback=[{callbackProgress?.Progress.ToDiagnostic() ?? "NotInstrumented"}]. " +
+                    // Registration-time markers surround observer creation, not native work or an atomic callback-chain snapshot.
+                    $"ObserverRegistrations=[BeforeObserve={beforeObserver?.Progress.ToDiagnostic() ?? "NotInstrumented"}; " +
+                    $"AfterObserve={afterObserver?.Progress.ToDiagnostic() ?? "NotInstrumented"}]. " +
                     $"{fixture.StartupDiagnostic}");
                 throw;
             }
