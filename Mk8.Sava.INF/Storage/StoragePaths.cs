@@ -27,11 +27,7 @@ public sealed class StoragePaths : IStoragePaths, IDisposable
         EnsureDurableDirectory(Staging);
         try
         {
-            _rootLease = new FileStream(
-                Path.Combine(Root, ".mk8-sava.lock"),
-                FileMode.OpenOrCreate,
-                FileAccess.ReadWrite,
-                FileShare.None);
+            _rootLease = StorageRootLease.Acquire(Path.Combine(Root, ".mk8-sava.lock"));
         }
         catch (IOException exception)
         {
