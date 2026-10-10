@@ -69,8 +69,11 @@ public sealed class MetadataStoreLifetimeTests(ITestOutputHelper output)
         Assert.True(await metadata.TryCreateContainerAsync(record, CancellationToken.None).ConfigureAwait(true));
         metadata.Dispose();
 
-        Assert.Throws<StorageRootLeaseException>(() => new StoragePaths(
-            new TestEnvironment(fixture.Root), Options.Create(new SavaOptions { DataPath = fixture.Root })));
+        Assert.Throws<StorageRootLeaseException>(() =>
+        {
+            using var contender = new StoragePaths(
+                new TestEnvironment(fixture.Root), Options.Create(new SavaOptions { DataPath = fixture.Root }));
+        });
         using var fresh = new MetadataStore(fixture.Paths, new NullStorageFaultInjector());
         await fresh.InitializeAsync().ConfigureAwait(true);
         var retained = await fresh.GetContainerAsync(record.Account, record.Name, includeDeleted: false,
