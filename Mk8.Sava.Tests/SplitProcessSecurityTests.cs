@@ -21,7 +21,7 @@ using Mk8.Sava.Storage;
 namespace Mk8.Sava.Tests;
 
 [Trait("Category", "SplitProcess")]
-public sealed class SplitProcessSecurityTests
+public sealed partial class SplitProcessSecurityTests
 {
     private const string IssuerId = "bd3fa379-e71d-4883-a2d7-4a6b2bbfaea2";
     private const string EndUserId = "564893d2-6eb4-49c7-bab5-c8a3fb084449";

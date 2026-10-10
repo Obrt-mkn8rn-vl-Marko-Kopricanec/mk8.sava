@@ -12,7 +12,7 @@ public sealed class SavaOptions : IValidatableObject
     public string DataPath { get; init; } = "data";
 
     [Required]
-    public string DefaultAccount { get; init; } = "devstoreaccount1";
+    public string DefaultAccount { get; init; } = string.Empty;
 
     [Required]
     public IDictionary<string, string> Accounts { get; init; } = new Dictionary<string, string>(StringComparer.Ordinal);

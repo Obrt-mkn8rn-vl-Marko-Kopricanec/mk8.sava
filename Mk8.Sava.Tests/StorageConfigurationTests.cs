@@ -10,6 +10,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
@@ -31,6 +32,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
@@ -56,6 +58,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
@@ -80,6 +83,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
@@ -97,6 +101,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
@@ -119,6 +124,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["devstoreaccount1"] = SavaWebApplicationFactory.AccountKey
@@ -181,6 +187,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey
@@ -206,6 +213,7 @@ public sealed class StorageConfigurationTests
     {
         var options = new SavaOptions
         {
+            DefaultAccount = SavaWebApplicationFactory.AccountName,
             Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [SavaWebApplicationFactory.AccountName] = SavaWebApplicationFactory.AccountKey

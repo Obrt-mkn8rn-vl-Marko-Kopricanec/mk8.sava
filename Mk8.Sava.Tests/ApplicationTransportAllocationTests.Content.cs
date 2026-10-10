@@ -21,8 +21,7 @@ public sealed partial class ApplicationTransportAllocationTests
             await File.WriteAllTextAsync(key, Convert.ToBase64String(new byte[32])).ConfigureAwait(true);
             if (!OperatingSystem.IsWindows())
                 File.SetUnixFileMode(key, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-            var options = new ApplicationTransportOptions { AccessKeyFile = key };
-            using var client = new ApplicationRpcClient(options, new SavaOptions());
+            using var client = CreatePreparationClient(key);
             using var source = new MemoryStream();
             var contract = RpcContracts.GetContract(string.Equals(form, "control", StringComparison.Ordinal)
                 ? typeof(IApplicationReadiness) : typeof(IBlobApplication));
@@ -72,6 +71,16 @@ public sealed partial class ApplicationTransportAllocationTests
         {
             directory.Delete(recursive: true);
         }
+    }
+
+    private static ApplicationRpcClient CreatePreparationClient(string key)
+    {
+        var options = new ApplicationTransportOptions
+        {
+            Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
+            AccessKeyFile = key,
+        };
+        return new ApplicationRpcClient(options, new SavaOptions());
     }
 
     private static async Task PrepareAndDisposeAsync(ApplicationRpcClient client, RpcContract contract, RpcMethod method, object?[] arguments)

@@ -19,6 +19,7 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
     private readonly ApplicationTransportOptions transportOptions;
     private readonly SavaOptions storageOptions = new()
     {
+        DefaultAccount = SavaWebApplicationFactory.AccountName,
         Accounts = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["devstoreaccount1"] = Convert.ToBase64String(new byte[32]),
@@ -31,7 +32,11 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
         File.WriteAllText(keyPath, Convert.ToBase64String(accessKey));
         if (!OperatingSystem.IsWindows())
             File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        transportOptions = new ApplicationTransportOptions { AccessKeyFile = keyPath };
+        transportOptions = new ApplicationTransportOptions
+        {
+            Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
+            AccessKeyFile = keyPath,
+        };
     }
 
     public void Dispose()
