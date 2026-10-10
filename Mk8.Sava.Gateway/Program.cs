@@ -37,11 +37,18 @@ public sealed partial class Program
         // Refuse the framework's implicit listener; Kestrel validates the supplied
         // URLs/endpoints and certificates when it starts. Ports explicitly select
         // the framework's wildcard semantics, not a site address chosen here.
-        if (HasConfiguredUrls(configuration[WebHostDefaults.ServerUrlsKey]) ||
-            HasConfiguredPorts(configuration[WebHostDefaults.HttpPortsKey]) ||
-            HasConfiguredPorts(configuration[WebHostDefaults.HttpsPortsKey]) ||
+        var urls = configuration[WebHostDefaults.ServerUrlsKey];
+        if (HasConfiguredUrls(urls) ||
             configuration.GetSection("Kestrel:Endpoints").GetChildren()
                 .Any(endpoint => HasConfiguredUrls(endpoint["Url"])))
+        {
+            return;
+        }
+        // A nonempty URLS value suppresses ports even if it splits to no URLs.
+        // Ignored port settings must not admit the framework's default listener.
+        if (string.IsNullOrEmpty(urls) &&
+            (HasConfiguredPorts(configuration[WebHostDefaults.HttpPortsKey]) ||
+             HasConfiguredPorts(configuration[WebHostDefaults.HttpsPortsKey])))
         {
             return;
         }
