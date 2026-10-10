@@ -13,6 +13,8 @@ it was moved from code to a tracked template.
 the existing HTTPS or literal-loopback-HTTP, credential/query/fragment and private
 listener validation remains required. Gateway needs explicit URLs, ports or named
 Kestrel endpoint configuration rather than an implicit framework listener.
+Nonempty URLS takes precedence over port settings; ignored ports cannot authorize
+an empty effective URL list. A genuine named Kestrel endpoint remains explicit.
 The environment examples intentionally leave required assignments empty and
 cannot be used unchanged as working deployment configuration.
 
