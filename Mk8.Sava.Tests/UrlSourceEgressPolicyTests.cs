@@ -7,6 +7,9 @@ namespace Mk8.Sava.Tests;
 
 public sealed class UrlSourceEgressPolicyTests
 {
+    // These are address-classification vectors, never resolvers or site assignments.
+    // Connection controls below inject both DNS answers and an in-memory/throwing
+    // connector, so their representative global addresses are never contacted.
     [Theory]
     [InlineData("1.1.1.1", true)]
     [InlineData("8.8.8.8", true)]

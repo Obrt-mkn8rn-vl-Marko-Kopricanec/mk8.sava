@@ -28,9 +28,17 @@ use the normal Blob conditions and operation-specific client recovery.
 
 ## Transport and configuration
 
-Both components configure `ApplicationTransport:Endpoint`, such as
-`http://127.0.0.1:18581/internal/application`, and
-`ApplicationTransport:AccessKeyFile`. The file contains base64 text decoding to
+Both components require an explicitly configured `ApplicationTransport:Endpoint`
+and `ApplicationTransport:AccessKeyFile`. There is no built-in endpoint, port or
+account assignment: set `Sava:DefaultAccount` to an explicitly configured account.
+Gateway also requires an explicit listener through `urls`/`ASPNETCORE_URLS`,
+`HTTP_PORTS`/`HTTPS_PORTS`, or named `Kestrel:Endpoints`. Missing or empty listener
+configuration is rejected rather than using the framework's implicit listener.
+Kestrel validates supplied URL/endpoint syntax and required TLS material during
+startup. Port-only configuration explicitly selects its wildcard-bind semantics;
+it is not a private-address allocation. See [source policy](../SOURCE-POLICY.md).
+
+The transport-key file contains base64 text decoding to
 32–512 cryptographically random bytes. Keep it outside both the data root and
 Gateway staging, protected from other users. A transport key grants access to
 the trusted Application boundary; do not give it to Blob clients or put it in
@@ -119,7 +127,12 @@ members of the RPC group. Deploy a matched release as:
     application-access.key
 ```
 
-Replace the policy/account placeholders before use. Root owns the three `.env`
+Select all bind addresses, ports, account names, origins and TLS identities in
+operator-owned configuration; the tracked environment templates deliberately
+leave their required listener/endpoint/default-account values empty. They are
+invalid as supplied. Replace the policy/account placeholders before use. Keep
+site-specific scripts/configuration under ignored `deploy/internal/` or outside
+the checkout, never in another tracked default/template. Root owns the three `.env`
 files with mode 0600; systemd reads them before changing service identity.
 Create the transport key without printing it, then allow the RPC group to read
 that exact file:
@@ -155,11 +168,13 @@ Application, so stopping Application does not stop Gateway.
 After installing adapted units and protected configs:
 
 ```bash
+: "${SAVA_APPLICATION_HEALTH_ORIGIN:?Supply the selected Application health origin}"
+: "${SAVA_GATEWAY_HEALTH_ORIGIN:?Supply the selected Gateway health origin}"
 sudo systemctl daemon-reload
 sudo systemctl start mk8-sava-application.service
-curl --fail http://127.0.0.1:18581/health/ready
+curl --fail -- "$SAVA_APPLICATION_HEALTH_ORIGIN/health/ready"
 sudo systemctl start mk8-sava-gateway.service
-curl --fail http://127.0.0.1:18580/health/ready
+curl --fail -- "$SAVA_GATEWAY_HEALTH_ORIGIN/health/ready"
 ```
 
 `Type=simple` means a started unit is not itself a readiness verdict. Check
@@ -194,7 +209,7 @@ settings for both shells. In the Application shell set its existing
 `./Application/Mk8.Sava.Application` (Linux) or
 `& .\Application\Mk8.Sava.Application.exe` (PowerShell). In the separate Gateway
 shell set `Gateway__StagingPath` to a private scratch directory and
-`ASPNETCORE_URLS=http://127.0.0.1:18580`, then execute
+`ASPNETCORE_URLS` to the explicitly selected listener URL, then execute
 `./Gateway/Mk8.Sava.Gateway` or `& .\Gateway\Mk8.Sava.Gateway.exe`.
 Protect the transport key/config files with appropriate service-account ACLs
 on Windows; do not grant `Users` or `Everyone` access. Gateway may be started

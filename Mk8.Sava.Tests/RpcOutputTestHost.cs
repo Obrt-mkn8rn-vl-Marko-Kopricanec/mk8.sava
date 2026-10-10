@@ -27,7 +27,11 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
     {
         this.application = application;
         this.directory = directory;
-        endpoint = new ApplicationRpcEndpoint(new ApplicationTransportOptions { AccessKeyFile = keyPath }, options);
+        endpoint = new ApplicationRpcEndpoint(new ApplicationTransportOptions
+        {
+            Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
+            AccessKeyFile = keyPath,
+        }, options);
     }
 
     public IApplicationReadSessions Sessions { get; private set; } = null!;

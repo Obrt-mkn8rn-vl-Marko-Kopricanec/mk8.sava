@@ -7,7 +7,7 @@ public sealed class ApplicationTransportOptions : IValidatableObject
 {
     public const string SectionName = "ApplicationTransport";
 
-    public Uri? Endpoint { get; init; } = new("http://127.0.0.1:18581/internal/application", UriKind.Absolute);
+    public Uri? Endpoint { get; init; }
     public string AccessKeyFile { get; init; } = string.Empty;
     public int MaximumControlFrameBytes { get; init; } = 64 * 1024 * 1024;
     public TimeSpan ConnectTimeout { get; init; } = TimeSpan.FromSeconds(5);

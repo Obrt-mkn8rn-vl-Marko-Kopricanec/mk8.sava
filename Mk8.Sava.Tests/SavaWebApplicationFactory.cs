@@ -321,6 +321,9 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
 
     private Dictionary<string, string?> CreateBaseConfiguration() => new(StringComparer.Ordinal)
     {
+        // Explicit synthetic TestServer descriptors, not a deployment listener or RPC peer.
+        ["urls"] = "http://127.0.0.1:0",
+        ["ApplicationTransport:Endpoint"] = "http://127.0.0.1:0/internal/application",
         ["Sava:DataPath"] = DataPath,
         ["Gateway:StagingPath"] = DataPath + ".gateway",
         ["ApplicationTransport:AccessKeyFile"] = Path.Combine(DataPath, "unused-in-process-access-key"),

@@ -1,4 +1,5 @@
 /docs/internal
+/deploy/internal/
 **/bin/
 **/obj/
 **/node_modules/
