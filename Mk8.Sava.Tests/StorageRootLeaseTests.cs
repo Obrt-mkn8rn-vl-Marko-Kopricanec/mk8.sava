@@ -89,6 +89,7 @@ public sealed class StorageRootLeaseTests
         start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
         start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
         var keyPath = Path.Combine(dataPath, "contender.key");
+        start.Environment["ApplicationTransport__Endpoint"] = "http://127.0.0.1:0/internal/application";
         start.Environment["ApplicationTransport__AccessKeyFile"] = keyPath;
         await File.WriteAllTextAsync(keyPath,
             Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32))).ConfigureAwait(true);
