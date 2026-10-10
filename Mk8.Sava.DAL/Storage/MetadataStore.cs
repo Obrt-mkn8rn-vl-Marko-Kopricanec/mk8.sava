@@ -195,12 +195,24 @@ public sealed partial class MetadataStore(
     }.ToString();
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+    private bool _disposed;
 
     public void Dispose()
     {
-        ClearPool(_connectionString);
-        _writeGate.Dispose();
-        GC.SuppressFinalize(this);
+        if (_disposed)
+            return;
+        // The owner must join admitted work before retirement. This state
+        // prevents later connection admission, not concurrent read/dispose.
+        _disposed = true;
+        try
+        {
+            ClearPool(_connectionString);
+        }
+        finally
+        {
+            _writeGate.Dispose();
+            GC.SuppressFinalize(this);
+        }
     }
 
     internal static void ClearPoolForDatabase(string database)
@@ -871,6 +883,7 @@ public sealed partial class MetadataStore(
 
     internal bool PackedChunkExists(string chunkId)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
         using var command = connection.CreateCommand();
@@ -881,6 +894,7 @@ public sealed partial class MetadataStore(
 
     internal bool ChunkPackExists(string packId)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
         using var command = connection.CreateCommand();
@@ -891,6 +905,7 @@ public sealed partial class MetadataStore(
 
     internal int CountPackedChunks()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
         using var command = connection.CreateCommand();
@@ -3536,6 +3551,7 @@ public sealed partial class MetadataStore(
 
     private async Task<SqliteConnection> OpenAsync(CancellationToken cancellationToken)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var connection = new SqliteConnection(_connectionString);
         try
         {
