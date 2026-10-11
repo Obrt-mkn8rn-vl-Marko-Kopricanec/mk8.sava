@@ -2247,7 +2247,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             blob,
             write: false,
             cancellationToken).ConfigureAwait(false);
-        EvaluateReadConditions(http.Request, blob);
+        EvaluateContentReadConditions(http, blob);
         ValidateOptionalLease(http.Request, blob.Lease, "blob");
         await WriteBlobAsync(http, service, blob, encryption, cancellationToken).ConfigureAwait(false);
         return;
@@ -4485,6 +4485,35 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
         }
 
         Require(request, 'w');
+    }
+
+    private static void EvaluateContentReadConditions(HttpContext http, BlobRecord blob)
+    {
+        try
+        {
+            EvaluateReadConditions(http.Request, blob);
+        }
+        catch (AzureStorageException exception) when (exception.StatusCode == StatusCodes.Status304NotModified)
+        {
+            // The error boundary clears the response. Carry only the authorized
+            // representation's validators and cache/CORS fields through that boundary.
+            AzureResponseWriter.AddBlobEntityHeaders(http.Response, blob);
+            if (blob.Http.CacheControl is not null)
+                http.Response.Headers.CacheControl = blob.Http.CacheControl;
+            ApplySasResponseOverrides(http);
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var name in new[]
+            {
+                "ETag", "Last-Modified", "Cache-Control", "Vary",
+                "Access-Control-Allow-Origin", "Access-Control-Expose-Headers",
+            })
+            {
+                if (http.Response.Headers.TryGetValue(name, out var value))
+                    headers[name] = value.ToString();
+            }
+            throw new AzureStorageException(exception.StatusCode, exception.ErrorCode, exception.Message,
+                exception.HeaderName, exception.HeaderValue, headers, exception.Details);
+        }
     }
 
     private static void EvaluateReadConditions(HttpRequest request, BlobRecord blob)
