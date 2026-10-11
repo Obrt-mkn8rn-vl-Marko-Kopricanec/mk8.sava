@@ -187,7 +187,7 @@ public sealed partial class SplitProcessSecurityTests
     [InlineData("http://localhost:18581/internal/application", "literal IP address")]
     public async Task ApplicationRejectsUnsafeTlsBindingsBeforeOpeningItsDataRoot(string endpoint, string diagnostic)
     {
-        var host = await SplitProcessHost.StartAsync(application: false).ConfigureAwait(true);
+        var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var rejectedData = Path.Combine(host.Root, "rejected-application-data");
         var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
