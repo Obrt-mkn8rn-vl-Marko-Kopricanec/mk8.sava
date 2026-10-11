@@ -25,7 +25,7 @@ internal static class GatewayStagingCleanup
             var ownerPath = Path.Combine(path, ".owner");
             if (!File.Exists(ownerPath) || File.GetAttributes(ownerPath).HasFlag(FileAttributes.ReparsePoint))
                 return;
-            using (var owner = new FileStream(ownerPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            using (var owner = GatewayStagingOwnerLease.Acquire(ownerPath, FileMode.Open))
             {
                 var marker = new byte[OwnerMarker.Length];
                 if (owner.Length != marker.Length || owner.Read(marker) != marker.Length || !marker.AsSpan().SequenceEqual(OwnerMarker))

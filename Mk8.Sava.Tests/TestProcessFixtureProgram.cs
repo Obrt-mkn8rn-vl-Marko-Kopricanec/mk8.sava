@@ -24,6 +24,9 @@ internal static partial class TestProcessFixtureProgram
 
     private static async Task<int> Main(string[] arguments)
     {
+        if (arguments.Length > 0 && arguments[0] is "--gateway-staging-owner-fixture")
+            return await GatewayStagingOwnerFixtureProgram.RunAsync(arguments).ConfigureAwait(false);
+
         if (arguments.Length > 0 && arguments[0] is "--storage-root-lease-fixture")
             return await StorageRootLeaseFixtureProgram.RunAsync(arguments).ConfigureAwait(false);
 
