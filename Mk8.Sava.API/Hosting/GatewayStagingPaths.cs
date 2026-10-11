@@ -29,9 +29,20 @@ internal sealed class GatewayStagingPaths : IDisposable
         GatewayStagingCleanup.RemoveOrphans(root);
         Staging = Path.Combine(root, "gw-" + Guid.NewGuid().ToString("N"));
         CreatePrivateDirectory(Staging);
-        _owner = new FileStream(Path.Combine(Staging, ".owner"), FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
-        _owner.Write(GatewayStagingCleanup.OwnerMarker);
-        _owner.Flush(flushToDisk: true);
+        var owner = GatewayStagingOwnerLease.Acquire(Path.Combine(Staging, ".owner"), FileMode.CreateNew);
+        var transferred = false;
+        try
+        {
+            owner.Write(GatewayStagingCleanup.OwnerMarker);
+            owner.Flush(flushToDisk: true);
+            _owner = owner;
+            transferred = true;
+        }
+        finally
+        {
+            if (!transferred)
+                owner.Dispose();
+        }
     }
 
     public string Staging { get; }
