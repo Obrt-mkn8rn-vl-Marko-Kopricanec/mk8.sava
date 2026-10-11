@@ -48,6 +48,25 @@ internal sealed class SplitProcessHost : IAsyncDisposable
     public static async Task<SplitProcessHost> StartAsync(bool application = true,
         IReadOnlyDictionary<string, string?>? settings = null)
     {
+        var host = await PrepareAsync(settings).ConfigureAwait(false);
+        try
+        {
+            if (application)
+                await host.StartApplicationAsync().ConfigureAwait(false);
+            await host.StartGatewayAsync().ConfigureAwait(false);
+            return host;
+        }
+        catch
+        {
+            await host.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    // Refusal controls need owned configuration/key paths, not an unrelated
+    // running Gateway whose startup could prevent the target child from running.
+    public static async Task<SplitProcessHost> PrepareAsync(IReadOnlyDictionary<string, string?>? settings = null)
+    {
         var host = new SplitProcessHost(Directory.CreateTempSubdirectory("sava-split-").FullName,
             settings ?? new Dictionary<string, string?>(StringComparer.Ordinal));
         try
@@ -58,9 +77,6 @@ internal sealed class SplitProcessHost : IAsyncDisposable
             var key = new FileStream(host.AccessKeyFile, creation);
             await using (key.ConfigureAwait(false))
                 await key.WriteAsync(Encoding.ASCII.GetBytes(Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)))).ConfigureAwait(false);
-            if (application)
-                await host.StartApplicationAsync().ConfigureAwait(false);
-            await host.StartGatewayAsync().ConfigureAwait(false);
             return host;
         }
         catch

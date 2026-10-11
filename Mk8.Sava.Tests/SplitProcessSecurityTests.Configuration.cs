@@ -13,7 +13,7 @@ public sealed partial class SplitProcessSecurityTests
     [InlineData(" ; ; ")]
     public async Task GatewayWithoutAConfiguredListenerRefusesBeforeCreatingStaging(string? urls)
     {
-        var host = await SplitProcessHost.StartAsync(application: false).ConfigureAwait(true);
+        var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var staging = Path.Combine(host.Root, "unconfigured-listener-staging");
         var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
@@ -46,7 +46,7 @@ public sealed partial class SplitProcessSecurityTests
     [InlineData(" ; ; ", "8080", "8443")]
     public async Task GatewayPortsCannotAuthorizeAnEmptyOverridingUrlList(string urls, string? httpPorts, string? httpsPorts)
     {
-        var host = await SplitProcessHost.StartAsync(application: false).ConfigureAwait(true);
+        var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var staging = Path.Combine(host.Root, "ignored-port-listener-staging");
         var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
@@ -110,7 +110,7 @@ public sealed partial class SplitProcessSecurityTests
     [Fact]
     public async Task ApplicationWithoutAnEndpointRefusesBeforeOpeningItsDataRoot()
     {
-        var host = await SplitProcessHost.StartAsync(application: false).ConfigureAwait(true);
+        var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var data = Path.Combine(host.Root, "unconfigured-endpoint-storage");
         var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
