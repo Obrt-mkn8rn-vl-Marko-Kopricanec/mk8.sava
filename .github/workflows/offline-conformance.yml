@@ -66,10 +66,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Execute published Application and Gateway
         shell: pwsh
-        run: ./deploy/Test-PublishedHosts.ps1 -PublishRoot artifacts/publish -EvidencePath artifacts/published-smoke
+        run: ./tools/PublishedHosts/Test-PublishedHosts.ps1 -PublishRoot artifacts/publish -EvidencePath artifacts/published-smoke
       - name: Freeze published release manifest
         shell: pwsh
-        run: ./deploy/Write-ReleaseManifest.ps1 -PublishRoot artifacts/publish -RuntimeIdentifier ${{ matrix.rid }} -OutputPath artifacts/release-manifest.json
+        run: ./tools/PublishedHosts/Write-ReleaseManifest.ps1 -PublishRoot artifacts/publish -RuntimeIdentifier ${{ matrix.rid }} -OutputPath artifacts/release-manifest.json
       - name: Retain source-bound release and test evidence
         if: always()
         uses: actions/upload-artifact@v4

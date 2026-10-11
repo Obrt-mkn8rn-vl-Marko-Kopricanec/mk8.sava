@@ -2,10 +2,10 @@
 
 Deploy two independently running executables: `Mk8.Sava.Gateway` is the Azure
 Blob HTTP boundary; `Mk8.Sava.Application` is the exclusive storage owner.
-`Mk8.Sava.API` is a protocol library, not a third server. See the
-[matched host deployment guide](deploy/README.md) for protected configuration,
-Linux units, portable Linux/Windows launch, published-artifact qualification
-and existing-root upgrade/rollback.
+`Mk8.Sava.API` is a protocol library, not a third server. This document describes
+product contracts and development verification. Operational configuration,
+service units, provisioning and deployment runbooks are maintained separately in
+the internal archive; public source does not define a site's installation.
 
 Application keeps its authoritative metadata in `metadata.db` and encrypted,
 content-addressed extents under `chunks/` or append-only small-object packs under
@@ -17,7 +17,7 @@ has only bounded private ephemeral staging and must never receive access to
 this durable root or Application's separately configured data-encryption keys.
 Account signing keys still reside in Gateway; legacy account-key-as-data-key
 roots do not gain cryptographic key isolation merely by splitting the processes.
-Preserve effective data keys and follow the deployment guide's rotation caveat.
+Any account-key rotation must preserve the root's effective data keys.
 
 ## Upload request limits
 
@@ -40,8 +40,8 @@ Application transport. Application must see the successful framed terminal
 integrity boundary before it can publish; connection loss or a failed checksum
 cannot be mistaken for a complete upload. Its data-root admission controls are
 shared by all Gateways. Private control-frame size, request deadline and Gateway
-ephemeral staging budgets are separate deployment limits; see the deployment
-guide before sizing large/slow transfers.
+ephemeral staging budgets are separate caller-configured limits, not workload
+capacity reservations or an assigned deployment profile.
 
 Any reverse proxy or ingress body-size limit is independent of this application
 setting. Configure it to permit the intended operation sizes plus structured
