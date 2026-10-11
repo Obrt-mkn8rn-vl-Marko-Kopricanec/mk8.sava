@@ -137,7 +137,19 @@ internal sealed class RequestContextMiddleware(
     private string? ResolveHostAccount(string host)
     {
         var firstLabel = host.Split('.', 2)[0];
-        return _options.Accounts.ContainsKey(firstLabel) ? firstLabel : null;
+        // HTTP host names are case-insensitive; configured account names are
+        // lowercase ASCII. Fold only ASCII letters, preserving all other input.
+        var account = string.Create(firstLabel.Length, firstLabel, static (characters, label) =>
+        {
+            for (var index = 0; index < label.Length; index++)
+            {
+                var character = label[index];
+                characters[index] = character is >= 'A' and <= 'Z'
+                    ? (char)(character + ('a' - 'A'))
+                    : character;
+            }
+        });
+        return _options.Accounts.ContainsKey(account) ? account : null;
     }
 
     private static bool IsStaticWebsiteHost(string host) =>
