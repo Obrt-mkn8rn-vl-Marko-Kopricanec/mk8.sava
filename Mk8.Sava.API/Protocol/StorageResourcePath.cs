@@ -14,16 +14,20 @@ internal static class StorageResourcePath
 
     public static IReadOnlyList<string> GetSignaturePathCandidates(HttpRequest request)
     {
-        var primary = GetEscapedPath(request);
         var candidates = new List<string>(4);
-        AddCandidate(primary);
-        if (!TryGetRawEscapedPath(request, out _) &&
-            request.Path.Value is { } decodedPath &&
-            decodedPath.Contains('%', StringComparison.Ordinal))
+        if (TryGetRawEscapedPath(request, out var rawPath))
         {
-            var forcedPercentEscaping = new PathString(decodedPath.Replace("%", "%25", StringComparison.Ordinal))
-                .ToUriComponent();
-            AddCandidate(forcedPercentEscaping);
+            AddCandidate(rawPath);
+        }
+        else
+        {
+            // Path is already decoded. A literal % must not become a signed
+            // escape for a different name when the original target is absent.
+            var decodedPath = request.Path.Value ?? string.Empty;
+            AddCandidate(new PathString(decodedPath.Replace("%", "%25", StringComparison.Ordinal)).ToUriComponent());
+            // The SDK escapes each object segment more strictly than PathString
+            // (for example + and &). Preserve the actual slash boundaries.
+            AddCandidate(string.Join('/', decodedPath.Split('/').Select(EscapePathSegment)));
         }
         return candidates;
 
