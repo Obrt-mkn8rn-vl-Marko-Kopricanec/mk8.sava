@@ -729,7 +729,8 @@
           "Mk8.Sava.Contracts": "[1.0.0, )",
           "Mk8.Sava.DAL": "[1.0.0, )",
           "Mk8.Sava.INF": "[1.0.0, )",
-          "Mk8.Sava.Transport": "[1.0.0, )"
+          "Mk8.Sava.Transport": "[1.0.0, )",
+          "Supprocom.Secrets": "[0.1.4, 0.1.4]"
         }
       },
       "mk8.sava.bll": {
@@ -753,7 +754,8 @@
       "mk8.sava.gateway": {
         "type": "Project",
         "dependencies": {
-          "Mk8.Sava.API": "[1.0.0, )"
+          "Mk8.Sava.API": "[1.0.0, )",
+          "Supprocom.Secrets": "[0.1.4, 0.1.4]"
         }
       },
       "mk8.sava.inf": {

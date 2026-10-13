@@ -10,6 +10,9 @@
     <Content Include="Environment/.env.template" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The host owns a base-template-only policy; do not import the package's
+         independent development-template discovery/copy targets. -->
+    <PackageReference Include="Supprocom.Secrets" Version="[0.1.4]" ExcludeAssets="build;buildTransitive" />
     <ProjectReference Include="../Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
     <ProjectReference Include="../Mk8.Sava.Transport/Mk8.Sava.Transport.csproj" />
     <ProjectReference Include="../Mk8.Sava.BLL/Mk8.Sava.BLL.csproj" />
