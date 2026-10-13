@@ -4366,13 +4366,16 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         start.ArgumentList.Add(typeof(Mk8.Sava.Application.ApplicationProgram).Assembly.Location);
         start.ArgumentList.Add("--hns-acl-apply");
         start.ArgumentList.Add(manifestPath);
-        start.Environment["Sava__DataPath"] = dataPath;
-        start.Environment["Sava__DefaultAccount"] = SavaWebApplicationFactory.AccountName;
-        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
-        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
-        start.Environment[$"Sava__AccountCapabilities__{SavaWebApplicationFactory.AccountName}__HierarchicalNamespaceEnabled"] = "true";
-        start.Environment["ApplicationTransport__AccessKey"] = Convert.ToBase64String(new byte[32]);
-        await PortableTestConfiguration.MaterializeAsync(start, dataPath).ConfigureAwait(true);
+        var settings = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:DataPath"] = dataPath,
+            ["Sava:DefaultAccount"] = SavaWebApplicationFactory.AccountName,
+            [$"Sava:Accounts:{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey,
+            [$"Sava:Accounts:{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey,
+            [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
+            ["ApplicationTransport:AccessKey"] = Convert.ToBase64String(new byte[32]),
+        };
+        await PortableTestConfiguration.MaterializeAsync(start, dataPath, settings).ConfigureAwait(true);
         using var process = Process.Start(start);
         Assert.NotNull(process);
         var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))

@@ -26,13 +26,14 @@ public sealed class SplitProcessHostPreparationTests
             Assert.False(Directory.Exists(host.GatewayUnusedDataPath));
             Assert.False(Directory.Exists(Path.Combine(root, "gateway-staging")));
 
-            var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
-            Assert.Equal("0", start.Environment["Gateway__MaximumConcurrentRequests"]);
+            var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location, out var childSettings);
+            Assert.Equal("0", childSettings["Gateway:MaximumConcurrentRequests"]);
             Assert.True(CryptographicOperations.FixedTimeEquals(
                 Convert.FromBase64String(host.AccessKey),
-                Convert.FromBase64String(start.Environment["ApplicationTransport__AccessKey"] ?? string.Empty)));
+                Convert.FromBase64String(childSettings["ApplicationTransport:AccessKey"] ?? string.Empty)));
             Assert.Equal(new Uri(host.ApplicationAddress, "/internal/application").AbsoluteUri,
-                start.Environment["ApplicationTransport__Endpoint"]);
+                childSettings["ApplicationTransport:Endpoint"]);
+            Assert.False(start.Environment.ContainsKey("ApplicationTransport__AccessKey"));
         }
         Assert.False(Directory.Exists(root));
     }

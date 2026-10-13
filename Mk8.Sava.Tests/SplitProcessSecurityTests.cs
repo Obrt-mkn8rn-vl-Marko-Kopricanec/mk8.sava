@@ -190,13 +190,13 @@ public sealed partial class SplitProcessSecurityTests
         var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var rejectedData = Path.Combine(host.Root, "rejected-application-data");
-        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
-        start.Environment["Sava__DataPath"] = rejectedData;
-        start.Environment["ApplicationTransport__Endpoint"] = endpoint;
-        start.Environment["Service__CertificateBase64"] = string.Empty;
-        start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
-        start.Environment["Kestrel__Endpoints__Bypass__Url"] = "http://127.0.0.1:0";
-        var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
+        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location, out var settings);
+        settings["Sava:DataPath"] = rejectedData;
+        settings["ApplicationTransport:Endpoint"] = endpoint;
+        settings["Service:CertificateBase64"] = string.Empty;
+        settings["urls"] = "http://127.0.0.1:0";
+        settings["Kestrel:Endpoints:Bypass:Url"] = "http://127.0.0.1:0";
+        var result = await RunOperatorProcessAsync(start, settings).ConfigureAwait(true);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains(diagnostic, result.Error, StringComparison.Ordinal);
@@ -435,11 +435,11 @@ public sealed partial class SplitProcessSecurityTests
         var manifestPath = Path.Combine(host.Root, "acl-" + Guid.NewGuid().ToString("N") + ".json");
         await File.WriteAllTextAsync(manifestPath, JsonSerializer.Serialize(
             new HierarchicalAclManifest { SchemaVersion = 1, Entries = [.. entries] }, JsonSerializerOptions.Web)).ConfigureAwait(true);
-        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
-        start.Environment["Sava__DataPath"] = host.StoragePath;
+        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location, out var settings);
+        settings["Sava:DataPath"] = host.StoragePath;
         start.ArgumentList.Add("--hns-acl-apply");
         start.ArgumentList.Add(manifestPath);
-        var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
+        var result = await RunOperatorProcessAsync(start, settings).ConfigureAwait(true);
         Assert.True(result.ExitCode == 0, result.Error);
         Assert.Contains(FormattableString.Invariant($"Applied HNS access ACLs to {entries.Length} existing targets."),
             result.Output, StringComparison.Ordinal);
@@ -525,9 +525,10 @@ public sealed partial class SplitProcessSecurityTests
 
     private static void AssertForbidden(RequestFailedException failure) => Assert.Equal(403, failure.Status);
 
-    private static async Task<OperatorResult> RunOperatorProcessAsync(ProcessStartInfo start)
+    private static async Task<OperatorResult> RunOperatorProcessAsync(ProcessStartInfo start,
+        IReadOnlyDictionary<string, string?> settings)
     {
-        await PortableTestConfiguration.MaterializeAsync(start, start.WorkingDirectory).ConfigureAwait(false);
+        await PortableTestConfiguration.MaterializeAsync(start, start.WorkingDirectory, settings).ConfigureAwait(false);
         using var process = Process.Start(start);
         Assert.NotNull(process);
         var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(5))

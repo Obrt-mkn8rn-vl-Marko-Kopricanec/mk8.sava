@@ -33,7 +33,8 @@ public static class SavaServiceConfiguration
             ContentRootPath = AppContext.BaseDirectory,
         });
         await LoadAsync(builder.Configuration, Path.Combine(AppContext.BaseDirectory, "Environment")).ConfigureAwait(false);
-        builder.WebHost.UseKestrel();
+        builder.WebHost.UseKestrel(server =>
+            server.Configure(builder.Configuration.GetSection("Kestrel"), reloadOnChange: false));
         builder.Host.UseConsoleLifetime();
         builder.Services.AddRouting();
         builder.Logging.AddConsole();

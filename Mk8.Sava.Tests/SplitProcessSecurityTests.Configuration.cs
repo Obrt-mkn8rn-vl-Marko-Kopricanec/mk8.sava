@@ -16,19 +16,11 @@ public sealed partial class SplitProcessSecurityTests
         var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var staging = Path.Combine(host.Root, "unconfigured-listener-staging");
-        var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
-        foreach (var key in start.Environment.Keys.Where(key =>
-                     string.Equals(key, "URLS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("_URLS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("HTTP_PORTS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("HTTPS_PORTS", StringComparison.OrdinalIgnoreCase)).ToArray())
-        {
-            start.Environment.Remove(key);
-        }
-        start.Environment["ASPNETCORE_URLS"] = urls;
-        start.Environment["Gateway__StagingPath"] = staging;
+        var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location, out var settings);
+        settings["urls"] = urls;
+        settings["Gateway:StagingPath"] = staging;
 
-        var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
+        var result = await RunOperatorProcessAsync(start, settings).ConfigureAwait(true);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("A Gateway listener must be explicitly configured", result.Error, StringComparison.Ordinal);
@@ -49,22 +41,14 @@ public sealed partial class SplitProcessSecurityTests
         var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var staging = Path.Combine(host.Root, "ignored-port-listener-staging");
-        var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
-        foreach (var key in start.Environment.Keys.Where(key =>
-                     string.Equals(key, "URLS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("_URLS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("HTTP_PORTS", StringComparison.OrdinalIgnoreCase) ||
-                     key.EndsWith("HTTPS_PORTS", StringComparison.OrdinalIgnoreCase)).ToArray())
-        {
-            start.Environment.Remove(key);
-        }
+        var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location, out var settings);
         // Fixed ports are refusal inputs only: this child must bind no listener.
-        start.Environment["ASPNETCORE_URLS"] = urls;
-        start.Environment["ASPNETCORE_HTTP_PORTS"] = httpPorts;
-        start.Environment["ASPNETCORE_HTTPS_PORTS"] = httpsPorts;
-        start.Environment["Gateway__StagingPath"] = staging;
+        settings["urls"] = urls;
+        settings["http_ports"] = httpPorts;
+        settings["https_ports"] = httpsPorts;
+        settings["Gateway:StagingPath"] = staging;
 
-        var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
+        var result = await RunOperatorProcessAsync(start, settings).ConfigureAwait(true);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("A Gateway listener must be explicitly configured", result.Error, StringComparison.Ordinal);
@@ -113,11 +97,11 @@ public sealed partial class SplitProcessSecurityTests
         var host = await SplitProcessHost.PrepareAsync().ConfigureAwait(true);
         await using var lifetime = host.ConfigureAwait(false);
         var data = Path.Combine(host.Root, "unconfigured-endpoint-storage");
-        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
-        start.Environment.Remove("ApplicationTransport__Endpoint");
-        start.Environment["Sava__DataPath"] = data;
+        var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location, out var settings);
+        settings.Remove("ApplicationTransport:Endpoint");
+        settings["Sava:DataPath"] = data;
 
-        var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
+        var result = await RunOperatorProcessAsync(start, settings).ConfigureAwait(true);
 
         Assert.NotEqual(0, result.ExitCode);
         Assert.Contains("An Application endpoint is required", result.Error, StringComparison.Ordinal);

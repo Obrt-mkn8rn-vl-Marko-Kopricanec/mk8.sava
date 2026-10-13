@@ -4,42 +4,35 @@ using System.Text.Json;
 
 namespace Mk8.Sava.Tests;
 
-// Existing fixture overrides remain caller inputs, but the actual child receives
-// an independent installation-local collection loaded with Supprocom.Secrets.
+// Only explicit fixture inputs enter the independent installation-local collection.
+// Process inheritance is never a source of protected child configuration.
 internal static class PortableTestConfiguration
 {
-    public static async Task MaterializeAsync(ProcessStartInfo start, string root)
+    public static void RemoveServiceEnvironment(ProcessStartInfo start)
+    {
+        ArgumentNullException.ThrowIfNull(start);
+        foreach (var key in start.Environment.Keys.Where(IsServiceEnvironmentKey).ToArray())
+            start.Environment.Remove(key);
+    }
+
+    public static async Task MaterializeAsync(ProcessStartInfo start, string root,
+        IReadOnlyDictionary<string, string?> fixtureSettings)
     {
         ArgumentNullException.ThrowIfNull(start);
         ArgumentException.ThrowIfNullOrWhiteSpace(root);
+        ArgumentNullException.ThrowIfNull(fixtureSettings);
+        RemoveServiceEnvironment(start);
         var settings = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
-        foreach (var pair in start.Environment.ToArray())
+        foreach (var pair in fixtureSettings)
         {
             var key = pair.Key;
             if (key.StartsWith("ASPNETCORE_", StringComparison.OrdinalIgnoreCase))
-            {
                 key = key[11..];
-            }
-            else if (!key.StartsWith("Sava__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("Service__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("Gateway__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("ApplicationTransport__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("ApplicationHosting__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("Kestrel__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.StartsWith("Logging__", StringComparison.OrdinalIgnoreCase) &&
-                     !key.Equals("URLS", StringComparison.OrdinalIgnoreCase) &&
-                     !key.Equals("HTTP_PORTS", StringComparison.OrdinalIgnoreCase) &&
-                     !key.Equals("HTTPS_PORTS", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-            start.Environment.Remove(pair.Key);
             if (key.Equals("ENVIRONMENT", StringComparison.OrdinalIgnoreCase))
                 continue;
             settings[key.Replace("__", ":", StringComparison.Ordinal)] = pair.Value;
         }
         await MaterializeCertificateAsync(settings).ConfigureAwait(false);
-        start.Environment.Remove("DOTNET_ENVIRONMENT");
         var publishRoot = Path.Combine(root, "installation-" + Guid.NewGuid().ToString("N"));
         settings["Service:Role"] = Path.GetFileName(start.ArgumentList[0]).Contains("Application", StringComparison.Ordinal)
             ? "Application" : "Gateway";
@@ -66,6 +59,20 @@ internal static class PortableTestConfiguration
             await file.WriteAsync(Encoding.UTF8.GetBytes(document)).ConfigureAwait(false);
         }
     }
+
+    private static bool IsServiceEnvironmentKey(string key) =>
+        key.StartsWith("Sava__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("Service__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("Gateway__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("ApplicationTransport__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("ApplicationHosting__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("Kestrel__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("Logging__", StringComparison.OrdinalIgnoreCase) ||
+        key.StartsWith("ASPNETCORE_", StringComparison.OrdinalIgnoreCase) ||
+        key.Equals("DOTNET_ENVIRONMENT", StringComparison.OrdinalIgnoreCase) ||
+        key.Equals("URLS", StringComparison.OrdinalIgnoreCase) ||
+        key.Equals("HTTP_PORTS", StringComparison.OrdinalIgnoreCase) ||
+        key.Equals("HTTPS_PORTS", StringComparison.OrdinalIgnoreCase);
 
     private static async Task MaterializeCertificateAsync(Dictionary<string, string?> settings)
     {

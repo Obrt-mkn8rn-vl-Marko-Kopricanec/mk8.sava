@@ -146,12 +146,12 @@ internal sealed class SplitProcessHost : IAsyncDisposable
     {
         if (_application is not null)
             throw new InvalidOperationException("Application is already running.");
-        var start = CreateStart(typeof(Mk8.Sava.Application.ApplicationProgram).Assembly.Location);
-        start.Environment["Sava__DataPath"] = StoragePath;
+        var start = CreateStart(typeof(Mk8.Sava.Application.ApplicationProgram).Assembly.Location, out var settings);
+        settings["Sava:DataPath"] = StoragePath;
         _applicationOverrides = overrides ?? new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var pair in _applicationOverrides)
-            start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
-        await PortableTestConfiguration.MaterializeAsync(start, Root).ConfigureAwait(false);
+            settings[pair.Key] = pair.Value;
+        await PortableTestConfiguration.MaterializeAsync(start, Root, settings).ConfigureAwait(false);
         _application = new SplitServiceProcess(start);
         ApplicationAddress = await _application.WaitForAddressAsync("Application", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         await AssertStatusAsync(ApplicationAddress, "/health/ready", HttpStatusCode.OK).ConfigureAwait(false);
@@ -197,15 +197,15 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         if (_gateway is not null)
             throw new InvalidOperationException("Gateway is already running.");
         _gatewayCertificateHash = trustedGatewayCertificate?.GetCertHashString(HashAlgorithmName.SHA256);
-        var start = CreateStart(typeof(Program).Assembly.Location);
-        start.Environment["Sava__DataPath"] = GatewayUnusedDataPath;
-        start.Environment["Gateway__StagingPath"] = Path.Combine(Root, "gateway-staging");
+        var start = CreateStart(typeof(Program).Assembly.Location, out var settings);
+        settings["Sava:DataPath"] = GatewayUnusedDataPath;
+        settings["Gateway:StagingPath"] = Path.Combine(Root, "gateway-staging");
         if (overrides is not null)
         {
             foreach (var pair in overrides)
-                start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
+                settings[pair.Key] = pair.Value;
         }
-        await PortableTestConfiguration.MaterializeAsync(start, Root).ConfigureAwait(false);
+        await PortableTestConfiguration.MaterializeAsync(start, Root, settings).ConfigureAwait(false);
         _gateway = new SplitServiceProcess(start);
         GatewayAddress = await _gateway.WaitForAddressAsync("Gateway", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         using var probe = CreateHttpClient();
@@ -224,7 +224,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         Assert.Equal(status, response.StatusCode);
     }
 
-    public ProcessStartInfo CreateStart(string assembly)
+    public ProcessStartInfo CreateStart(string assembly, out Dictionary<string, string?> settings)
     {
         var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
         {
@@ -234,21 +234,12 @@ internal sealed class SplitProcessHost : IAsyncDisposable
             UseShellExecute = false
         };
         start.ArgumentList.Add(assembly);
-        foreach (var key in start.Environment.Keys.Where(key => key.StartsWith("Sava__", StringComparison.OrdinalIgnoreCase) ||
-                     key.StartsWith("Gateway__", StringComparison.OrdinalIgnoreCase) ||
-                     key.StartsWith("ApplicationTransport__", StringComparison.OrdinalIgnoreCase) ||
-                     key.StartsWith("ApplicationHosting__", StringComparison.OrdinalIgnoreCase) ||
-                     key.StartsWith("Kestrel__", StringComparison.OrdinalIgnoreCase) ||
-                     key.StartsWith("ASPNETCORE_", StringComparison.OrdinalIgnoreCase)).ToArray())
-            start.Environment.Remove(key);
-        foreach (var pair in CommonSettings())
-            start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
-        start.Environment["ASPNETCORE_ENVIRONMENT"] = "Production";
-        start.Environment["DOTNET_ENVIRONMENT"] = "Production";
-        start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
-        start.Environment["ApplicationTransport__Endpoint"] = new Uri(ApplicationAddress, "/internal/application").AbsoluteUri;
-        start.Environment["ApplicationTransport__AccessKey"] = AccessKey;
-        start.Environment["Logging__LogLevel__Microsoft.Hosting.Lifetime"] = "Information";
+        PortableTestConfiguration.RemoveServiceEnvironment(start);
+        settings = CommonSettings();
+        settings["urls"] = "http://127.0.0.1:0";
+        settings["ApplicationTransport:Endpoint"] = new Uri(ApplicationAddress, "/internal/application").AbsoluteUri;
+        settings["ApplicationTransport:AccessKey"] = AccessKey;
+        settings["Logging:LogLevel:Microsoft.Hosting.Lifetime"] = "Information";
         return start;
     }
 

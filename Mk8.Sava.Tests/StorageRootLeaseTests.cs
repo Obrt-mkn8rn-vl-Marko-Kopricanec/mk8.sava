@@ -84,14 +84,17 @@ public sealed class StorageRootLeaseTests
 
     private static async Task ConfigureContenderAsync(ProcessStartInfo start, string dataPath)
     {
-        start.Environment["Sava__DataPath"] = dataPath;
-        start.Environment["Sava__DefaultAccount"] = SavaWebApplicationFactory.AccountName;
-        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
-        start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
-        start.Environment["ApplicationTransport__Endpoint"] = "http://127.0.0.1:0/internal/application";
-        start.Environment["ApplicationTransport__AccessKey"] = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32));
-        start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
-        await PortableTestConfiguration.MaterializeAsync(start, dataPath).ConfigureAwait(true);
+        var settings = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:DataPath"] = dataPath,
+            ["Sava:DefaultAccount"] = SavaWebApplicationFactory.AccountName,
+            [$"Sava:Accounts:{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey,
+            [$"Sava:Accounts:{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey,
+            ["ApplicationTransport:Endpoint"] = "http://127.0.0.1:0/internal/application",
+            ["ApplicationTransport:AccessKey"] = Convert.ToBase64String(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)),
+            ["urls"] = "http://127.0.0.1:0",
+        };
+        await PortableTestConfiguration.MaterializeAsync(start, dataPath, settings).ConfigureAwait(true);
     }
 
     [Fact]
