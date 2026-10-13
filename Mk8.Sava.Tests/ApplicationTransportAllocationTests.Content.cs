@@ -17,10 +17,7 @@ public sealed partial class ApplicationTransportAllocationTests
         var directory = Directory.CreateTempSubdirectory("sava-content-allocation-");
         try
         {
-            var key = Path.Combine(directory.FullName, "access.key");
-            await File.WriteAllTextAsync(key, Convert.ToBase64String(new byte[32])).ConfigureAwait(true);
-            if (!OperatingSystem.IsWindows())
-                File.SetUnixFileMode(key, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            var key = Convert.ToBase64String(new byte[32]);
             using var client = CreatePreparationClient(key);
             using var source = new MemoryStream();
             var contract = RpcContracts.GetContract(string.Equals(form, "control", StringComparison.Ordinal)
@@ -78,7 +75,7 @@ public sealed partial class ApplicationTransportAllocationTests
         var options = new ApplicationTransportOptions
         {
             Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
-            AccessKeyFile = key,
+            AccessKey = key,
         };
         return new ApplicationRpcClient(options, new SavaOptions());
     }

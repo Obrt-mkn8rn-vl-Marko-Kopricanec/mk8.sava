@@ -182,8 +182,8 @@ public sealed partial class SplitProcessSecurityTests
 
     [Theory]
     [InlineData("http://0.0.0.0:0/internal/application", "requires HTTPS")]
-    [InlineData("https://0.0.0.0:0/internal/application", "ApplicationHosting:CertificateFile")]
-    [InlineData("https://127.0.0.1:0/internal/application", "ApplicationHosting:CertificateFile")]
+    [InlineData("https://0.0.0.0:0/internal/application", "Service:CertificateBase64")]
+    [InlineData("https://127.0.0.1:0/internal/application", "Service:CertificateBase64")]
     [InlineData("http://localhost:18581/internal/application", "literal IP address")]
     public async Task ApplicationRejectsUnsafeTlsBindingsBeforeOpeningItsDataRoot(string endpoint, string diagnostic)
     {
@@ -193,7 +193,7 @@ public sealed partial class SplitProcessSecurityTests
         var start = host.CreateStart(typeof(ApplicationProgram).Assembly.Location);
         start.Environment["Sava__DataPath"] = rejectedData;
         start.Environment["ApplicationTransport__Endpoint"] = endpoint;
-        start.Environment["ApplicationHosting__CertificateFile"] = string.Empty;
+        start.Environment["Service__CertificateBase64"] = string.Empty;
         start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
         start.Environment["Kestrel__Endpoints__Bypass__Url"] = "http://127.0.0.1:0";
         var result = await RunOperatorProcessAsync(start).ConfigureAwait(true);
@@ -527,6 +527,7 @@ public sealed partial class SplitProcessSecurityTests
 
     private static async Task<OperatorResult> RunOperatorProcessAsync(ProcessStartInfo start)
     {
+        await PortableTestConfiguration.MaterializeAsync(start, start.WorkingDirectory).ConfigureAwait(false);
         using var process = Process.Start(start);
         Assert.NotNull(process);
         var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(45), TimeSpan.FromSeconds(5))

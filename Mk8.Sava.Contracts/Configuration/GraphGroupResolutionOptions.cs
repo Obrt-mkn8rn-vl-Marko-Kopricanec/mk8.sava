@@ -4,6 +4,8 @@ public sealed class GraphGroupResolutionOptions
 {
     public bool Enabled { get; init; }
     public string? TenantId { get; init; }
+    public string? ClientId { get; init; }
+    public string? ClientSecret { get; init; }
     public MicrosoftGraphCloud Cloud { get; init; } = MicrosoftGraphCloud.Global;
 
     public Uri GraphEndpoint => Cloud switch

@@ -103,6 +103,8 @@ public sealed partial class AzureSdkCompatibilityTests
             [$"Sava:BearerAuthentication:Principals:{issuerId}:Permissions"] = "",
             [$"Sava:BearerAuthentication:Principals:{issuerId}:CanGenerateUserDelegationKey"] = "true",
             ["Sava:BearerAuthentication:GraphGroupResolution:Enabled"] = "true",
+            ["Sava:BearerAuthentication:GraphGroupResolution:ClientId"] = SavaWebApplicationFactory.DelegatorObjectId,
+            ["Sava:BearerAuthentication:GraphGroupResolution:ClientSecret"] = "synthetic-injected-credential",
             ["Sava:BearerAuthentication:GraphGroupResolution:TenantId"] = SavaWebApplicationFactory.TenantId
         }, () => graph, new StaticTokenCredential("graph-test-token"));
         await using var disposal = application.ConfigureAwait(true);

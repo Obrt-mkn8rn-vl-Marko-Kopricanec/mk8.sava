@@ -2,6 +2,7 @@ using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using Microsoft.Extensions.Options;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Hosting;
 using Mk8.Sava.Storage;
 using Mk8.Sava.Transport;
 
@@ -15,8 +16,9 @@ public static class ApplicationProgram
     {
         ArgumentNullException.ThrowIfNull(args);
         var command = ParseOperatorCommand(args);
-        var builder = CreateBuilder(args);
+        var builder = await CreateBuilderAsync(args).ConfigureAwait(false);
         using var certificate = command is null ? ConfigureRpcHost(builder) : null;
+        SavaServiceConfiguration.RequireRole(builder.Configuration, "Application");
         var app = builder.Build();
         await using var appDisposal = app.ConfigureAwait(false);
         if (await RunOperatorAsync(app, command).ConfigureAwait(false))
@@ -32,9 +34,9 @@ public static class ApplicationProgram
         }
     }
 
-    private static WebApplicationBuilder CreateBuilder(string[] args)
+    private static async Task<WebApplicationBuilder> CreateBuilderAsync(string[] args)
     {
-        var builder = WebApplication.CreateBuilder(args);
+        var builder = await SavaServiceConfiguration.CreateBuilderAsync(args).ConfigureAwait(false);
         builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
         builder.Services.AddOptions<SavaOptions>()
             .Bind(builder.Configuration.GetSection(SavaOptions.SectionName))
@@ -86,21 +88,10 @@ public static class ApplicationProgram
 
     private static X509Certificate2? LoadCertificate(WebApplicationBuilder builder, Uri endpoint)
     {
+        SavaServiceCertificate.RefuseLegacySources(builder.Configuration);
         if (!string.Equals(endpoint.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal))
             return null;
-        var hosting = builder.Configuration.GetSection(ApplicationHostingOptions.SectionName)
-            .Get<ApplicationHostingOptions>() ?? new ApplicationHostingOptions();
-        if (string.IsNullOrWhiteSpace(hosting.CertificateFile))
-            throw new InvalidOperationException("An HTTPS Application listener requires ApplicationHosting:CertificateFile.");
-        var certificate = X509CertificateLoader.LoadPkcs12FromFile(
-            Path.GetFullPath(hosting.CertificateFile, builder.Environment.ContentRootPath),
-            hosting.CertificatePassword, X509KeyStorageFlags.EphemeralKeySet);
-        if (!certificate.HasPrivateKey)
-        {
-            certificate.Dispose();
-            throw new InvalidOperationException("The Application TLS certificate must contain its private key.");
-        }
-        return certificate;
+        return SavaServiceCertificate.Load(builder.Configuration, required: true);
     }
 
     private static async Task<bool> RunOperatorAsync(WebApplication app, (string Name, string Path)? command)

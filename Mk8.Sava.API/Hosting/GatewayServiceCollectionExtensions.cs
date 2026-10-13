@@ -71,15 +71,18 @@ public static class GatewayServiceCollectionExtensions
             .Configure<IOptions<SavaOptions>>((jwt, options) => ConfigureBearer(jwt, options.Value.BearerAuthentication));
         services.AddSingleton<TokenCredential>(provider =>
         {
-            var cloud = provider.GetRequiredService<IOptions<SavaOptions>>().Value.BearerAuthentication.GraphGroupResolution.Cloud;
-            var authority = cloud switch
+            var graph = provider.GetRequiredService<IOptions<SavaOptions>>().Value.BearerAuthentication.GraphGroupResolution;
+            if (!graph.Enabled)
+                return new DisabledGraphCredential();
+            var authority = graph.Cloud switch
             {
                 MicrosoftGraphCloud.Global => AzureAuthorityHosts.AzurePublicCloud,
                 MicrosoftGraphCloud.UsGovernment or MicrosoftGraphCloud.UsGovernmentDod => AzureAuthorityHosts.AzureGovernment,
                 MicrosoftGraphCloud.China => AzureAuthorityHosts.AzureChina,
                 _ => throw new InvalidOperationException("Unsupported Microsoft Graph cloud.")
             };
-            return new DefaultAzureCredential(new DefaultAzureCredentialOptions { AuthorityHost = authority });
+            return new ClientSecretCredential(graph.TenantId, graph.ClientId, graph.ClientSecret,
+                new ClientSecretCredentialOptions { AuthorityHost = authority });
         });
         services.AddHttpClient<MicrosoftGraphGroupMembershipResolver>(client => client.Timeout = TimeSpan.FromSeconds(5))
             .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false });

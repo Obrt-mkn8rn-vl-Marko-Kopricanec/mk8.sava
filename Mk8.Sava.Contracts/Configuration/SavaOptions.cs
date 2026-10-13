@@ -607,10 +607,12 @@ public sealed class SavaOptions : IValidatableObject
         }
         if (BearerAuthentication.GraphGroupResolution.Enabled &&
             (!BearerAuthentication.Enabled ||
-             !Guid.TryParse(BearerAuthentication.GraphGroupResolution.TenantId, out _)))
+             !Guid.TryParse(BearerAuthentication.GraphGroupResolution.TenantId, out _) ||
+             !Guid.TryParse(BearerAuthentication.GraphGroupResolution.ClientId, out _) ||
+             string.IsNullOrWhiteSpace(BearerAuthentication.GraphGroupResolution.ClientSecret)))
         {
             yield return new ValidationResult(
-                "Graph group resolution requires enabled bearer authentication and a valid tenant ID.",
+                "Graph group resolution requires enabled bearer authentication and Supprocom.Secrets tenant, client ID and client secret configuration.",
                 [nameof(BearerAuthentication)]);
         }
         if (BearerAuthentication.Enabled)

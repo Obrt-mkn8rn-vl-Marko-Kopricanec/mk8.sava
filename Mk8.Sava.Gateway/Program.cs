@@ -1,6 +1,9 @@
 using System.Globalization;
 using System.Net;
+using Microsoft.Extensions.Options;
+using Mk8.Sava.Configuration;
 using Mk8.Sava.Hosting;
+using Mk8.Sava.Transport;
 
 namespace Mk8.Sava.Gateway;
 
@@ -21,13 +24,24 @@ public sealed partial class Program
             Environment.ExitCode = 1;
             return;
         }
-        var builder = WebApplication.CreateBuilder(args);
+        var builder = await SavaServiceConfiguration.CreateBuilderAsync(args).ConfigureAwait(false);
+        SavaServiceCertificate.RefuseLegacySources(builder.Configuration);
+        using var certificate = SavaServiceCertificate.Load(builder.Configuration,
+            SavaServiceCertificate.RequiresGatewayHttps(builder.Configuration));
+        if (certificate is not null)
+            builder.WebHost.ConfigureKestrel(server => server.ConfigureHttpsDefaults(https => https.ServerCertificate = certificate));
         builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
         builder.Services.AddSavaGateway(builder.Configuration);
         var app = builder.Build();
         await using var disposal = app.ConfigureAwait(false);
         // Include deferred host configuration, but refuse before service startup.
         RequireListenerConfiguration(builder.Configuration);
+        SavaServiceConfiguration.RequireRole(app.Configuration, "Gateway");
+        // Validate formats/budgets before hosted-service constructors can own
+        // scratch directories or a listener can become available.
+        _ = app.Services.GetRequiredService<IOptions<SavaOptions>>().Value;
+        _ = app.Services.GetRequiredService<IOptions<GatewayOptions>>().Value;
+        _ = app.Services.GetRequiredService<IOptions<ApplicationTransportOptions>>().Value;
         app.MapSavaGateway();
         await app.RunAsync().ConfigureAwait(false);
     }

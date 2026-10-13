@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace Mk8.Sava.Tests;
 
 public sealed class SplitProcessHostPreparationTests
@@ -14,10 +16,10 @@ public sealed class SplitProcessHostPreparationTests
         await using (host.ConfigureAwait(false))
         {
             Assert.True(Directory.Exists(root));
-            var keyText = await File.ReadAllTextAsync(host.AccessKeyFile).ConfigureAwait(true);
+            var keyText = host.AccessKey;
             Assert.Equal(32, Convert.FromBase64String(keyText).Length);
             if (!OperatingSystem.IsWindows())
-                Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(host.AccessKeyFile));
+                Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(Path.Combine(root, "Environment", ".installation.key")));
             Assert.Throws<InvalidOperationException>(() => host.GatewayProcessId);
             Assert.Empty(host.CapturedLogs);
             Assert.False(Directory.Exists(host.StoragePath));
@@ -26,7 +28,9 @@ public sealed class SplitProcessHostPreparationTests
 
             var start = host.CreateStart(typeof(Mk8.Sava.Gateway.Program).Assembly.Location);
             Assert.Equal("0", start.Environment["Gateway__MaximumConcurrentRequests"]);
-            Assert.Equal(host.AccessKeyFile, start.Environment["ApplicationTransport__AccessKeyFile"]);
+            Assert.True(CryptographicOperations.FixedTimeEquals(
+                Convert.FromBase64String(host.AccessKey),
+                Convert.FromBase64String(start.Environment["ApplicationTransport__AccessKey"] ?? string.Empty)));
             Assert.Equal(new Uri(host.ApplicationAddress, "/internal/application").AbsoluteUri,
                 start.Environment["ApplicationTransport__Endpoint"]);
         }

@@ -208,6 +208,10 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     protected override IHost CreateHost(IHostBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
+        // DeferredHostBuilder converts this collection to entry-point CLI args.
+        // The real service rejects CLI configuration; keep this test harness's
+        // service injection below, without teaching production a bypass.
+        builder.ConfigureHostConfiguration(configuration => configuration.Sources.Clear());
         var host = builder.Build();
         try
         {
@@ -322,11 +326,12 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
     private Dictionary<string, string?> CreateBaseConfiguration() => new(StringComparer.Ordinal)
     {
         // Explicit synthetic TestServer descriptors, not a deployment listener or RPC peer.
+        ["Service:Role"] = "Gateway",
         ["urls"] = "http://127.0.0.1:0",
         ["ApplicationTransport:Endpoint"] = "http://127.0.0.1:0/internal/application",
         ["Sava:DataPath"] = DataPath,
         ["Gateway:StagingPath"] = DataPath + ".gateway",
-        ["ApplicationTransport:AccessKeyFile"] = Path.Combine(DataPath, "unused-in-process-access-key"),
+        ["ApplicationTransport:AccessKey"] = AccountKey,
         ["Sava:DefaultAccount"] = AccountName,
         [$"Sava:Accounts:{AccountName}"] = AccountKey,
         [$"Sava:Accounts:{SecondAccountName}"] = SecondAccountKey,

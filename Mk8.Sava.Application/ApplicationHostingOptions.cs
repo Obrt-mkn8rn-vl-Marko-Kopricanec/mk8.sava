@@ -5,8 +5,6 @@ namespace Mk8.Sava.Application;
 internal sealed class ApplicationHostingOptions
 {
     public const string SectionName = "ApplicationHosting";
-    public string CertificateFile { get; init; } = string.Empty;
-    public string? CertificatePassword { get; init; }
     [Range(1, 65536)]
     public int MaximumReadSessions { get; init; } = 256;
     public TimeSpan ReadSessionIdleTimeout { get; init; } = TimeSpan.FromMinutes(2);

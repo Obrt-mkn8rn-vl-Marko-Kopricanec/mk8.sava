@@ -23,14 +23,14 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
     private ApplicationRpcClient? client;
     private int verifiedPeerRequests;
 
-    private RpcOutputTestHost(WebApplication application, DirectoryInfo directory, string keyPath, SavaOptions options)
+    private RpcOutputTestHost(WebApplication application, DirectoryInfo directory, string accessKey, SavaOptions options)
     {
         this.application = application;
         this.directory = directory;
         endpoint = new ApplicationRpcEndpoint(new ApplicationTransportOptions
         {
             Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
-            AccessKeyFile = keyPath,
+            AccessKey = accessKey,
         }, options);
     }
 
@@ -83,16 +83,11 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
         RpcOutputTestHost? host = null;
         try
         {
-            var keyPath = Path.Combine(hostDirectory.FullName, "transport.key");
             var key = RandomNumberGenerator.GetBytes(32);
+            string accessKey;
             try
             {
-                var creation = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
-                if (!OperatingSystem.IsWindows())
-                    creation.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-                var file = new FileStream(keyPath, creation);
-                await using var fileLifetime = file.ConfigureAwait(false);
-                await file.WriteAsync(System.Text.Encoding.ASCII.GetBytes(Convert.ToBase64String(key))).ConfigureAwait(false);
+                accessKey = Convert.ToBase64String(key);
             }
             finally
             {
@@ -103,14 +98,14 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
             builder.Logging.ClearProviders();
             builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
             webApplication = builder.Build();
-            host = new RpcOutputTestHost(webApplication, hostDirectory, keyPath, options);
+            host = new RpcOutputTestHost(webApplication, hostDirectory, accessKey, options);
             var ownedHost = host;
             webApplication.MapPost("/internal/application", context => handle(context, ownedHost));
             using var startup = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await webApplication.StartAsync(startup.Token).ConfigureAwait(false);
             var address = webApplication.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!
                 .Addresses.Single();
-            host.Connect(new Uri(new Uri(address), "/internal/application"), keyPath, options);
+            host.Connect(new Uri(new Uri(address), "/internal/application"), accessKey, options);
             return host;
         }
         catch
@@ -127,11 +122,11 @@ internal sealed class RpcOutputTestHost : IAsyncDisposable
         }
     }
 
-    private void Connect(Uri address, string keyPath, SavaOptions options)
+    private void Connect(Uri address, string accessKey, SavaOptions options)
     {
         client = new ApplicationRpcClient(new ApplicationTransportOptions
         {
-            AccessKeyFile = keyPath,
+            AccessKey = accessKey,
             Endpoint = address,
             RequestTimeout = TimeSpan.FromSeconds(15),
         }, options);

@@ -303,6 +303,8 @@ public sealed partial class MicrosoftGraphGroupMembershipResolverTests
             [$"Sava:AccountCapabilities:{SavaWebApplicationFactory.AccountName}:HierarchicalNamespaceEnabled"] = "true",
             ["Sava:BearerAuthentication:GraphGroupResolution:Enabled"] = "true",
             ["Sava:BearerAuthentication:GraphGroupResolution:TenantId"] = SavaWebApplicationFactory.TenantId,
+            ["Sava:BearerAuthentication:GraphGroupResolution:ClientId"] = SavaWebApplicationFactory.DelegatorObjectId,
+            ["Sava:BearerAuthentication:GraphGroupResolution:ClientSecret"] = "synthetic-injected-credential",
             ["Sava:BearerAuthentication:GraphGroupResolution:Cloud"] = cloud.ToString()
         };
         var application = new SavaWebApplicationFactory(configuration, () => handler, credential);

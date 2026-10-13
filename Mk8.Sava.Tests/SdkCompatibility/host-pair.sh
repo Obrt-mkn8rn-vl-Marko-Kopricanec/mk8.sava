@@ -61,7 +61,9 @@ start_sava_hosts() {
     local application_port gateway_port
     local environment_name
     local -a sava_host_environment=(env)
-    local access_key_file="$harness_root/application-access.key"
+    local transport_key
+    local application_root="$harness_root/Application"
+    local gateway_root="$harness_root/Gateway"
 
     # Disposable process lanes must not inherit production listeners/policies
     # from the invoking shell. Remove only host configuration, not tool paths.
@@ -73,8 +75,10 @@ start_sava_hosts() {
     done < <(compgen -e)
 
     chmod 700 "$harness_root"
-    openssl rand -base64 -out "$access_key_file" 32
-    chmod 600 "$access_key_file"
+    transport_key=$(openssl rand -base64 32)
+    mkdir "$application_root" "$gateway_root"
+    copy_sava_test_output "$solution_root/Mk8.Sava.Application/bin/$build_configuration/net10.0" "$application_root"
+    copy_sava_test_output "$solution_root/Mk8.Sava.Gateway/bin/$build_configuration/net10.0" "$gateway_root"
     read -r application_port gateway_port < <("${PYTHON_HOST_PATH:-python3}" -S - <<'PY'
 import socket
 with socket.socket() as application, socket.socket() as gateway:
@@ -91,29 +95,19 @@ PY
     # shellcheck disable=SC2034 # The calling SDK lane consumes this shared result.
     endpoint="$gateway_address/$storage_account"
 
-    "${sava_host_environment[@]}" \
-        ASPNETCORE_ENVIRONMENT=Production \
-        DOTNET_ENVIRONMENT=Production \
-        ApplicationTransport__Endpoint="$application_endpoint" \
-        ApplicationTransport__AccessKeyFile="$access_key_file" \
-        Sava__DataPath="$harness_root/storage" \
-        Sava__DefaultAccount="$storage_account" \
-        "Sava__Accounts__$storage_account=$storage_account_key" \
-        "$dotnet_executable" "$solution_root/Mk8.Sava.Application/bin/$build_configuration/net10.0/Mk8.Sava.Application.dll" \
+    # Finite disposable SDK fixture inputs, not deployment configuration.
+    # Values are written only to each owned installation-local active document.
+    write_sava_collection "$application_root" Application "$application_address" "$application_endpoint" \
+        "$storage_account" "$storage_account_key" "$transport_key" "$harness_root/storage" "$harness_root/gateway-staging"
+    write_sava_collection "$gateway_root" Gateway "$gateway_address" "$application_endpoint" \
+        "$storage_account" "$storage_account_key" "$transport_key" "$harness_root/gateway-unused" "$harness_root/gateway-staging"
+
+    "${sava_host_environment[@]}" "$dotnet_executable" "$application_root/Mk8.Sava.Application.dll" \
         >"$application_log" 2>&1 &
     sava_application_pid=$!
     wait_for_sava_host Application "$application_address" "$sava_application_pid"
 
-    "${sava_host_environment[@]}" \
-        ASPNETCORE_ENVIRONMENT=Production \
-        DOTNET_ENVIRONMENT=Production \
-        ASPNETCORE_URLS="$gateway_address" \
-        ApplicationTransport__Endpoint="$application_endpoint" \
-        ApplicationTransport__AccessKeyFile="$access_key_file" \
-        Gateway__StagingPath="$harness_root/gateway-staging" \
-        Sava__DefaultAccount="$storage_account" \
-        "Sava__Accounts__$storage_account=$storage_account_key" \
-        "$dotnet_executable" "$solution_root/Mk8.Sava.Gateway/bin/$build_configuration/net10.0/Mk8.Sava.Gateway.dll" \
+    "${sava_host_environment[@]}" "$dotnet_executable" "$gateway_root/Mk8.Sava.Gateway.dll" \
         >"$server_log" 2>&1 &
     sava_gateway_pid=$!
     wait_for_sava_host Gateway "$gateway_address" "$sava_gateway_pid" "$sava_application_pid"
@@ -127,4 +121,36 @@ show_sava_host_logs() {
             tail -n 100 "$log_file" >&2
         fi
     done
+}
+
+# This is test input construction only; the services themselves read their
+# encrypted Supprocom snapshot, not shell/process-environment service values.
+copy_sava_test_output() {
+    local source=$1 destination=$2 entry
+    # Never copy an existing installation's active collection or key.
+    while IFS= read -r -d '' entry; do
+        cp -R "$entry" "$destination/"
+    done < <(find "$source" -mindepth 1 -maxdepth 1 ! -name Environment -print0)
+}
+
+write_sava_collection() {
+    local root=$1 role=$2 listener=$3 rpc=$4 account=$5 account_key=$6 key=$7 data=$8 staging=$9
+    mkdir -p "$root/Environment"
+    printf '%s\n' "$listener" "$rpc" "$account" "$account_key" "$key" "$data" "$staging" |
+        "${PYTHON_HOST_PATH:-python3}" -S -c '
+import json, os, sys
+values = sys.stdin.read().splitlines()
+if len(values) != 7:
+    raise ValueError("Invalid disposable fixture inputs")
+root, role = sys.argv[1:]
+listener, rpc, account, account_key, key, data, staging = values
+settings = {"Service__Role": role, "urls": listener,
+    "ApplicationTransport__Endpoint": rpc, "ApplicationTransport__AccessKey": key,
+    "Sava__DefaultAccount": account, "Sava__Accounts__" + account: account_key,
+    "Sava__DataPath": data, "Gateway__StagingPath": staging}
+document = "".join(name + "=" + json.dumps(value) + "\n" for name, value in settings.items())
+descriptor = os.open(os.path.join(root, "Environment", ".env"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w") as stream:
+    stream.write(document)
+' "$root" "$role"
 }

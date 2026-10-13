@@ -12,6 +12,7 @@ using Azure.Core.Pipeline;
 using Microsoft.Extensions.Configuration;
 using Mk8.Sava.Configuration;
 using Mk8.Sava.Transport;
+using Supprocom.Secrets;
 
 namespace Mk8.Sava.Tests;
 
@@ -31,14 +32,13 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         _settings = settings;
         StoragePath = Path.Combine(root, "storage");
         GatewayUnusedDataPath = Path.Combine(root, "gateway-not-storage");
-        AccessKeyFile = Path.Combine(root, "transport.key");
         ApplicationAddress = new Uri($"http://127.0.0.1:{ReservePort()}/");
     }
 
     public string Root { get; }
     public string StoragePath { get; }
     public string GatewayUnusedDataPath { get; }
-    public string AccessKeyFile { get; }
+    public string AccessKey { get; private set; } = string.Empty;
     public Uri ApplicationAddress { get; private set; }
     public Uri GatewayAddress { get; private set; } = null!;
     public int GatewayProcessId => _gateway?.Id ?? throw new InvalidOperationException("Gateway is not running.");
@@ -71,12 +71,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
             settings ?? new Dictionary<string, string?>(StringComparer.Ordinal));
         try
         {
-            var creation = new FileStreamOptions { Mode = FileMode.CreateNew, Access = FileAccess.Write };
-            if (!OperatingSystem.IsWindows())
-                creation.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-            var key = new FileStream(host.AccessKeyFile, creation);
-            await using (key.ConfigureAwait(false))
-                await key.WriteAsync(Encoding.ASCII.GetBytes(Convert.ToBase64String(RandomNumberGenerator.GetBytes(32)))).ConfigureAwait(false);
+            await host.SetAccessKeyAsync(Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))).ConfigureAwait(false);
             return host;
         }
         catch
@@ -96,7 +91,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         return new ApplicationRpcClient(new ApplicationTransportOptions
         {
             Endpoint = new Uri(ApplicationAddress, "/internal/application"),
-            AccessKeyFile = AccessKeyFile
+            AccessKey = AccessKey,
         }, options);
     }
 
@@ -156,6 +151,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         _applicationOverrides = overrides ?? new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach (var pair in _applicationOverrides)
             start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
+        await PortableTestConfiguration.MaterializeAsync(start, Root).ConfigureAwait(false);
         _application = new SplitServiceProcess(start);
         ApplicationAddress = await _application.WaitForAddressAsync("Application", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         await AssertStatusAsync(ApplicationAddress, "/health/ready", HttpStatusCode.OK).ConfigureAwait(false);
@@ -209,6 +205,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
             foreach (var pair in overrides)
                 start.Environment[pair.Key.Replace(":", "__", StringComparison.Ordinal)] = pair.Value;
         }
+        await PortableTestConfiguration.MaterializeAsync(start, Root).ConfigureAwait(false);
         _gateway = new SplitServiceProcess(start);
         GatewayAddress = await _gateway.WaitForAddressAsync("Gateway", TimeSpan.FromSeconds(60)).ConfigureAwait(false);
         using var probe = CreateHttpClient();
@@ -231,7 +228,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
     {
         var start = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
         {
-            WorkingDirectory = AppContext.BaseDirectory,
+            WorkingDirectory = Root,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false
@@ -250,7 +247,7 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         start.Environment["DOTNET_ENVIRONMENT"] = "Production";
         start.Environment["ASPNETCORE_URLS"] = "http://127.0.0.1:0";
         start.Environment["ApplicationTransport__Endpoint"] = new Uri(ApplicationAddress, "/internal/application").AbsoluteUri;
-        start.Environment["ApplicationTransport__AccessKeyFile"] = AccessKeyFile;
+        start.Environment["ApplicationTransport__AccessKey"] = AccessKey;
         start.Environment["Logging__LogLevel__Microsoft.Hosting.Lifetime"] = "Information";
         return start;
     }
@@ -267,6 +264,19 @@ internal sealed class SplitProcessHost : IAsyncDisposable
         foreach (var pair in _settings)
             result[pair.Key] = pair.Value;
         return result;
+    }
+
+    public async Task SetAccessKeyAsync(string key)
+    {
+        var options = new SupprocomSecretsOptions { EnvironmentName = "Production", FileOverridesProcessEnvironment = true };
+        options.File.Directory = Path.Combine(Root, "Environment");
+        options.File.Protection = SecretFileProtection.InstallationBoundAesGcm;
+        options.File.Import = SecretFileImport.None;
+        options.File.Recovery = SecretFileRecovery.None;
+        var store = new SupprocomSecretFileStore(options);
+        await store.SetAsync("ApplicationTransport__AccessKey", key, options.StartupCancellationToken).ConfigureAwait(false);
+        var snapshot = await store.LoadAsync(options.StartupCancellationToken).ConfigureAwait(false);
+        AccessKey = snapshot["ApplicationTransport:AccessKey"];
     }
 
     public async ValueTask DisposeAsync()

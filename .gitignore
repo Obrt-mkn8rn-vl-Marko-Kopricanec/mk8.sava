@@ -10,6 +10,11 @@ TestResults/
 artifacts/
 data/
 .gateway-staging/
+**/Environment/*
+!**/Environment/.env.template
+**/.env
+**/.dev.env
+**/.env.development
 *.db
 *.db-shm
 *.db-wal

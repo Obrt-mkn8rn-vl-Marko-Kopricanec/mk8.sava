@@ -4,6 +4,7 @@
     <RootNamespace>Mk8.Sava</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <PackageReference Include="Supprocom.Secrets" Version="[0.1.4]" />
     <ProjectReference Include="../Mk8.Sava.Contracts/Mk8.Sava.Contracts.csproj" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>

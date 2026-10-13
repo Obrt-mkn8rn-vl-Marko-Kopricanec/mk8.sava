@@ -27,7 +27,7 @@ public sealed class ExplicitDeploymentConfigurationTests
     [Fact]
     public void ATransportCredentialDoesNotChooseAnImplicitEndpoint()
     {
-        var options = new ApplicationTransportOptions { AccessKeyFile = "not-opened-by-validation" };
+        var options = new ApplicationTransportOptions { AccessKey = SavaWebApplicationFactory.AccountKey };
 
         Assert.Null(options.Endpoint);
         var errors = new List<ValidationResult>();
@@ -47,7 +47,7 @@ public sealed class ExplicitDeploymentConfigurationTests
             ["Sava:DefaultAccount"] = account,
             [$"Sava:Accounts:{account}"] = SavaWebApplicationFactory.AccountKey,
             ["ApplicationTransport:Endpoint"] = endpoint,
-            ["ApplicationTransport:AccessKeyFile"] = "not-opened-by-validation",
+            ["ApplicationTransport:AccessKey"] = SavaWebApplicationFactory.AccountKey,
         }).Build();
         var storage = configuration.GetSection(SavaOptions.SectionName).Get<SavaOptions>();
         var transport = configuration.GetSection(ApplicationTransportOptions.SectionName).Get<ApplicationTransportOptions>();

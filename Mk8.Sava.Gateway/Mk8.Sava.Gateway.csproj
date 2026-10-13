@@ -4,6 +4,12 @@
     <RootNamespace>Mk8.Sava.Gateway</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Active installation documents and keys are never build/publish inputs. -->
+    <Content Remove="Environment/**" />
+    <None Remove="Environment/**" />
+    <Content Include="Environment/.env.template" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="../Mk8.Sava.API/Mk8.Sava.API.csproj" />
   </ItemGroup>
 </Project>

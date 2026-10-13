@@ -4371,6 +4371,8 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.AccountName}"] = SavaWebApplicationFactory.AccountKey;
         start.Environment[$"Sava__Accounts__{SavaWebApplicationFactory.SecondAccountName}"] = SavaWebApplicationFactory.SecondAccountKey;
         start.Environment[$"Sava__AccountCapabilities__{SavaWebApplicationFactory.AccountName}__HierarchicalNamespaceEnabled"] = "true";
+        start.Environment["ApplicationTransport__AccessKey"] = Convert.ToBase64String(new byte[32]);
+        await PortableTestConfiguration.MaterializeAsync(start, dataPath).ConfigureAwait(true);
         using var process = Process.Start(start);
         Assert.NotNull(process);
         var result = await TestProcessRunner.ObserveAsync(process, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(5))

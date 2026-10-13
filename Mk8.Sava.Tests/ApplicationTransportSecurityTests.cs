@@ -6,6 +6,8 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Mk8.Sava.Application;
 using Mk8.Sava.Configuration;
+using Mk8.Sava.Hosting;
+using Microsoft.Extensions.Configuration;
 using Mk8.Sava.Protocol;
 using Mk8.Sava.Storage;
 using Mk8.Sava.Transport;
@@ -28,14 +30,10 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
 
     public ApplicationTransportSecurityTests()
     {
-        var keyPath = Path.Combine(directory.FullName, "access.key");
-        File.WriteAllText(keyPath, Convert.ToBase64String(accessKey));
-        if (!OperatingSystem.IsWindows())
-            File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         transportOptions = new ApplicationTransportOptions
         {
             Endpoint = new Uri("http://127.0.0.1:0/internal/application"),
-            AccessKeyFile = keyPath,
+            AccessKey = Convert.ToBase64String(accessKey),
         };
     }
 
@@ -60,7 +58,7 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
         var options = new ApplicationTransportOptions
         {
             Endpoint = new Uri(endpoint, UriKind.Absolute),
-            AccessKeyFile = transportOptions.AccessKeyFile,
+            AccessKey = transportOptions.AccessKey,
         };
         var failures = new List<ValidationResult>();
 
@@ -667,16 +665,16 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
     [Fact]
     public void ShortOrInvalidSecretFilesAreRejectedWithoutPrintingTheirContents()
     {
-        File.WriteAllText(transportOptions.AccessKeyFile, Convert.ToBase64String(new byte[31]));
-        var shortFailure = Assert.Throws<InvalidOperationException>(() =>
+        var shortOptions = new ApplicationTransportOptions { Endpoint = transportOptions.Endpoint, AccessKey = Convert.ToBase64String(new byte[31]) };
+        var shortFailure = Assert.Throws<ValidationException>(() =>
         {
-            using var client = new ApplicationRpcClient(transportOptions, storageOptions);
+            using var client = new ApplicationRpcClient(shortOptions, storageOptions);
         });
         Assert.Contains("256", shortFailure.Message, StringComparison.Ordinal);
-        File.WriteAllText(transportOptions.AccessKeyFile, "not-base64-secret-material");
-        var invalidFailure = Assert.Throws<InvalidOperationException>(() =>
+        var invalidOptions = new ApplicationTransportOptions { Endpoint = transportOptions.Endpoint, AccessKey = "not-base64-secret-material" };
+        var invalidFailure = Assert.Throws<ValidationException>(() =>
         {
-            using var endpoint = new ApplicationRpcEndpoint(transportOptions, storageOptions);
+            using var endpoint = new ApplicationRpcEndpoint(invalidOptions, storageOptions);
         });
         Assert.DoesNotContain("not-base64-secret-material", invalidFailure.Message, StringComparison.Ordinal);
     }
@@ -689,22 +687,28 @@ public sealed partial class ApplicationTransportSecurityTests : IDisposable
     [InlineData(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupWrite, false)]
     [InlineData(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupExecute, false)]
     [InlineData(UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute, false)]
-    public void UnixKeyFileRequiresOwnerOrTrustedReadOnlyGroupAccess(UnixFileMode mode, bool permitted)
+    public async Task UnixKeyFileRequiresOwnerOrTrustedReadOnlyGroupAccess(UnixFileMode mode, bool permitted)
     {
         if (OperatingSystem.IsWindows())
             return;
-        File.SetUnixFileMode(transportOptions.AccessKeyFile, mode);
+        var collection = Path.Combine(directory.FullName, ".env");
+        await File.WriteAllTextAsync(collection, "ApplicationTransport__AccessKey=" + Convert.ToBase64String(accessKey)).ConfigureAwait(true);
+        File.SetUnixFileMode(collection, mode);
+        using var configuration = new ConfigurationManager();
         if (permitted)
         {
-            using var endpoint = new ApplicationRpcEndpoint(transportOptions, storageOptions);
+            await SavaServiceConfiguration.LoadAsync(configuration, directory.FullName).ConfigureAwait(true);
+            using var endpoint = new ApplicationRpcEndpoint(new ApplicationTransportOptions
+            {
+                Endpoint = transportOptions.Endpoint,
+                AccessKey = configuration["ApplicationTransport:AccessKey"] ?? string.Empty,
+            }, storageOptions);
             return;
         }
-        var failure = Assert.Throws<InvalidOperationException>(() =>
-        {
-            using var client = new ApplicationRpcClient(transportOptions, storageOptions);
-        });
-        Assert.DoesNotContain(transportOptions.AccessKeyFile, failure.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain(Convert.ToBase64String(accessKey), failure.Message, StringComparison.Ordinal);
+        var failure = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            SavaServiceConfiguration.LoadAsync(configuration, directory.FullName)).ConfigureAwait(true);
+        Assert.DoesNotContain(collection, failure.Message, StringComparison.Ordinal);
+        Assert.False(failure.Message.Contains(Convert.ToBase64String(accessKey), StringComparison.Ordinal));
     }
 
     private DefaultHttpContext CreateContext(Stream input, Stream response)

@@ -164,7 +164,7 @@ public sealed class SplitProcessTests
         using var trustedApplication = host.CreateApplicationClient();
         await host.StopGatewayAsync().ConfigureAwait(true);
         var rejectedKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-        await File.WriteAllTextAsync(host.AccessKeyFile, rejectedKey).ConfigureAwait(true);
+        await host.SetAccessKeyAsync(rejectedKey).ConfigureAwait(true);
         await host.StartGatewayAsync().ConfigureAwait(true);
 
         await AssertRejectedGatewayAsync(host, container.Name, rejectedKey).ConfigureAwait(true);

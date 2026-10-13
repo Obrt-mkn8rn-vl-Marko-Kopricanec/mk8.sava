@@ -41,7 +41,9 @@ public static class ApplicationTransportSecurity
     {
         ArgumentNullException.ThrowIfNull(options);
         Validator.ValidateObject(options, new ValidationContext(options), validateAllProperties: true);
-        var text = ReadProtectedKeyFile(options.AccessKeyFile);
+        var text = options.AccessKey;
+        if (text.Length > 4096)
+            throw new InvalidOperationException("The application transport access key exceeds its permitted length.");
         byte[] key;
         try
         {
@@ -49,7 +51,7 @@ public static class ApplicationTransportSecurity
         }
         catch (FormatException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
         {
-            throw new InvalidOperationException("The application transport access-key file must contain a base64 key.");
+            throw new InvalidOperationException("The application transport access key must contain a base64 key.");
         }
         if (key.Length < 32 || key.Length > 512)
         {
@@ -57,31 +59,6 @@ public static class ApplicationTransportSecurity
             throw new InvalidOperationException("The application transport access key must contain between 256 and 4096 bits.");
         }
         return key;
-    }
-
-    private static string ReadProtectedKeyFile(string path)
-    {
-        try
-        {
-            if (!OperatingSystem.IsWindows())
-            {
-                var permissions = File.GetUnixFileMode(path);
-                const UnixFileMode allowed = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
-                if ((permissions & ~allowed) != UnixFileMode.None)
-                    throw new InvalidOperationException("The application transport access-key file permits access outside its owner and optional trusted read-only group.");
-            }
-            if (new FileInfo(path).Length > 4096)
-                throw new InvalidOperationException("The application transport access-key file exceeds its permitted length.");
-            return File.ReadAllText(path).Trim();
-        }
-        catch (IOException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
-        {
-            throw new InvalidOperationException("The application transport access-key file could not be read.");
-        }
-        catch (UnauthorizedAccessException exception) when (!CatastrophicExceptionPolicy.Contains(exception))
-        {
-            throw new InvalidOperationException("The application transport access-key file could not be read.");
-        }
     }
 
     internal static string HashSecret(string value) =>
