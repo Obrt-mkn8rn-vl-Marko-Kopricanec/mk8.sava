@@ -75,6 +75,7 @@ public sealed partial class SplitServiceProcessTests
             var failure = await observedDisposal.WaitAsync(TimeSpan.FromSeconds(6)).ConfigureAwait(true);
             ThrowUnexpectedFailure(failure);
             var timeout = Assert.IsType<TimeoutException>(failure);
+            fixture.VerifiedCleanupFailure = timeout;
             Assert.Same(completion, fixture.Service.RootExitCompletion);
             Assert.Same(completion, fixture.Service.CleanupRootExitCompletion);
             Assert.True(completion.IsCompletedSuccessfully);

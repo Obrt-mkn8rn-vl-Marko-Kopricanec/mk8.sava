@@ -262,6 +262,7 @@ internal sealed class UrlTransferClient(
         string? sourceRange,
         bool allowSourceCustomerProvidedKey)
     {
+        var range = ParseReadSourceRange(sourceRange);
         var sourceRequest = new HttpRequestMessage(HttpMethod.Get, sourceUri);
         try
         {
@@ -271,8 +272,7 @@ internal sealed class UrlTransferClient(
                 "x-ms-version",
                 StorageRequestContext.Get(destinationRequest.HttpContext).ServiceVersion);
             AddSourceCustomerProvidedKey(destinationRequest, sourceRequest, sourceUri, allowSourceCustomerProvidedKey);
-            if (sourceRange is not null)
-                sourceRequest.Headers.TryAddWithoutValidation("Range", sourceRange);
+            sourceRequest.Headers.Range = range;
             return sourceRequest;
         }
         catch
@@ -326,6 +326,8 @@ internal sealed class UrlTransferClient(
         }
         if (sourceRange is not null && response.StatusCode != HttpStatusCode.PartialContent)
             throw CannotVerifyCopySource("The source did not honor the requested byte range.");
+        if (sourceRange is not null)
+            ValidateReturnedSourceRange(response, sourceRange);
 
         var contentLength = response.Content.Headers.ContentLength;
         if (!contentLength.HasValue &&
@@ -349,6 +351,56 @@ internal sealed class UrlTransferClient(
         return contentLength.Value;
     }
 
+    private static RangeHeaderValue? ParseReadSourceRange(string? sourceRange)
+    {
+        if (sourceRange is null)
+            return null;
+        if (!RangeHeaderValue.TryParse(sourceRange, out var range) ||
+            !string.Equals(range.Unit, "bytes", StringComparison.OrdinalIgnoreCase) ||
+            range.Ranges.Count != 1 ||
+            range.Ranges.First() is { From: null, To: 0 })
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-source-range", sourceRange);
+        }
+        return range;
+    }
+
+    private static void ValidateReturnedSourceRange(HttpResponseMessage response, string sourceRange)
+    {
+        var requested = ParseReadSourceRange(sourceRange)?.Ranges.First()
+            ?? throw CannotVerifyCopySource("The requested source range is missing.");
+        var returned = response.Content.Headers.ContentRange;
+        if (returned is null || !string.Equals(returned.Unit, "bytes", StringComparison.OrdinalIgnoreCase) ||
+            returned.From is not { } from || returned.To is not { } to ||
+            from < 0 || to < from || to - from == long.MaxValue ||
+            (returned.Length is { } total && total <= to))
+        {
+            throw CannotVerifyCopySource("The source returned an invalid byte Content-Range.");
+        }
+
+        var (expectedFrom, expectedTo) = ResolveSourceRangeCoordinates(requested, returned.Length);
+        if (from != expectedFrom || to != expectedTo ||
+            (response.Content.Headers.ContentLength is { } contentLength && contentLength != to - from + 1))
+        {
+            throw CannotVerifyCopySource("The source returned different range coordinates or an inconsistent length.");
+        }
+    }
+
+    private static (long From, long To) ResolveSourceRangeCoordinates(RangeItemHeaderValue requested, long? total)
+    {
+        if (requested.From is { } from)
+        {
+            var to = requested.To ?? (total is { } length
+                ? length - 1
+                : throw CannotVerifyCopySource("An open source range requires the source's complete length."));
+            return (from, total is { } completeLength ? Math.Min(to, completeLength - 1) : to);
+        }
+
+        var sourceLength = total ?? throw CannotVerifyCopySource("A suffix source range requires the source's complete length.");
+        var suffixLength = requested.To ?? throw CannotVerifyCopySource("The suffix source range is invalid.");
+        return (Math.Max(0, sourceLength - suffixLength), sourceLength - 1);
+    }
+
     private async Task<UrlTransferResult<TResult>> ConsumeWithChecksumValidationAsync<TResult>(
         HttpRequest request,
         UrlSource source,
@@ -356,24 +408,14 @@ internal sealed class UrlTransferClient(
         Func<UrlSource, Task<TResult>> consume,
         CancellationToken cancellationToken)
     {
-        var expectedMd5Text = ProtocolParsing.First(request.Headers, "x-ms-source-content-md5");
-        var expectedCrc64Text = ProtocolParsing.First(request.Headers, "x-ms-source-content-crc64");
-        if (expectedMd5Text is not null && expectedCrc64Text is not null)
-        {
-            throw new AzureStorageException(
-                StatusCodes.Status400BadRequest,
-                "BothCrc64AndMd5Specified",
-                "Both CRC64 and MD5 were specified for the source. Specify only one checksum.");
-        }
-        if (expectedMd5Text is null && expectedCrc64Text is null)
+        var (expected, verifyCrc64) = ReadSourceChecksumHeaders(request);
+        if (expected is null)
         {
             using var hashingSource = new TransactionalChecksumReadStream(source.Content);
             var value = await consume(source with { Content = hashingSource }).ConfigureAwait(false);
             return new UrlTransferResult<TResult>(value, hashingSource.Complete());
         }
 
-        var headerName = expectedMd5Text is null ? "x-ms-source-content-crc64" : "x-ms-source-content-md5";
-        var expected = DecodeChecksum(expectedMd5Text ?? expectedCrc64Text!, expectedMd5Text is null ? 8 : 16, headerName);
         var temporaryPath = Path.Combine(paths.Staging, $"url-source-{Guid.NewGuid():N}.tmp");
         try
         {
@@ -384,7 +426,7 @@ internal sealed class UrlTransferClient(
                     source.Content,
                     temporary,
                     maximumBytes,
-                    expectedMd5Text is null,
+                    verifyCrc64,
                     expected,
                     cancellationToken).ConfigureAwait(false);
                 temporary.Position = 0;
@@ -397,6 +439,35 @@ internal sealed class UrlTransferClient(
             if (File.Exists(temporaryPath))
                 File.Delete(temporaryPath);
         }
+    }
+
+    internal static (byte[]? Expected, bool VerifyCrc64) ReadSourceChecksumHeaders(HttpRequest request)
+    {
+        var expectedMd5Text = ReadSourceChecksumHeader(request, "x-ms-source-content-md5");
+        var expectedCrc64Text = ReadSourceChecksumHeader(request, "x-ms-source-content-crc64");
+        if (expectedMd5Text is not null && expectedCrc64Text is not null)
+        {
+            throw new AzureStorageException(
+                StatusCodes.Status400BadRequest,
+                "BothCrc64AndMd5Specified",
+                "Both CRC64 and MD5 were specified for the source. Specify only one checksum.");
+        }
+        if (expectedMd5Text is null && expectedCrc64Text is null)
+            return (null, false);
+
+        var headerName = expectedMd5Text is null ? "x-ms-source-content-crc64" : "x-ms-source-content-md5";
+        var text = expectedMd5Text ?? expectedCrc64Text
+            ?? throw AzureStorageException.InvalidHeader(headerName);
+        return (DecodeChecksum(text, expectedMd5Text is null ? 8 : 16, headerName), expectedMd5Text is null);
+    }
+
+    private static string? ReadSourceChecksumHeader(HttpRequest request, string name)
+    {
+        if (!request.Headers.TryGetValue(name, out var values))
+            return null;
+        if (values.Count != 1 || string.IsNullOrEmpty(values[0]))
+            throw AzureStorageException.InvalidHeader(name);
+        return values[0];
     }
 
     private static async Task<(TransactionalChecksums Checksums, long Length)> CopyAndVerifySourceAsync(

@@ -97,12 +97,16 @@ public sealed class AzurePutBlobTypeSemanticsTests(SavaWebApplicationFactory fac
                           CancellationToken.None)
                       ?? throw new InvalidOperationException("The test blob was not persisted.");
 
+        var parent = await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName, container.Name,
+            includeDeleted: false, CancellationToken.None).ConfigureAwait(true)
+            ?? throw new InvalidOperationException("The test parent was not persisted.");
         await Assert.ThrowsAsync<StorageBlobTypeMismatchException>(() => metadata.PublishBlobAsync(
             current with { Kind = BlobKind.AppendBlob },
             current.GenerationId,
             current.Revision,
+            parent.Revision,
             hierarchicalNamespace: false,
-            CancellationToken.None));
+            CancellationToken.None)).ConfigureAwait(true);
 
         var persisted = await metadata.GetBlobAsync(
             current.Account,
@@ -111,7 +115,7 @@ public sealed class AzurePutBlobTypeSemanticsTests(SavaWebApplicationFactory fac
             versionId: null,
             snapshot: null,
             includeDeleted: false,
-            CancellationToken.None);
+            CancellationToken.None).ConfigureAwait(true);
         Assert.NotNull(persisted);
         Assert.Equal(BlobKind.BlockBlob, persisted.Kind);
         Assert.Equal(current.Revision, persisted.Revision);

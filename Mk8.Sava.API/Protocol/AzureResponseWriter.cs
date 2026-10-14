@@ -1329,8 +1329,11 @@ internal static partial class AzureResponseWriter
 
     private static bool IsValidBlobCursor(BlobListCursor? cursor)
     {
-        if (cursor is null || cursor.NameComplete || string.IsNullOrEmpty(cursor.Name))
+        if (cursor?.NameComplete != false || string.IsNullOrEmpty(cursor.Name) ||
+            cursor.OrderedId is null || cursor.GenerationId is null)
+        {
             return false;
+        }
         if (cursor.IsPrefix)
         {
             return cursor.Rank == -1 &&

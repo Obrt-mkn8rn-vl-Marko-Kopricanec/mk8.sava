@@ -88,6 +88,7 @@ internal sealed class RequestContextMiddleware(
             container,
             blob,
             context.Request.Query["restype"].ToString());
+        (container, blob) = ResolveLogicalBlobAddress(resourceKind, container, blob);
 
         var (serviceVersion, versionSource) = await ResolveServiceVersionAsync(
             context.Request,
@@ -108,6 +109,16 @@ internal sealed class RequestContextMiddleware(
         };
         return new ParsedRequest(request, versionSource);
     }
+
+    private static (string? Container, string? Blob) ResolveLogicalBlobAddress(
+        StorageResourceKind resourceKind,
+        string? container,
+        string? blob) =>
+        // Resolve the implicit root alias BEFORE SAS, bearer or ACL scope checks.
+        // The wire path remains unchanged for Shared Key canonicalization.
+        resourceKind == StorageResourceKind.Blob && blob is null && container is not null
+            ? ("$root", container)
+            : (container, blob);
 
     private static StorageResourceKind ResolveResourceKind(
         bool staticWebsite,

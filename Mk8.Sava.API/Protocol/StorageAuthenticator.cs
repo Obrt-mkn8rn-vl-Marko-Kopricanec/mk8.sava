@@ -302,16 +302,24 @@ internal sealed class StorageAuthenticator(
             throw AzureStorageException.AuthorizationFailure();
 
         var granted = new HashSet<char>();
+        var accountWide = new HashSet<char>();
         var canGenerateUserDelegationKey = false;
         if (configuration.Principals.TryGetValue(subject, out var access) &&
-            Covers(access.Accounts, request.Account) &&
-            (request.Container is null || Covers(access.Containers, request.Container)))
+            Covers(access.Accounts, request.Account))
         {
-            granted.UnionWith(access.Permissions);
             canGenerateUserDelegationKey = access.CanGenerateUserDelegationKey;
+            var coversAccount = access.Containers.Count == 0 || access.Containers.Contains("*", StringComparer.Ordinal);
+            if (coversAccount)
+            {
+                accountWide.UnionWith(access.Permissions);
+                granted.UnionWith(access.Permissions);
+            }
+            else if (request.Container is not null && Covers(access.Containers, request.Container))
+            {
+                granted.UnionWith(access.Permissions);
+            }
         }
 
-        var accountWide = new HashSet<char>();
         var roleGrants = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var role in principal.FindAll("roles").Select(claim => claim.Value))
         {
@@ -1355,9 +1363,17 @@ internal sealed class StorageAuthenticator(
     private static string BuildSharedKeyLiteString(
         HttpRequest request,
         StorageRequestContext context,
-        string escapedPath) =>
-        Header(request, "Date") + "\n" + BuildCanonicalizedHeaders(request) +
-        BuildCanonicalizedResource(request, context, escapedPath);
+        string escapedPath)
+    {
+        // Blob/Queue Lite is not the Table Lite format. It binds the verb and
+        // entity headers, and its resource query contains only the component.
+        var resource = "/" + context.Account + escapedPath;
+        if (request.Query.TryGetValue("comp", out var component))
+            resource += "?comp=" + component;
+        return string.Join('\n', request.Method, Header(request, "Content-MD5"),
+            Header(request, "Content-Type"), request.Headers.ContainsKey("x-ms-date") ? string.Empty : Header(request, "Date"),
+            BuildCanonicalizedHeaders(request) + resource);
+    }
 
     private static string BuildCanonicalizedHeaders(HttpRequest request)
     {

@@ -331,24 +331,17 @@ public sealed class StorageFaultInjectionTests
             var payload = RandomNumberGenerator.GetBytes(1024);
             var encryption = new BlobEncryption(Scope: null, CustomerProvidedKeySha256: null);
 
-            Task<StoredContent> StoreAsync() => Task.Run(() => store.StorePinnedAsync(
-                SavaWebApplicationFactory.AccountName,
-                encryption,
-                new MemoryStream(payload, writable: false),
-                CancellationToken.None));
+            Task<StoredContent> StoreAsync(CancellationToken cancellationToken) => Task.Run(async () =>
+            {
+                var source = new MemoryStream(payload, writable: false);
+                await using var sourceLifetime = source.ConfigureAwait(false);
+                return await store.StorePinnedAsync(SavaWebApplicationFactory.AccountName,
+                    encryption, source, cancellationToken).ConfigureAwait(false);
+            }, CancellationToken.None);
 
-            var pending = new[] { StoreAsync(), StoreAsync() };
-            var stored = await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(30));
-            try
-            {
-                await AssertSinglePublishedPackedChunkAsync(
-                    application, store, metadata, stored, encryption, payload).ConfigureAwait(true);
-            }
-            finally
-            {
-                foreach (var item in stored)
-                    item.Dispose();
-            }
+            await OwnedStoredContentOperations.RunAsync(StoreAsync, StoreAsync,
+                stored => AssertSinglePublishedPackedChunkAsync(application, store, metadata, stored, encryption, payload),
+                TimeSpan.FromSeconds(30)).ConfigureAwait(true);
         }
         finally
         {

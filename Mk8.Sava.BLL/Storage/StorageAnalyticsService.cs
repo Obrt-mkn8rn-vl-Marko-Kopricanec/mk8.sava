@@ -24,6 +24,9 @@ public sealed class StorageAnalyticsService(
             return;
 
         await EnsureContainerAsync(request.Account, cancellationToken).ConfigureAwait(false);
+        var parent = await metadata.GetContainerAsync(request.Account, LogsContainerName,
+            includeDeleted: false, cancellationToken).ConfigureAwait(false)
+            ?? throw new StorageConcurrencyException("The analytics parent disappeared before content admission.");
         var bytes = Encoding.UTF8.GetBytes(FormatRecord(logging.Version, request));
         var source = new MemoryStream(bytes, writable: false);
         await using var sourceDisposal = source.ConfigureAwait(false);
@@ -38,6 +41,10 @@ public sealed class StorageAnalyticsService(
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var currentParent = await metadata.GetContainerAsync(request.Account, LogsContainerName,
+                includeDeleted: false, cancellationToken).ConfigureAwait(false);
+            if (!string.Equals(currentParent?.Revision, parent.Revision, StringComparison.Ordinal))
+                throw new StorageConcurrencyException("The admitted analytics parent changed before publication.");
             var lastName = await metadata.GetLastBlobNameAsync(
                 request.Account,
                 LogsContainerName,
@@ -53,6 +60,7 @@ public sealed class StorageAnalyticsService(
                     proposed,
                     null,
                     null,
+                    parent.Revision,
                     hierarchicalNamespace: false,
                     cancellationToken).ConfigureAwait(false);
                 return;

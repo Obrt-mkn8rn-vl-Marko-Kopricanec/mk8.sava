@@ -157,6 +157,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
         internal SplitServiceProcess Service { get; }
         internal Process Root { get; }
         internal Process? Descendant { get; private set; }
+        internal Exception? VerifiedCleanupFailure { get; set; }
 
         internal static async Task<ServiceFixture> StartAsync(string mode, Action<ServiceFixture>? writerReady = null)
         {
@@ -330,7 +331,7 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
             {
                 try
                 {
-                    await RetireAndDisposeAsync(RetireAsync, Service.DisposeAsync).ConfigureAwait(false);
+                    await RetireAndDisposeAsync(RetireAsync, DisposeServiceAsync).ConfigureAwait(false);
                 }
                 catch (Exception failure)
                 {
@@ -351,6 +352,19 @@ public sealed partial class SplitServiceProcessTests(ITestOutputHelper output)
                 if (workflowFailure is not null && !resourcesReleased)
                     throw new AggregateException("Fixture resource release also failed.", workflowFailure, releaseFailure);
                 throw;
+            }
+        }
+
+        private async ValueTask DisposeServiceAsync()
+        {
+            try
+            {
+                await Service.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception failure) when (ReferenceEquals(failure, VerifiedCleanupFailure))
+            {
+                // An explicit control already asserted this exact cleanup outcome.
+                // Other failures and all unmarked fixtures still fail cleanup.
             }
         }
 

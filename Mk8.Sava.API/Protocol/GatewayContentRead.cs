@@ -9,6 +9,7 @@ internal sealed class GatewayContentRead : IAsyncDisposable
     private readonly ApplicationReadSession _session;
     private readonly CancellationTokenSource _renewalCancellation;
     private readonly Task _renewal;
+    private readonly TaskCompletionSource _disposal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private int _closed;
     private static readonly Action<ILogger, string, Exception?> RenewalFailed = LoggerMessage.Define<string>(
         LogLevel.Warning, new EventId(5101, "ReadSessionRenewalFailed"),
@@ -38,10 +39,32 @@ internal sealed class GatewayContentRead : IAsyncDisposable
         Stream destination, CancellationToken cancellationToken) =>
         _sessions.WriteRangeAsync(_session.Token, encryption, offset, length, destination, cancellationToken);
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _closed, 1) != 0)
-            return;
+        // Publish the shared completion before starting cleanup: synchronous
+        // callbacks may reenter, and repeats must join rather than report success.
+        if (Interlocked.Exchange(ref _closed, 1) == 0)
+            _ = CompleteDisposalAsync();
+        return new ValueTask(_disposal.Task);
+    }
+
+    private async Task CompleteDisposalAsync()
+    {
+        try
+        {
+            await DisposeCoreAsync().ConfigureAwait(false);
+            _disposal.TrySetResult();
+        }
+#pragma warning disable CA1031 // Transfer every cleanup failure, including fatal graphs, unchanged to the one completion awaited by all owners; do not swallow or normalize it.
+        catch (Exception failure)
+#pragma warning restore CA1031
+        {
+            _disposal.TrySetException(failure);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         try
         {
             await _renewalCancellation.CancelAsync().ConfigureAwait(false);

@@ -14,6 +14,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security.Claims;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -7884,15 +7885,24 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
     [Fact]
     public async Task IdenticalContentIsCompressedAndPhysicallyDeduplicated()
     {
-        var service = CreateClient(factory);
+        var application = new SavaWebApplicationFactory(
+            TimeProvider.System,
+            new Dictionary<string, string?>(StringComparer.Ordinal),
+            disableMaintenance: true);
+        await using var applicationLifetime = application.ConfigureAwait(false);
+        using var transport = new HttpClientTransport(application.Server.CreateHandler());
+        var service = new BlobServiceClient(
+            new Uri($"http://{SavaWebApplicationFactory.AccountName}.localhost"),
+            new StorageSharedKeyCredential(SavaWebApplicationFactory.AccountName, SavaWebApplicationFactory.AccountKey),
+            new BlobClientOptions { Transport = transport, Retry = { MaxRetries = 0 } });
         var container = service.GetBlobContainerClient($"space-{Guid.NewGuid():N}");
         await container.CreateAsync();
         var content = Enumerable.Repeat((byte)'A', 512 * 1024).ToArray();
 
         await container.GetBlobClient("one").UploadAsync(BinaryData.FromBytes(content));
-        var afterFirst = EnumerateChunkFiles(factory.DataPath).ToArray();
+        var afterFirst = EnumerateChunkFiles(application.DataPath).ToArray();
         await container.GetBlobClient("two").UploadAsync(BinaryData.FromBytes(content));
-        var afterSecond = EnumerateChunkFiles(factory.DataPath).ToArray();
+        var afterSecond = EnumerateChunkFiles(application.DataPath).ToArray();
 
         Assert.NotEmpty(afterFirst);
         Assert.Equal(afterFirst.Length, afterSecond.Length);
@@ -13231,7 +13241,7 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             var metadata = application.Services.GetRequiredService<MetadataStore>();
             var chunks = application.Services.GetRequiredService<ChunkStore>();
             using var snapshot = await metadata.CreateBackupSnapshotAsync(
-                snapshotPath, chunks.PinChunkIds, CancellationToken.None).ConfigureAwait(false);
+                snapshotPath, chunks.TryPinChunkIdsForBackup, CancellationToken.None).ConfigureAwait(false);
             var metadataBytes = await File.ReadAllBytesAsync(snapshotPath).ConfigureAwait(false);
             Assert.DoesNotContain(Convert.ToBase64String(key), Encoding.Latin1.GetString(metadataBytes),
                 StringComparison.Ordinal);
@@ -13547,8 +13557,12 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             containerName,
             uncommitted.Name,
             CancellationToken.None).ConfigureAwait(false));
+        var parent = await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName, containerName,
+            includeDeleted: false, CancellationToken.None).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The fixture parent is missing.");
         await metadata.PutStagedBlockAsync(
             staged with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) },
+            parent.Revision,
             CancellationToken.None).ConfigureAwait(false);
 
         await blobService.RunMaintenanceAsync(CancellationToken.None).ConfigureAwait(false);
@@ -14013,8 +14027,11 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
                      SavaWebApplicationFactory.AccountName, containerName, uncommitted.Name,
                      CancellationToken.None).ConfigureAwait(false))
         {
+            var parent = await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName, containerName,
+                includeDeleted: false, CancellationToken.None).ConfigureAwait(false)
+                ?? throw new InvalidOperationException("The fixture parent is missing.");
             await metadata.PutStagedBlockAsync(
-                block with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) }, CancellationToken.None)
+                block with { CreatedAt = DateTimeOffset.UtcNow.AddDays(-8) }, parent.Revision, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         return uncommitted;
@@ -17179,19 +17196,13 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
             .Append('/')
             .Append(SavaWebApplicationFactory.AccountName)
             .Append(requestUri.AbsolutePath);
-        foreach (var parameter in Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(requestUri.Query)
-                     .OrderBy(parameter => parameter.Key, StringComparer.OrdinalIgnoreCase))
-        {
-            canonicalResource
-                .Append('\n')
-                // Azure Shared Key Lite signs canonical lowercase query names.
-#pragma warning disable CA1308
-                .Append(parameter.Key.ToLowerInvariant())
-#pragma warning restore CA1308
-                .Append(':')
-                .AppendJoin(',', parameter.Value.OrderBy(value => value, StringComparer.Ordinal));
-        }
-        var stringToSign = "\n" + canonicalHeaders + canonicalResource;
+        var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(requestUri.Query);
+        if (query.TryGetValue("comp", out var component))
+            canonicalResource.Append("?comp=").Append(component.ToString());
+        var stringToSign = string.Join('\n', request.Method.Method,
+            request.Content?.Headers.ContentMD5 is { } md5 ? Convert.ToBase64String(md5) : string.Empty,
+            request.Content?.Headers.ContentType?.ToString() ?? string.Empty,
+            string.Empty, canonicalHeaders.ToString() + canonicalResource);
         using var hmac = new HMACSHA256(Convert.FromBase64String(SavaWebApplicationFactory.AccountKey));
         var signature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(stringToSign)));
         request.Headers.TryAddWithoutValidation(
@@ -17577,39 +17588,76 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
         public int SourceRequestCount => Volatile.Read(ref sourceRequests[0]);
         public int RedirectTargetRequests => Volatile.Read(ref redirectTargetRequests[0]);
 
-        public static async Task<LoopbackSource> StartAsync(byte[] content)
+        internal enum StartupPhase { Built, Mapped, Started, AddressResolved }
+
+        public static async Task<LoopbackSource> StartAsync(
+            byte[] content,
+            Action<WebApplicationBuilder>? configure = null,
+            Func<StartupPhase, WebApplication, Task>? observe = null)
         {
             var sourceRequests = new int[1];
             var redirectTargetRequests = new int[1];
             var builder = WebApplication.CreateSlimBuilder();
             builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+            configure?.Invoke(builder);
             var application = builder.Build();
-            application.MapGet("/source", context => WriteSourceContentAsync(context, content, sourceRequests));
-            application.MapGet("/missing", context =>
-                WriteSourceErrorAsync(context, StatusCodes.Status404NotFound, "BlobNotFound"));
-            application.MapGet("/redirect", context =>
+            try
             {
-                context.Response.Redirect("/redirect-target");
-                return Task.CompletedTask;
-            });
-            application.MapGet("/redirect-target", async context =>
+                await ObserveAsync(StartupPhase.Built, application, observe).ConfigureAwait(false);
+                application.MapGet("/source", context => WriteSourceContentAsync(context, content, sourceRequests));
+                application.MapGet("/missing", context =>
+                    WriteSourceErrorAsync(context, StatusCodes.Status404NotFound, "BlobNotFound"));
+                application.MapGet("/redirect", context =>
+                {
+                    context.Response.Redirect("/redirect-target");
+                    return Task.CompletedTask;
+                });
+                application.MapGet("/redirect-target", async context =>
+                {
+                    Interlocked.Increment(ref redirectTargetRequests[0]);
+                    context.Response.ContentLength = content.Length;
+                    await context.Response.Body.WriteAsync(content, CancellationToken.None).ConfigureAwait(false);
+                });
+                await ObserveAsync(StartupPhase.Mapped, application, observe).ConfigureAwait(false);
+                await application.StartAsync(CancellationToken.None).ConfigureAwait(false);
+                await ObserveAsync(StartupPhase.Started, application, observe).ConfigureAwait(false);
+                var addresses = application.Services
+                    .GetRequiredService<IServer>()
+                    .Features
+                    .Get<IServerAddressesFeature>()
+                    ?.Addresses;
+                var address = addresses?.Single() ?? throw new InvalidOperationException("The source server did not publish an address.");
+                await ObserveAsync(StartupPhase.AddressResolved, application, observe).ConfigureAwait(false);
+                return new LoopbackSource(
+                    application,
+                    new Uri(new Uri(address), "/source"),
+                    sourceRequests,
+                    redirectTargetRequests);
+            }
+#pragma warning disable CA1031 // This acquisition owner attempts both independent cleanup steps and rethrows the initiating and cleanup graphs, including fatal graphs.
+            catch (Exception failure)
+#pragma warning restore CA1031
             {
-                Interlocked.Increment(ref redirectTargetRequests[0]);
-                context.Response.ContentLength = content.Length;
-                await context.Response.Body.WriteAsync(content).ConfigureAwait(false);
-            });
-            await application.StartAsync().ConfigureAwait(false);
-            var addresses = application.Services
-                .GetRequiredService<IServer>()
-                .Features
-                .Get<IServerAddressesFeature>()
-                ?.Addresses;
-            var address = addresses?.Single() ?? throw new InvalidOperationException("The source server did not publish an address.");
-            return new LoopbackSource(
-                application,
-                new Uri(new Uri(address), "/source"),
-                sourceRequests,
-                redirectTargetRequests);
+                var cleanup = await Record.ExceptionAsync(() => RetireAsync(application)).ConfigureAwait(false);
+                if (cleanup is not null)
+                    throw new AggregateException("Source startup and owned cleanup failed.", failure, cleanup);
+                throw;
+            }
+        }
+
+        private static Task ObserveAsync(StartupPhase phase, WebApplication application,
+            Func<StartupPhase, WebApplication, Task>? observe) => observe?.Invoke(phase, application) ?? Task.CompletedTask;
+
+        private static async Task RetireAsync(WebApplication application)
+        {
+            var stop = await Record.ExceptionAsync(() => application.StopAsync(CancellationToken.None)).ConfigureAwait(false);
+            var dispose = await Record.ExceptionAsync(() => application.DisposeAsync().AsTask()).ConfigureAwait(false);
+            if (stop is not null && dispose is not null)
+                throw new AggregateException("Source stop and disposal failed.", stop, dispose);
+            if (stop is not null)
+                ExceptionDispatchInfo.Throw(stop);
+            if (dispose is not null)
+                ExceptionDispatchInfo.Throw(dispose);
         }
 
         private static async Task WriteSourceContentAsync(
@@ -17668,10 +17716,6 @@ public sealed partial class AzureSdkCompatibilityTests(SavaWebApplicationFactory
                 $"<Error><Code>{errorCode}</Code><Message>{message}</Message></Error>").ConfigureAwait(false);
         }
 
-        public async ValueTask DisposeAsync()
-        {
-            await application.StopAsync().ConfigureAwait(false);
-            await application.DisposeAsync().ConfigureAwait(false);
-        }
+        public ValueTask DisposeAsync() => new(RetireAsync(application));
     }
 }

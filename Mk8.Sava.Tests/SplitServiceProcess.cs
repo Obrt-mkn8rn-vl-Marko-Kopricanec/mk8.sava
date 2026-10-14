@@ -24,6 +24,7 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
     private bool _processDisposed;
     private bool _exitedAtDisposal;
     private int _stopping;
+    private readonly TaskCompletionSource _disposal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task? _captureCallbacks;
     private Task? _cleanupRootExit;
 
@@ -138,10 +139,30 @@ internal sealed class SplitServiceProcess : IAsyncDisposable
             _address.TrySetResult(address);
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _stopping, 1) != 0)
-            return;
+        if (Interlocked.Exchange(ref _stopping, 1) == 0)
+            _ = CompleteDisposalAsync();
+        return new ValueTask(_disposal.Task);
+    }
+
+    private async Task CompleteDisposalAsync()
+    {
+        try
+        {
+            await DisposeCoreAsync().ConfigureAwait(false);
+            _disposal.TrySetResult();
+        }
+#pragma warning disable CA1031 // Preserve the actual owned cleanup outcome, including fatal graphs, on the shared completion; all disposal callers must observe it.
+        catch (Exception failure)
+#pragma warning restore CA1031
+        {
+            _disposal.TrySetException(failure);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         var beforeCleanup = Snapshot();
         try
         {

@@ -26,7 +26,20 @@ internal static class BlobConditionEvaluator
     public static void EvaluateRead(
         HttpRequest request,
         string etag,
-        DateTimeOffset lastModified)
+        DateTimeOffset lastModified) =>
+        EvaluateReadCore(request, etag, lastModified, websiteEtags: false);
+
+    public static void EvaluateWebsiteRead(
+        HttpRequest request,
+        string etag,
+        DateTimeOffset lastModified) =>
+        EvaluateReadCore(request, etag, lastModified, websiteEtags: true);
+
+    private static void EvaluateReadCore(
+        HttpRequest request,
+        string etag,
+        DateTimeOffset lastModified,
+        bool websiteEtags)
     {
         var conditions = ReadConditions(request.Headers, StandardHeaders);
         if (!conditions.HasAny)
@@ -52,7 +65,9 @@ internal static class BlobConditionEvaluator
             writeFailure: false,
             AzureStorageException.ConditionNotMet,
             AzureStorageException.NotModified,
-            supportsQuotedEtags: IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
+            // Website responses echo the stored quoted validator even when the
+            // anonymous request uses the legacy storage-version fallback.
+            supportsQuotedEtags: websiteEtags || IsServiceVersionAtLeast(request, new DateOnly(2011, 8, 18)));
     }
 
     public static void EvaluateWrite(

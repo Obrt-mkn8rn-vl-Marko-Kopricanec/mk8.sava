@@ -325,6 +325,24 @@ public sealed class ChunkStore : IDisposable
         return new PinLease(this, ids);
     }
 
+    internal ChunkPinAttempt TryPinChunkIdsForBackup(IReadOnlySet<string> chunkIds)
+    {
+        var ids = chunkIds.Where(id => !id.EndsWith("/$zero", StringComparison.Ordinal)).ToArray();
+        if (!TryPinIds(ids, out var pending))
+            return new ChunkPinAttempt(Pins: null, pending);
+        IDisposable? pins = new PinLease(this, ids);
+        try
+        {
+            var attempt = new ChunkPinAttempt(pins, PendingMutation: null);
+            pins = null;
+            return attempt;
+        }
+        finally
+        {
+            pins?.Dispose();
+        }
+    }
+
     internal async Task CopyChunkFileForBackupAsync(
         string id,
         string destination,
@@ -2126,34 +2144,38 @@ public sealed class ChunkStore : IDisposable
     {
         while (true)
         {
-            Task? reservationCompletion = null;
-            lock (_pinGate)
-            {
-                foreach (var id in ids)
-                {
-                    if (_mutationReservations.TryGetValue(id, out var reservation))
-                    {
-                        reservationCompletion = reservation.Completion;
-                        break;
-                    }
-                }
-
-                if (reservationCompletion is null)
-                {
-                    foreach (var id in ids)
-                    {
-                        if (!File.Exists(GetChunkPath(id)) && !_metadata.PackedChunkExists(id))
-                            throw new InvalidDataException($"Chunk '{id}' is missing.");
-                    }
-                    foreach (var id in ids)
-                        _pins[id] = _pins.GetValueOrDefault(id) + 1;
-                    return;
-                }
-            }
+            if (TryPinIds(ids, out var reservationCompletion))
+                return;
+            var pending = reservationCompletion
+                ?? throw new InvalidOperationException("A declined content pin did not name its pending mutation.");
 
 #pragma warning disable VSTHRD002 // Pin is a synchronous lease API; this waits only for an in-flight chunk mutation to release its reservation.
-            reservationCompletion.GetAwaiter().GetResult();
+            pending.GetAwaiter().GetResult();
 #pragma warning restore VSTHRD002
+        }
+    }
+
+    private bool TryPinIds(IReadOnlyList<string> ids, out Task? pendingMutation)
+    {
+        lock (_pinGate)
+        {
+            foreach (var id in ids)
+            {
+                if (_mutationReservations.TryGetValue(id, out var reservation))
+                {
+                    pendingMutation = reservation.Completion;
+                    return false;
+                }
+            }
+            foreach (var id in ids)
+            {
+                if (!File.Exists(GetChunkPath(id)) && !_metadata.PackedChunkExists(id))
+                    throw new InvalidDataException($"Chunk '{id}' is missing.");
+            }
+            foreach (var id in ids)
+                _pins[id] = _pins.GetValueOrDefault(id) + 1;
+            pendingMutation = null;
+            return true;
         }
     }
 

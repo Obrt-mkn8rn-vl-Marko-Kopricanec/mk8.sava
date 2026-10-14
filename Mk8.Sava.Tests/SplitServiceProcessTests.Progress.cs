@@ -32,6 +32,7 @@ public sealed partial class SplitServiceProcessTests
             var observed = await observedDisposal.WaitAsync(TimeSpan.FromSeconds(6)).ConfigureAwait(true);
             ThrowUnexpectedFailure(observed);
             var failure = Assert.IsType<TimeoutException>(observed);
+            fixture.VerifiedCleanupFailure = failure;
 
             Assert.False(fixture.Service.CaptureCallbackCompletion.IsCompleted);
             Assert.Contains("CaptureCancellationRequested=True", failure.Message, StringComparison.Ordinal);
@@ -79,6 +80,7 @@ public sealed partial class SplitServiceProcessTests
 
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Service.DisposeAsync().AsTask()
             .WaitAsync(TimeSpan.FromSeconds(6))).ConfigureAwait(true);
+        fixture.VerifiedCleanupFailure = failure;
 
         Assert.True(fixture.Service.CaptureCallbackCompletion.IsFaulted);
         Assert.Contains("CaptureCallbacks=Faulted", failure.Message, StringComparison.Ordinal);

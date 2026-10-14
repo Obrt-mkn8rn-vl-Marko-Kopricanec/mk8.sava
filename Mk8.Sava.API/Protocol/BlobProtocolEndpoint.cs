@@ -287,8 +287,31 @@ internal static class BlobProtocolEndpoint
         }
 
         if (statusCode == StatusCodes.Status200OK)
-            EvaluateReadConditions(http.Request, blob);
+            EvaluateStaticWebsiteReadConditions(http, blob);
         await WriteStaticWebsiteBlobAsync(http, blob, statusCode, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void EvaluateStaticWebsiteReadConditions(HttpContext http, BlobRecord blob)
+    {
+        try
+        {
+            BlobConditionEvaluator.EvaluateWebsiteRead(http.Request, blob.ETag, blob.LastModified);
+            EvaluateTagCondition(http.Request, blob, "x-ms-if-tags", source: false);
+        }
+        catch (AzureStorageException exception) when (exception.StatusCode == StatusCodes.Status304NotModified)
+        {
+            // Carry only this selected website representation's validators and
+            // cache field through the error boundary, which clears the response.
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["ETag"] = blob.ETag,
+                ["Last-Modified"] = blob.LastModified.ToString("R", CultureInfo.InvariantCulture),
+            };
+            if (blob.Http.CacheControl is not null)
+                headers["Cache-Control"] = blob.Http.CacheControl;
+            throw new AzureStorageException(exception.StatusCode, exception.ErrorCode, exception.Message,
+                exception.HeaderName, exception.HeaderValue, headers, exception.Details);
+        }
     }
 
     private static string CombineWebsitePath(string directory, string document) =>
@@ -1331,10 +1354,8 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
         StorageRequestContext request,
         IBlobApplication service)
     {
-        var containerName = request.Container ?? "$root";
-        var blobName = request.Blob ?? request.Container ?? throw AzureStorageException.BlobNotFound();
-        if (request.Blob is null)
-            containerName = "$root";
+        var containerName = request.Container ?? throw AzureStorageException.BlobNotFound();
+        var blobName = request.Blob ?? throw AzureStorageException.BlobNotFound();
         var comp = http.Request.Query["comp"].ToString().ToRequiredLowerInvariant();
         if (string.Equals(containerName, StorageAnalyticsConstants.LogsContainerName, StringComparison.Ordinal) &&
             !HttpMethods.IsGet(http.Request.Method) &&
@@ -2984,7 +3005,7 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             requireTagsPermission: copySourceTags || HasSourceTagCondition(http.Request)).ConfigureAwait(false);
         EvaluateCopySourceConditions(http.Request, source);
         ValidateCopySourceTier(http.Request, source, allowArchivedSource: false);
-        source = await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
+        source = await VerifyInternalCopySourceChecksumAsync(http, service, source, cancellationToken).ConfigureAwait(false);
         return await service.CopyBlockBlobFromBlobAsync(
             request.Account,
             containerName,
@@ -3001,6 +3022,38 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             current?.GenerationId,
             current?.Revision,
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<BlobRecord> VerifyInternalCopySourceChecksumAsync(
+        HttpContext http, IBlobApplication service, BlobRecord source, CancellationToken cancellationToken)
+    {
+        var (expected, verifyCrc64) = UrlTransferClient.ReadSourceChecksumHeaders(http.Request);
+        if (expected is null)
+            return await service.RecordDataAccessAsync(source, cancellationToken).ConfigureAwait(false);
+
+        var read = await GatewayContentRead.OpenAsync(http, source, query: false, cancellationToken).ConfigureAwait(false);
+        await using var readLifetime = read.ConfigureAwait(false);
+        source = read.Record;
+        var encryption = new BlobEncryption(source.EncryptionScope, source.CustomerProvidedKeySha256);
+        var content = new BlobSeekableReadStream(
+            (offset, length, destination, token) => read.WriteRangeAsync(encryption, offset, length, destination, token),
+            source.Content.Length, cancellationToken);
+        await using var contentLifetime = content.ConfigureAwait(false);
+        var hashing = new TransactionalChecksumReadStream(content);
+        await using var hashingLifetime = hashing.ConfigureAwait(false);
+        await hashing.CopyToAsync(Stream.Null, 128 * 1024, cancellationToken).ConfigureAwait(false);
+        var checksums = hashing.Complete();
+        var actual = verifyCrc64 ? checksums.Crc64 : checksums.Md5;
+        if (!CryptographicOperations.FixedTimeEquals(expected, actual))
+        {
+            throw new AzureStorageException(StatusCodes.Status400BadRequest,
+                verifyCrc64 ? "Crc64Mismatch" : "Md5Mismatch",
+                "The checksum specified for the source did not match its content.");
+        }
+        // Publication consumes this exact verified manifest. Retire read admission
+        // first: cross-domain copy may need its own read permit. BLL re-pins the
+        // captured content and refuses unavailable chunks before publication.
+        return source;
     }
 
     private static async Task<BlobRecord> CopyBlockBlobFromExternalSourceAsync(
@@ -4416,7 +4469,10 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
 
     private static void Require(StorageRequestContext request, char permission)
     {
-        if (!request.Authorization.Allows(permission))
+        var allowed = request.ResourceKind == StorageResourceKind.Service && request.Authorization.Kind == StorageAuthorizationKind.Bearer
+            ? request.Authorization.AccountWidePermissions.Contains(permission, StringComparison.Ordinal)
+            : request.Authorization.Allows(permission);
+        if (!allowed)
             throw request.Authorization.Kind == StorageAuthorizationKind.Anonymous
                 ? AzureStorageException.AuthenticationFailed()
                 : AzureStorageException.AuthorizationPermissionMismatch();

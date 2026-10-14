@@ -182,13 +182,11 @@ internal static class ProtocolParsing
     {
         using var reader = CreateXmlReader(body);
         var document = await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, cancellationToken).ConfigureAwait(false);
+        var tagSet = ReadTagSet(document);
         var tags = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var tag in document.Descendants().Where(element => string.Equals(element.Name.LocalName, "Tag", StringComparison.Ordinal)))
+        foreach (var tag in tagSet.Elements())
         {
-            var key = ChildValue(tag, "Key");
-            var value = ChildValue(tag, "Value");
-            if (key is null || value is null)
-                throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified XML is not syntactically valid.");
+            var (key, value) = ReadTagPair(tag, tagSet.Name.Namespace);
             ValidateTag(key, value);
             if (!tags.TryAdd(key, value))
                 throw new AzureStorageException(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "Blob tag keys must be unique.");
@@ -197,6 +195,39 @@ internal static class ProtocolParsing
             throw new AzureStorageException(StatusCodes.Status400BadRequest, "TagsTooLarge", "The number of blob tags exceeds the permitted limit.");
         return tags;
     }
+
+    private static XElement ReadTagSet(XDocument document)
+    {
+        if (document.Root is not { } root || !string.Equals(root.Name.LocalName, "Tags", StringComparison.Ordinal))
+            throw InvalidTagsXml();
+        var children = root.Elements().ToArray();
+        if (children.Length != 1 || children[0].Name != root.Name.Namespace + "TagSet")
+            throw InvalidTagsXml();
+        ValidateTagContainerText(root);
+        ValidateTagContainerText(children[0]);
+        return children[0];
+    }
+
+    private static (string Key, string Value) ReadTagPair(XElement tag, XNamespace xmlNamespace)
+    {
+        if (tag.Name != xmlNamespace + "Tag")
+            throw InvalidTagsXml();
+        ValidateTagContainerText(tag);
+        var key = tag.Element(xmlNamespace + "Key");
+        var value = tag.Element(xmlNamespace + "Value");
+        if (tag.Elements().Take(3).Count() != 2 || key is null || value is null || key.HasElements || value.HasElements)
+            throw InvalidTagsXml();
+        return (key.Value, value.Value);
+    }
+
+    private static void ValidateTagContainerText(XElement element)
+    {
+        if (element.Nodes().OfType<XText>().Any(text => !string.IsNullOrWhiteSpace(text.Value)))
+            throw InvalidTagsXml();
+    }
+
+    private static AzureStorageException InvalidTagsXml() =>
+        new(StatusCodes.Status400BadRequest, "InvalidXmlDocument", "The specified blob tags XML structure is invalid.");
 
     public static async Task<IReadOnlyList<BlockListEntry>> ReadBlockListAsync(Stream body, CancellationToken cancellationToken)
     {

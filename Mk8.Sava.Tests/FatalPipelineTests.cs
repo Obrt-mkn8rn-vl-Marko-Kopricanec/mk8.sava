@@ -1,4 +1,3 @@
-using Azure;
 using Azure.Core.Pipeline;
 using Azure.Storage;
 using Azure.Storage.Blobs;
@@ -45,14 +44,14 @@ public sealed class FatalPipelineTests
         using var batch = batchClient.CreateBatch();
         batch.DeleteBlob(container.Name, blob.Name);
 
-        // TestServer's developer exception page renders an unhandled failure as plain text;
-        // a Batch subresponse or AzureExceptionMiddleware would instead return Azure XML.
-        var escaped = await Assert.ThrowsAsync<RequestFailedException>(() =>
+        // The portable host is explicitly Production and has no developer page.
+        // The injected fatal graph must escape both the Batch subresponse and
+        // Azure error translation, reaching this owned TestServer caller intact.
+        var escaped = await Record.ExceptionAsync(() =>
             batchClient.SubmitBatchAsync(batch, throwOnAnyFailure: false));
 
-        Assert.Equal(500, escaped.Status);
-        Assert.Contains("injected batch fatal", escaped.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain("<Error>", escaped.Message, StringComparison.Ordinal);
+        Assert.Same(failure, escaped);
+        Assert.IsType<OutOfMemoryException>(Assert.IsType<InvalidOperationException>(escaped).InnerException);
         Volatile.Write(ref armed, 0);
         Assert.True((await blob.ExistsAsync()).Value);
     }
@@ -77,13 +76,12 @@ public sealed class FatalPipelineTests
         var container = service.GetBlobContainerClient($"analytics-fatal-{Guid.NewGuid():N}");
         sink.Arm();
 
-        // An unhandled fatal is rendered by TestServer, not swallowed by analytics
-        // or converted to an Azure XML error by the storage exception middleware.
-        var escaped = await Assert.ThrowsAsync<RequestFailedException>(() => container.CreateAsync());
+        // Production has no developer exception page. Analytics must retain the
+        // exact fatal outcome after publication, not swallow or translate it.
+        var escaped = await Record.ExceptionAsync(() => container.CreateAsync());
 
-        Assert.Equal(500, escaped.Status);
-        Assert.Contains("injected analytics fatal", escaped.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain("<Error>", escaped.Message, StringComparison.Ordinal);
+        Assert.Same(failure, escaped);
+        Assert.IsType<AccessViolationException>(escaped);
         Assert.True((await container.ExistsAsync()).Value);
     }
 

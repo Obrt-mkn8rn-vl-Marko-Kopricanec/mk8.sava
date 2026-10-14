@@ -499,6 +499,10 @@ internal sealed class BlobQueryPlan
         {
             throw InvalidType("The arithmetic result is outside the supported numeric range.");
         }
+        catch (ArgumentOutOfRangeException)
+        {
+            throw InvalidType("The arithmetic result is outside the supported timestamp range.");
+        }
     }
 
     private static QueryCell Cast(QueryCell value, QueryValueType type)
@@ -512,7 +516,14 @@ internal sealed class BlobQueryPlan
             {
                 QueryValueType.Int when value.Value is long integer => new QueryCell(integer),
                 QueryValueType.Int when value.Value is bool boolean => new QueryCell(boolean ? 1L : 0L),
-                QueryValueType.Int when TryDouble(value, out var number) => new QueryCell(checked((long)Math.Truncate(number))),
+                QueryValueType.Int when value.Value is decimal exact => new QueryCell(checked((long)decimal.Truncate(exact))),
+                QueryValueType.Int when value.Value is string text &&
+                    long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var integer) => new QueryCell(integer),
+                QueryValueType.Int when value.Value is string text &&
+                    decimal.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var exact) =>
+                    new QueryCell(checked((long)decimal.Truncate(exact))),
+                QueryValueType.Int when value.Value is not string && TryDouble(value, out var number) =>
+                    new QueryCell(checked((long)Math.Truncate(number))),
                 QueryValueType.Float when TryDouble(value, out var number) => new QueryCell(number),
                 QueryValueType.String => new QueryCell(value.ToText()),
                 QueryValueType.Timestamp when TryTimestamp(value, out var timestamp) => new QueryCell(timestamp),
@@ -807,6 +818,20 @@ internal sealed class BlobQueryPlan
 
     private static int CompareValues(QueryCell left, QueryCell right)
     {
+        if (left.Value is double leftFloating && right.Value is double rightFloating &&
+            double.IsFinite(leftFloating) && double.IsFinite(rightFloating))
+        {
+            return leftFloating.CompareTo(rightFloating);
+        }
+        if (left.Value is double || right.Value is double)
+        {
+            if (TryComparisonNumber(left, out var leftNumber) && TryComparisonNumber(right, out var rightNumber))
+            {
+                return (leftNumber.Numerator * rightNumber.Denominator)
+                    .CompareTo(rightNumber.Numerator * leftNumber.Denominator);
+            }
+            throw new BlobQueryDataException("InvalidTypeConversion", "Invalid type conversion.", 0);
+        }
         if (TryDecimal(left, out var leftDecimal) && TryDecimal(right, out var rightDecimal))
             return leftDecimal.CompareTo(rightDecimal);
         if (left.Value is long or decimal or double || right.Value is long or decimal or double)
@@ -816,6 +841,67 @@ internal sealed class BlobQueryPlan
         if (left.Value is bool leftBoolean && right.Value is bool rightBoolean)
             return leftBoolean.CompareTo(rightBoolean);
         return string.Compare(left.ToText(), right.ToText(), StringComparison.Ordinal);
+    }
+
+    // Mixed exact/FLOAT comparisons use represented values, not a rounded
+    // decimal cast of FLOAT or a lossy double cast of a 64-bit integer.
+    private readonly record struct ComparisonNumber(BigInteger Numerator, BigInteger Denominator);
+
+    private static bool TryComparisonNumber(QueryCell cell, out ComparisonNumber number)
+    {
+        switch (cell.Value)
+        {
+            case long integer:
+                number = new ComparisonNumber(integer, BigInteger.One);
+                return true;
+            case decimal exact:
+                number = DecimalComparisonNumber(exact);
+                return true;
+            case double floating when double.IsFinite(floating):
+                number = FloatingComparisonNumber(floating);
+                return true;
+            case string text when decimal.TryParse(text, NumberStyles.Number | NumberStyles.AllowExponent,
+                CultureInfo.InvariantCulture, out var exact):
+                number = DecimalComparisonNumber(exact);
+                return true;
+            case string text when double.TryParse(text, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out var floating) && double.IsFinite(floating):
+                number = FloatingComparisonNumber(floating);
+                return true;
+            default:
+                number = default;
+                return false;
+        }
+    }
+
+    private static ComparisonNumber DecimalComparisonNumber(decimal value)
+    {
+        Span<int> words = stackalloc int[4];
+        _ = decimal.GetBits(value, words);
+        var magnitude = ((BigInteger)unchecked((uint)words[2]) << 64) |
+                        ((BigInteger)unchecked((uint)words[1]) << 32) |
+                        unchecked((uint)words[0]);
+        var numerator = (words[3] & int.MinValue) != 0 ? -magnitude : magnitude;
+        var scale = (words[3] >> 16) & 0xFF;
+        return new ComparisonNumber(numerator, BigInteger.Pow(10, scale));
+    }
+
+    private static ComparisonNumber FloatingComparisonNumber(double value)
+    {
+        var bits = BitConverter.DoubleToUInt64Bits(value);
+        var exponent = (int)((bits >> 52) & 0x7FF);
+        var significand = bits & 0x000F_FFFF_FFFF_FFFF;
+        if (exponent != 0)
+            significand |= 1UL << 52;
+        BigInteger numerator = significand;
+        if ((bits & (1UL << 63)) != 0)
+            numerator = -numerator;
+        // Subnormals have no implicit leading bit. Their minimum exponent,
+        // and the largest normal exponent, bound these temporary integers.
+        var shift = exponent == 0 ? -1074 : exponent - 1075;
+        return shift >= 0
+            ? new ComparisonNumber(numerator << shift, BigInteger.One)
+            : new ComparisonNumber(numerator, BigInteger.One << -shift);
     }
 
     private static bool TryGetJsonProperty(
@@ -1028,6 +1114,7 @@ internal sealed class BlobQueryPlan
                 throw DepthCapacityExceeded();
             }
 
+            ValidateRowExpressions(projections, predicate);
             var aggregate = ParseAggregate(ref projections);
             var (splitSize, splitName) = ParseSplit(ref projections, predicate, limit, tablePath);
             return new BlobQueryPlan(
@@ -1038,6 +1125,85 @@ internal sealed class BlobQueryPlan
                 tablePath,
                 splitSize,
                 splitName);
+        }
+
+        private void ValidateRowExpressions(IReadOnlyList<QueryProjection> projections, QueryPredicate? predicate)
+        {
+            foreach (var projection in projections)
+            {
+                if (projection.Expression is QueryAggregateExpression aggregate)
+                    ValidateScalarExpression(aggregate.Operand);
+                else if (projection.Expression is not QuerySplitExpression)
+                    ValidateScalarExpression(projection.Expression);
+            }
+            ValidateScalarPredicate(predicate);
+        }
+
+        private void ValidateScalarExpression(QueryExpression? expression)
+        {
+            switch (expression)
+            {
+                case null or QueryOperand:
+                    return;
+                case QueryBinaryExpression binary:
+                    ValidateScalarExpression(binary.Left);
+                    ValidateScalarExpression(binary.Right);
+                    return;
+                case QueryUnaryExpression unary:
+                    ValidateScalarExpression(unary.Operand);
+                    return;
+                case QueryCastExpression cast:
+                    ValidateScalarExpression(cast.Operand);
+                    return;
+                case QueryFunctionExpression function:
+                    foreach (var argument in function.Arguments)
+                        ValidateScalarExpression(argument);
+                    return;
+                default:
+                    throw InvalidQuery(Current.Position,
+                        "Aggregate and Sys.Split expressions cannot be nested in scalar expressions or predicates.");
+            }
+        }
+
+        private void ValidateScalarPredicate(QueryPredicate? predicate)
+        {
+            switch (predicate)
+            {
+                case null:
+                    return;
+                case LogicalPredicate logical:
+                    ValidateScalarPredicate(logical.Left);
+                    ValidateScalarPredicate(logical.Right);
+                    return;
+                case NotPredicate not:
+                    ValidateScalarPredicate(not.Inner);
+                    return;
+                case NullPredicate nullable:
+                    ValidateScalarExpression(nullable.Operand);
+                    return;
+                case MissingPredicate missing:
+                    ValidateScalarExpression(missing.Operand);
+                    return;
+                case TruthPredicate truth:
+                    ValidateScalarExpression(truth.Operand);
+                    return;
+                case ComparisonPredicate comparison:
+                    ValidateScalarExpression(comparison.Left);
+                    ValidateScalarExpression(comparison.Right);
+                    return;
+                case BetweenPredicate between:
+                    ValidateScalarExpression(between.Value);
+                    ValidateScalarExpression(between.Lower);
+                    ValidateScalarExpression(between.Upper);
+                    return;
+                case InPredicate membership:
+                    ValidateScalarExpression(membership.Value);
+                    foreach (var candidate in membership.Candidates)
+                        ValidateScalarExpression(candidate);
+                    return;
+                default:
+                    throw InvalidQuery(Current.Position, "The predicate contains an unsupported expression shape.");
+            }
         }
 
         private QueryAggregateState? ParseAggregate(ref List<QueryProjection> projections)
@@ -1320,11 +1486,11 @@ internal sealed class BlobQueryPlan
 
         private QueryExpression ParseIdentifier(QueryToken token)
         {
-            if (string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
+            if (!token.Quoted && string.Equals(token.Text, "NULL", StringComparison.OrdinalIgnoreCase))
                 return new QueryOperand(null, new QueryCell(null));
-            if (string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
+            if (!token.Quoted && string.Equals(token.Text, "TRUE", StringComparison.OrdinalIgnoreCase))
                 return new QueryOperand(null, new QueryCell(true));
-            if (string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
+            if (!token.Quoted && string.Equals(token.Text, "FALSE", StringComparison.OrdinalIgnoreCase))
                 return new QueryOperand(null, new QueryCell(false));
             if (!token.Quoted &&
                 string.Equals(token.Text, "sys", StringComparison.OrdinalIgnoreCase) &&

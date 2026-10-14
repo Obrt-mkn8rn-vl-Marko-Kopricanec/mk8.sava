@@ -66,6 +66,9 @@ public sealed class GatewayReadSessionTests
         var actual = await Record.ExceptionAsync(() => read.DisposeAsync().AsTask()).ConfigureAwait(true);
 
         Assert.Same(failure, actual);
+        var repeated = await Record.ExceptionAsync(() => read.DisposeAsync().AsTask()).ConfigureAwait(true);
+        Assert.Same(failure, repeated);
+        fixture.VerifiedDisposalFailure = failure;
         Assert.Equal(1, fixture.Sessions.Closes);
         Assert.Empty(fixture.Logger.Messages);
     }
@@ -109,6 +112,7 @@ public sealed class GatewayReadSessionTests
         internal SessionProbe Sessions { get; }
         internal LifetimeProbe Lifetime { get; } = new();
         internal ProbeLogger Logger { get; } = new();
+        internal Exception? VerifiedDisposalFailure { get; set; }
 
         internal RenewalFixture(Exception? failure = null, bool hangTouch = false)
         {
@@ -127,10 +131,31 @@ public sealed class GatewayReadSessionTests
 
         public async ValueTask DisposeAsync()
         {
-            if (_read is not null)
-                await _read.DisposeAsync().ConfigureAwait(false);
-            await _provider.DisposeAsync().ConfigureAwait(false);
-            Lifetime.Dispose();
+            try
+            {
+                if (_read is not null)
+                {
+                    try
+                    {
+                        await _read.DisposeAsync().ConfigureAwait(false);
+                    }
+                    catch (Exception failure) when (ReferenceEquals(failure, VerifiedDisposalFailure))
+                    {
+                        // The fatal control already checked this exact repeated outcome.
+                    }
+                }
+            }
+            finally
+            {
+                try
+                {
+                    await _provider.DisposeAsync().ConfigureAwait(false);
+                }
+                finally
+                {
+                    Lifetime.Dispose();
+                }
+            }
         }
     }
 

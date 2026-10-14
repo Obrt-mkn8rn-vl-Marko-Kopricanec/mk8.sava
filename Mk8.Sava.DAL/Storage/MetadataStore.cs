@@ -1793,6 +1793,7 @@ public sealed partial class MetadataStore(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
+        string expectedContainerRevision,
         bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
@@ -1801,6 +1802,7 @@ public sealed partial class MetadataStore(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
+            expectedContainerRevision,
             stagedBlockSnapshot: null,
             hierarchicalNamespace,
             cancellationToken);
@@ -1811,6 +1813,7 @@ public sealed partial class MetadataStore(
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
         IReadOnlyList<StagedBlockRecord> stagedBlockSnapshot,
+        string expectedContainerRevision,
         bool hierarchicalNamespace,
         CancellationToken cancellationToken)
     {
@@ -1820,6 +1823,7 @@ public sealed partial class MetadataStore(
             proposed,
             expectedCurrentGeneration,
             expectedCurrentRevision,
+            expectedContainerRevision,
             stagedBlockSnapshot,
             hierarchicalNamespace,
             cancellationToken);
@@ -1829,6 +1833,7 @@ public sealed partial class MetadataStore(
         BlobRecord proposed,
         string? expectedCurrentGeneration,
         string? expectedCurrentRevision,
+        string expectedContainerRevision,
         IReadOnlyList<StagedBlockRecord>? stagedBlockSnapshot,
         bool hierarchicalNamespace,
         CancellationToken cancellationToken)
@@ -1840,6 +1845,8 @@ public sealed partial class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
+            await EnsureContainerWriteAdmissionAsync(connection, transaction, proposed.Account, proposed.Container,
+                expectedContainerRevision, cancellationToken).ConfigureAwait(false);
             var (current, prepared) = await PrepareBlobPublicationAsync(
                 connection, transaction, proposed, expectedCurrentGeneration,
                 expectedCurrentRevision, stagedBlockSnapshot, hierarchicalNamespace,
@@ -1881,6 +1888,18 @@ public sealed partial class MetadataStore(
         {
             _writeGate.Release();
         }
+    }
+
+    private static async Task EnsureContainerWriteAdmissionAsync(SqliteConnection connection, SqliteTransaction transaction,
+        string account, string container, string expectedRevision, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(expectedRevision);
+        var current = await GetContainerAsync(connection, transaction, account, container,
+            includeDeleted: false, cancellationToken).ConfigureAwait(false);
+        // A revision is a conservative fence: policy changes also invalidate the
+        // captured admission, rather than permitting publication against stale policy.
+        if (current is null || !string.Equals(current.Revision, expectedRevision, StringComparison.Ordinal))
+            throw new StorageConcurrencyException("The admitted parent container changed before publication.");
     }
 
     private static async Task<(BlobRecord? Current, BlobRecord Proposed)> PrepareBlobPublicationAsync(
@@ -2117,6 +2136,7 @@ public sealed partial class MetadataStore(
         BlobRecord proposedDestination,
         ObjectReplicationState proposedState,
         string statusKey,
+        string expectedContainerRevision,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -2126,6 +2146,8 @@ public sealed partial class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
+            await EnsureContainerWriteAdmissionAsync(connection, transaction, proposedDestination.Account,
+                proposedDestination.Container, expectedContainerRevision, cancellationToken).ConfigureAwait(false);
             var (source, mapped, current) = await LoadObjectReplicationContextAsync(
                 connection, transaction, expectedSource, proposedDestination,
                 proposedState, cancellationToken).ConfigureAwait(false);
@@ -2345,6 +2367,8 @@ public sealed partial class MetadataStore(
             await using var transactionDisposal = transaction.ConfigureAwait(false);
             var currentRecords = await ReadCurrentMutationRecordsAsync(
                 connection, transaction, mutations, cancellationToken).ConfigureAwait(false);
+            await EnsureDirectoriesEmptyBeforeRemovalAsync(
+                connection, transaction, mutations, currentRecords, cancellationToken).ConfigureAwait(false);
 
             foreach (var mutation in mutations)
             {
@@ -2398,6 +2422,31 @@ public sealed partial class MetadataStore(
                                       StringComparison.Ordinal)))
         {
             throw new ArgumentException("Blob record mutations must target unique, stable generation identities.", nameof(mutations));
+        }
+    }
+
+    private static async Task EnsureDirectoriesEmptyBeforeRemovalAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        IReadOnlyList<BlobRecordMutation> mutations,
+        IReadOnlyList<BlobRecord> currentRecords,
+        CancellationToken cancellationToken)
+    {
+        // Revisions alone do not fence a directory: publishing a child can reuse
+        // its existing parent without updating the parent's revision.
+        for (var index = 0; index < mutations.Count; index++)
+        {
+            var current = currentRecords[index];
+            if (current is not { IsDirectory: true, IsCurrent: true, IsDeleted: false } ||
+                mutations[index].Replacement is { IsCurrent: true, IsDeleted: false })
+            {
+                continue;
+            }
+            if (await HasActiveBlobDescendantsAsync(connection, transaction, current.Account, current.Container,
+                    current.Name, cancellationToken).ConfigureAwait(false))
+            {
+                throw new StorageDirectoryNotEmptyException();
+            }
         }
     }
 
@@ -2519,8 +2568,21 @@ public sealed partial class MetadataStore(
     {
         var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
         await using var connectionDisposal = connection.ConfigureAwait(false);
+        return await HasActiveBlobDescendantsAsync(connection, transaction: null, account, container,
+            directoryName, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<bool> HasActiveBlobDescendantsAsync(
+        SqliteConnection connection,
+        SqliteTransaction? transaction,
+        string account,
+        string container,
+        string directoryName,
+        CancellationToken cancellationToken)
+    {
         var command = connection.CreateCommand();
         await using var commandDisposal = command.ConfigureAwait(false);
+        command.Transaction = transaction;
         command.CommandText = """
             SELECT 1 FROM blobs
             WHERE account = $account
@@ -2722,7 +2784,8 @@ public sealed partial class MetadataStore(
         }
     }
 
-    public async Task PutStagedBlockAsync(StagedBlockRecord block, CancellationToken cancellationToken)
+    public async Task PutStagedBlockAsync(StagedBlockRecord block, string expectedContainerRevision,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(block);
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -2732,6 +2795,8 @@ public sealed partial class MetadataStore(
             await using var connectionDisposal = connection.ConfigureAwait(false);
             var transaction = ((SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false));
             await using var transactionDisposal = transaction.ConfigureAwait(false);
+            await EnsureContainerWriteAdmissionAsync(connection, transaction, block.Account, block.Container,
+                expectedContainerRevision, cancellationToken).ConfigureAwait(false);
             var command = connection.CreateCommand();
             await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;
@@ -3103,49 +3168,77 @@ public sealed partial class MetadataStore(
 
     internal async Task<MetadataBackupSnapshot> CreateBackupSnapshotAsync(
         string destinationDatabasePath,
-        Func<IReadOnlySet<string>, IDisposable> acquireContentPins,
+        Func<IReadOnlySet<string>, ChunkPinAttempt> tryAcquireContentPins,
         CancellationToken cancellationToken)
     {
-        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        IDisposable? pins = null;
-        try
+        ArgumentNullException.ThrowIfNull(tryAcquireContentPins);
+        while (true)
         {
-            var source = (await OpenAsync(cancellationToken).ConfigureAwait(false));
-            await using var sourceDisposal = source.ConfigureAwait(false);
-            var inventory = await ReadVerifiedStorageInventoryAsync(source, cancellationToken).ConfigureAwait(false);
-            pins = acquireContentPins(inventory.ReachableChunkIds);
-            var destinationConnectionString = new SqliteConnectionStringBuilder
+            Task pendingMutation;
+            await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            IDisposable? pins = null;
+            try
             {
-                DataSource = destinationDatabasePath,
-                Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Private,
-                Pooling = false
-            }.ToString();
-            var destination = new SqliteConnection(destinationConnectionString);
-            await using (destination.ConfigureAwait(false))
-            {
-                await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
-                cancellationToken.ThrowIfCancellationRequested();
-                source.BackupDatabase(destination);
-                cancellationToken.ThrowIfCancellationRequested();
-                var journalMode = destination.CreateCommand();
-                await using var journalModeDisposal = journalMode.ConfigureAwait(false);
-                journalMode.CommandText = "PRAGMA journal_mode=DELETE;";
-                var selectedMode = Convert.ToString(
-                    await journalMode.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
-                    CultureInfo.InvariantCulture);
-                if (!string.Equals(selectedMode, "delete", StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidDataException("The metadata backup could not be normalized to a standalone database file.");
+                var source = await OpenAsync(cancellationToken).ConfigureAwait(false);
+                await using var sourceDisposal = source.ConfigureAwait(false);
+                var inventory = await ReadVerifiedStorageInventoryAsync(source, cancellationToken).ConfigureAwait(false);
+                var attempt = tryAcquireContentPins(inventory.ReachableChunkIds);
+                pins = attempt.Pins;
+                if ((pins is null) == (attempt.PendingMutation is null))
+                    throw new InvalidOperationException("A content pin attempt must supply either pins or a pending mutation.");
+                if (pins is not null)
+                {
+                    await CreateStandaloneBackupFileAsync(source, destinationDatabasePath, cancellationToken).ConfigureAwait(false);
+                    var snapshot = new MetadataBackupSnapshot(inventory, pins);
+                    pins = null;
+                    return snapshot;
+                }
+                pendingMutation = attempt.PendingMutation
+                    ?? throw new InvalidOperationException("A declined pin attempt did not name its pending mutation.");
             }
-            var snapshot = new MetadataBackupSnapshot(inventory, pins);
-            pins = null;
-            return snapshot;
+            finally
+            {
+                try
+                {
+                    pins?.Dispose();
+                }
+                finally
+                {
+                    _writeGate.Release();
+                }
+            }
+
+            // Compaction can need this same metadata gate before releasing its
+            // reservation. Wait outside the gate, then re-read authoritative
+            // reachability and re-attempt pins under the gate, never a stale list.
+            await pendingMutation.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-        finally
+    }
+
+    private static async Task CreateStandaloneBackupFileAsync(
+        SqliteConnection source, string destinationDatabasePath, CancellationToken cancellationToken)
+    {
+        var destinationConnectionString = new SqliteConnectionStringBuilder
         {
-            pins?.Dispose();
-            _writeGate.Release();
-        }
+            DataSource = destinationDatabasePath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Private,
+            Pooling = false,
+        }.ToString();
+        var destination = new SqliteConnection(destinationConnectionString);
+        await using var destinationDisposal = destination.ConfigureAwait(false);
+        await destination.OpenAsync(cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        source.BackupDatabase(destination);
+        cancellationToken.ThrowIfCancellationRequested();
+        var journalMode = destination.CreateCommand();
+        await using var journalModeDisposal = journalMode.ConfigureAwait(false);
+        journalMode.CommandText = "PRAGMA journal_mode=DELETE;";
+        var selectedMode = Convert.ToString(
+            await journalMode.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false),
+            CultureInfo.InvariantCulture);
+        if (!string.Equals(selectedMode, "delete", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("The metadata backup could not be normalized to a standalone database file.");
     }
 
     internal static async Task<MetadataDatabaseInspection> InspectDatabaseAsync(

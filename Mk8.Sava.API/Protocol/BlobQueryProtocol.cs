@@ -896,6 +896,14 @@ internal static class BlobQueryProtocol
                 continue;
             }
 
+            if (headers is not null && fields.Count != headers.Length)
+            {
+                throw new BlobQueryDataException("ParseError",
+                    string.Create(CultureInfo.InvariantCulture,
+                        $"Delimited input row {rowNumber} has {fields.Count} fields; its header has {headers.Length}."),
+                    record.Position);
+            }
+
             var names = headers is null
                 ? Enumerable.Range(1, fields.Count).Select(index => $"_{index}").ToArray()
                 : headers;
@@ -1106,7 +1114,7 @@ internal static class BlobQueryProtocol
                 throw new BlobQueryDataException("UnclosedQuote", "A delimited query input field contains an unclosed quote.", 0);
             if (_escapePending)
                 _field.Append(format.Escape);
-            if (_field.Length == 0 && _fields.Count == 0)
+            if (_recordCharacters == 0)
                 return null;
             _fields.Add(_field.ToString());
             return new DelimitedRecord(_fields.ToArray(), _recordPosition);
@@ -1181,13 +1189,8 @@ internal static class BlobQueryProtocol
             builder.Append(format.Quote);
             foreach (var character in value)
             {
-                if (character == format.Quote)
-                {
-                    if (format.Escape == format.Quote)
-                        builder.Append(format.Quote);
-                    else
-                        builder.Append(format.Escape);
-                }
+                if (character == format.Quote || character == format.Escape)
+                    builder.Append(format.Escape);
                 builder.Append(character);
             }
             builder.Append(format.Quote);

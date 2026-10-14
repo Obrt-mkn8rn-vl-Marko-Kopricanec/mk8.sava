@@ -40,7 +40,7 @@ public sealed class StorageBackupService(
             var metadataPath = Path.Combine(temporary, MetadataFileName);
             using var snapshot = await metadata.CreateBackupSnapshotAsync(
                 metadataPath,
-                chunks.PinChunkIds,
+                chunks.TryPinChunkIdsForBackup,
                 cancellationToken).ConfigureAwait(false);
             await MetadataStore.NormalizePackedLocationsForStandaloneBackupAsync(
                 metadataPath,

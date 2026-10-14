@@ -696,7 +696,8 @@ public sealed class BlobService(
         ArgumentNullException.ThrowIfNull(options);
         ValidateBlobName(name);
         ValidateEncryptionContext(account, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         var encryption = EncryptionOf(options);
         using var content = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
         if (options.GenerateContentMd5 && options.Http.ContentMd5 is null)
@@ -715,6 +716,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -732,7 +734,8 @@ public sealed class BlobService(
         ArgumentNullException.ThrowIfNull(options);
         ValidateBlobName(name);
         ValidateEncryptionContext(account, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.AppendBlob, chunks.Empty(account, EncryptionOf(options)), options, now) with
         {
@@ -742,6 +745,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -769,7 +773,8 @@ public sealed class BlobService(
             throw AzureStorageException.InvalidHeader("x-ms-blob-content-length", length.ToString(CultureInfo.InvariantCulture));
         if (sequenceNumber < 0)
             throw AzureStorageException.InvalidHeader("x-ms-blob-sequence-number", sequenceNumber.ToString(CultureInfo.InvariantCulture));
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         var now = metadata.GetUtcNow();
         var proposed = NewBlob(account, container, name, BlobKind.PageBlob, chunks.Sparse(account, EncryptionOf(options), length), options, now) with
         {
@@ -780,6 +785,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -826,7 +832,7 @@ public sealed class BlobService(
             BlockId = blockId,
             Content = content.Manifest,
             CreatedAt = metadata.GetUtcNow()
-        }, cancellationToken).ConfigureAwait(false);
+        }, containerRecord.Revision, cancellationToken).ConfigureAwait(false);
         if (current is not null)
         {
             var written = PrepareBlobWrite(current);
@@ -865,12 +871,13 @@ public sealed class BlobService(
 
         ValidateEncryptionContext(account, options);
         var current = await metadata.GetBlobAsync(account, container, name, null, null, includeDeleted: false, cancellationToken).ConfigureAwait(false);
-        options = await ApplyContainerEncryptionPolicyAsync(
+        var admission = await ApplyContainerEncryptionPolicyAsync(
             account,
             container,
             options,
             cancellationToken,
             current).ConfigureAwait(false);
+        options = admission.Options;
         var staged = await metadata.ListStagedBlocksAsync(account, container, name, cancellationToken).ConfigureAwait(false);
         var encryption = EncryptionOf(options);
         var selected = SelectBlockListEntries(account, encryption, blockList, staged, current);
@@ -888,6 +895,7 @@ public sealed class BlobService(
             expectedGeneration,
             expectedRevision,
             staged,
+            admission.Revision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -1189,6 +1197,8 @@ public sealed class BlobService(
         EnsureNoPendingCopy(current);
         EnsureBlobMutable(current);
         current = PrepareBlobWrite(current);
+        var parent = await GetContainerAsync(current.Account, current.Container,
+            includeDeleted: false, cancellationToken).ConfigureAwait(false);
         var updated = current with
         {
             Metadata = userMetadata,
@@ -1208,6 +1218,7 @@ public sealed class BlobService(
                 },
                 current.GenerationId,
                 current.Revision,
+                parent.Revision,
                 hierarchicalNamespace: false,
                 cancellationToken).ConfigureAwait(false);
         }
@@ -1839,7 +1850,8 @@ public sealed class BlobService(
         ArgumentNullException.ThrowIfNull(options);
         var sourceIsArchived = string.Equals(source.AccessTier, "Archive", StringComparison.Ordinal);
         ValidateCopyRehydrationOptions(source.Kind, sourceIsArchived, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1863,6 +1875,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -1890,7 +1903,8 @@ public sealed class BlobService(
                 "InvalidSourceBlobType",
                 "The source blob type is invalid for this operation.");
         }
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1908,6 +1922,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -1925,7 +1940,8 @@ public sealed class BlobService(
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(source);
         EnsureBlobKindSupported(account, source.Kind);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         using var prepared = await PrepareCopyContentAsync(
             account,
             source,
@@ -1948,6 +1964,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -1971,7 +1988,8 @@ public sealed class BlobService(
 #pragma warning restore CA1054
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(sourceBlocks);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         using var content = await StoreRemoteBlockBlobAsync(
             account,
             source,
@@ -1990,6 +2008,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -2004,6 +2023,7 @@ public sealed class BlobService(
         LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
+        string expectedContainerRevision,
         CancellationToken cancellationToken)
     {
         ValidateBlobName(name);
@@ -2026,6 +2046,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            expectedContainerRevision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -2176,14 +2197,15 @@ public sealed class BlobService(
     {
         EnsureFlatNamespace(account);
         ValidateBlobName(name);
-        options = await ApplyContainerEncryptionPolicyAsync(
+        var admission = await ApplyContainerEncryptionPolicyAsync(
             account,
             container,
             options,
             cancellationToken,
             current).ConfigureAwait(false);
         var (preparedCurrent, encryption) =
-            PrepareIncrementalCopyDestination(source, current, options);
+            PrepareIncrementalCopyDestination(source, current, admission.Options);
+        options = admission.Options;
         current = preparedCurrent;
         using var prepared = await prepareContent(encryption, cancellationToken).ConfigureAwait(false);
         var now = metadata.GetUtcNow();
@@ -2196,6 +2218,7 @@ public sealed class BlobService(
                 pending,
                 null,
                 null,
+                admission.Revision,
                 IsHierarchicalNamespaceEnabled(account),
                 cancellationToken).ConfigureAwait(false);
         await metadata.PutBlobRecordAsync(pending, current.Revision, cancellationToken).ConfigureAwait(false);
@@ -2339,7 +2362,8 @@ public sealed class BlobService(
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(sourceBlocks);
         ValidateCopyRehydrationOptions(sourceKind, sourceIsArchived, options);
-        options = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        var admission = await ApplyContainerEncryptionPolicyAsync(account, container, options, cancellationToken).ConfigureAwait(false);
+        options = admission.Options;
         var encryption = EncryptionOf(options);
         if (sourceKind == BlobKind.BlockBlob)
         {
@@ -2367,6 +2391,7 @@ public sealed class BlobService(
                 destinationLease,
                 expectedGeneration,
                 expectedRevision,
+                admission.Revision,
                 cancellationToken).ConfigureAwait(false);
         }
         using var stored = await chunks.StorePinnedAsync(account, encryption, source, cancellationToken).ConfigureAwait(false);
@@ -2389,6 +2414,7 @@ public sealed class BlobService(
             destinationLease,
             expectedGeneration,
             expectedRevision,
+            admission.Revision,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -2409,6 +2435,7 @@ public sealed class BlobService(
         LeaseRecord destinationLease,
         string? expectedGeneration,
         string? expectedRevision,
+        string expectedContainerRevision,
         CancellationToken cancellationToken)
     {
         EnsureBlobKindSupported(account, sourceKind);
@@ -2461,6 +2488,7 @@ public sealed class BlobService(
             proposed,
             expectedGeneration,
             expectedRevision,
+            expectedContainerRevision,
             IsHierarchicalNamespaceEnabled(account),
             cancellationToken).ConfigureAwait(false);
     }
@@ -3292,7 +3320,7 @@ public sealed class BlobService(
             throw AzureStorageException.BlobOperationNotSupported();
         }
 
-        var options = await ApplyContainerEncryptionPolicyAsync(
+        var admission = await ApplyContainerEncryptionPolicyAsync(
             policy.DestinationAccount,
             rule.DestinationContainer,
             new BlobWriteOptions(
@@ -3303,17 +3331,18 @@ public sealed class BlobService(
                     : new Dictionary<string, string>(StringComparer.Ordinal)),
             cancellationToken).ConfigureAwait(false);
         using var prepared = await PrepareCopyContentAsync(
-            policy.DestinationAccount, source, EncryptionOf(options),
+            policy.DestinationAccount, source, EncryptionOf(admission.Options),
             preserveCommittedBlocks: true, cancellationToken).ConfigureAwait(false);
         var proposedDestination = NewBlob(
             policy.DestinationAccount, rule.DestinationContainer, source.Name,
-            BlobKind.BlockBlob, prepared.Content, options, now) with
+            BlobKind.BlockBlob, prepared.Content, admission.Options, now) with
         {
             CommittedBlocks = prepared.CommittedBlocks.ToList(),
             ObjectReplicationDestinationPolicyId = policy.PolicyId
         };
         _ = await metadata.ApplyObjectReplicationAsync(
             source, proposedDestination, proposedState, statusKey,
+            admission.Revision,
             cancellationToken).ConfigureAwait(false);
     }
 
@@ -3837,7 +3866,9 @@ public sealed class BlobService(
         }
     }
 
-    private async Task<BlobWriteOptions> ApplyContainerEncryptionPolicyAsync(
+    private sealed record ContainerWriteAdmission(BlobWriteOptions Options, string Revision);
+
+    private async Task<ContainerWriteAdmission> ApplyContainerEncryptionPolicyAsync(
         string account,
         string container,
         BlobWriteOptions options,
@@ -3848,12 +3879,12 @@ public sealed class BlobService(
         if (options.ImmutabilityUntil.HasValue || options.ImmutabilityLocked || options.HasLegalHold)
             EnsureVersionLevelImmutabilityEnabled(containerRecord);
         var resolved = ApplyContainerEncryptionPolicy(containerRecord, EncryptionOf(options), current);
-        return options with
+        return new ContainerWriteAdmission(options with
         {
             EncryptionScope = resolved.Scope,
             CustomerProvidedKeySha256 = resolved.CustomerProvidedKeySha256,
             CustomerProvidedKey = resolved.CustomerProvidedKey
-        };
+        }, containerRecord.Revision);
     }
 
     private static BlobEncryption ApplyContainerEncryptionPolicy(
