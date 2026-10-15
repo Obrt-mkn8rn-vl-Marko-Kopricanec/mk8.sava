@@ -22,6 +22,8 @@ public static class StorageExceptionMapper
             StorageBlobTypeMismatchException mismatch => new AzureStorageException(409, "InvalidBlobType", mismatch.Message),
             StoragePathConflictException => AzureStorageException.PathAlreadyExists(),
             StorageDirectoryNotEmptyException => AzureStorageException.DirectoryIsNotEmpty(),
+            StorageBlockAdmissionException block => new AzureStorageException(block.CapacityExceeded ? 409 : 400,
+                block.CapacityExceeded ? "BlockCountExceedsLimit" : "InvalidBlobOrBlock", block.Message),
             XmlException => new AzureStorageException(400, "InvalidXmlDocument", "The specified XML is not syntactically valid."),
             _ => new AzureStorageException(500, "InternalError", "The server encountered an internal error. Please retry the request."),
         };
@@ -32,6 +34,6 @@ public static class StorageExceptionMapper
         ArgumentNullException.ThrowIfNull(exception);
         return exception is AzureStorageException or RequestBodyTooLargeException or StorageConcurrencyException or
             StorageImmutabilityException or StoragePendingCopyException or StorageBlobTypeMismatchException or
-            StoragePathConflictException or StorageDirectoryNotEmptyException or XmlException;
+            StoragePathConflictException or StorageDirectoryNotEmptyException or StorageBlockAdmissionException or XmlException;
     }
 }

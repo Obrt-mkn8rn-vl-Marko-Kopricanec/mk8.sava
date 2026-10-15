@@ -1175,7 +1175,7 @@ public sealed class BlobService(
             readLease, blob.Content, encryption, offset, length, destination, cancellationToken).ConfigureAwait(false);
     }
 
-    private static void EnsureReadableContent(BlobRecord blob)
+    internal static void EnsureReadableContent(BlobRecord blob)
     {
         ArgumentNullException.ThrowIfNull(blob);
         EnsureNoPendingCopy(blob);

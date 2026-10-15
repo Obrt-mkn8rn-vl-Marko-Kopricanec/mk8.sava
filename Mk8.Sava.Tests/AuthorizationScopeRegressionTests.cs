@@ -10,6 +10,8 @@ using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Sas;
 using Microsoft.IdentityModel.Tokens;
+using Microsoft.Extensions.DependencyInjection;
+using Mk8.Sava.Storage;
 
 namespace Mk8.Sava.Tests;
 
@@ -20,6 +22,86 @@ public sealed class AuthorizationScopeRegressionTests
     private const string Subject = SavaWebApplicationFactory.DelegatorObjectId;
     private const string Issuer = "https://issuer.example.test";
     private const string Audience = "https://storage.azure.com/";
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task DeletedContainerRestoreRequiresBothSourceAndDestinationAuthority(bool grantSource, bool grantDestination)
+    {
+        const string sourceName = "private-restore-source";
+        const string destinationName = "allowed-restore-target";
+        var factory = CreateRestoreFactory(sourceName, destinationName, grantSource, grantDestination);
+        await using var lifetime = factory.ConfigureAwait(false);
+        using var sdkTransport = new HttpClientTransport(factory.Server.CreateHandler());
+        var owner = CreateOwner(sdkTransport);
+        var metadata = factory.Services.GetRequiredService<MetadataStore>();
+        var properties = await metadata.GetServicePropertiesAsync(SavaWebApplicationFactory.AccountName,
+            CancellationToken.None).ConfigureAwait(true);
+        await metadata.PutServicePropertiesAsync(SavaWebApplicationFactory.AccountName, properties with
+        {
+            ContainerSoftDeleteEnabled = true,
+            ContainerSoftDeleteRetentionDays = 7,
+        }, CancellationToken.None).ConfigureAwait(true);
+        var blob = await SeedBlobAsync(owner, sourceName).ConfigureAwait(true);
+        await owner.GetBlobContainerClient(sourceName).DeleteAsync().ConfigureAwait(true);
+        var deleted = Assert.IsType<ContainerRecord>(await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName,
+            sourceName, includeDeleted: true, CancellationToken.None).ConfigureAwait(true));
+        Assert.NotNull(deleted.DeletedVersion);
+        using var client = new HttpClient(factory.Server.CreateHandler());
+        using var request = new HttpRequestMessage(HttpMethod.Put,
+            new Uri(owner.Uri + "/" + destinationName + "?restype=container&comp=undelete"))
+        {
+            Content = new ByteArrayContent([]),
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", CreateToken());
+        request.Headers.TryAddWithoutValidation("x-ms-version", "2023-11-03");
+        request.Headers.TryAddWithoutValidation("x-ms-deleted-container-name", sourceName);
+        request.Headers.TryAddWithoutValidation("x-ms-deleted-container-version", deleted.DeletedVersion);
+        using var response = await client.SendAsync(request).ConfigureAwait(true);
+        var allowed = grantSource && grantDestination;
+        Assert.Equal(allowed ? HttpStatusCode.Created : HttpStatusCode.Forbidden, response.StatusCode);
+        if (!allowed)
+        {
+            Assert.Equal(grantDestination ? "AuthorizationPermissionMismatch" : "AuthorizationFailure",
+                Assert.Single(response.Headers.GetValues("x-ms-error-code")));
+            var remaining = await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName,
+                sourceName, includeDeleted: true, CancellationToken.None).ConfigureAwait(true);
+            Assert.Equal(System.Text.Json.JsonSerializer.Serialize(deleted), System.Text.Json.JsonSerializer.Serialize(remaining));
+            Assert.False((await owner.GetBlobContainerClient(destinationName).ExistsAsync().ConfigureAwait(true)).Value);
+            // The refusal must not consume the deleted source/version or alter its content.
+            await owner.UndeleteBlobContainerAsync(sourceName, deleted.DeletedVersion).ConfigureAwait(true);
+            Assert.Equal(Payload, (await blob.DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+        }
+        else
+        {
+            Assert.Null(await metadata.GetContainerAsync(SavaWebApplicationFactory.AccountName,
+                sourceName, includeDeleted: true, CancellationToken.None).ConfigureAwait(true));
+            Assert.Equal(Payload, (await owner.GetBlobContainerClient(destinationName).GetBlobClient(blob.Name)
+                .DownloadContentAsync().ConfigureAwait(true)).Value.Content.ToString());
+        }
+    }
+
+    private static SavaWebApplicationFactory CreateRestoreFactory(string sourceName, string destinationName,
+        bool grantSource, bool grantDestination)
+    {
+        var settings = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["Sava:BearerAuthentication:ValidIssuers:0"] = Issuer,
+            ["Sava:BearerAuthentication:ValidAudiences:0"] = Audience,
+            [$"Sava:BearerAuthentication:Principals:{Subject}:Permissions"] = "rw",
+            [$"Sava:BearerAuthentication:Principals:{Subject}:Containers:0"] = "unrelated-container",
+        };
+        if (grantSource)
+            settings[$"Sava:BearerAuthentication:Principals:{Subject}:Containers:1"] = sourceName;
+        if (grantDestination)
+        {
+            var index = grantSource ? "2" : "1";
+            settings[$"Sava:BearerAuthentication:Principals:{Subject}:Containers:{index}"] = destinationName;
+        }
+        return new SavaWebApplicationFactory(TimeProvider.System, settings, disableMaintenance: true);
+    }
 
     [Theory]
     [InlineData(false)]

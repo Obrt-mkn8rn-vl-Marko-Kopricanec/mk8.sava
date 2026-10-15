@@ -78,14 +78,17 @@ public sealed partial class MetadataStore
         var command = connection.CreateCommand();
         await using var commandDisposal = command.ConfigureAwait(false);
         command.Transaction = transaction;
-        // Closed enum selects only built-in SQL; all three names are bound parameters.
+        // Closed enum selects built-in SQL; names and the new revision are bound.
+        // Moving every blob also invalidates captured generation mutations in
+        // this transaction, including stale replacements and deletions. Retain
+        // generation identities so chunk references and historical data survive.
 #pragma warning disable CA2100
         command.CommandText = step switch
         {
             ContainerRelocationStep.MoveBlobs => """
                 UPDATE blobs
                 SET container = $destination,
-                    data = json_set(data, '$.container', $destination)
+                    data = json_set(data, '$.container', $destination, '$.revision', $revision)
                 WHERE account = $account AND container = $container;
                 """,
             ContainerRelocationStep.CloneStagedBlocks => """
@@ -116,6 +119,8 @@ public sealed partial class MetadataStore
 #pragma warning restore CA2100
         command.Parameters.AddWithValue("$account", account);
         command.Parameters.AddWithValue("$container", sourceName);
+        if (step == ContainerRelocationStep.MoveBlobs)
+            command.Parameters.AddWithValue("$revision", NewRevision());
         if (step is ContainerRelocationStep.MoveBlobs or ContainerRelocationStep.CloneStagedBlocks or
             ContainerRelocationStep.CloneStagedBlockReferences)
         {

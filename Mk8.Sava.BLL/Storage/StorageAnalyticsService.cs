@@ -38,51 +38,21 @@ public sealed class StorageAnalyticsService(
 
         var completedAt = request.CompletedAt.ToUniversalTime();
         var prefix = $"blob/{completedAt:yyyy/MM/dd/HH}00/";
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var currentParent = await metadata.GetContainerAsync(request.Account, LogsContainerName,
-                includeDeleted: false, cancellationToken).ConfigureAwait(false);
-            if (!string.Equals(currentParent?.Revision, parent.Revision, StringComparison.Ordinal))
-                throw new StorageConcurrencyException("The admitted analytics parent changed before publication.");
-            var lastName = await metadata.GetLastBlobNameAsync(
-                request.Account,
-                LogsContainerName,
-                prefix,
-                cancellationToken).ConfigureAwait(false);
-            var counter = NextCounter(prefix, lastName);
-            var now = metadata.GetUtcNow();
-            var proposed = CreateLogRecord(request, logging.Version, prefix, counter, content.Manifest, now);
-
-            try
-            {
-                _ = await metadata.PublishBlobAsync(
-                    proposed,
-                    null,
-                    null,
-                    parent.Revision,
-                    hierarchicalNamespace: false,
-                    cancellationToken).ConfigureAwait(false);
-                return;
-            }
-            catch (StorageConcurrencyException)
-            {
-                // Another request allocated this hourly counter. Re-read the tail and retry.
-            }
-        }
+        var proposed = CreateLogRecord(request, logging.Version, prefix, content.Manifest, metadata.GetUtcNow());
+        _ = await metadata.PublishAnalyticsBlobAsync(proposed, prefix, parent.Revision, cancellationToken).ConfigureAwait(false);
     }
 
     private static BlobRecord CreateLogRecord(
         StorageAnalyticsRequest request,
         string version,
         string prefix,
-        int counter,
         ContentManifest content,
         DateTimeOffset now) => new()
         {
             Account = request.Account,
             Container = LogsContainerName,
-            Name = $"{prefix}{counter:D6}.log",
+            // The transaction chooses the final numeric suffix before insertion.
+            Name = prefix,
             GenerationId = Guid.NewGuid().ToString("N"),
             Revision = MetadataStore.NewRevision(),
             IsCurrent = true,
@@ -167,22 +137,6 @@ public sealed class StorageAnalyticsService(
     private static bool ShouldLog(StorageAnalyticsRequest request) =>
         !string.Equals(request.AuthenticationType, "anonymous", StringComparison.Ordinal) ||
         request.StatusCode is >= 200 and < 300 or StatusCodes.Status304NotModified or >= 500;
-
-    private static int NextCounter(string prefix, string? lastName)
-    {
-        if (lastName is null ||
-            !lastName.StartsWith(prefix, StringComparison.Ordinal) ||
-            !lastName.EndsWith(".log", StringComparison.Ordinal) ||
-            !int.TryParse(
-                lastName.AsSpan(prefix.Length, lastName.Length - prefix.Length - ".log".Length),
-                NumberStyles.None,
-                CultureInfo.InvariantCulture,
-                out var lastCounter))
-        {
-            return 0;
-        }
-        return checked(lastCounter + 1);
-    }
 
     internal static string FormatRecord(string version, StorageAnalyticsRequest request)
     {

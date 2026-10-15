@@ -582,6 +582,8 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
                           ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-name");
         var version = ProtocolParsing.First(http.Request.Headers, "x-ms-deleted-container-version")
                       ?? throw AzureStorageException.MissingHeader("x-ms-deleted-container-version");
+        http.RequestServices.GetRequiredService<StorageAuthenticator>()
+            .EnsureContainerPermission(request, deletedName, 'w');
         _ = await service.RestoreContainerAsync(
             request.Account,
             deletedName,
@@ -1137,6 +1139,7 @@ string.Equals(comp, "acl", StringComparison.Ordinal))
             request, resolved.Snapshot is not null, resolved.VersionId is not null);
         Require(context, permanentDelete ? 'y' : resolved.VersionId is not null ? 'x' : 'd');
         EvaluateWriteConditions(request, blob);
+        BlobConditionEvaluator.EvaluateAccessTierDeleteConditions(request, blob.AccessTierChangedAt);
         EnsureLease(request, blob.Lease, "blob");
         await RecheckParentMutationAclAsync(request.HttpContext, context, cancellationToken).ConfigureAwait(false);
         if (permanentDelete)
@@ -6275,15 +6278,27 @@ string.Equals(route.Comp, "metadata", StringComparison.Ordinal))
             case "relativetonow":
                 if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var milliseconds) || milliseconds <= 0)
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
-                return metadataNow.AddMilliseconds(milliseconds);
+                return AddRelativeExpiry(metadataNow, milliseconds, value);
             case "relativetocreation":
                 if (!allowRelativeToCreation)
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option);
                 if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var fromCreation) || fromCreation <= 0)
                     throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
-                return createdAt.AddMilliseconds(fromCreation);
+                return AddRelativeExpiry(createdAt, fromCreation, value);
             default:
                 throw AzureStorageException.InvalidHeader("x-ms-expiry-option", option);
+        }
+    }
+
+    private static DateTimeOffset AddRelativeExpiry(DateTimeOffset origin, long milliseconds, string? value)
+    {
+        try
+        {
+            return origin.AddMilliseconds(milliseconds);
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            throw AzureStorageException.InvalidHeader("x-ms-expiry-time", value);
         }
     }
 

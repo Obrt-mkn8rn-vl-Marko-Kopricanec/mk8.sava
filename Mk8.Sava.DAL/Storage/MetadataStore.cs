@@ -803,30 +803,6 @@ public sealed partial class MetadataStore(
         return await ReadSingleJsonAsync<BlobRecord>(command, cancellationToken).ConfigureAwait(false);
     }
 
-    internal async Task<string?> GetLastBlobNameAsync(
-        string account,
-        string container,
-        string prefix,
-        CancellationToken cancellationToken)
-    {
-        var connection = (await OpenAsync(cancellationToken).ConfigureAwait(false));
-        await using var connectionDisposal = connection.ConfigureAwait(false);
-        var command = connection.CreateCommand();
-        await using var commandDisposal = command.ConfigureAwait(false);
-        command.CommandText = """
-            SELECT name FROM blobs
-            WHERE account = $account
-              AND container = $container
-              AND substr(name, 1, length($prefix)) = $prefix
-            ORDER BY name DESC
-            LIMIT 1;
-            """;
-        command.Parameters.AddWithValue("$account", account);
-        command.Parameters.AddWithValue("$container", container);
-        command.Parameters.AddWithValue("$prefix", prefix);
-        return (string?)await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
-    }
-
     public async Task<IReadOnlyList<BlobRecord>> ListBlobsAsync(
         string account,
         string container,
@@ -1805,6 +1781,7 @@ public sealed partial class MetadataStore(
             expectedContainerRevision,
             stagedBlockSnapshot: null,
             hierarchicalNamespace,
+            analyticsPrefix: null,
             cancellationToken);
     }
 
@@ -1826,6 +1803,7 @@ public sealed partial class MetadataStore(
             expectedContainerRevision,
             stagedBlockSnapshot,
             hierarchicalNamespace,
+            analyticsPrefix: null,
             cancellationToken);
     }
 
@@ -1836,6 +1814,7 @@ public sealed partial class MetadataStore(
         string expectedContainerRevision,
         IReadOnlyList<StagedBlockRecord>? stagedBlockSnapshot,
         bool hierarchicalNamespace,
+        string? analyticsPrefix,
         CancellationToken cancellationToken)
     {
         await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -1847,6 +1826,12 @@ public sealed partial class MetadataStore(
             await using var transactionDisposal = transaction.ConfigureAwait(false);
             await EnsureContainerWriteAdmissionAsync(connection, transaction, proposed.Account, proposed.Container,
                 expectedContainerRevision, cancellationToken).ConfigureAwait(false);
+            if (analyticsPrefix is not null)
+            {
+                var name = await AllocateAnalyticsNameAsync(connection, transaction,
+                    proposed.Account, proposed.Container, analyticsPrefix, cancellationToken).ConfigureAwait(false);
+                proposed = proposed with { Name = name };
+            }
             var (current, prepared) = await PrepareBlobPublicationAsync(
                 connection, transaction, proposed, expectedCurrentGeneration,
                 expectedCurrentRevision, stagedBlockSnapshot, hierarchicalNamespace,
@@ -1867,7 +1852,9 @@ public sealed partial class MetadataStore(
                 DeletedAt = null,
                 DeleteRetentionUntil = null,
                 VersionId = serviceProperties.VersioningEnabled && !hierarchicalNamespace
-                    ? proposed.VersionId ?? CreateVersionId(proposed.LastModified)
+                    ? proposed.VersionId ?? await CreateUniqueVersionIdAsync(
+                        connection, transaction, proposed.Account, proposed.Container, proposed.Name,
+                        proposed.LastModified, cancellationToken).ConfigureAwait(false)
                     : null,
                 Snapshot = null
             };
@@ -2797,6 +2784,7 @@ public sealed partial class MetadataStore(
             await using var transactionDisposal = transaction.ConfigureAwait(false);
             await EnsureContainerWriteAdmissionAsync(connection, transaction, block.Account, block.Container,
                 expectedContainerRevision, cancellationToken).ConfigureAwait(false);
+            await EnsureStagedBlockAdmissionAsync(connection, transaction, block, cancellationToken).ConfigureAwait(false);
             var command = connection.CreateCommand();
             await using var commandDisposal = command.ConfigureAwait(false);
             command.Transaction = transaction;

@@ -40,12 +40,14 @@ internal sealed class ApplicationReadSessions(
                 ? await chunks.Admission.AcquireQueryAsync(cancellationToken).ConfigureAwait(false)
                 : await chunks.Admission.AcquireReadAsync(cancellationToken).ConfigureAwait(false);
             var authoritative = await ReloadBlobAsync(record, cancellationToken).ConfigureAwait(false);
+            BlobService.EnsureReadableContent(authoritative);
             pin = chunks.Pin(authoritative.Content);
             // A delete/overwrite can race the initial row lookup before the pin
             // takes effect. Do not read that retired incarnation: after pinning,
             // confirm that the authoritative revision still names this content.
             _ = await ReloadBlobAsync(authoritative, cancellationToken).ConfigureAwait(false);
             var accessed = await blobs.RecordDataAccessAsync(authoritative, cancellationToken).ConfigureAwait(false);
+            BlobService.EnsureReadableContent(accessed);
             if (!string.Equals(accessed.GenerationId, authoritative.GenerationId, StringComparison.Ordinal) ||
                 !ContentMatchesPinnedManifest(authoritative.Content, accessed.Content))
             {
