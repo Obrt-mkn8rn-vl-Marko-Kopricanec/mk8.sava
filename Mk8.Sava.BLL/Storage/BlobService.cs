@@ -641,45 +641,31 @@ public sealed class BlobService(
         BlobRecord current,
         CancellationToken cancellationToken)
     {
-        while (true)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var now = metadata.GetUtcNow();
-            var smartTier = string.Equals(current.AccessTier, "Smart", StringComparison.Ordinal);
-            var trackLastAccess = IsLastAccessTimeTrackingEnabled(current.Account) &&
-                                  (!current.LastAccessedAt.HasValue ||
-                                   now - current.LastAccessedAt.Value >= TimeSpan.FromHours(24));
-            if (!smartTier && !trackLastAccess)
-                return current;
+        ArgumentNullException.ThrowIfNull(current);
+        cancellationToken.ThrowIfCancellationRequested();
+        var now = metadata.GetUtcNow();
+        var smartTier = string.Equals(current.AccessTier, "Smart", StringComparison.Ordinal);
+        var trackLastAccess = IsLastAccessTimeTrackingEnabled(current.Account) &&
+                              (!current.LastAccessedAt.HasValue ||
+                               now - current.LastAccessedAt.Value >= TimeSpan.FromHours(24));
+        if (!smartTier && !trackLastAccess)
+            return current;
 
-            var movedToHot = smartTier &&
-                             !string.Equals(current.SmartAccessTier, "Hot", StringComparison.Ordinal);
-            var updated = current with
-            {
-                Revision = MetadataStore.NewRevision(),
-                SmartAccessTier = smartTier ? "Hot" : current.SmartAccessTier,
-                SmartTierLastAccessedAt = smartTier ? now : current.SmartTierLastAccessedAt,
-                LastAccessedAt = trackLastAccess ? now : current.LastAccessedAt,
-                AccessTierChangedAt = movedToHot ? now : current.AccessTierChangedAt
-            };
-            try
-            {
-                await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
-                return updated;
-            }
-            catch (StorageConcurrencyException)
-            {
-                current = await metadata.GetBlobAsync(
-                              current.Account,
-                              current.Container,
-                              current.Name,
-                              current.VersionId,
-                              current.Snapshot,
-                              includeDeleted: false,
-                              cancellationToken).ConfigureAwait(false)
-                          ?? throw AzureStorageException.BlobNotFound();
-            }
-        }
+        var movedToHot = smartTier &&
+                         !string.Equals(current.SmartAccessTier, "Hot", StringComparison.Ordinal);
+        var updated = current with
+        {
+            Revision = MetadataStore.NewRevision(),
+            SmartAccessTier = smartTier ? "Hot" : current.SmartAccessTier,
+            SmartTierLastAccessedAt = smartTier ? now : current.SmartTierLastAccessedAt,
+            LastAccessedAt = trackLastAccess ? now : current.LastAccessedAt,
+            AccessTierChangedAt = movedToHot ? now : current.AccessTierChangedAt,
+        };
+        // Authorization, source conditions and any read pin apply to this revision.
+        // A conflict must return to that admission boundary; reloading here could
+        // substitute unchecked content, tags, ACLs or encryption properties.
+        await metadata.PutBlobRecordAsync(updated, current.Revision, cancellationToken).ConfigureAwait(false);
+        return updated;
     }
 
     public async Task<BlobRecord> PutBlockBlobAsync(

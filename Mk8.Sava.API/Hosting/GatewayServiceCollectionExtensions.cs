@@ -48,7 +48,10 @@ public static class GatewayServiceCollectionExtensions
         services.AddSingleton<LeaseService>();
         services.AddSingleton<StorageAuthenticator>();
         AddIdentityServices(services);
-        services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
+        // Every source request uses ResponseHeadersRead: bound the header wait
+        // without applying a total HttpClient timeout to streamed blob content.
+        services.AddHttpClient<UrlTransferClient>((provider, client) => client.Timeout =
+                provider.GetRequiredService<IOptions<SavaOptions>>().Value.UrlTransferResponseHeaderTimeout)
             .RemoveAllLoggers().ConfigurePrimaryHttpMessageHandler(provider =>
             {
                 var egress = new UrlSourceEgressPolicy(provider.GetRequiredService<IOptions<SavaOptions>>().Value);

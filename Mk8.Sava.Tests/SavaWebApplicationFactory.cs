@@ -247,7 +247,7 @@ public sealed class SavaWebApplicationFactory : WebApplicationFactory<Program>, 
         if (_urlTransferHandlerFactory is not null)
         {
             builder.ConfigureServices(services =>
-                services.AddHttpClient<UrlTransferClient>(client => client.Timeout = Timeout.InfiniteTimeSpan)
+                services.AddHttpClient<UrlTransferClient>()
                     .ConfigurePrimaryHttpMessageHandler(_urlTransferHandlerFactory));
         }
         ConfigureGraphResolverServices(builder);

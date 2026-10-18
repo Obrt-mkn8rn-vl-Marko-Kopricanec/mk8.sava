@@ -61,8 +61,8 @@ public sealed class ApplicationBackendTests
         await AssertQueryRenewalAsync(expire).ConfigureAwait(true);
 
     [Fact]
-    public async Task ADataAccessCasRetryAcceptsIdenticalReloadedChunkReferences() =>
-        await AssertDataAccessRetryContentAsync().ConfigureAwait(true);
+    public async Task DataAccessRequiresFreshAdmissionEvenWhenChangedMetadataRetainsTheSameContent() =>
+        await AssertDataAccessRevisionAsync().ConfigureAwait(true);
 
     [Fact]
     public async Task RpcAdmissionIsGlobalAcrossPeersAndKeepsReadinessAndControlIndependent() =>
@@ -420,7 +420,7 @@ public sealed class ApplicationBackendTests
         Assert.Equal(record.Content.Chunks.Count, await service.CollectGarbageAsync(CancellationToken.None).ConfigureAwait(false));
     }
 
-    private static async Task AssertDataAccessRetryContentAsync()
+    private static async Task AssertDataAccessRevisionAsync()
     {
         var time = new AdjustableClock(DateTimeOffset.UtcNow);
         var factory = CreateFactory(time, new Dictionary<string, string?>(StringComparer.Ordinal)
@@ -430,10 +430,16 @@ public sealed class ApplicationBackendTests
         await using var disposal = factory.ConfigureAwait(false);
         var (record, _) = await CreateBlobAsync(factory).ConfigureAwait(false);
         var service = factory.Services.GetRequiredService<BlobService>();
-        _ = await service.SetBlobMetadataAsync(record, Metadata("benign", "update"), CancellationToken.None)
+        var changed = await service.SetBlobMetadataAsync(record, Metadata("benign", "update"), CancellationToken.None)
             .ConfigureAwait(false);
         time.Advance(TimeSpan.FromDays(1));
-        var accessed = await service.RecordDataAccessAsync(record, CancellationToken.None).ConfigureAwait(false);
+        await Assert.ThrowsAsync<StorageConcurrencyException>(() =>
+            service.RecordDataAccessAsync(record, CancellationToken.None)).ConfigureAwait(false);
+        var fresh = await service.GetBlobAsync(record.Account, record.Container, record.Name,
+            versionId: null, snapshot: null, includeDeleted: false, CancellationToken.None).ConfigureAwait(false);
+        Assert.Equal(changed.Revision, fresh.Revision);
+        Assert.Equal(changed.LastAccessedAt, fresh.LastAccessedAt);
+        var accessed = await service.RecordDataAccessAsync(fresh, CancellationToken.None).ConfigureAwait(false);
         Assert.Equal("update", accessed.Metadata["benign"]);
         Assert.Equal(time.GetUtcNow(), accessed.LastAccessedAt);
         Assert.NotSame(record.Content, accessed.Content);
