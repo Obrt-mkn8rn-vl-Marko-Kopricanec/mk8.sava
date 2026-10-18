@@ -1,4 +1,9 @@
-/docs/internal
+# Narrative documentation belongs in the private Overwatch archive.
+/docs/
+/tools/
+*.[Mm][Dd]
+*.[Rr][Ss][Tt]
+*.[Aa][Dd][Oo][Cc]
 /deploy/
 **/bin/
 **/obj/
