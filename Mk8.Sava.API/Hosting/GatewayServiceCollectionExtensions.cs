@@ -59,6 +59,8 @@ public static class GatewayServiceCollectionExtensions
                 {
                     AllowAutoRedirect = false,
                     AutomaticDecompression = DecompressionMethods.None,
+                    // The pooled handler must not carry source-cookie authority between callers.
+                    UseCookies = false,
                     UseProxy = false,
                     ConnectTimeout = TimeSpan.FromSeconds(10),
                     ConnectCallback = egress.ConnectAsync
