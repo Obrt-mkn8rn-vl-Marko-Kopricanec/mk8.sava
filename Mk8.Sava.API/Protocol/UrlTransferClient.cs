@@ -115,7 +115,8 @@ internal sealed class UrlTransferClient(
         var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))
         {
-            using var limited = new LengthLimitedReadStream(stream, expected);
+            using var timed = new UrlSourceBodyReadStream(stream, _options.UrlTransferReadIdleTimeout, cancellationToken);
+            using var limited = new LengthLimitedReadStream(timed, expected);
             try
             {
                 await consume(limited, cancellationToken).ConfigureAwait(false);
@@ -200,7 +201,8 @@ internal sealed class UrlTransferClient(
         var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         await using (source.ConfigureAwait(false))
         {
-            using var limitedSource = new LengthLimitedReadStream(source, effectiveMaximumBytes);
+            using var timed = new UrlSourceBodyReadStream(source, _options.UrlTransferReadIdleTimeout, cancellationToken);
+            using var limitedSource = new LengthLimitedReadStream(timed, effectiveMaximumBytes);
             var sourceInfo = new UrlSource(
                 limitedSource,
                 contentLength,
@@ -304,7 +306,7 @@ internal sealed class UrlTransferClient(
         }
     }
 
-    private static async Task<long> ValidateReadSourceResponseAsync(
+    private async Task<long> ValidateReadSourceResponseAsync(
         HttpRequest destinationRequest,
         HttpResponseMessage response,
         string? sourceRange,
@@ -775,7 +777,8 @@ internal sealed class UrlTransferClient(
             var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             await using (body.ConfigureAwait(false))
             {
-                return await ProtocolParsing.ReadTagsBodyAsync(body, cancellationToken).ConfigureAwait(false);
+                using var timed = new UrlSourceBodyReadStream(body, _options.UrlTransferReadIdleTimeout, cancellationToken);
+                return await ProtocolParsing.ReadTagsBodyAsync(timed, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -1009,7 +1012,8 @@ internal sealed class UrlTransferClient(
                 var body = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
                 await using (body.ConfigureAwait(false))
                 {
-                    using var reader = XmlReader.Create(body, new XmlReaderSettings
+                    using var timed = new UrlSourceBodyReadStream(body, _options.UrlTransferReadIdleTimeout, cancellationToken);
+                    using var reader = XmlReader.Create(timed, new XmlReaderSettings
                     {
                         Async = true,
                         DtdProcessing = DtdProcessing.Prohibit,
@@ -1106,7 +1110,7 @@ internal sealed class UrlTransferClient(
         request.Headers.ContainsKey("x-ms-source-if-unmodified-since") ||
         request.Headers.ContainsKey("x-ms-source-if-tags");
 
-    private static async Task<AzureStorageException> CreateSourceFailureAsync(
+    private async Task<AzureStorageException> CreateSourceFailureAsync(
         HttpRequest destinationRequest,
         HttpResponseMessage response,
         CancellationToken cancellationToken,
@@ -1156,7 +1160,7 @@ internal sealed class UrlTransferClient(
             details: details);
     }
 
-    private static async Task<(string? Code, string? Message)> ReadSourceErrorAsync(
+    private async Task<(string? Code, string? Message)> ReadSourceErrorAsync(
         HttpContent content,
         CancellationToken cancellationToken)
     {
@@ -1166,11 +1170,12 @@ internal sealed class UrlTransferClient(
             var source = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
             await using (source.ConfigureAwait(false))
             {
+                using var timed = new UrlSourceBodyReadStream(source, _options.UrlTransferReadIdleTimeout, cancellationToken);
                 using var buffer = new MemoryStream();
                 var bytes = new byte[4096];
                 while (buffer.Length <= maximumErrorBodyBytes)
                 {
-                    var read = await source.ReadAsync(bytes, cancellationToken).ConfigureAwait(false);
+                    var read = await timed.ReadAsync(bytes, cancellationToken).ConfigureAwait(false);
                     if (read == 0)
                         break;
                     await buffer.WriteAsync(bytes.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
@@ -1196,7 +1201,8 @@ internal sealed class UrlTransferClient(
             }
         }
         catch (Exception exception) when (
-            (exception is XmlException or InvalidOperationException or IOException) &&
+            (exception is XmlException or InvalidOperationException or IOException or
+                AzureStorageException { ErrorCode: "CannotVerifyCopySource" }) &&
             !CatastrophicExceptionPolicy.Contains(exception))
         {
             return (null, null);

@@ -54,6 +54,7 @@ public sealed class SavaOptions : IValidatableObject
     public int MaximumQueuedStorageOperations { get; init; } = 128;
     public IList<string> UrlTransferAllowedPrivateHosts { get; init; } = [];
     public TimeSpan UrlTransferResponseHeaderTimeout { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan UrlTransferReadIdleTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public int SoftDeleteRetentionDays { get; init; } = 7;
     public TimeSpan StandardRehydrationDelay { get; init; } = TimeSpan.FromHours(15);
     public TimeSpan HighPriorityRehydrationDelay { get; init; } = TimeSpan.FromHours(1);
@@ -530,6 +531,12 @@ public sealed class SavaOptions : IValidatableObject
         {
             yield return new ValidationResult("UrlTransferResponseHeaderTimeout must be between 100 milliseconds and 10 minutes.",
                 [nameof(UrlTransferResponseHeaderTimeout)]);
+        }
+        if (UrlTransferReadIdleTimeout < TimeSpan.FromMilliseconds(100) ||
+            UrlTransferReadIdleTimeout > TimeSpan.FromMinutes(10))
+        {
+            yield return new ValidationResult("UrlTransferReadIdleTimeout must be between 100 milliseconds and 10 minutes.",
+                [nameof(UrlTransferReadIdleTimeout)]);
         }
 
         foreach (var host in UrlTransferAllowedPrivateHosts)
